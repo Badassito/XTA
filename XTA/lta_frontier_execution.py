@@ -52,12 +52,14 @@ def _drive_canonical_relay_frontier(
     which input revisions belong to a wave.
     """
     from . import lta_execution as execution
-    from .lta_frontier import CanonicalFrontier
+    from .lta_frontier import CanonicalFrontier, MIN_FRONTIER_DATABASE_BYTES
     from .lta_postprocessing import fill_binary_mask_holes_2d
     from .lta_propagation import partition_mask_seed_sessions, read_seed_artifact, write_seed_artifact
     from .lta_relay_episodes import read_relay_observations, merge_relay_observations_across_chains
     from .lta_scheduler import LtaSessionWork, LtaViewAffinityScheduler, LtaViewKey
     from .lta_worker_adapter import _write_relay_artifacts
+    from .publication_memory import publication_ram_headroom
+    from .workspace import _env_int
 
     temp_root = Path(temp_root)
     devices = tuple(device_ids if device_ids is not None else getattr(pool, "device_ids", tuple(pool.pids)))
@@ -92,7 +94,14 @@ def _drive_canonical_relay_frontier(
             raise RuntimeError("frontier artifact is outside its scratch root") from error
         return resolved
 
-    with CanonicalFrontier(temp_root / "canonical_frontier.sqlite3", frame_count=view_plan.frame_count) as frontier:
+    # A memory database also holds a rollback journal and a small packed retry
+    # batch. Limit its pages to a small fraction of actual run headroom.
+    requested = max(0, _env_int("XTA_LTA_FRONTIER_MEMORY_MIB", 16)) * 1024**2
+    memory_bytes = min(requested, publication_ram_headroom() // 64) if requested else 0
+    if memory_bytes < MIN_FRONTIER_DATABASE_BYTES:
+        memory_bytes = 0
+    with CanonicalFrontier(temp_root / "canonical_frontier.sqlite3", frame_count=view_plan.frame_count,
+                           memory_database_bytes=memory_bytes) as frontier:
         for generation in range(1, int(max_relay_generations) + 2):
             generation_tasks = 0
             generation_waves = 0
@@ -120,14 +129,16 @@ def _drive_canonical_relay_frontier(
                             or tuple(seeds[0].mask.shape) != (grid.tile_size, grid.tile_size)):
                         raise RuntimeError("relay seed metadata does not match its frontier destination")
                     grouped[(lineage, tile_index, frame, direction)].append(record)
-                for (_lineage, tile_index, _frame, direction), group in sorted(grouped.items()):
-                    seed = execution._select_and_merge_relay_group(
-                        group, direction=direction, destination_tile_index=tile_index, generation=generation,
-                        enable_2D_hole_fill=enable_2D_hole_fill)
-                    audit["spatial_seed_candidates"] += 1
-                    # Join historical input support before handoff. A fragment
-                    # covered on its own can close a hole in the accumulated seed.
-                    frontier.offer(seed, tile_index=tile_index, direction=direction)
+                def spatial_offers():
+                    for (_lineage, tile_index, _frame, direction), group in sorted(grouped.items()):
+                        # A covered fragment can close a hole in the accumulated seed.
+                        seed = execution._select_and_merge_relay_group(
+                            group, direction=direction, destination_tile_index=tile_index,
+                            generation=generation, enable_2D_hole_fill=enable_2D_hole_fill)
+                        yield seed, tile_index, direction
+
+                frontier.offer_many(spatial_offers())
+                audit["spatial_seed_candidates"] += len(grouped)
                 execution._unlink_consumed_temp_artifacts(paths, temp_root=temp_root)
             incoming = ()
             entries = frontier.take_wave(limit=FRONTIER_WAVE_SEEDS)
@@ -248,7 +259,9 @@ def _drive_canonical_relay_frontier(
                             input_seeds = read_seed_artifact(
                                 payload["seed_artifact_path"], expected_sha256=payload["seed_artifact_sha256"])
                             _validate_frontier_observation_bindings(observations, payload, input_seeds)
-                            outgoing = execution._verified_dogfood_artifacts(manifest, payload)
+                            outgoing = execution._verified_dogfood_artifacts(manifest, input_seeds)
+                            input_lineages = tuple(seed.lineage for seed in input_seeds)
+                            del input_seeds
                             window = payload["window"]
                             endpoints = {int(window["frame_start"]), int(window["frame_stop"]) - 1}
                             if any(frame not in endpoints for frame in outgoing):
@@ -260,7 +273,9 @@ def _drive_canonical_relay_frontier(
                                 contained(path)
                             _unused_relays, union_path = execution._consume_chain_manifest(manifest, view_union=view_union)
                         with phase("lineage_coverage_ingest", work_id=result.work_id, generation=generation):
-                            execution._ingest_lineage_coverage(manifest, payload, coverage, temp_root=temp_root)
+                            execution._ingest_lineage_coverage(
+                                manifest, payload, coverage, temp_root=temp_root, input_lineages=input_lineages,
+                            )
                         execution._unlink_consumed_temp_artifacts((union_path,), temp_root=temp_root)
                         received[result.work_id] = (result, manifest, observations, outgoing, legacy_paths)
                         scheduler.complete(claim, result)
@@ -283,8 +298,9 @@ def _drive_canonical_relay_frontier(
                     terminal = boundary == (view_plan.frame_count - 1 if direction == "forward" else 0)
                     if not terminal and boundary in outgoing:
                         record = outgoing[boundary]
-                        for seed in read_seed_artifact(record["path"], expected_sha256=record["sha256"]):
-                            frontier.offer(seed, tile_index=payload["tile_index"], direction=direction)
+                        seeds = read_seed_artifact(record["path"], expected_sha256=record["sha256"])
+                        frontier.offer_many(seeds, tile_index=payload["tile_index"], direction=direction)
+                        del seeds
                     consumed = [Path(result.artifact_path), Path(payload["seed_artifact_path"]),
                                 Path(manifest["relay_observation_artifact"]["path"]),
                                 *legacy_paths, *(Path(record["path"]) for record in outgoing.values())]

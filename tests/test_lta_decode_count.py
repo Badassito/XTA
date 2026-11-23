@@ -33,17 +33,17 @@ class _Progress:
 
 
 class StrictDecodeCountTests(unittest.TestCase):
-    def _decode_mapped_pipe(self, root: Path, *, byte_count: int, exit_code: int):
+    def _decode_mapped_pipe(self, root: Path, *, byte_count: int, exit_code: int, strict=True):
         processes = []
         mappings = []
         commands = []
         original_spawn = media._spawn_decode_process
         output_path = root / "decoded.u8.raw"
-        # Diagnostics precede stdout and exceed ordinary pipe capacity. Strict
-        # EOF verification must drain them while reading the decoded pixels.
+        # Strict EOF tests also use diagnostics larger than the pipe capacity.
+        diagnostic_size = 300 * 1024 if strict else 32
         child = (
             "import sys; "
-            "sys.stderr.buffer.write(b'x' * (300 * 1024) + b'last-decoder-diagnostic'); "
+            f"sys.stderr.buffer.write(b'x' * {diagnostic_size} + b'last-decoder-diagnostic'); "
             "sys.stderr.buffer.flush(); "
             f"sys.stdout.buffer.write(bytes([3]) * {byte_count}); "
             "sys.stdout.buffer.flush(); "
@@ -76,16 +76,17 @@ class StrictDecodeCountTests(unittest.TestCase):
                         root / "unused.mkv", output_path,
                         num_frames=2, width=3, height=2,
                         overwrite=True, prefer_memory=False, reserve_bytes=0,
-                        strict_frame_count=True,
+                        strict_frame_count=strict,
                     )
                 except BaseException as error:
                     failure = error
             self.assertEqual(len(mappings), 1)
             self.assertEqual(len(processes), 1)
             self.assertIsNotNone(processes[0].poll())
-            map_index = commands[0].index("-map")
-            self.assertEqual(commands[0][map_index + 1], "0:v:0")
-            return result, failure, mappings[0], output_path
+            if strict:
+                map_index = commands[0].index("-map")
+                self.assertEqual(commands[0][map_index + 1], "0:v:0")
+            return result, failure, mappings.pop(), output_path
         finally:
             for process in processes:
                 if process.poll() is None:
@@ -120,6 +121,19 @@ class StrictDecodeCountTests(unittest.TestCase):
                 moved = root / "discarded.raw"
                 path.replace(moved)
                 moved.unlink()
+
+    def test_default_decode_failure_does_not_pin_mapping_in_retained_traceback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            _, failure, mapping, path = self._decode_mapped_pipe(
+                root, byte_count=5, exit_code=0, strict=False,
+            )
+            mapping_ref = weakref.ref(mapping._mmap)
+            mapping = None
+            gc.collect()
+            self.assertIsNone(mapping_ref())
+            path.replace(root / 'discarded.raw')
+            self.assertRegex(str(failure), 'Unexpected EOF')
 
     def test_exact_count_returns_an_open_mapping_with_unmodified_pixels(self):
         with tempfile.TemporaryDirectory() as folder:

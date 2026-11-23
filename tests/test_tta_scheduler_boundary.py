@@ -127,7 +127,6 @@ def _operations(**overrides: object) -> TtaSchedulerOperations:
         memfd_workspace_enabled=lambda: False,
         preflight_multiprocessing_payload=lambda _payload: None,
         azimuthal_batch_padding_count=lambda *_args, **_kwargs: 0,
-        azimuthal_batch_padding_mirror_groups=lambda *_args, **_kwargs: (),
         runtime_telemetry=lambda: telemetry,
         tile_dense_worker_result_warn_seconds=lambda: 0.0,
         view_processing_volume_shape=lambda _view, size: (1, int(size), int(size)),

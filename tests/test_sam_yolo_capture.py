@@ -2,6 +2,7 @@
 from concurrent.futures import Future
 from contextlib import contextmanager
 import os
+import sqlite3
 import threading
 from types import SimpleNamespace
 
@@ -78,6 +79,50 @@ def session(pool,*,n=24,h=3,w=5,torch=None,publisher=None):
     capture=GrayCaptureSession(pool,payload(n,h,w),torch=torch or fake_torch(),
         device='cuda:0',publish_frames=publish,seal=lambda:len(frames)==n)
     return capture,frames
+
+
+def test_session_reuses_writer_and_retries_busy_packet(tmp_path, monkeypatch):
+    from XTA import gray_cache
+    cache = payload(17)
+    cache['store_root'] = tmp_path
+    cache['spec'].update(source_identity='test', physical_view_record={})
+    real_connect = sqlite3.connect
+    opened, closed = [], []
+    transactions = 0
+
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            nonlocal transactions
+            if sql == 'BEGIN IMMEDIATE':
+                transactions += 1
+                if transactions == 2:
+                    raise sqlite3.OperationalError('database is locked')
+            return super().execute(sql, *args, **kwargs)
+
+        def close(self):
+            assert capture._writer_lock.locked()
+            closed.append(self)
+            super().close()
+
+    def connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs, factory=Connection)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(gray_cache.sqlite3, 'connect', connect)
+    monkeypatch.setattr(gray_cache.shutil, 'disk_usage', lambda _path: SimpleNamespace(free=64*1024**3))
+    pool = GrayCapturePool(cache['host_capacity_bytes'], cpu_workers=2)
+    capture = GrayCaptureSession(pool, cache, torch=fake_torch(), device='cuda:0')
+    try:
+        capture.capture_gpu(Tensor(np.ones((17, 3, 3, 5), np.float32)), range(17), None)
+        result = capture.finish_capture().result(timeout=10)
+        assert result['gray_capture_committed_frames'] == 17
+        assert result['gray_capture_packets'] == 3
+        assert result['gray_capture_sealed']
+        assert transactions == 6  # Initialization, three packets, one retry, one seal.
+        assert len(opened) == 1 and closed == opened
+    finally:
+        pool.close()
 
 
 def test_quantized_center_pixels_ignore_padding_and_leave_model_input_untouched():

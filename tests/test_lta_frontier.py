@@ -12,7 +12,7 @@ import unittest
 
 import numpy as np
 
-from XTA.lta_frontier import CanonicalFrontier
+from XTA.lta_frontier import CanonicalFrontier, MIN_FRONTIER_DATABASE_BYTES
 from XTA.lta_propagation import LtaMaskSeed, LtaSeedProvenance
 from XTA.lta_tile_tracking import LtaLineageId
 
@@ -24,8 +24,8 @@ class CanonicalFrontierTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.lineage = LtaLineageId("volume", "transverse", "tta_a0", "object", "s4_st2")
 
-    def frontier(self, name="frontier", frames=90):
-        value = CanonicalFrontier(self.root / (name + ".sqlite3"), frame_count=frames)
+    def frontier(self, name="frontier", frames=90, **options):
+        value = CanonicalFrontier(self.root / (name + ".sqlite3"), frame_count=frames, **options)
         self.addCleanup(value.close)
         return value
 
@@ -70,6 +70,63 @@ class CanonicalFrontierTests(unittest.TestCase):
             frontier.complete(entries)
             self.assertEqual(frontier.take_wave(), ())
         self.assertEqual(len(set(signatures)), 1)
+
+    def test_memory_page_spill_preserves_revision_lease_and_counts(self):
+        frontiers = (
+            self.frontier("memory", memory_database_bytes=MIN_FRONTIER_DATABASE_BYTES),
+            self.frontier("file"),
+        )
+        start = self.seed(frame=1, shape=(256, 256))
+        leases = []
+        for frontier in frontiers:
+            frontier.offer(start, tile_index=0, direction="forward")
+            leases.append(frontier.take_wave())
+        self.assertEqual(frontiers[0].stats()["database_backing"], "memory")
+        self.assertFalse(frontiers[0].path.exists())
+
+        # Each packed record fits the retry batch. Several records force SQLite
+        # past the page limit and exercise rollback plus replay on disk.
+        mask = np.ones((256, 256), dtype=bool)
+        offered_frames = []
+        for frame in range(1, 18):
+            def source():
+                offered_frames.append(frame)
+                yield replace(start, frame_index=frame, mask=mask)
+            frontiers[0].offer_many(source(), tile_index=0, direction="forward")
+            frontiers[1].offer(replace(start, frame_index=frame, mask=mask), tile_index=0, direction="forward")
+        self.assertEqual(offered_frames, list(range(1, 18)))
+        self.assertEqual(frontiers[0].stats()["database_backing"], "file")
+        self.assertTrue(frontiers[0].path.is_file())
+
+        snapshots = []
+        for frontier, lease in zip(frontiers, leases):
+            frontier.complete(lease)
+            entries = frontier.take_wave()
+            snapshots.append([(entry.key, entry.revision_sha256, entry.seed.mask.tobytes()) for entry in entries])
+            self.assertEqual(len(entries), len(offered_frames))
+            self.assertEqual(frontier.stats()["offer_count"], len(offered_frames) + 1)
+            self.assertEqual(frontier.stats()["dirty_count"], len(offered_frames))
+        self.assertEqual(*snapshots)
+        frontiers[0].close()
+        with CanonicalFrontier(frontiers[0].path, frame_count=90,
+                               memory_database_bytes=MIN_FRONTIER_DATABASE_BYTES) as reopened:
+            self.assertEqual(reopened.stats()["database_backing"], "file")
+            self.assertEqual(reopened.stats()["dirty_count"], len(offered_frames))
+
+    def test_spilled_stream_is_still_one_atomic_offer_batch(self):
+        frontier = self.frontier(memory_database_bytes=MIN_FRONTIER_DATABASE_BYTES)
+        seed = self.seed(shape=(256, 256))
+        frontier.offer(seed, tile_index=0, direction="forward")
+        large = replace(seed, frame_index=13, mask=np.ones((256, 256), dtype=bool))
+        # Two large prepared records exceed the bounded retry batch. The last
+        # invalid seed must roll back both offers, including the ones before spill.
+        with self.assertRaisesRegex(TypeError, "frontier offers require"):
+            frontier.offer_many(iter((large, replace(large, frame_index=14), object())),
+                                tile_index=0, direction="forward")
+        stats = frontier.stats()
+        self.assertEqual(stats["database_backing"], "file")
+        self.assertEqual(stats["mailbox_count"], 1)
+        self.assertEqual(stats["offer_count"], 1)
 
     def test_subsets_and_score_or_provenance_changes_do_not_redirty(self):
         frontier = self.frontier()
@@ -248,6 +305,18 @@ class CanonicalFrontierTests(unittest.TestCase):
             frontier.offer(self.seed(lineage=second), tile_index=0, direction="forward")
         self.assertEqual(frontier.stats()["mailbox_count"], before["mailbox_count"] + 1)
         self.assertEqual(frontier.stats()["offer_count"], before["offer_count"] + 1)
+
+    def test_offer_many_rolls_back_mailboxes_and_totals_after_invalid_seed(self):
+        frontier = self.frontier()
+        seed = self.seed()
+        with self.assertRaises(TypeError):
+            frontier.offer_many(((seed, 0, "forward"), (object(), 1, "backward")))
+        self.assertEqual(frontier.stats()["mailbox_count"], 0)
+        self.assertEqual(frontier.take_wave(), ())
+        self.assertEqual(frontier.offer_many(((seed, 0, "forward"), (seed, 0, "forward"),
+                                             (seed, 1, "backward"))),
+                         (True, False, True))
+        self.assertEqual(frontier.stats()["offer_count"], 3)
 
     def test_sqlite_storage_is_cropped_packed_and_uncompleted_inputs_survive_reopen(self):
         path = self.root / "packed.sqlite3"

@@ -144,6 +144,7 @@ def cleanup_tta_selected_run_scratch(
     temp_dir: Path,
     out_dir: Path,
     release_memfd_owners_under: Callable[[Path], int],
+    wait_for_memmap_unlinks: Callable[..., None],
     remove_tree: Callable[[Path], object],
 ) -> None:
     """Strictly retire scratch owned by the selected run."""
@@ -155,6 +156,8 @@ def cleanup_tta_selected_run_scratch(
         if int(released_memfd_files) > 0:
             print(f"Released {int(released_memfd_files)} memfd-backed scratch payload(s).")
 
+        # A joined worker's mapping can still be queued for deletion on Windows.
+        wait_for_memmap_unlinks(under=temp_dir)
         for child in list(temp_dir.iterdir()):
             if child.is_symlink() or child.is_file():
                 child.unlink(missing_ok=True)

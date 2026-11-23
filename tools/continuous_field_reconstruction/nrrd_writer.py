@@ -17,6 +17,11 @@ from pathlib import Path
 import tempfile
 import numpy as np
 
+try:
+    from isal.igzip import IGzipFile as _gzip_reader
+except (ImportError, OSError):
+    _gzip_reader = gzip.GzipFile
+
 MIB=1024**2
 READBACK_CHUNK=4*MIB
 
@@ -75,7 +80,7 @@ def _readback(path,shape,expected_header,progress=None):
     with Path(path).open('rb') as raw:
         if raw.read(len(expected_header))!=expected_header:
             raise ValueError('Written NRRD header, native shape or global origin differs from the contract')
-        with gzip.GzipFile(fileobj=raw,mode='rb') as compressed:
+        with _gzip_reader(fileobj=raw,mode='rb') as compressed:
             while done<total:
                 needed=min(READBACK_CHUNK,total-done)
                 data=compressed.read(needed)

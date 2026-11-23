@@ -99,15 +99,19 @@ if TYPE_CHECKING:
     from .backprojection import _ResidentTensorRTRingFatalError
 
 
-_AZIMUTHAL_LINEAR_NATIVE_KERNEL = None
+_AZIMUTHAL_LINEAR_NATIVE_KERNELS = {}
+_RENDER_KERNEL_LOCK = threading.Lock()
 
 
-def _azimuthal_linear_native_kernel():
+def _azimuthal_linear_native_kernel(device_index=None):
     """Fuse the reference four plane taps without a second texture-volume copy."""
-    global _AZIMUTHAL_LINEAR_NATIVE_KERNEL
-    if _AZIMUTHAL_LINEAR_NATIVE_KERNEL is None:
-        import cupy as cp
+    import cupy as cp
 
+    device_index = cp.cuda.runtime.getDevice() if device_index is None else int(device_index)
+    with _RENDER_KERNEL_LOCK:
+        cached = _AZIMUTHAL_LINEAR_NATIVE_KERNELS.get(device_index)
+        if cached is not None:
+            return cached
         source = r'''
         __device__ float logical_voxel(
             const unsigned char* source, int t, int y, int x,
@@ -159,10 +163,12 @@ def _azimuthal_linear_native_kernel():
           output[row * columns + col] = ((values[0] + values[1]) + values[2]) + values[3];
         }
         '''
-        kernel = cp.RawKernel(source, 'azimuthal_linear_native', options=('--fmad=false',))
-        kernel.compile()
-        _AZIMUTHAL_LINEAR_NATIVE_KERNEL = argparse.Namespace(cp=cp, kernel=kernel)
-    return _AZIMUTHAL_LINEAR_NATIVE_KERNEL
+        with cp.cuda.Device(device_index):
+            kernel = cp.RawKernel(source, 'azimuthal_linear_native', options=('--fmad=false',))
+            kernel.compile()
+        cached = argparse.Namespace(cp=cp, kernel=kernel)
+        _AZIMUTHAL_LINEAR_NATIVE_KERNELS[device_index] = cached
+        return cached
 
 def open_existing_gray_memmap(path: object, shape: Sequence[int], dtype: object = np.uint8, mode: str = 'r') -> np.memmap:
     return np.memmap(Path(path), dtype=np.dtype(dtype), mode=str(mode), shape=tuple(int(x) for x in shape))
@@ -542,11 +548,14 @@ def _radial_native_kernels() -> Optional[object]:
 
         __device__ __forceinline__ float radial_logical_voxel(
             const unsigned char* source, int t, int y, int x,
-            int native_t, int logical_t, int full_h, int full_w, int source_t_origin) {
+            int native_t, int logical_t, int full_h, int full_w, int source_t_origin, int source_t_len) {
             const unsigned long long stride = (unsigned long long)full_h * full_w;
             const unsigned long long spatial = (unsigned long long)y * full_w + x;
-            if (native_t == logical_t)
-                return (float)source[(unsigned long long)(t - source_t_origin) * stride + spatial];
+            if (native_t == logical_t) {
+                int local = t - source_t_origin;
+                return local >= 0 && local < source_t_len
+                    ? (float)source[(unsigned long long)local * stride + spatial] : 0.0f;
+            }
             // Reproduce the integer logical-T cube first, including its uint8
             // rounding. Interpolating native T directly changes the source data.
             double rf = __dadd_rn(__dmul_rn(__dadd_rn((double)t, 0.5),
@@ -554,15 +563,20 @@ def _radial_native_kernels() -> Optional[object]:
             int t0 = radial_clip_index((int)floor(rf), native_t);
             int t1 = radial_clip_index(t0 + 1, native_t);
             float alpha = __double2float_rn(fmin(1.0, fmax(0.0, rf - (double)t0)));
-            float f0 = (float)source[(unsigned long long)(t0 - source_t_origin) * stride + spatial];
-            float f1 = (float)source[(unsigned long long)(t1 - source_t_origin) * stride + spatial];
+            int local0 = t0 - source_t_origin;
+            if (local0 < 0 || local0 >= source_t_len) return 0.0f;
+            float f0 = (float)source[(unsigned long long)local0 * stride + spatial];
+            if (alpha == 0.0f || t0 == t1) return f0;
+            int local1 = t1 - source_t_origin;
+            if (local1 < 0 || local1 >= source_t_len) return 0.0f;
+            float f1 = (float)source[(unsigned long long)local1 * stride + spatial];
             float value = __fadd_rn(f0, __fmul_rn(alpha, __fsub_rn(f1, f0)));
             return (float)__float2uint_rn(fminf(255.0f, fmaxf(0.0f, value)));
         }
 
         extern "C" __global__ void radial_native_f32(
             const unsigned char* source, float* out,
-            int native_t, int logical_t, int full_h, int full_w, int source_t_origin,
+            int native_t, int logical_t, int full_h, int full_w, int source_t_origin, int source_t_len,
             int rows, int columns, int base_id, int direction_id,
             int height_origin, double radius, double arc_origin,
             double center_x, double center_y, double shear) {
@@ -605,21 +619,21 @@ def _radial_native_kernels() -> Optional[object]:
             for (int it = 0; it < 2; ++it) {
                 int ti = t0 + it;
                 float wt = it ? dt : __fsub_rn(1.0f, dt);
+                if (wt == 0.0f || ti < 0 || ti >= logical_t) continue;
                 #pragma unroll
                 for (int iy = 0; iy < 2; ++iy) {
                     int yi = y0 + iy;
                     float wy = iy ? dy : __fsub_rn(1.0f, dy);
+                    if (wy == 0.0f || yi < 0 || yi >= full_h) continue;
                     #pragma unroll
                     for (int ix = 0; ix < 2; ++ix) {
                         int xi = x0 + ix;
                         float wx = ix ? dx : __fsub_rn(1.0f, dx);
-                        if (ti >= 0 && ti < logical_t && yi >= 0 && yi < full_h &&
-                            xi >= 0 && xi < full_w) {
-                            float voxel = radial_logical_voxel(source, ti, yi, xi,
-                                native_t, logical_t, full_h, full_w, source_t_origin);
-                            float weight = __fmul_rn(__fmul_rn(wt, wy), wx);
-                            value = __fadd_rn(value, __fmul_rn(voxel, weight));
-                        }
+                        if (wx == 0.0f || xi < 0 || xi >= full_w) continue;
+                        float voxel = radial_logical_voxel(source, ti, yi, xi,
+                            native_t, logical_t, full_h, full_w, source_t_origin, source_t_len);
+                        float weight = __fmul_rn(__fmul_rn(wt, wy), wx);
+                        value = __fadd_rn(value, __fmul_rn(voxel, weight));
                     }
                 }
             }
@@ -646,7 +660,7 @@ def _radial_native_kernels() -> Optional[object]:
 
         extern "C" __global__ void radial_native_columns_f32(
             const unsigned char* source, const double* geometry, float* out,
-            int native_t, int logical_t, int full_h, int full_w, int source_t_origin,
+            int native_t, int logical_t, int full_h, int full_w, int source_t_origin, int source_t_len,
             int rows, int columns, int base_id, int height_origin) {
             int u = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
             int row = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
@@ -679,21 +693,21 @@ def _radial_native_kernels() -> Optional[object]:
             for (int it = 0; it < 2; ++it) {
                 int ti = t0 + it;
                 float wt = it ? dt : __fsub_rn(1.0f, dt);
+                if (wt == 0.0f || ti < 0 || ti >= logical_t) continue;
                 #pragma unroll
                 for (int iy = 0; iy < 2; ++iy) {
                     int yi = y0 + iy;
                     float wy = iy ? dy : __fsub_rn(1.0f, dy);
+                    if (wy == 0.0f || yi < 0 || yi >= full_h) continue;
                     #pragma unroll
                     for (int ix = 0; ix < 2; ++ix) {
                         int xi = x0 + ix;
                         float wx = ix ? dx : __fsub_rn(1.0f, dx);
-                        if (ti >= 0 && ti < logical_t && yi >= 0 && yi < full_h &&
-                            xi >= 0 && xi < full_w) {
-                            float voxel = radial_logical_voxel(source, ti, yi, xi,
-                                native_t, logical_t, full_h, full_w, source_t_origin);
-                            float weight = __fmul_rn(__fmul_rn(wt, wy), wx);
-                            value = __fadd_rn(value, __fmul_rn(voxel, weight));
-                        }
+                        if (wx == 0.0f || xi < 0 || xi >= full_w) continue;
+                        float voxel = radial_logical_voxel(source, ti, yi, xi,
+                            native_t, logical_t, full_h, full_w, source_t_origin, source_t_len);
+                        float weight = __fmul_rn(__fmul_rn(wt, wy), wx);
+                        value = __fadd_rn(value, __fmul_rn(voxel, weight));
                     }
                 }
             }
@@ -712,24 +726,23 @@ def _radial_native_kernels() -> Optional[object]:
         _RADIAL_NATIVE_KERNELS_ERROR = f'{type(exc).__name__}: {exc}'
         return None
 
-_FUSED_DIRECT_RENDER_KERNELS: Optional[object] = None
+_FUSED_DIRECT_RENDER_KERNELS = {}
+_FUSED_DIRECT_RENDER_KERNELS_ERRORS = {}
 
-_FUSED_DIRECT_RENDER_KERNELS_FAILED = False
 
-_FUSED_DIRECT_RENDER_KERNELS_ERROR: Optional[str] = None
+def _fused_direct_render_kernels(device_index=None) -> Optional[object]:
+    """Compile the resident Azimuthal and Tilted render bundle on its owning device."""
+    if device_index is None:
+        import cupy as cp
 
-_FUSED_DIRECT_RENDER_KERNELS_WARNED = False
+        device_index = cp.cuda.runtime.getDevice()
+    with _RENDER_KERNEL_LOCK:
+        if device_index not in _FUSED_DIRECT_RENDER_KERNELS:
+            _FUSED_DIRECT_RENDER_KERNELS[device_index] = _compile_fused_direct_render_kernels(device_index)
+        return _FUSED_DIRECT_RENDER_KERNELS[device_index]
 
-def _fused_direct_render_kernels() -> Optional[object]:
-    """Compile the allocation-free resident Azimuthal and Tilted render kernels once.
-    
-    Explicit fp32/fp16 entry points are materialized eagerly so toolchain failures retain a complete diagnostic."""
-    global _FUSED_DIRECT_RENDER_KERNELS, _FUSED_DIRECT_RENDER_KERNELS_FAILED
-    global _FUSED_DIRECT_RENDER_KERNELS_ERROR, _FUSED_DIRECT_RENDER_KERNELS_WARNED
-    if _FUSED_DIRECT_RENDER_KERNELS is not None:
-        return _FUSED_DIRECT_RENDER_KERNELS
-    if _FUSED_DIRECT_RENDER_KERNELS_FAILED:
-        return None
+
+def _compile_fused_direct_render_kernels(device_index):
     src = r'''
     #include <cuda_fp16.h>
 
@@ -1168,16 +1181,14 @@ def _fused_direct_render_kernels() -> Optional[object]:
             'azimuthal_texture_native_f32', 'azimuthal_texture_grid_f32',
             'tilted_direct_f32', 'tilted_direct_f16',
         )
-        module = cp.RawModule(code=src, options=('--std=c++14',))
-        compile_fn = getattr(module, 'compile', None)
-        if callable(compile_fn):
-            compile_fn()
-        functions = {name: module.get_function(name) for name in names}
-        _FUSED_DIRECT_RENDER_KERNELS = argparse.Namespace(cp=cp, module=module, **functions)
-        _FUSED_DIRECT_RENDER_KERNELS_ERROR = None
-        return _FUSED_DIRECT_RENDER_KERNELS
+        with cp.cuda.Device(device_index):
+            module = cp.RawModule(code=src, options=('--std=c++14',))
+            compile_fn = getattr(module, 'compile', None)
+            if callable(compile_fn):
+                compile_fn()
+            functions = {name: module.get_function(name) for name in names}
+        return argparse.Namespace(cp=cp, module=module, **functions)
     except Exception as exc:
-        _FUSED_DIRECT_RENDER_KERNELS_FAILED = True
         try:
             import hashlib
             source_id = hashlib.sha256(src.encode('utf-8')).hexdigest()[:16]
@@ -1193,25 +1204,23 @@ def _fused_direct_render_kernels() -> Optional[object]:
             except Exception:
                 pass
             try:
-                details.append(f'compute_capability={cp.cuda.Device().compute_capability}')
+                details.append(f'compute_capability={cp.cuda.Device(device_index).compute_capability}')
             except Exception:
                 pass
         except Exception:
             pass
-        _FUSED_DIRECT_RENDER_KERNELS_ERROR = '; '.join(details)
+        _FUSED_DIRECT_RENDER_KERNELS_ERRORS[device_index] = '; '.join(details)
         dump_path = os.environ.get('YOLO_TTA_FUSED_RENDER_DUMP_CUDA', '').strip()
         if dump_path:
             try:
                 Path(dump_path).expanduser().write_text(src)
             except Exception:
                 pass
-        if not _FUSED_DIRECT_RENDER_KERNELS_WARNED:
-            _FUSED_DIRECT_RENDER_KERNELS_WARNED = True
-            print(
-                'Warning: fused Azimuthal/Tilted NVRTC module failed to compile; '
-                f'{_FUSED_DIRECT_RENDER_KERNELS_ERROR}. '
-                'The reference Torch renderers remain active.'
-            )
+        print(
+            'Warning: fused Azimuthal/Tilted NVRTC module failed to compile; '
+            f'{_FUSED_DIRECT_RENDER_KERNELS_ERRORS[device_index]}. '
+            'The reference Torch renderers remain active.'
+        )
         return None
 
 def _wait_for_cube_ready_sentinel(
@@ -1996,7 +2005,11 @@ class _GpuWorkerRenderEngine:
     def _fused_cupy_volume(self, kernels: object) -> object:
         with self._azimuthal_texture_lock:
             if self._fused_volume_ref is None:
-                self._fused_volume_ref = kernels.cp.asarray(self._volume_gpu)
+                cp = kernels.cp
+                with cp.cuda.Device(self._volume_gpu.device.index), _cupy_external_stream(cp, self._stream):
+                    if self._volume_gpu.is_cuda:
+                        self._volume_gpu.record_stream(self._stream)
+                    self._fused_volume_ref = cp.asarray(self._volume_gpu)
             return self._fused_volume_ref
 
     def _ensure_azimuthal_texture(self, kernels: object) -> object:
@@ -2134,21 +2147,21 @@ class _GpuWorkerRenderEngine:
             radians = np.deg2rad(angles_np.astype(np.float64)).astype(np.float32)
             cos_np = np.ascontiguousarray(np.cos(radians).astype(np.float32))
             sin_np = np.ascontiguousarray(np.sin(radians).astype(np.float32))
-            torch = self.torch
-            angle_cos = torch.from_numpy(cos_np).to(self.device)
-            angle_sin = torch.from_numpy(sin_np).to(self.device)
-            cp = kernels.cp
-            refs = argparse.Namespace(
-                angle_cos=angle_cos,
-                angle_sin=angle_sin,
-                cp_angle_cos=cp.asarray(angle_cos),
-                cp_angle_sin=cp.asarray(angle_sin),
-                n_angles=n_angles,
-                n_u=n_u,
-                plane_h=int(plane_h),
-                plane_w=int(plane_w),
-                nbytes=int(cos_np.nbytes + sin_np.nbytes),
-            )
+            cp, torch = kernels.cp, self.torch
+            with cp.cuda.Device(self.device.index), torch.cuda.stream(self._stream), _cupy_external_stream(cp, self._stream):
+                angle_cos = torch.from_numpy(cos_np).to(self.device)
+                angle_sin = torch.from_numpy(sin_np).to(self.device)
+                refs = argparse.Namespace(
+                    angle_cos=angle_cos,
+                    angle_sin=angle_sin,
+                    cp_angle_cos=cp.asarray(angle_cos),
+                    cp_angle_sin=cp.asarray(angle_sin),
+                    n_angles=n_angles,
+                    n_u=n_u,
+                    plane_h=int(plane_h),
+                    plane_w=int(plane_w),
+                    nbytes=int(cos_np.nbytes + sin_np.nbytes),
+                )
             self._fused_azimuthal_taps[key] = refs
             self._fused_azimuthal_taps.move_to_end(key)
             limit = max(8, _env_int('YOLO_TTA_AZIMUTHAL_TEXTURE_GEOMETRY_CACHE_ENTRIES', 128))
@@ -2193,11 +2206,11 @@ class _GpuWorkerRenderEngine:
                 raise RuntimeError('Azimuthal view/source-volume XY geometry mismatch')
             if int(frame_index) < 0 or int(frame_index) >= len(view.azimuths_deg):
                 raise RuntimeError(f'Azimuthal frame index {frame_index} is outside its azimuth table')
-            kernels = _fused_direct_render_kernels()
+            kernels = _fused_direct_render_kernels(self.device.index)
             if kernels is None:
                 raise RuntimeError(
                     'CuPy/NVRTC direct renderer kernels are unavailable: '
-                    + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
+                    + str(_FUSED_DIRECT_RENDER_KERNELS_ERRORS.get(self.device.index, 'no diagnostic'))
                 )
             geometry = self._ensure_fused_azimuthal_taps(view, kernels)
             source_arg = self._ensure_azimuthal_texture(kernels).texture
@@ -2314,9 +2327,9 @@ class _GpuWorkerRenderEngine:
             center = int(tilted_frame_center(view, int(frame_index)))
             if stack_len <= 0 or center < 0 or center >= stack_len:
                 raise RuntimeError('Tilted frame center is outside the stack geometry')
-            kernels = _fused_direct_render_kernels()
+            kernels = _fused_direct_render_kernels(self.device.index)
             if kernels is None:
-                raise RuntimeError('CuPy/NVRTC direct renderer kernels are unavailable: ' + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic'))
+                raise RuntimeError('CuPy/NVRTC direct renderer kernels are unavailable: ' + str(_FUSED_DIRECT_RENDER_KERNELS_ERRORS.get(self.device.index, 'no diagnostic')))
             matrix = np.asarray(aff.M_out_to_src, dtype=np.float32).reshape(2, 3)
             if not bool(np.all(np.isfinite(matrix))):
                 raise RuntimeError('Tilted output-to-source affine is non-finite')
@@ -2411,55 +2424,58 @@ class _GpuWorkerRenderEngine:
         matrix = np.asarray(M_out_to_src, dtype=np.float32).reshape(2, 3)
         if not bool(np.all(np.isfinite(matrix))):
             raise RuntimeError('Tilted output-to-source affine is non-finite')
-        kernels = _fused_direct_render_kernels()
+        kernels = _fused_direct_render_kernels(self.device.index)
         if kernels is None:
             raise RuntimeError(
                 'CuPy/NVRTC direct renderer kernels are unavailable: '
-                + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
+                + str(_FUSED_DIRECT_RENDER_KERNELS_ERRORS.get(self.device.index, 'no diagnostic'))
             )
-        if self._standalone_render_meta is None:
-            self._standalone_render_meta = self.torch.empty(
-                (1,), dtype=self.torch.int32, device=self.device,
+        cp = kernels.cp
+        with cp.cuda.Device(self.device.index), self.torch.cuda.stream(self._stream), _cupy_external_stream(cp, self._stream) as external:
+            if self._standalone_render_meta is None:
+                self._standalone_render_meta = self.torch.empty(
+                    (1,), dtype=self.torch.int32, device=self.device,
+                )
+                self._standalone_render_meta_ref = kernels.cp.asarray(
+                    self._standalone_render_meta
+                )
+            self._standalone_render_meta.fill_(int(center))
+            output = self.torch.empty(
+                (height, width), dtype=self.torch.float32, device=self.device,
             )
-            self._standalone_render_meta_ref = kernels.cp.asarray(
-                self._standalone_render_meta
+            output.record_stream(self._stream)
+            cp_output = cp.asarray(output)
+            render_block = (32, 8)
+            render_grid = (
+                (width + render_block[0] - 1) // render_block[0],
+                (height + render_block[1] - 1) // render_block[1],
             )
-        self._standalone_render_meta.fill_(int(center))
-        output = self.torch.empty(
-            (height, width), dtype=self.torch.float32, device=self.device,
-        )
-        cp_output = kernels.cp.asarray(output)
-        render_block = (32, 8)
-        render_grid = (
-            (width + render_block[0] - 1) // render_block[0],
-            (height + render_block[1] - 1) // render_block[1],
-        )
-        kernels.tilted_direct_f32(
-            render_grid,
-            render_block,
-            (
-                self._fused_cupy_volume(kernels),
-                np.int32(native_t), np.int32(full_h), np.int32(full_w),
-                np.int32(self._logical_t), np.int32(view.src_h), np.int32(view.src_w),
-                np.int32(stack_len), np.int32(base_ids[base]),
-                np.int32(0 if direction == 'vertical' else 1),
-                self._standalone_render_meta_ref,
-                np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
-                np.int32(1),  # PTA quantizes native tilted taps before the affine.
-                np.int32(height), np.int32(width),
-                *(np.float32(value) for value in matrix.reshape(-1)),
-                cp_output,
-            ),
-            stream=_cupy_external_stream(kernels.cp, self._stream),
-        )
-        if 'tilted' not in self._fused_announced_families:
-            self._fused_announced_families.add('tilted')
-            print(
-                'PTA fused Tilted renderer active: TTA affine/shear/gather kernel '
-                'writes standalone CUDA rasters.'
+            kernels.tilted_direct_f32(
+                render_grid,
+                render_block,
+                (
+                    self._fused_cupy_volume(kernels),
+                    np.int32(native_t), np.int32(full_h), np.int32(full_w),
+                    np.int32(self._logical_t), np.int32(view.src_h), np.int32(view.src_w),
+                    np.int32(stack_len), np.int32(base_ids[base]),
+                    np.int32(0 if direction == 'vertical' else 1),
+                    self._standalone_render_meta_ref,
+                    np.float32(math.tan(math.radians(float(view.tilt_angle_deg)))),
+                    np.int32(1),  # PTA quantizes native tilted taps before the affine.
+                    np.int32(height), np.int32(width),
+                    *(np.float32(value) for value in matrix.reshape(-1)),
+                    cp_output,
+                ),
+                stream=external,
             )
-        # The shared kernel writes normalized TensorRT-ready values.
-        return output.mul_(255.0)
+            if 'tilted' not in self._fused_announced_families:
+                self._fused_announced_families.add('tilted')
+                print(
+                    'PTA fused Tilted renderer active: TTA affine/shear/gather kernel '
+                    'writes standalone CUDA rasters.'
+                )
+            # The shared kernel writes normalized TensorRT-ready values.
+            return output.mul_(255.0)
 
     def render_tilted_grid_resident(
         self,
@@ -2521,7 +2537,7 @@ class _GpuWorkerRenderEngine:
             and slot.render_graph_key == slot.render_expected_key
             and family not in self._fused_disabled_families
         ):
-            kernels = _fused_direct_render_kernels()
+            kernels = _fused_direct_render_kernels(self.device.index)
             if kernels is None:
                 return False
             if family == 'azimuthal':
@@ -2834,7 +2850,7 @@ class _GpuWorkerRenderEngine:
             return
         if slot.render_graph is not None and slot.render_graph_key == key:
             return
-        kernels = _fused_direct_render_kernels()
+        kernels = _fused_direct_render_kernels(self.device.index)
         if kernels is None:
             return
         dynamic_value = (
@@ -3312,58 +3328,61 @@ class _GpuWorkerRenderEngine:
 
     def _render_azimuthal_native_texture(self, view: ViewInfo, frame_idx: int) -> object:
         """Render one upright or tilted Azimuthal native plane from the 3D source texture."""
-        kernels = _fused_direct_render_kernels()
+        kernels = _fused_direct_render_kernels(self.device.index)
         if kernels is None:
             raise RuntimeError(
                 'CuPy/NVRTC kernels unavailable: '
-                + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
+                + str(_FUSED_DIRECT_RENDER_KERNELS_ERRORS.get(self.device.index, 'no diagnostic'))
             )
-        geometry = self._ensure_fused_azimuthal_taps(view, kernels)
-        source_arg = self._ensure_azimuthal_texture(kernels).texture
-        kernel = kernels.azimuthal_texture_native_f32
-        base = str(azimuthal_base_view_name(view))
-        base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
-        tilted = bool(is_tilted_azimuthal_view(view))
-        direction = str(view.tilt_direction) if tilted else 'vertical'
-        if base not in base_ids or direction not in ('vertical', 'horizontal'):
-            raise RuntimeError(
-                f'unsupported Azimuthal texture geometry base={base!r}, direction={direction!r}'
+        cp = kernels.cp
+        with cp.cuda.Device(self.device.index), self.torch.cuda.stream(self._stream), _cupy_external_stream(cp, self._stream) as external:
+            geometry = self._ensure_fused_azimuthal_taps(view, kernels)
+            source_arg = self._ensure_azimuthal_texture(kernels).texture
+            kernel = kernels.azimuthal_texture_native_f32
+            base = str(azimuthal_base_view_name(view))
+            base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+            tilted = bool(is_tilted_azimuthal_view(view))
+            direction = str(view.tilt_direction) if tilted else 'vertical'
+            if base not in base_ids or direction not in ('vertical', 'horizontal'):
+                raise RuntimeError(
+                    f'unsupported Azimuthal texture geometry base={base!r}, direction={direction!r}'
+                )
+            rows = int(view.src_h)
+            n_u = int(geometry.n_u)
+            stack_len = int(azimuthal_stack_length(view))
+            out = self.torch.empty((rows, n_u), dtype=self.torch.float32, device=self.device)
+            out.record_stream(self._stream)
+            cp_out = cp.asarray(out)
+            render_block = (32, 8)
+            render_grid = (
+                (int(n_u) + render_block[0] - 1) // render_block[0],
+                (int(rows) + render_block[1] - 1) // render_block[1],
             )
-        rows = int(view.src_h)
-        n_u = int(geometry.n_u)
-        stack_len = int(azimuthal_stack_length(view))
-        out = self.torch.empty((rows, n_u), dtype=self.torch.float32, device=self.device)
-        cp_out = kernels.cp.asarray(out)
-        render_block = (32, 8)
-        render_grid = (
-            (int(n_u) + render_block[0] - 1) // render_block[0],
-            (int(rows) + render_block[1] - 1) // render_block[1],
-        )
-        kernel(
-            render_grid, render_block,
-            (
-                source_arg,
-                np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
-                np.int32(self._volume_gpu.shape[2]), np.int32(self._logical_t),
-                np.int32(rows), np.int32(n_u), np.int32(stack_len),
-                np.int32(base_ids[base]), np.int32(0 if direction == 'vertical' else 1),
-                np.int32(frame_idx),
-                np.float32(
-                    math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0
+            kernel(
+                render_grid, render_block,
+                (
+                    source_arg,
+                    np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
+                    np.int32(self._volume_gpu.shape[2]), np.int32(self._logical_t),
+                    np.int32(rows), np.int32(n_u), np.int32(stack_len),
+                    np.int32(base_ids[base]), np.int32(0 if direction == 'vertical' else 1),
+                    np.int32(frame_idx),
+                    np.float32(
+                        math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0
+                    ),
+                    np.float32(view.center_x), np.float32(view.center_y),
+                    np.float32(view.roi_radius),
+                    geometry.cp_angle_cos, geometry.cp_angle_sin, cp_out,
                 ),
-                np.float32(view.center_x), np.float32(view.center_y),
-                np.float32(view.roi_radius),
-                geometry.cp_angle_cos, geometry.cp_angle_sin, cp_out,
-            ),
-            stream=_cupy_external_stream(kernels.cp, self._stream),
-        )
-        announce_key = 'tilted_azimuthal_native' if tilted else 'azimuthal_native'
-        if announce_key not in self._fused_announced_families:
-            self._fused_announced_families.add(announce_key)
-            print(
-                f'Resident {"tilted-" if tilted else ""}Azimuthal native-plane texture kernel active.'
+                stream=external,
             )
-        return out
+            announce_key = 'tilted_azimuthal_native' if tilted else 'azimuthal_native'
+            if announce_key not in self._fused_announced_families:
+                self._fused_announced_families.add(announce_key)
+                print(
+                    f'Resident {"tilted-" if tilted else ""}Azimuthal native-plane texture kernel active.'
+                )
+            return out
 
     def _render_azimuthal_texture_grid(
         self,
@@ -3380,68 +3399,71 @@ class _GpuWorkerRenderEngine:
             raise IndexError(
                 f'Azimuthal frame index {int(frame_idx)} is outside [0,{len(view.azimuths_deg)})'
             )
-        kernels = _fused_direct_render_kernels()
+        kernels = _fused_direct_render_kernels(self.device.index)
         if kernels is None:
             raise RuntimeError(
                 'CuPy/NVRTC kernels unavailable: '
-                + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
+                + str(_FUSED_DIRECT_RENDER_KERNELS_ERRORS.get(self.device.index, 'no diagnostic'))
             )
-        geometry = self._ensure_fused_azimuthal_taps(view, kernels)
-        source_arg = self._ensure_azimuthal_texture(kernels).texture
-        kernel = kernels.azimuthal_texture_grid_f32
-        base = str(azimuthal_base_view_name(view))
-        base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
-        tilted = bool(is_tilted_azimuthal_view(view))
-        direction = str(view.tilt_direction) if tilted else 'vertical'
-        if base not in base_ids or direction not in ('vertical', 'horizontal'):
-            raise RuntimeError(
-                f'unsupported Azimuthal texture geometry base={base!r}, direction={direction!r}'
+        cp = kernels.cp
+        with cp.cuda.Device(self.device.index), self.torch.cuda.stream(self._stream), _cupy_external_stream(cp, self._stream) as external:
+            geometry = self._ensure_fused_azimuthal_taps(view, kernels)
+            source_arg = self._ensure_azimuthal_texture(kernels).texture
+            kernel = kernels.azimuthal_texture_grid_f32
+            base = str(azimuthal_base_view_name(view))
+            base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
+            tilted = bool(is_tilted_azimuthal_view(view))
+            direction = str(view.tilt_direction) if tilted else 'vertical'
+            if base not in base_ids or direction not in ('vertical', 'horizontal'):
+                raise RuntimeError(
+                    f'unsupported Azimuthal texture geometry base={base!r}, direction={direction!r}'
+                )
+            matrix = np.asarray(M_out_to_src, dtype=np.float32).reshape(2, 3)
+            if not bool(np.all(np.isfinite(matrix))):
+                raise RuntimeError('Azimuthal output-to-source affine is non-finite')
+            rows = int(view.src_h)
+            n_u = int(geometry.n_u)
+            stack_len = int(azimuthal_stack_length(view))
+            if min(rows, n_u, stack_len, int(out_h), int(out_w)) <= 0:
+                raise RuntimeError('Azimuthal texture output/source geometry is empty')
+            out = self.torch.empty(
+                (int(out_h), int(out_w)), dtype=self.torch.float32, device=self.device,
             )
-        matrix = np.asarray(M_out_to_src, dtype=np.float32).reshape(2, 3)
-        if not bool(np.all(np.isfinite(matrix))):
-            raise RuntimeError('Azimuthal output-to-source affine is non-finite')
-        rows = int(view.src_h)
-        n_u = int(geometry.n_u)
-        stack_len = int(azimuthal_stack_length(view))
-        if min(rows, n_u, stack_len, int(out_h), int(out_w)) <= 0:
-            raise RuntimeError('Azimuthal texture output/source geometry is empty')
-        out = self.torch.empty(
-            (int(out_h), int(out_w)), dtype=self.torch.float32, device=self.device,
-        )
-        cp_out = kernels.cp.asarray(out)
-        render_block = (32, 8)
-        render_grid = (
-            (int(out_w) + render_block[0] - 1) // render_block[0],
-            (int(out_h) + render_block[1] - 1) // render_block[1],
-        )
-        kernel(
-            render_grid, render_block,
-            (
-                source_arg,
-                np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
-                np.int32(self._volume_gpu.shape[2]), np.int32(self._logical_t),
-                np.int32(rows), np.int32(n_u), np.int32(stack_len),
-                np.int32(base_ids[base]), np.int32(0 if direction == 'vertical' else 1),
-                np.int32(frame_idx),
-                np.float32(
-                    math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0
+            out.record_stream(self._stream)
+            cp_out = cp.asarray(out)
+            render_block = (32, 8)
+            render_grid = (
+                (int(out_w) + render_block[0] - 1) // render_block[0],
+                (int(out_h) + render_block[1] - 1) // render_block[1],
+            )
+            kernel(
+                render_grid, render_block,
+                (
+                    source_arg,
+                    np.int32(self._volume_gpu.shape[0]), np.int32(self._volume_gpu.shape[1]),
+                    np.int32(self._volume_gpu.shape[2]), np.int32(self._logical_t),
+                    np.int32(rows), np.int32(n_u), np.int32(stack_len),
+                    np.int32(base_ids[base]), np.int32(0 if direction == 'vertical' else 1),
+                    np.int32(frame_idx),
+                    np.float32(
+                        math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0
+                    ),
+                    np.float32(view.center_x), np.float32(view.center_y),
+                    np.float32(view.roi_radius),
+                    np.int32(out_h), np.int32(out_w),
+                    *(np.float32(v) for v in matrix.reshape(-1)),
+                    geometry.cp_angle_cos, geometry.cp_angle_sin, cp_out,
                 ),
-                np.float32(view.center_x), np.float32(view.center_y),
-                np.float32(view.roi_radius),
-                np.int32(out_h), np.int32(out_w),
-                *(np.float32(v) for v in matrix.reshape(-1)),
-                geometry.cp_angle_cos, geometry.cp_angle_sin, cp_out,
-            ),
-            stream=_cupy_external_stream(kernels.cp, self._stream),
-        )
-        announce_key = 'tilted_azimuthal_grid' if tilted else 'azimuthal_grid'
-        if announce_key not in self._fused_announced_families:
-            self._fused_announced_families.add(announce_key)
-            print(
-                f'Direct {"tilted-" if tilted else ""}Azimuthal grid renderer active: '
-                'output affine + azimuthal mapping + texture sampling in one launch.'
+                stream=external,
             )
-        return out
+            announce_key = 'tilted_azimuthal_grid' if tilted else 'azimuthal_grid'
+            if announce_key not in self._fused_announced_families:
+                self._fused_announced_families.add(announce_key)
+                print(
+                    f'Direct {"tilted-" if tilted else ""}Azimuthal grid renderer active: '
+                    'output affine + azimuthal mapping + texture sampling in one launch.'
+                )
+            return out
 
     def _render_tilted_azimuthal_native_linear_resident(self, view: ViewInfo, frame_idx: int) -> object:
         """Retain Torch per-tap shear/gray8 virtual-T semantics in one CUDA launch."""
@@ -3450,7 +3472,7 @@ class _GpuWorkerRenderEngine:
         volume, torch = self._volume_gpu, self.torch
         if not bool(getattr(volume, 'is_cuda', False)) or volume.dtype != torch.uint8:
             raise ValueError('linear native fallback requires resident CUDA uint8')
-        kernels = _azimuthal_linear_native_kernel()
+        kernels = _azimuthal_linear_native_kernel(volume.device.index)
         base = {'transverse': 0, 'sagittal': 1, 'coronal': 2}[str(azimuthal_base_view_name(view))]
         tilted = is_tilted_azimuthal_view(view)
         direction = str(view.tilt_direction) if tilted else 'vertical'
@@ -3458,34 +3480,35 @@ class _GpuWorkerRenderEngine:
             raise ValueError('unsupported tilted Azimuthal direction')
         rows, columns = int(view.src_h), int(view.src_w)
         stack_length = int(azimuthal_stack_length(view))
-        taps, weights = self._azimuthal_taps_gpu(view, float(view.azimuths_deg[int(frame_idx)]))
-        centers = torch.arange(rows, dtype=torch.float32, device=self.device)
-        if rows != stack_length:
-            centers = ((centers + 0.5) * (float(stack_length) / float(rows)) - 0.5).clamp_(
-                0.0, float(max(0, stack_length - 1)))
-        owners = [taps, weights, centers]
-        virtual_t = int(volume.shape[0]) != int(self._logical_t)
-        if virtual_t:
-            owners.extend(self._native_t_indices())
-        output = torch.empty((rows, columns), dtype=torch.float32, device=self.device)
         cp = kernels.cp
-        null = np.uint64(0)
-        lower, upper, alpha = (tuple(cp.asarray(x) for x in owners[-3:])
-                               if virtual_t else (null, null, null))
-        for tensor in (*owners, volume, output):
-            tensor.record_stream(self._stream)
-        kernels.kernel(
-            ((columns + 31) // 32, (rows + 7) // 8), (32, 8),
-            (self._fused_cupy_volume(kernels), cp.asarray(taps), cp.asarray(weights),
-             cp.asarray(centers), lower, upper, alpha,
-             *(np.int32(x) for x in (volume.shape[0], self._logical_t, volume.shape[1], volume.shape[2],
-                                    rows, columns, azimuthal_plane_shape(view)[1], stack_length,
-                                    base, direction == 'horizontal')),
-             np.float32(math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0),
-             np.float32(view.center_x), np.float32(view.center_y), cp.asarray(output)),
-            stream=_cupy_external_stream(cp, self._stream),
-        )
-        return output
+        with cp.cuda.Device(self.device.index), self.torch.cuda.stream(self._stream), _cupy_external_stream(cp, self._stream) as external:
+            taps, weights = self._azimuthal_taps_gpu(view, float(view.azimuths_deg[int(frame_idx)]))
+            centers = torch.arange(rows, dtype=torch.float32, device=self.device)
+            if rows != stack_length:
+                centers = ((centers + 0.5) * (float(stack_length) / float(rows)) - 0.5).clamp_(
+                    0.0, float(max(0, stack_length - 1)))
+            owners = [taps, weights, centers]
+            virtual_t = int(volume.shape[0]) != int(self._logical_t)
+            if virtual_t:
+                owners.extend(self._native_t_indices())
+            output = torch.empty((rows, columns), dtype=torch.float32, device=self.device)
+            null = np.uint64(0)
+            lower, upper, alpha = (tuple(cp.asarray(x) for x in owners[-3:])
+                                   if virtual_t else (null, null, null))
+            for tensor in (*owners, volume, output):
+                tensor.record_stream(self._stream)
+            kernels.kernel(
+                ((columns + 31) // 32, (rows + 7) // 8), (32, 8),
+                (self._fused_cupy_volume(kernels), cp.asarray(taps), cp.asarray(weights),
+                 cp.asarray(centers), lower, upper, alpha,
+                 *(np.int32(x) for x in (volume.shape[0], self._logical_t, volume.shape[1], volume.shape[2],
+                                        rows, columns, azimuthal_plane_shape(view)[1], stack_length,
+                                        base, direction == 'horizontal')),
+                 np.float32(math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0),
+                 np.float32(view.center_x), np.float32(view.center_y), cp.asarray(output)),
+                stream=external,
+            )
+            return output
 
     def _render_tilted_azimuthal_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
         """Render a tilted-Azimuthal plane through the texture kernel, with Torch fallback."""
@@ -4053,7 +4076,8 @@ class _GpuWorkerRenderEngine:
         volume = self._volume_gpu
         if volume is None or volume.dtype != torch.uint8 or not bool(volume.is_contiguous()):
             raise RuntimeError('Radial native CUDA sampling requires a contiguous resident uint8 source')
-        native_t, full_h, full_w = (int(v) for v in volume.shape)
+        source_t_len, full_h, full_w = (int(v) for v in volume.shape)
+        native_t = source_t_len
         source_t_origin = 0
         if getattr(self, '_radial_source_t', None) is not None:
             native_t, source_t_origin = map(int, self._radial_source_t)
@@ -4078,8 +4102,6 @@ class _GpuWorkerRenderEngine:
         out = torch.empty((rows, columns), dtype=torch.float32, device=self.device)
         if bool(out.is_cuda):
             out.record_stream(self._stream)
-        cp_source = self._fused_cupy_volume(kernels)
-        cp_out = kernels.cp.asarray(out)
         block = (32, 8)
         geometry = None
         height_length = logical_t if base_id == 0 else (full_h if base_id == 1 else full_w)
@@ -4091,45 +4113,50 @@ class _GpuWorkerRenderEngine:
             except torch.OutOfMemoryError:
                 self._radial_column_geometry_disabled = True
                 print('Radial column geometry workspace unavailable; retaining the scalar CUDA renderer.', flush=True)
-        if geometry is not None:
-            # This per-call table cannot be overwritten by a concurrent frame.
-            # CuPy launches are invisible to Torch's allocator; retain the table
-            # through its render-stream reads even when the caller uses another stream.
-            if bool(geometry.is_cuda):
-                geometry.record_stream(self._stream)
-            cp_geometry = kernels.cp.asarray(geometry)
+        with kernels.cp.cuda.Device(volume.device.index):
             external = _cupy_external_stream(kernels.cp, self._stream)
-            kernels.radial_columns_f64(
-                ((columns + 255) // 256,), (256,),
-                (cp_geometry, np.int32(columns), np.int32(direction_id), np.float64(radius),
-                 np.float64(view.radial_arc_origin), np.float64(view.center_x),
-                 np.float64(view.center_y), np.float64(shear)), stream=external,
-            )
-            kernels.radial_native_columns_f32(
-                ((columns + block[0] - 1) // block[0], (rows + block[1] - 1) // block[1]), block,
-                (cp_source, cp_geometry, cp_out, np.int32(native_t), np.int32(logical_t),
-                 np.int32(full_h), np.int32(full_w), np.int32(source_t_origin), np.int32(rows), np.int32(columns),
-                 np.int32(base_id), np.int32(view.radial_height_origin)), stream=external,
-            )
-            if not bool(getattr(self, '_radial_column_geometry_announced', False)):
-                self._radial_column_geometry_announced = True
-                print('Radial column geometry CUDA renderer active: FP64 shell geometry reused across rows.', flush=True)
-            return out
-        kernels.radial_native_f32(
-            ((columns + block[0] - 1) // block[0], (rows + block[1] - 1) // block[1]), block,
-            (cp_source, cp_out,
-             np.int32(native_t), np.int32(logical_t), np.int32(full_h), np.int32(full_w),
-             np.int32(source_t_origin),
-             np.int32(rows), np.int32(columns), np.int32(base_id), np.int32(direction_id),
-             np.int32(view.radial_height_origin), np.float64(radius), np.float64(view.radial_arc_origin),
-             np.float64(view.center_x), np.float64(view.center_y), np.float64(shear)),
-            stream=_cupy_external_stream(kernels.cp, self._stream),
-        )
-        if not bool(getattr(self, '_radial_native_kernel_announced', False)):
-            self._radial_native_kernel_announced = True
-            print('Radial native CUDA renderer active: scalar shell geometry and '
-                  'source interpolation in one launch per patch.', flush=True)
-        return out
+            with external:
+                cp_source = self._fused_cupy_volume(kernels)
+                cp_out = kernels.cp.asarray(out)
+                if geometry is not None:
+                    # This per-call table cannot be overwritten by a concurrent frame.
+                    # CuPy launches are invisible to Torch's allocator; retain the table
+                    # through its render-stream reads even when the caller uses another stream.
+                    if bool(geometry.is_cuda):
+                        geometry.record_stream(self._stream)
+                    cp_geometry = kernels.cp.asarray(geometry)
+                    kernels.radial_columns_f64(
+                        ((columns + 255) // 256,), (256,),
+                        (cp_geometry, np.int32(columns), np.int32(direction_id), np.float64(radius),
+                         np.float64(view.radial_arc_origin), np.float64(view.center_x),
+                         np.float64(view.center_y), np.float64(shear)), stream=external,
+                    )
+                    kernels.radial_native_columns_f32(
+                        ((columns + block[0] - 1) // block[0], (rows + block[1] - 1) // block[1]), block,
+                        (cp_source, cp_geometry, cp_out, np.int32(native_t), np.int32(logical_t),
+                         np.int32(full_h), np.int32(full_w), np.int32(source_t_origin), np.int32(source_t_len),
+                         np.int32(rows), np.int32(columns),
+                         np.int32(base_id), np.int32(view.radial_height_origin)), stream=external,
+                    )
+                    if not bool(getattr(self, '_radial_column_geometry_announced', False)):
+                        self._radial_column_geometry_announced = True
+                        print('Radial column geometry CUDA renderer active: FP64 shell geometry reused across rows.', flush=True)
+                    return out
+                kernels.radial_native_f32(
+                    ((columns + block[0] - 1) // block[0], (rows + block[1] - 1) // block[1]), block,
+                    (cp_source, cp_out,
+                     np.int32(native_t), np.int32(logical_t), np.int32(full_h), np.int32(full_w),
+                     np.int32(source_t_origin), np.int32(source_t_len),
+                     np.int32(rows), np.int32(columns), np.int32(base_id), np.int32(direction_id),
+                     np.int32(view.radial_height_origin), np.float64(radius), np.float64(view.radial_arc_origin),
+                     np.float64(view.center_x), np.float64(view.center_y), np.float64(shear)),
+                    stream=external,
+                )
+                if not bool(getattr(self, '_radial_native_kernel_announced', False)):
+                    self._radial_native_kernel_announced = True
+                    print('Radial native CUDA renderer active: scalar shell geometry and '
+                          'source interpolation in one launch per patch.', flush=True)
+                return out
 
     def _render_radial_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
         """Sample one periodic shell patch from the resident uint8 source.

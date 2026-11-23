@@ -241,14 +241,32 @@ def test_semantic_trt_resident_batch_one_reuses_slots(monkeypatch):
         def reset_direct_ring(self):
             self._direct_ring = None
 
+    class Batch(list):
+        _tta_gpu_tensor = SimpleNamespace(shape=(1, 1, 128, 128), dtype=torch.float32, is_cuda=True)
+
+    class BufferedSource:
+        bs = 1
+
+        def __iter__(self):
+            for _ in range(3):
+                yield None, Batch([object()]), None
+
     class FakeExecutor:
         created = 0
 
         def __init__(self, backend, _engine, plan, *, slots, **_kwargs):
             type(self).created += 1
-            self.backend, self.engine, self.plan, self.slots = backend, _engine, plan, list(slots)
-            self.direct, self.active, self.closed = True, True, False
+            self.backend, self.engine, self.plan = backend, _engine, plan
+            self.slots = list(slots) if slots is not None else [object(), object()]
+            self.direct, self.active, self.closed = slots is not None, True, False
             self.infer_graph_count = 0
+            self.rebindings = 0
+
+        def bind_direct_slots(self, slots, **_kwargs):
+            self.resume()
+            self.slots = list(slots)
+            self.direct = True
+            self.rebindings += 1
 
         def enqueue(self, *_args, **_kwargs):
             pass
@@ -277,17 +295,15 @@ def test_semantic_trt_resident_batch_one_reuses_slots(monkeypatch):
     )
     predictor = SimpleNamespace(model=backend)
     cfg = SimpleNamespace(batch=1, input_channels=1)
-    first = semantic_trt.try_semantic_trt_ring(
-        predictor, Source(), cfg, num_frames=3, out_size=128,
-        consume_batch=lambda *_args: None,
-    )
-    second = semantic_trt.try_semantic_trt_ring(
-        predictor, Source(), cfg, num_frames=3, out_size=128,
-        consume_batch=lambda *_args: None,
-    )
-    assert first['semantic_trt_ring_used'] == 1
-    assert second['semantic_trt_ring_cache_hit'] == 1
+    for source, expected_hit in [(BufferedSource(), 0), (Source(), 1), (BufferedSource(), 1), (Source(), 1)]:
+        stats = semantic_trt.try_semantic_trt_ring(
+            predictor, source, cfg, num_frames=3, out_size=128,
+            consume_batch=lambda *_args: None,
+        )
+        assert stats['semantic_trt_ring_used'] == 1
+        assert stats['semantic_trt_ring_cache_hit'] == expected_hit
     assert FakeExecutor.created == 1
+    assert semantic_trt._CACHE[id(backend)].rebindings == 1
     assert semantic_trt.release_semantic_trt_cache() == 1
 
 
@@ -320,7 +336,8 @@ def test_semantic_trt_prefetch_owner_retention_is_bounded():
     assert executor.input_owners[0][1] is owners[9]
 
 
-def test_semantic_trt_accepts_resident_slots_without_output_attribute():
+@pytest.mark.parametrize('change', ['replace', 'swap', 'partial'])
+def test_semantic_trt_rebinds_inputs_with_existing_contexts_and_outputs(monkeypatch, change):
     torch = pytest.importorskip('torch')
     plan = semantic_trt.SemanticTrtBindingPlan(
         ('images', 'logits'), {'images': 0, 'logits': 1},
@@ -347,13 +364,60 @@ def test_semantic_trt_accepts_resident_slots_without_output_attribute():
     executor = object.__new__(semantic_trt.SemanticTrtRingExecutor)
     executor.torch = torch
     executor.plan = plan
+    executor.input_dtype = torch.float32
     executor.output_dtype = torch.float32
-    executor.slots = [SimpleNamespace(input=torch.empty(plan.input_shape)) for _ in range(2)]
+    executor.slots = [SimpleNamespace(input=torch.empty(plan.input_shape), infer_graph=object()) for _ in range(2)]
     executor.contexts = (Context(), Context())
+    executor.active = False
+    executor.closed = False
+    executor.preflight_key = 'old slots'
     executor._bind_all()
-    for slot in executor.slots:
-        assert tuple(slot.output.shape) == plan.output_shape
-        assert set(slot.context.addresses) == {'images', 'logits'}
+    previous_slots = executor.slots
+    outputs = [slot.output for slot in previous_slots]
+    direct_slots = [SimpleNamespace(input=torch.empty(plan.input_shape)) for _ in range(2)]
+    if change == 'swap':
+        direct_slots = previous_slots[::-1]
+    elif change == 'partial':
+        direct_slots[0] = previous_slots[1]
+    capture_calls = []
+    monkeypatch.setattr(executor, '_warmup_and_capture', capture_calls.append)
+    executor.bind_direct_slots(direct_slots, capture_graphs=True)
+    for previous in previous_slots:
+        assert previous.infer_graph is None
+        if all(previous is not current for current in direct_slots):
+            assert previous.context is previous.output is previous.addresses is None
+    for current, context, output in zip(executor.slots, executor.contexts, outputs):
+        assert current.context is context
+        assert current.output is output
+        assert current.context.addresses['images'] == current.input.data_ptr()
+        assert current.context.addresses['logits'] == current.output.data_ptr()
+    assert executor.slots[0].output.data_ptr() != executor.slots[1].output.data_ptr()
+    assert capture_calls == [True]
+    assert executor.preflight_key is None
+
+    duplicate = SimpleNamespace(input=direct_slots[0].input)
+    with pytest.raises(ValueError, match='independent input slots'):
+        executor._validate_slots([direct_slots[0], duplicate])
+    with pytest.raises(ValueError, match='independent input slots'):
+        executor._validate_slots([direct_slots[0], direct_slots[0]])
+
+
+def test_semantic_trt_disabled_capture_discards_any_preexisting_graphs(monkeypatch):
+    torch = pytest.importorskip('torch')
+    monkeypatch.setattr(torch.cuda, 'stream', lambda _stream: nullcontext())
+    executor = object.__new__(semantic_trt.SemanticTrtRingExecutor)
+    executor.torch = torch
+    executor.slots = [
+        SimpleNamespace(input=torch.ones(1), infer_graph=object(),
+                        infer_stream=SimpleNamespace(synchronize=lambda: None))
+        for _ in range(2)
+    ]
+    executions = []
+    monkeypatch.setattr(executor, '_execute', executions.append)
+    executor._warmup_and_capture(capture_graphs=False)
+    assert executions == executor.slots * 2
+    assert executor.infer_graph_count == 0
+    assert all(slot.infer_graph is None for slot in executor.slots)
 
 
 @pytest.mark.parametrize(

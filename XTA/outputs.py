@@ -40,7 +40,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from .json_publication import write_json_atomic
+from .json_publication import _fsync_parent_directory, write_json_atomic
 from .nrrd_spans import stream_native_crop_spans
 from . import nrrd_compression
 # Retained import contracts for existing stream users and embedded shutdown callers.
@@ -232,15 +232,8 @@ def _publish_staged_file_atomically(stage_path: Path, out_path: Path) -> None:
             os.fsync(stage_fh.fileno())
     with phase('rename'):
         os.replace(stage, final_path)
-    try:
-        with phase('directory_durability'):
-            parent_fd = os.open(str(final_path.parent), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-            try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
-    except OSError:
-        pass
+    with phase('directory_durability'):
+        _fsync_parent_directory(final_path.parent)
 
 
 @contextlib.contextmanager
@@ -281,13 +274,14 @@ def _run_sharded_ffv1_encode(
     scratch_dir: Optional[Path] = None,
     publication_root: Optional[Path] = None,
 ) -> None:
-    """Encode contiguous FFV1 shards into memory, then stream-concat atomically to disk.
+    """Encode one FFV1 stream or concatenate memory-backed shards atomically.
 
  Each range callback owns one ffmpeg producer/process whose Matroska output is an anonymous
  memfd. On the first shard failure all registered encoders are terminated and every worker
  is reaped. The only filesystem write is the ordered concat stream into a same-filesystem
  atomic publication stage, so the previous destination remains untouched on failure.
- ``scratch_dir`` is accepted for caller compatibility and ignored; encoded shards never touch the filesystem."""
+    A single encoder writes directly to the private publication stage.
+    ``scratch_dir`` is accepted for caller compatibility and ignored."""
     _ = scratch_dir
     total = int(total_frames)
     segments = int(ffv1_segment_count(total))
@@ -343,6 +337,14 @@ def _run_sharded_ffv1_encode(
     first_error: Optional[BaseException] = None
     try:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        if segments == 1 or not callable(getattr(os, 'memfd_create', None)):
+            joined_path, publication_stage_dir = _atomic_publication_stage_path(
+                Path(out_path), publication_root=publication_root,
+            )
+            encode_range(0, total, joined_path, cancel_event, _register, _unregister, _progress_one)
+            _publish_staged_file_atomically(joined_path, Path(out_path))
+            joined_path = None
+            return
         ranges = _ffv1_contiguous_segments(total, segments)
         for idx in range(len(ranges)):
             shard_files.append(_open_memory_backed_encoded_chunk(
@@ -388,45 +390,35 @@ def _run_sharded_ffv1_encode(
         joined_path, publication_stage_dir = _atomic_publication_stage_path(
             Path(out_path), publication_root=publication_root,
         )
-        if len(shard_files) == 1:
-            shard_files[0].seek(0)
-            with open(joined_path, 'wb', buffering=0) as dst_fh:
-                shutil.copyfileobj(shard_files[0], dst_fh, length=16 * 1024 * 1024)
-                dst_fh.flush()
-                os.fsync(dst_fh.fileno())
-        else:
-            for chunk in shard_files:
-                chunk.seek(0)
-            concat_text = 'ffconcat version 1.0\n' + ''.join(
-                f"file 'file:/proc/self/fd/{int(chunk.fileno())}'\n"
-                for chunk in shard_files
+        for chunk in shard_files:
+            chunk.seek(0)
+        concat_text = 'ffconcat version 1.0\n' + ''.join(
+            f"file 'file:/proc/self/fd/{int(chunk.fileno())}'\n"
+            for chunk in shard_files
+        )
+        cmd = [
+            'ffmpeg', '-y', '-v', 'error',
+            '-f', 'concat', '-safe', '0',
+            '-protocol_whitelist', 'file,pipe', '-i', 'pipe:0',
+            '-map', '0:v:0', '-c', 'copy', '-f', 'matroska', str(joined_path),
+        ]
+        completed = _spawn_subprocess_with_retry(
+            lambda: subprocess.run(
+                cmd,
+                input=concat_text.encode('utf-8'),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                pass_fds=tuple(int(chunk.fileno()) for chunk in shard_files),
+            ),
+            f'ffmpeg FFV1 concat ({Path(out_path).name})',
+        )
+        if int(completed.returncode) != 0:
+            stderr = (
+                completed.stderr.decode('utf-8', errors='ignore')
+                if isinstance(completed.stderr, (bytes, bytearray)) else str(completed.stderr)
             )
-            cmd = [
-                'ffmpeg', '-y', '-v', 'error',
-                '-f', 'concat', '-safe', '0',
-                '-protocol_whitelist', 'file,pipe', '-i', 'pipe:0',
-                '-map', '0:v:0', '-c', 'copy', '-f', 'matroska', str(joined_path),
-            ]
-            completed = _spawn_subprocess_with_retry(
-                lambda: subprocess.run(
-                    cmd,
-                    input=concat_text.encode('utf-8'),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                    pass_fds=tuple(int(chunk.fileno()) for chunk in shard_files),
-                ),
-                f'ffmpeg FFV1 concat ({Path(out_path).name})',
-            )
-            if int(completed.returncode) != 0:
-                stderr = (
-                    completed.stderr.decode('utf-8', errors='ignore')
-                    if isinstance(completed.stderr, (bytes, bytearray))
-                    else str(completed.stderr)
-                )
-                raise RuntimeError(f'FFV1 lossless concat failed for {Path(out_path).name}: {stderr}')
-            with open(joined_path, 'rb') as joined_fh:
-                os.fsync(joined_fh.fileno())
+            raise RuntimeError(f'FFV1 lossless concat failed for {Path(out_path).name}: {stderr}')
         _publish_staged_file_atomically(joined_path, Path(out_path))
         joined_path = None
     except BaseException:
@@ -1483,6 +1475,41 @@ class _CroppedNrrdPayloadWriter:
     def write_owned_known_nonzero(self, data: object) -> int:
         return self._write_reference_bytes(data, owned=True)
 
+    def try_write_crop_span_batch(
+        self,
+        data: np.ndarray,
+        segments: Sequence[Tuple[int, int, int]],
+        records: Sequence[Tuple[int, int, int, int, int, int]],
+    ) -> Optional[int]:
+        """Route validated bbox bands to the stored raster without rescanning pixels."""
+        write_batch = getattr(self.inner, 'write_owned_member_batch', None)
+        if not callable(write_batch) or any(
+            not (self._t0 <= z < self._t1 and self._y0 <= y0 < y1 <= self._y1
+                 and self._x0 <= x0 < x1 <= self._x1)
+            for _, y0, x0, y1, x1, z in records
+        ):
+            return None
+        if self._finished:
+            raise RuntimeError('Cannot write to a finished cropped NRRD payload stream')
+        position = self._position
+        box_width = self._x1 - self._x0
+        cropped_segments = []
+        for zeros, first, stop in segments:
+            data_start = position + zeros
+            box_zeros = self._box_bytes_before(data_start) - self._box_bytes_before(position)
+            cropped_segments.append(
+                (box_zeros, first // self._width * box_width, stop // self._width * box_width),
+            )
+            position = data_start + stop - first
+        if position > self._stop:
+            raise ValueError('Cropped NRRD payload stream received bytes beyond its declared range')
+        cropped = np.ascontiguousarray(data[:, self._x0:self._x1])
+        self._flush_data()
+        self._flush_zeros()
+        self._stored += int(write_batch(cropped, cropped_segments))
+        self._position = position
+        return int(cropped.size)
+
     def write_zeros(self, nbytes: int) -> int:
         if self._finished:
             raise RuntimeError('Cannot write to a finished cropped NRRD payload stream')
@@ -2357,7 +2384,7 @@ def _write_single_layer_nrrd_file(
                 _copy_spool(spool, fh)
                 spool.close()
                 spools[-1] = None
-        os.replace(final_tmp, out_path)
+        _publish_staged_file_atomically(final_tmp, out_path)
         completed_metrics = [m for m in n19_band_metrics if m is not None]
         compressed_total = sum(int(m[1]) for m in completed_metrics)
         slowest = max(completed_metrics, key=lambda m: float(m[0])) if completed_metrics else None
@@ -2564,8 +2591,12 @@ def _acquire_output_gpu_stage(torch_mod: object, purpose: str) -> Optional[_Main
 def _try_create_gpu_mirror_tee(
     mirror_jobs: List[Dict[str, object]],
     out_t: int,
+    source_hw: Tuple[int, int],
 ) -> Optional['_GpuMirrorTee']:
-    if not nrrd_gpu_mirror_tee_enabled() or not mirror_jobs:
+    in_h, in_w = source_hw
+    if not nrrd_gpu_mirror_tee_enabled() or not mirror_jobs or any(
+        int(job['shape'][1]) > in_h or int(job['shape'][2]) > in_w for job in mirror_jobs
+    ):
         return None
     lease: Optional[_MainProcessGpuStageLease] = None
     try:
@@ -2675,7 +2706,7 @@ def write_layer_nrrd_with_low_quality_mirrors(
     # derive the mirrors on a GPU when one is free — the per-slice resizes
     # and striped-lock ORs leave the CPU tee entirely; mirror volumes come back in one
     # small D2H after the layer streams. CPU tee (below) remains the fallback.
-    gpu_tee = None if bool(sparse_mirror_tee) else _try_create_gpu_mirror_tee(mirror_jobs, out_t)
+    gpu_tee = None if sparse_mirror_tee else _try_create_gpu_mirror_tee(mirror_jobs, out_t, output_shape[1:])
     if gpu_tee is not None:
         global _NRRD_GPU_MIRROR_TEE_ANNOUNCED
         if not _NRRD_GPU_MIRROR_TEE_ANNOUNCED:
@@ -3027,9 +3058,11 @@ class NrrdLayerSink:
         executor: Optional[ThreadPoolExecutor] = None,
         layer_file_processes: Optional[object] = None,
         layer_layout: str = NRRD_LAYER_LAYOUT_CROPPED,
+        relative_artifact_paths: bool = True,
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
         self.run_id = run_id
+        self.relative_artifact_paths = bool(relative_artifact_paths)
         # Optional sweep_nrrd_processes.SweepNrrdProcessPool owned by the caller: it
         # writes eligible layer files outside this process's GIL. This sink keeps every
         # name, colour, manifest row and publication record either way.
@@ -3103,11 +3136,18 @@ class NrrdLayerSink:
         self._segment_colors_in_use.add(color)
         return color
 
+    def _layer_provenance(self, ref, *, relative_to):
+        # Grouped sweep sources are staged on scratch, which can be on another
+        # volume. Their final catalog rebases these references on publication.
+        return interpolation_layer_provenance(
+            ref, relative_to=relative_to if self.relative_artifact_paths else None,
+        )
+
     def submit_layer(self, ref: Optional['NrrdLayerRef'], suffix: str) -> Optional[Path]:
         if ref is None:
             return None
         requested_suffix = str(suffix)
-        provenance = interpolation_layer_provenance(ref, relative_to=self.nrrd_dir)
+        provenance = self._layer_provenance(ref, relative_to=self.nrrd_dir)
         if ref.mask_kind == 'extrapolation':
             tail = dict(getattr(ref, 'extrapolation_provenance', {}) or {})
             if tail.get('direction') not in {'forward', 'backward'} or tail.get('backend') != 'sam':
@@ -3248,7 +3288,7 @@ class NrrdLayerSink:
                     'segment_name': segment_name,
                     'segment_color_rgb': [round(float(c), 6) for c in segment_color],
                 }
-                lq_manifest_entry.update(interpolation_layer_provenance(ref, relative_to=self._lq_nrrd_dir(spec)))
+                lq_manifest_entry.update(self._layer_provenance(ref, relative_to=self._lq_nrrd_dir(spec)))
                 self._lq_manifests.setdefault(str(spec.token), []).append(lq_manifest_entry)
                 lq_manifest_entries.append((lq_shape, lq_manifest_entry))
             def _execute_layer_write() -> Path:
@@ -3434,7 +3474,7 @@ class NrrdLayerSink:
         from .tta_sweep_branch_manifest import adopt_published_layer
         return adopt_published_layer(self,ref,record,
             basename_for_suffix=nrrd_layer_file_basename,
-            provenance_for_directory=interpolation_layer_provenance)
+            provenance_for_directory=self._layer_provenance)
 
     def centerline_audit_layer_count(self) -> int:
         with self._lock:
@@ -4512,12 +4552,13 @@ def resolve_low_quality_downbin_specs(
                     f'rounded to {int(rounded_target)} for isotropic low-quality output.'
                 )
                 warnings.append(warning)
-            scale = float(rounded_target) / float(max_dim)
+            scale = min(1.0, float(rounded_target) / float(max_dim))
 
-        out_t = _round_low_quality_dimension(float(in_t) * float(scale))
-        out_h = _round_low_quality_dimension(float(in_h) * float(scale))
-        out_w = _round_low_quality_dimension(float(in_w) * float(scale))
-        shape = (int(out_t), int(out_h), int(out_w))
+        # Round down when the nearest block would exceed the source dimension.
+        shape = tuple(
+            min(_round_low_quality_dimension(dim * scale), max(4, dim // 4 * 4))
+            for dim in (in_t, in_h, in_w)
+        )
         if shape in seen_shapes:
             continue
         seen_shapes.add(shape)
@@ -4888,8 +4929,10 @@ def save_single_low_quality_output(
     temp_dir: Path,
     workers: int = 1,
     show_progress: bool = True,
+    save_overlay: bool = True,
+    stage_mask: Optional[Callable[[LowQualityDownbinSpec, np.ndarray], None]] = None,
 ) -> Dict[str, Path]:
-    """Write one low-quality downbin's overlay and binary videos concurrently."""
+    """Write requested videos and optionally stage the same binary grid for a sweep."""
     low_root = Path(out_dir) / 'low_quality'
     low_root.mkdir(parents=True, exist_ok=True)
     source_t = max(1, int(mask_u8.shape[0]))
@@ -4907,14 +4950,7 @@ def save_single_low_quality_output(
         f'per-bin output writer concurrency={low_quality_per_bin_output_workers(int(workers))}'
     )
 
-    gray_lq = resize_gray_volume_to_shape(
-        volume_gray,
-        (out_t, out_h, out_w),
-        Path(temp_dir) / 'low_quality' / spec.token / 'source.gray8.dat',
-        workers=int(workers),
-        prefer_memory=True,
-        desc=f'Low-quality source resize {spec.token}',
-    )
+    gray_lq = None
     mask_lq = resize_binary_mask_volume_to_shape(
         mask_u8,
         (out_t, out_h, out_w),
@@ -4927,8 +4963,20 @@ def save_single_low_quality_output(
     try:
         overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
         binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
+        if save_overlay:
+            gray_lq = resize_gray_volume_to_shape(
+                volume_gray,
+                (out_t, out_h, out_w),
+                Path(temp_dir) / 'low_quality' / spec.token / 'source.gray8.dat',
+                workers=int(workers),
+                prefer_memory=True,
+                desc=f'Low-quality source resize {spec.token}',
+            )
+        if stage_mask is not None:
+            stage_mask(spec, mask_lq)
 
         def _write_lq_overlay() -> Path:
+            assert gray_lq is not None
             return write_low_quality_overlay_video(
                 gray_lq, mask_lq, overlay_path, fps_lq,
                 show_progress=show_progress,
@@ -4944,10 +4992,10 @@ def save_single_low_quality_output(
 
         # the low-quality NRRD decomposition is produced per component layer by the
         # NrrdLayerSink as views complete, not here. Only the distribution videos are written below.
-        writer_thunks = [_write_lq_overlay, _write_lq_binary]
+        writer_thunks = [_write_lq_overlay, _write_lq_binary] if save_overlay else [_write_lq_binary]
 
         writer_count = low_quality_per_bin_output_workers(int(workers))
-        if writer_count <= 1:
+        if writer_count <= 1 or len(writer_thunks) == 1:
             for thunk in writer_thunks:
                 thunk()
         else:
@@ -4956,11 +5004,12 @@ def save_single_low_quality_output(
                 for fut in as_completed(futures):
                     fut.result()
 
-        result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
+        if save_overlay:
+            result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
         result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
         return result_paths
     finally:
-        if gray_lq is not volume_gray:
+        if gray_lq is not None and gray_lq is not volume_gray:
             close_memmap_array(gray_lq)
         if mask_lq is not mask_u8:
             close_memmap_array(mask_lq)
@@ -4977,12 +5026,15 @@ def collect_low_quality_output_futures(
     temp_dir: Path,
     workers: int = 1,
     show_progress: bool = True,
+    save_overlay: bool = True,
+    stage_mask: Optional[Callable[[LowQualityDownbinSpec, np.ndarray], None]] = None,
 ) -> Tuple[Dict[str, Path], List[Future]]:
     """Submit each low-quality downbin as an independent background job."""
     result_paths = planned_low_quality_output_paths(
         out_dir=out_dir,
         stem=stem,
         downbin_specs=downbin_specs,
+        save_overlay=save_overlay,
     )
     futures: List[Future] = []
     for spec in list(downbin_specs):
@@ -4995,8 +5047,10 @@ def collect_low_quality_output_futures(
             fps=float(fps),
             spec=spec,
             temp_dir=temp_dir,
-                workers=int(workers),
+            workers=int(workers),
             show_progress=show_progress,
+            save_overlay=save_overlay,
+            stage_mask=stage_mask,
         ))
     return result_paths, futures
 
@@ -5005,6 +5059,7 @@ def planned_low_quality_output_paths(
     out_dir: Path,
     stem: str,
     downbin_specs: Sequence[LowQualityDownbinSpec],
+    save_overlay: bool = True,
 ) -> Dict[str, Path]:
     """Return paths for per-bin low-quality video writers."""
     low_root = out_dir / 'low_quality'
@@ -5013,7 +5068,8 @@ def planned_low_quality_output_paths(
         spec_dir = low_root / spec.token
         overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
         binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
-        result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
+        if save_overlay:
+            result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
         result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
     return result_paths
 
@@ -5029,8 +5085,9 @@ class BackgroundOutputSubmission:
         try:
             for fut in self.futures:
                 fut.result()
-        except BaseException as exc:  # pragma: no cover - surfaced to main
+        except BaseException as exc:
             error = exc
+            _settle_parallel_futures(self.futures)
         finally:
             for resource in self.resources:
                 close_memmap_array(resource)
@@ -5402,6 +5459,7 @@ def write_summary_file(
     output_workers: int,
     view_prediction_labels: Optional[Dict[str, str]] = None,
     sam_planning_omissions: Optional[Sequence[Dict[str, object]]] = None,
+    encoding: Optional[str] = None,
 ) -> Path:
     lines: List[str] = []
     omissions = (collect_sam_planning_omissions(interpolation_stats)
@@ -5614,5 +5672,5 @@ def write_summary_file(
         lines.append(f'{key}: {final_paths[key]}')
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines) + "\n")
+    out_path.write_text("\n".join(lines) + "\n", encoding=encoding)
     return out_path

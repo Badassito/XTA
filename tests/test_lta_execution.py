@@ -478,20 +478,28 @@ class LtaProductionExecutionTests(unittest.TestCase):
                 source.annotations[0],
                 polygons=(polygon,),
             )
-            owners = _authoritative_tile_owners((annotation,), grid)
-            seeded = [
-                (tile_index, seed)
-                for tile_index in range(len(grid.tiles))
-                for seeds in _seeds_for_tile(
-                    source,
-                    (annotation,),
-                    view_plan,
-                    grid,
-                    tile_index,
-                    authoritative_tile_owners=owners,
-                ).values()
-                for seed in seeds
-            ]
+            from XTA import lta_execution
+
+            owner_masks = {}
+            with mock.patch.object(lta_execution, "_rasterize_source_polygon",
+                                   wraps=lta_execution._rasterize_source_polygon) as rasterize:
+                owners = _authoritative_tile_owners((annotation,), grid, owner_masks=owner_masks)
+                seeded = [
+                    (tile_index, seed)
+                    for tile_index in range(len(grid.tiles))
+                    for seeds in _seeds_for_tile(
+                        source,
+                        (annotation,),
+                        view_plan,
+                        grid,
+                        tile_index,
+                        authoritative_tile_owners=owners,
+                        owner_masks=owner_masks,
+                    ).values()
+                    for seed in seeds
+                ]
+                rasterize.assert_called_once()
+            self.assertEqual(owner_masks, {})
 
         self.assertEqual(len(seeded), 1)
         owner, seed = seeded[0]

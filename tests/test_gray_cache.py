@@ -275,6 +275,40 @@ def test_partial_packet_has_no_success_metrics(tmp_path,monkeypatch):
     assert len(success)==1 and success[0]['raw_bytes']==30 and success[0]['committed_frames']==1
 
 
+@pytest.mark.parametrize('codec', ['raw', 'zlib'])
+def test_3d_strided_packet_resolves_encoder_once_and_owns_chunk_bytes(tmp_path, monkeypatch, codec):
+    record = spec((3, 258, 259))
+    path = gray_cache_path(tmp_path, record)
+    rng = np.random.default_rng(7)
+    values = rng.integers(0, 16, size=(6, 258, 518), dtype=np.uint8)[::2, :, ::2]
+    expected = values.copy()
+    resolved = []
+    resolve = gray_cache._resolve_gray_encoder
+    real_connect = sqlite3.connect
+
+    def resolve_packet(requested):
+        resolved.append(requested)
+        return resolve(requested)
+
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if sql == 'BEGIN IMMEDIATE' and resolved:
+                values[:] = 0
+            return super().execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(gray_cache, '_resolve_gray_encoder', resolve_packet)
+    monkeypatch.setattr(gray_cache.sqlite3, 'connect',
+        lambda *args, **kwargs: real_connect(*args, **kwargs, factory=Connection))
+    with GrayCacheWriter(path, record, codec, min_free_bytes=0) as writer:
+        assert writer.write_frames(range(3), values)
+        assert writer.seal()
+    assert resolved == [codec]
+    assert not values.any()
+    with GrayCacheReader(path, record) as reader:
+        for frame in range(3):
+            np.testing.assert_array_equal(reader.read_crop(frame, (0, 0, 258, 259)), expected[frame])
+
+
 @pytest.mark.parametrize('operation',['connect','schema','packet','seal'])
 def test_sqlite_full_is_optional_cache_decline(tmp_path,monkeypatch,operation):
     record=spec((1,5,6));path=gray_cache_path(tmp_path,record);data=values(record)
@@ -367,7 +401,16 @@ def test_foreign_schema_is_corruption_not_unavailable(tmp_path):
 def test_full_view_frame_validation_uses_packet_index(tmp_path):
     record=spec((512,5,6));path=gray_cache_path(tmp_path,record);data=create(path,record,'raw')
     with closing(sqlite3.connect(path)) as probe:
-        plan=probe.execute('EXPLAIN QUERY PLAN SELECT frame,plane FROM frames WHERE packet=? ORDER BY plane',(31,)).fetchall()
+        metadata,shape,centers = gray_cache._header(probe)
+        statements = []
+        probe.set_trace_callback(statements.append)
+        assert gray_cache._content_digest(probe,metadata,shape,centers) == metadata['content_digest']
+        probe.set_trace_callback(None)
+        frame_queries = [sql for sql in statements if 'FROM frames' in sql]
+        assert len(frame_queries) == len(centers)//gray_cache.DEPTH
+        assert sum('FROM chunks' in sql for sql in statements) == len(frame_queries)
+        assert sum('FROM packets' in sql for sql in statements) == 1
+        plan = probe.execute('EXPLAIN QUERY PLAN '+frame_queries[0]).fetchall()
         assert any('SEARCH frames USING' in row[3] and 'frames_packet_plane' in row[3] for row in plan)
         assert not any('SCAN frames' in row[3] or 'TEMP B-TREE' in row[3] for row in plan)
     with GrayCacheReader(path,record) as reader:
@@ -383,7 +426,7 @@ def test_writer_busy_is_optional_cache_decline(tmp_path,monkeypatch,operation,me
         def execute(self,sql,*args,**kwargs):
             nonlocal triggered
             if armed and ((operation in ('initialize','write') and sql=='BEGIN IMMEDIATE')
-                    or (operation=='header' and 'SELECT name FROM sqlite_master' in sql)
+                    or (operation=='header' and 'schema COLLATE BINARY' in sql)
                     or (operation=='seal' and 'UPDATE header SET sealed=1' in sql)):
                 triggered=True
                 raise sqlite3.OperationalError(message)

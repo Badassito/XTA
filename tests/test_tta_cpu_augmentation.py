@@ -74,6 +74,21 @@ def test_cpu_elastic_folds_are_unknown():
     assert not valid[:, 1:-1].any()
 
 
+@pytest.mark.parametrize('space', ['source', 'raster'])
+@pytest.mark.parametrize('shift', [-1.50005, 1.50005])
+@pytest.mark.parametrize('slope', [-2., 0.])
+def test_cpu_elastic_halo_preserves_edge_orientation(space, shift, slope):
+    h, w = 5, 7
+    x = np.arange(w, dtype=np.float32)
+    edge = -1 if shift > 0 else 0
+    field = np.zeros((h, w, 2), dtype=np.float32)
+    field[..., 0] = np.copysign(1.5, shift) + slope * (x - x[edge])
+    forward = np.eye(3)
+    forward[0, 2] = shift
+    _, valid = inverse_policy_grid_cpu(forward, field, h, w, displacement_space=space)
+    np.testing.assert_array_equal(valid[:, edge], np.full(h, slope == 0.))
+
+
 def _cpu_policy_module(profile):
     path = Path(__file__).resolve().parents[1] / 'XTA/examples/external_augmentations' / f'CPU_{profile}.py'
     spec = importlib.util.spec_from_file_location(f'test_cpu_policy_{profile}', path)
@@ -267,15 +282,17 @@ class BatchSource:
 
 def _exercise_cpu_runtime(tmp_path, monkeypatch, runner, *, shared=False):
     from XTA import tta_augmentation_cpu_runtime as runtime
-    from XTA.tta_augmentation_config import TtaAugmentationSettings
-    from XTA.augmentation_policy import inspect_augmentation_definition
+    from XTA.tta_augmentation_config import policy_seed, resolve_tta_augmentation
     monkeypatch.setattr(runtime, 'worker_cpu_policy', lambda _settings: CpuPolicyAdapter(TranslationPolicy()))
     policy_path = tmp_path / 'policy.py'
     policy_path.write_text('def build_augmentation(): pass\n')
-    definition = inspect_augmentation_definition(str(policy_path))
-    settings = TtaAugmentationSettings(ratio=3, path=str(policy_path),
-                                      content_sha256=definition.content_sha256,
-                                      export_name='build_augmentation', coverage='packed')
+    gpu_path = tmp_path / 'gpu_policy.py'
+    gpu_path.write_text('def build_gpu_augmentation(): pass\n')
+    settings = resolve_tta_augmentation(
+        SimpleNamespace(augmentation=[f'cpu:{policy_path}', f'gpu:{gpu_path}'],
+                        augmentation_ratio=3, augmentation_coverage='packed'),
+        gpu_devices=('0',), cpu_enabled=True,
+    )
     image = np.zeros((24, 24), np.uint8)
     image[4:12, 5:10] = 255
     source = BatchSource([image.copy() for _ in range(3)])
@@ -316,12 +333,15 @@ def _exercise_cpu_runtime(tmp_path, monkeypatch, runner, *, shared=False):
         if shared:
             assert (target[:4] == 7).all() and (target[7:] == 7).all()
         target._mmap.close()
-    for record in result['augmentation_records']:
-        packed = np.load(record['path'])
-        assert json.loads(packed['metadata'].item())['backend'] == 'cpu'
-        np.testing.assert_array_equal(packed['global_destinations'], [4, 5, 6])
-        valid = np.unpackbits(packed['validity_bits'], axis=2)[:, :, :24]
-        assert valid[:, :, :-3].all() and not valid[:, :, -3:].any()
+    for pass_index, record in enumerate(result['augmentation_records'], start=1):
+        with np.load(record['path']) as packed:
+            assert json.loads(packed['metadata'].item())['backend'] == 'cpu'
+            np.testing.assert_array_equal(packed['global_destinations'], [4, 5, 6])
+            expected = [policy_seed(settings, trajectory='transverse/fullframe/a0', pass_index=pass_index,
+                                    slice_index=index, lease_start=4) for index in (4, 5, 6)]
+            np.testing.assert_array_equal(packed['seeds'], np.asarray(expected, dtype=np.uint64))
+            valid = np.unpackbits(packed['validity_bits'], axis=2)[:, :, :24]
+            assert valid[:, :, :-3].all() and not valid[:, :, -3:].any()
     return result
 
 

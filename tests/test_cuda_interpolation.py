@@ -1124,22 +1124,13 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(stats['planner_cpu_render_wall_seconds']), 1.0)
 
-    def test_default_hybrid_uses_cpu_radius_and_gpu_rendering(self) -> None:
-        renderer = CudaInterpolationRenderer(
-            runtime=_NumpyDeviceRuntime(), cache_bytes=0, reserve_bytes=0,
-        )
-        with (
-            mock.patch.object(
-                interpolation,
-                '_estimate_linear_slice_bridge_min_radius_from_plan',
-                side_effect=self._accept_radius_on_cpu,
-            ) as cpu_estimate,
-            mock.patch.object(
-                interpolation,
-                'time',
-                self._clock(0.0, 1.0, 2.0, 3.0, 3.5, 4.0),
-            ),
-        ):
+    def test_default_radius_filter_paints_cached_sections_without_gpu_probe(self) -> None:
+        renderer = mock.Mock()
+        with mock.patch.object(
+            interpolation,
+            '_estimate_linear_slice_bridge_min_radius_from_plan',
+            side_effect=self._accept_radius_on_cpu,
+        ) as cpu_estimate:
             mask, stats = self._run_pass(
                 renderer,
                 interpolate_min_radius=0.5,
@@ -1148,19 +1139,20 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
             )
 
         self.assertEqual(cpu_estimate.call_count, 1)
+        self.assertEqual(renderer.mock_calls, [])
         self.assertEqual(int(np.count_nonzero(mask[1])), 9)
-        self.assertEqual(stats['interpolation_render_backend'], 'cuda_cupy_crop_bounded')
+        self.assertEqual(stats['interpolation_render_backend'], 'cpu_numpy_numba')
         self.assertEqual(stats['interpolation_radius_backend'], 'cpu_numpy_numba')
-        self.assertTrue(stats['gpu_interpolation_active'])
-        self.assertTrue(stats['gpu_interpolation_render_autotune_enabled'])
-        self.assertTrue(stats['gpu_interpolation_render_selected'])
+        self.assertFalse(stats['gpu_interpolation_active'])
+        self.assertFalse(stats['gpu_interpolation_render_autotune_enabled'])
+        self.assertFalse(stats['gpu_interpolation_render_selected'])
         for retired_key in (
             'gpu_interpolation_radius_enabled',
             'gpu_interpolation_radius_active',
             'gpu_interpolation_estimated_plans',
         ):
             self.assertNotIn(retired_key, stats)
-        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
+        self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 0)
 
     def test_required_mode_allows_the_intentional_default_cpu_radius(self) -> None:
         renderer = CudaInterpolationRenderer(

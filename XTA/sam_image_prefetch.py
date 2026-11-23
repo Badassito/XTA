@@ -54,17 +54,26 @@ def _try_image_profile(pool, needed, scope_id, probe, *, parent_profile=None, ca
             if (not live_parent or not parent_lease.active or parent_lease.owner_closed
                     or parent_lease.pool is not pool or hasattr(pool, '_sam_parent_pool')):
                 reason = 'parent_inactive_or_not_canonical'
+        physical = 0
+        while reason is None:
+            capacity = int(pool.capacity)
+            promised = resources.sam_parent_promised_bytes(pool)
+            pool.condition.release()
+            try:
+                physical = max(0, int(probe()))
+            except Exception:
+                physical = 0
+            finally:
+                pool.condition.acquire()
+            if capacity == int(pool.capacity) and resources.sam_parent_promised_bytes(pool) <= promised:
+                break
+            if optional_request:
+                reason = 'accounting_changed_during_probe'
         staging = getattr(pool, '_sam_image_staging_pool', None)
         if staging is None and reason is None:
             staging = pool._sam_image_staging_pool = SimpleNamespace(
                 capacity=resources.MAX_IMAGE_STAGING_BYTES, in_use=0, condition=pool.condition,
                 _sam_parent_pool=pool)
-        physical = 0
-        if reason is None:
-            try:
-                physical = max(0, int(probe()))
-            except Exception:
-                pass
         other = resources.sam_parent_promised_bytes(pool)
         # Parent-funded images already occupy parent rights. Only external
         # image grants extend the full future-parent physical envelope.

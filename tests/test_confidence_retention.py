@@ -35,9 +35,10 @@ def test_scalar_confidence_save_is_optional_and_composes_with_existing_outputs()
     assert request.low_quality_downbins == ('0.5',)
     assert not confidence_retention_requested(())
     assert confidence_retention_requested(request.options)
-    assert confidence_retention_requested((), sweep_cutoff=0)
-    assert confidence_retention_requested((), sweep_cutoff=100)
-    assert confidence_retention_requested((), reconciliation_enabled=True)
+    assert confidence_retention_requested((), reconciliation_mode='confidence')
+    for mode in ('union', 'weighted'):
+        assert not confidence_retention_requested((), reconciliation_mode=mode)
+        assert confidence_retention_requested(request.options, reconciliation_mode=mode)
 
 
 @pytest.mark.parametrize('task,kind', [

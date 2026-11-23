@@ -1,6 +1,8 @@
 """Replay identity, disk admission, packet integrity and worker aggregation regressions."""
+from contextlib import closing
 import multiprocessing as mp
 import os
+from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
 
@@ -126,8 +128,65 @@ def test_multiple_workers_share_admission_and_flush_statistics(store_env):
     assert summary["by_backend"]["test"]["hit"]==2
     assert summary["by_device"]["cpu"]["test"]["hit"]==2
     assert cache.load(cache.input_key(np.array([1],np.uint8)))[0].item()==1
-    with sqlite3.connect(root/"packets.sqlite") as db:
+    with closing(sqlite3.connect(root/"packets.sqlite")) as db:
+        assert db.execute("PRAGMA journal_mode").fetchone() == ("delete",)
         assert db.execute("SELECT count(*) FROM packets WHERE ready=0").fetchone()[0]==0
+    assert not (root/"packets.sqlite-wal").exists()
+    assert not (root/"packets.sqlite-shm").exists()
+
+
+def test_reopening_legacy_wal_cache_preserves_committed_packet(store_env):
+    root, model = store_env
+    cache = _cache(root, model)
+    array = np.array([1], np.uint8)
+    key = cache.input_key(array)
+    assert cache.store(key, (array,))
+    cache.flush()
+    cache._connection().close()
+    del cache._local.conn
+
+    with closing(sqlite3.connect(root/"packets.sqlite")) as legacy, legacy:
+        assert legacy.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        legacy.execute("INSERT INTO counters VALUES ('test', 'legacy_writer', 7)")
+    with closing(sqlite3.connect(root/"packets.sqlite")) as legacy:
+        assert legacy.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+
+    assert np.array_equal(cache.load(key)[0], array)
+    assert replay.replay_cache_summary(root)["by_backend"]["test"]["legacy_writer"] == 7
+    assert cache._connection().execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    assert not (root/"packets.sqlite-wal").exists()
+    assert not (root/"packets.sqlite-shm").exists()
+
+
+def test_raw_unlink_refusal_still_releases_reservation(store_env, monkeypatch):
+    root, model = store_env
+    cache = _cache(root, model)
+    array = np.arange(4096, dtype=np.float32)
+    key = cache.input_key(array)
+    path = cache._packet_path(key)
+    settle = cache._settle
+    unlink = Path.unlink
+
+    def fail_commit(key, reserved, actual=None, inline=None):
+        if actual is not None:
+            raise sqlite3.OperationalError('controlled packet commit failure')
+        return settle(key, reserved)
+
+    def deny_unlink(target, *args, **kwargs):
+        if target == path:
+            raise PermissionError('controlled file sharing violation')
+        return unlink(target, *args, **kwargs)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(cache, '_settle', fail_commit)
+        failure.setattr(Path, 'unlink', deny_unlink)
+        assert not cache.store(key, (array,))
+        db = cache._connection()
+        assert db.execute('SELECT bytes,pending FROM capacity WHERE id=1').fetchone() == (0, 0)
+        assert db.execute('SELECT key FROM packets WHERE key=?', (key,)).fetchone() is None
+
+    assert cache.store(key, (array,))
+    np.testing.assert_array_equal(cache.load(key)[0], array)
 
 
 def test_sweep_gpu_tie_remains_stealable_and_stable_across_cursors():

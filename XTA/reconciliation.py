@@ -99,7 +99,7 @@ def _binary_mask(layer, z0, z1, shape):
     values = np.asarray(layer.read_slab(z0, z1))
     if values.shape != shape or values.dtype not in (np.dtype('uint8'), np.dtype('bool')):
         raise ValueError(f'Reconciliation readers must return uint8/bool binary slabs: {layer.layer_id}')
-    if not np.all((values == 0) | (values == 1)):
+    if values.dtype == np.uint8 and values.max(initial=0) > 1:
         raise ValueError(f'Reconciliation masks must be binary 0/1: {layer.layer_id}')
     return values != 0
 
@@ -189,8 +189,7 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
             group_descriptors.append(descriptor)
         layer_groups.append(groups[key])
     group_count = len(groups)
-    # Six bytes per group hold score, direct-source support, and anchor support;
-    # reserve additional temporaries, dynamic orientation codes and input planes.
+    # Preserve the slab boundaries supplied to custom decision callbacks.
     has_extrapolation = any(evidence_role(layer.metadata) == 'extrapolation' for layer in layers)
     plan = voting_memory_plan(shape, group_count, memory_mib, include_extrapolation=has_extrapolation)
     slab_depth = plan['slab_depth']
@@ -204,24 +203,39 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
     source_records = {layer.layer_id: dict(group=groups[descriptors[i]['group_key']],
         role=evidence_role(layer.metadata), island_weight=weights[layer.layer_id], foreground_voxels=0)
         for i, layer in enumerate(layers)}
+    compare_sections = section_codes is not None and policy['mode'] != 'union'
+    angular_tolerance = policy['angular_tolerance_deg']
+    cached_codes = {}
+    if compare_sections:
+        # Section codes with no Z coordinate broadcast from one plane to each slab.
+        cached_codes = {
+            i: section_codes(descriptor, 0, 1, shape, geometry_context,
+                             angular_tolerance_deg=angular_tolerance)
+            for i, descriptor in enumerate(group_descriptors)
+            if descriptor['kind'] != 'azimuthal' or 2 not in descriptor['axes_xyz'][:2]
+        }
+    decide = policy['decide']
+    anchor_bonus = policy['anchor_bonus']
+    threshold = policy['threshold']
+    score_plane = np.empty(shape[1:], np.float64) if anchor_bonus and decide is None else None
     for z0 in range(0, shape[0], slab_depth):
         z1 = min(shape[0], z0 + slab_depth)
         block_shape = (z1 - z0, *shape[1:])
         scores = np.zeros((group_count, *block_shape), np.float32)
         direct = np.zeros((group_count, *block_shape), bool)
-        anchors = np.zeros((group_count, *block_shape), bool)
-        extrapolated = np.zeros((group_count, *block_shape), bool) if has_extrapolation else None
+        anchored = np.zeros(block_shape, bool)
+        extrapolated = np.zeros((group_count, *block_shape), bool) if has_extrapolation and decide is not None else None
         candidate = np.zeros(block_shape, bool)
         for layer, group in zip(layers, layer_groups):
             mask = _binary_mask(layer, z0, z1, block_shape)
             candidate |= mask
-            source_records[layer.layer_id]['foreground_voxels'] += int(np.count_nonzero(mask))
+            foreground_count = int(np.count_nonzero(mask))
+            source_records[layer.layer_id]['foreground_voxels'] += foreground_count
             role = evidence_role(layer.metadata)
-            value = mask.astype(np.float32)
             known = mask
             if policy['mode'] == 'confidence' and role == 'prediction':
                 if layer.confidence_reader is None:
-                    if np.any(mask):
+                    if foreground_count:
                         raise ValueError(f'Nonempty prediction layer has no confidence evidence: {layer.layer_id}')
                     continue
                 raw, observed = layer.confidence_reader(z0, z1)
@@ -229,60 +243,77 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
                 if raw.shape != block_shape or observed.shape != block_shape or raw.dtype != np.uint8 or observed.dtype != np.bool_:
                     raise ValueError(f'Confidence reader must return uint8 scores and boolean known support: {layer.layer_id}')
                 known = mask & observed & (raw > 0)
-                value = np.where(known, raw.astype(np.float32) / 255., 0.)
-                counts['confidence_known_voxels'] += int(np.count_nonzero(known))
-                counts['confidence_unknown_prediction_voxels'] += int(np.count_nonzero(mask & ~known))
-                anchors[group] |= known & (value >= policy['anchor_confidence'])
+                value = np.where(known, raw.astype(np.float32) / 255., np.float32(0.))
+                known_count = int(np.count_nonzero(known))
+                counts['confidence_known_voxels'] += known_count
+                counts['confidence_unknown_prediction_voxels'] += foreground_count - known_count
+                anchored |= known & (value >= policy['anchor_confidence'])
+            else:
+                value = mask.astype(np.float32)
             contribution = value * float(policy['provenance_weights'][role] * weights[layer.layer_id])
             np.maximum(scores[group], contribution, out=scores[group])
             if role == 'prediction':
                 direct[group] |= known & (contribution > 0)
-            elif role == 'extrapolation':
+            elif role == 'extrapolation' and extrapolated is not None:
                 extrapolated[group] |= mask & (contribution > 0)
-        if policy['grouping'] == 'sections' and policy['mode'] != 'union':
-            codes = [section_codes(descriptor, z0, z1, shape, geometry_context,
-                                   angular_tolerance_deg=policy['angular_tolerance_deg'])
-                     for descriptor in group_descriptors]
+        if compare_sections:
+            codes = [cached_codes[i] if i in cached_codes else
+                     section_codes(descriptor, z0, z1, shape, geometry_context,
+                                   angular_tolerance_deg=angular_tolerance)
+                     for i, descriptor in enumerate(group_descriptors)]
             for current in range(group_count):
                 for previous in range(current):
                     if np.isscalar(codes[current]) and np.isscalar(codes[previous]):
                         if codes[current] != codes[previous]:
                             continue
-                    same = np.equal(codes[current], codes[previous]) & (scores[current] > 0)
+                    same = (np.equal(codes[current], codes[previous])
+                            & (scores[current] > 0) & (scores[previous] > 0))
                     if not np.any(same):
                         continue
                     counts['duplicate_group_support_removed'] += int(np.count_nonzero(same))
-                    np.maximum(scores[previous], np.where(same, scores[current], 0.), out=scores[previous])
+                    np.maximum(scores[previous], scores[current], out=scores[previous], where=same)
                     direct[previous] |= same & direct[current]
-                    anchors[previous] |= same & anchors[current]
                     if extrapolated is not None:
                         extrapolated[previous] |= same & extrapolated[current]
                     scores[current][same] = 0.
                     direct[current][same] = False
-                    anchors[current][same] = False
                     if extrapolated is not None:
                         extrapolated[current][same] = False
-        support = np.count_nonzero(scores > 0, axis=0).astype(np.uint16)
-        direct_support = np.count_nonzero(direct, axis=0).astype(np.uint16)
-        extrapolation_support = (np.count_nonzero(extrapolated, axis=0).astype(np.uint16)
-            if extrapolated is not None else np.broadcast_to(np.uint16(0), block_shape))
+        # The layer-count check bounds each exact support count to uint16.
+        support = (scores > 0).sum(axis=0, dtype=np.uint16)
+        direct_support = direct.sum(axis=0, dtype=np.uint16)
         total = scores.sum(axis=0, dtype=np.float32)
-        anchored = anchors.any(axis=0) & (direct_support >= 2)
-        effective = total + np.where(anchored, policy['anchor_bonus'], 0.)
+        # Merging duplicate groups preserves the union of their confidence anchors.
+        anchored &= direct_support >= 2
         counts['anchored_voxels'] += int(np.count_nonzero(anchored))
-        block = dict(candidate=candidate, score=effective, support=support,
-                     prediction_support=direct_support, extrapolation_support=extrapolation_support,
-                     anchored=anchored, z0=z0, z1=z1)
-        if policy['decide'] is not None:
+        if decide is not None:
+            extrapolation_support = (extrapolated.sum(axis=0, dtype=np.uint16)
+                if extrapolated is not None else np.broadcast_to(np.uint16(0), block_shape))
+            effective = total.astype(np.float64)
+            np.add(effective, anchor_bonus, out=effective, where=anchored)
+            block = dict(candidate=candidate, score=effective, support=support,
+                         prediction_support=direct_support, extrapolation_support=extrapolation_support,
+                         anchored=anchored, z0=z0, z1=z1)
             for value in (candidate, effective, support, direct_support, extrapolation_support, anchored):
                 value.flags.writeable = False
-            keep = np.asarray(policy['decide'](block))
+            keep = np.asarray(decide(block))
             if keep.dtype != np.bool_ or keep.shape != block_shape:
                 raise ValueError('Custom reconciliation decide() must return a boolean array with the block shape')
         elif policy['mode'] == 'union':
             keep = candidate
         else:
-            keep = (candidate & (effective >= policy['threshold']) & (support >= policy['min_sources'])
+            # Compare at policy precision without upcasting the entire score slab.
+            if score_plane is None:
+                meets_threshold = np.greater_equal(
+                    total, threshold, signature=(np.float64, np.float64, np.bool_),
+                )
+            else:
+                meets_threshold = np.empty(block_shape, bool)
+                for values, anchor, matches in zip(total, anchored, meets_threshold):
+                    np.copyto(score_plane, values)
+                    np.add(score_plane, anchor_bonus, out=score_plane, where=anchor)
+                    np.greater_equal(score_plane, threshold, out=matches)
+            keep = (candidate & meets_threshold & (support >= policy['min_sources'])
                     & (direct_support >= policy['min_prediction_sources']))
         if np.any(keep & ~candidate):
             raise ValueError('Reconciliation cannot introduce foreground outside candidate evidence')

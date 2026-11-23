@@ -78,6 +78,29 @@ def test_nonempty_singleton_storage_pads_one_in_grid_neighbor_without_moving_mas
     assert np.all(offset >= 0) and np.all(offset + np.array(stored.shape[1:]) <= shape)
 
 
+def test_cropped_callbacks_fit_small_budget_and_keep_exact_reference_positions(tmp_path):
+    shape = (3, 4096, 8192)
+    left = np.zeros((3, 3, 4), np.uint8)
+    right = np.zeros((3, 2, 3), np.uint8)
+    left[:, 1, (0, 2)] = 1
+    right[1:, :, 2] = 1
+    segments = [
+        GroupedSegment("left", "Left", (1, 0, 0), lambda z0, z1: left[z0:z1],
+                       extent_xyz=(300, 302, 201, 201, 0, 2), source_window_yx=(200, 300, 203, 304)),
+        GroupedSegment("right", "Right", (0, 1, 0), lambda z0, z1: right[z0:z1],
+                       extent_xyz=(306, 306, 201, 202, 1, 2), source_window_yx=(201, 304, 203, 307)),
+    ]
+    path = tmp_path / "cropped.seg.nrrd"
+    record = write_grouped_seg_nrrd(path, shape_tyx=shape, segments=segments, memory_mib=1)
+    header, masks = read_stock(path)
+    assert record["minimum_numeric_buffer_bytes"] < 1024
+    assert header["Segmentation_ReferenceImageExtentOffset"] == "300 201 0"
+    expected = np.zeros((2, 3, 2, 7), np.uint8)
+    expected[0, :, 0, (0, 2)] = 1
+    expected[1, 1:, :, 6] = 1
+    np.testing.assert_array_equal(masks, expected)
+
+
 def test_conservative_extent_union_crops_oblique_grid_and_reads_source_once(tmp_path):
     shape = (9, 11, 13)
     a = np.zeros(shape, np.uint8)

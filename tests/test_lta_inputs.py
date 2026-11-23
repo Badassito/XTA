@@ -276,6 +276,17 @@ class LtaInputDiscoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "image changed"):
                 lta_inputs.revalidate_lta_input_identities(discovery)
 
+    def test_identity_revalidation_hashes_shared_exemplar_image_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = _write(root / "sample_0000.png", b"image")
+            _write(root / "sample_0000.txt", POLYGON + "0 0.1 0.1 0.3 0.1 0.2 0.2\n")
+            discovery = lta_inputs.discover_lta_inputs(root)
+            self.assertEqual(len(discovery.positive_pool), 2)
+            with mock.patch.object(lta_inputs, "_sha256_path", wraps=lta_inputs._sha256_path) as sha:
+                lta_inputs.revalidate_lta_input_identities(discovery)
+            self.assertEqual(sha.call_args_list.count(mock.call(image.resolve())), 1)
+
     def test_sparse_zero_based_video_labels_are_partial_and_missing_is_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

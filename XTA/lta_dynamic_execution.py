@@ -21,12 +21,13 @@ import uuid
 import numpy as np
 
 from .lta_dynamic_crops import (DYNAMIC_CROP_POLICY, DYNAMIC_MODEL_SIDE, DynamicCropSettings,
-                                DynamicObject, NativeMask, plan_dynamic_crops,
+                                DynamicObject, NativeMask, _bounds_touch_interior_guard,
+                                _has_split_components, plan_dynamic_crops,
                                 split_dynamic_object, split_depth_budget_reached, touches_interior_guard)
 from .lta_propagation import LtaMaskSeed, LtaSeedProvenance, read_seed_artifact, write_seed_artifact
 from .lta_scheduler import LtaSessionWork, LtaViewKey
 from .lta_tile_tracking import LtaLineageId
-from .lta_tiles import TilePlan, rasterize_polygons_to_shape
+from .lta_tiles import TilePlan, _rasterize_source_polygon
 from .lta_windows import AnchorDomain, WindowPlan, owned_frame_range, plan_domain_windows
 from .lta_workers import LtaWorkerTask
 
@@ -117,9 +118,9 @@ def plan_initial_dynamic_tasks(source, annotations, view_plan, cache_ref, *, tem
         frame = int(annotation.frame_position)
         objects = by_frame.setdefault(frame, [])
         for polygon in annotation.polygons:
-            mask = rasterize_polygons_to_shape((polygon,), height=view_plan.frame_height,
-                                                width=view_plan.frame_width)
-            native = NativeMask.from_crop(mask)
+            left, top, mask = _rasterize_source_polygon(
+                polygon, height=view_plan.frame_height, width=view_plan.frame_width)
+            native = NativeMask.from_crop(mask, left=left, top=top)
             if native is None:
                 continue
             lineage = LtaLineageId(str(source.volume_id), view_plan.physical_view_id,
@@ -153,54 +154,58 @@ def plan_initial_dynamic_tasks(source, annotations, view_plan, cache_ref, *, tem
     return tuple(tasks), inventory
 
 
-def _read_task_masks(task, manifest, *, temp_root, settings=DynamicCropSettings()):
+def _read_task_masks(task, manifest, *, settings=DynamicCropSettings()):
     """Validate all evidence, retaining only boundary and earliest event masks.
 
     The packet remains authoritative for every frame. The coordinator needs
     at most a boundary, a first crop/split event and a split-depth budget event
-    per direction and lineage. Decode other frames one at a time and release
-    them, rather than retaining thirty masks for every crop member.
+    per direction and lineage. Validated crop bounds and foreground counts
+    identify which other frames need a connected-component check.
     """
-    from .lta_coverage import LtaCoverageLedger, _decode, _packet_crop
+    from .lta_coverage import _decode, _read_coverage_packet
     receipt = manifest["lineage_coverage"]
-    ledger_path = Path(temp_root) / "dynamic-coverage-validation.sqlite3"
-    with LtaCoverageLedger(ledger_path, frame_count=task.payload["cache_ref"]["shape"][0]) as ledger:
-        ledger.ingest(receipt, expected_work_id=task.work.work_id, tile_index=task.work.tile_index,
-                       tile_config_id="dynamic", frame_start=task.window.frame_start,
-                       frame_stop=task.window.frame_stop,
-                       expected_lineages=tuple(item.seed.lineage for item in task.objects))
-    # Validation uses a fresh bounded ledger per packet; do not accumulate all
-    # dynamic prediction masks a second time for the duration of a long run.
-    ledger_path.unlink(missing_ok=True)
-    for suffix in ("-wal", "-shm"):
-        Path(str(ledger_path) + suffix).unlink(missing_ok=True)
     by_lineage = {item.seed.lineage: item for item in task.objects}
     masks = {}
     scores = manifest.get("crop_observation_scores", {})
-    with np.load(receipt["path"], allow_pickle=False) as archive:
-        metadata = json.loads(archive["metadata"].tobytes().decode())
-        lineages = tuple(LtaLineageId(**value) for value in metadata["lineages"])
-        rows = archive["masks"]
+    with _read_coverage_packet(
+        receipt, expected_work_id=task.work.work_id, tile_index=task.work.tile_index,
+        tile_config_id="dynamic", frame_count=task.payload["cache_ref"]["shape"][0],
+        frame_start=task.window.frame_start, frame_stop=task.window.frame_stop,
+        expected_lineages=by_lineage,
+    ) as (_, shape, lineages, rows, _, crop_at):
+        if shape != (task.crop.size, task.crop.size):
+            raise ValueError("coverage packet shape differs from its dynamic crop")
         by_frame = {}
         for index, row in enumerate(rows):
             by_frame.setdefault(lineages[int(row[0])], {})[int(row[1])] = index
 
-        def decode_object(index):
+        def tracker_score(lineage, frame):
+            score = scores.get(f"{lineage.token}|{frame}")
+            if score is None:
+                return by_lineage[lineage].seed.tracker_probability
+            score = float(score)
+            if not 0.0 <= score <= 1.0:
+                raise ValueError("tracker_probability must be finite and in [0,1]")
+            return score
+
+        def retain_object(index, score, raw=None):
             row = rows[index]
             lineage = lineages[int(row[0])]
             frame = int(row[1])
-            crop = _packet_crop(archive, row, index, (task.crop.size, task.crop.size))
-            native = NativeMask(task.crop.top + crop[0], task.crop.left + crop[1], _decode(crop))
+            if (lineage, frame) in masks:
+                return
+            if raw is None:
+                raw = _decode(crop_at(index))
+            native = NativeMask(task.crop.top + int(row[2]), task.crop.left + int(row[3]), raw)
             parent = by_lineage[lineage]
-            score = scores.get(f"{lineage.token}|{frame}")
             seed = replace(parent.seed, frame_index=frame, mask=native.mask,
                            provenance=LtaSeedProvenance.TEMPORAL_DOGFOOD,
-                           tracker_probability=parent.seed.tracker_probability if score is None else float(score),
+                           tracker_probability=score,
                            source_receipt={"parent_work_id": task.work.work_id,
                                            "parent_lineage": parent.seed.lineage.token,
                                            "crop_policy": DYNAMIC_CROP_POLICY,
                                            "source_crop_xyxy": list(task.crop.xyxy)})
-            return DynamicObject(seed, native, parent.split_depth)
+            masks[(lineage, frame)] = DynamicObject(seed, native, parent.split_depth)
 
         for lineage, records in by_frame.items():
             for direction in ("forward", "backward"):
@@ -208,21 +213,33 @@ def _read_task_masks(task, manifest, *, temp_root, settings=DynamicCropSettings(
                     continue
                 boundary = task.window.frame_stop - 1 if direction == "forward" else task.window.frame_start
                 if boundary in records:
-                    masks[(lineage, boundary)] = decode_object(records[boundary])
+                    retain_object(records[boundary], tracker_score(lineage, boundary))
                 frames = sorted((frame for frame in records if
                                  (frame > task.window.prompt_frame if direction == "forward"
                                   else frame < task.window.prompt_frame)), reverse=direction == "backward")
                 depth_budget_recorded = False
+                at_depth_limit = by_lineage[lineage].split_depth >= settings.max_split_depth
                 for frame in frames:
-                    item = masks.get((lineage, frame)) or decode_object(records[frame])
-                    edge = touches_interior_guard(item.native, task.crop, guard=settings.guard)
-                    split = len(split_dynamic_object(item, settings=settings)) > 1
-                    if not depth_budget_recorded and split_depth_budget_reached(item, settings=settings):
-                        masks[(lineage, frame)] = item
-                        depth_budget_recorded = True
-                    if edge or split:
-                        masks[(lineage, frame)] = item
+                    index = records[frame]
+                    y, x, height, width, foreground = map(int, rows[index][2:])
+                    left, top = task.crop.left + x, task.crop.top + y
+                    edge = _bounds_touch_interior_guard((left, top, left + width, top + height),
+                                                        task.crop, guard=settings.guard)
+                    score = tracker_score(lineage, frame)
+                    check_components = (not depth_budget_recorded if at_depth_limit
+                                        else not edge and settings.max_split_children > 1)
+                    raw = None
+                    split = False
+                    if check_components and foreground >= 2 * settings.split_min_pixels:
+                        retained = masks.get((lineage, frame))
+                        raw = retained.native.mask if retained is not None else _decode(crop_at(index))
+                        split = _has_split_components(raw, settings)
+                    if split or edge:
+                        retain_object(index, score, raw)
+                    if edge or (split and not at_depth_limit):
                         break
+                    if split:
+                        depth_budget_recorded = True
     return masks
 
 
@@ -411,7 +428,7 @@ def drive_dynamic_workers(*, scheduler, pool, initial, view_plan, cache_ref, vie
                           "prediction_count": int(window.get("prediction_count", 0)),
                           "dogfood_seed_count": int(window.get("dogfood_seed_count", 0))}
                          for window in manifest.get("windows", ())]})
-        masks = _read_task_masks(task, manifest, temp_root=temp_root, settings=settings)
+        masks = _read_task_masks(task, manifest, settings=settings)
         execution._consume_chain_manifest(manifest, view_union=view_union)
         execution._accumulate_worker_audit(audit, manifest, result)
         for child in followup_dynamic_tasks(task, masks, view_plan=view_plan, cache_ref=cache_ref,

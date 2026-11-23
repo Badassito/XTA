@@ -276,40 +276,35 @@ def test_gate_support_fingerprint_is_stable_across_policy_receipt_updates(tmp_pa
         store.close()
 
 
-def test_cpu_detector_sam_pool_does_not_keep_detector_inference_priority(tmp_path):
+@pytest.mark.parametrize('fanout_only', (False, True), ids=('cpu-detector', 'native-fanout'))
+def test_cpu_detector_sam_pool_does_not_keep_detector_inference_priority(tmp_path, fanout_only):
     # Execute the actual coordinator configuration and immediately following
     # conditional initialization, without launching the rest of the pipeline.
     tree = ast.parse(Path(pipeline.__file__).read_text(encoding='utf-8'))
-    statements = None
-    for parent in ast.walk(tree):
-        body = getattr(parent, 'body', ())
-        if not isinstance(body, list):
-            continue
-        for index, node in enumerate(body):
-            if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
-                    and isinstance(node.value.func, ast.Name)
-                    and node.value.func.id == '_configure_main_process_gpu_stage_workers'):
-                statements = [node]
-                for following in body[index + 1:]:
-                    if not isinstance(following, ast.If):
-                        break
-                    statements.append(following)
-                break
-        if statements is not None:
-            break
-    assert statements is not None
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_main_impl')
+    start = next(index for index, node in enumerate(main.body)
+                 if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                 and isinstance(node.value.func, ast.Name)
+                 and node.value.func.id == '_configure_main_process_gpu_stage_workers')
+    statements = main.body[start:start + 2]
+    assert isinstance(statements[1], ast.If)
     coordinator = backprojection._MainProcessGpuStageCoordinator()
+    devices = [0] if fanout_only else []
     namespace = dict(vars(pipeline))
     namespace.update(
-        gpu_logical_indices=[],
-        interpolation_settings=types.SimpleNamespace(sam_devices=('0',)),
-        gpu_worker_process_active=False,
+        gpu_logical_indices=devices,
+        gpu_worker_process_active=fanout_only,
+        scheduled_inference_views=() if fanout_only else (_view(),),
         _configure_main_process_gpu_stage_workers=coordinator.configure_workers,
         _set_main_process_gpu_inference_priority_active=coordinator.set_inference_priority_active,
+        _set_main_process_gpu_asset_retirement_pending=coordinator.set_inference_asset_retirement_pending,
     )
     exec(compile(ast.Module(body=statements, type_ignores=[]),
                  '<sam-coordinator-configuration>', 'exec'), namespace)
-    assert not coordinator.snapshot()['inference_priority_active']
+    snapshot = coordinator.snapshot()
+    assert snapshot['worker_devices'] == devices
+    assert not snapshot['inference_priority_active']
+    assert not snapshot['inference_asset_retirement_pending']
     context = _context(tmp_path)
     context.detector_assets_retired()
     runtime = mock.Mock(cleanup_settled=True)

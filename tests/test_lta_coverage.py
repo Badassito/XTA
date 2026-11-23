@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -50,6 +51,20 @@ def _packet(root, work, *, lineage=None, tile=0, shape=(32, 32),
 
 
 class LtaCoverageTests(unittest.TestCase):
+    def test_packet_reuses_validated_crops_under_cache_budget(self):
+        from XTA import lta_coverage
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            packet = _packet(root, "window", predictions=((1, _mask((4, 4))),))
+            for budget, expected_reads in ((1024, 1), (0, 2)):
+                with self.subTest(budget=budget), mock.patch.object(
+                    lta_coverage, "_PACKED_CROP_CACHE_BYTES", budget,
+                ), mock.patch.object(lta_coverage, "_packet_crop", wraps=lta_coverage._packet_crop) as read:
+                    with LtaCoverageLedger(root / f"coverage-{budget}.sqlite", frame_count=6) as ledger:
+                        self.assertEqual(_ingest(ledger, packet)["mask_count"], 1)
+                    self.assertEqual(read.call_count, expected_reads)
+
     def test_prompt_support_restores_context_without_losing_novel_pixels_or_metadata(self):
         lineage = _lineage()
         known, incoming = _mask((4, 4), (24, 25)), _mask((4, 4), (5, 5))

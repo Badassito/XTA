@@ -1,6 +1,7 @@
 """Reference-linear native fallback, dispatch, and active-path telemetry."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
 from dataclasses import replace
@@ -80,9 +81,10 @@ def test_explicit_native_kernel_optout_retains_torch(monkeypatch):
 def test_kernel_is_lazy_compiled_with_separate_multiply_add(monkeypatch):
     import sys
     kernel = mock.Mock()
-    cupy = SimpleNamespace(RawKernel=mock.Mock(return_value=kernel))
+    cupy = SimpleNamespace(RawKernel=mock.Mock(return_value=kernel),
+                           cuda=SimpleNamespace(Device=nullcontext, runtime=SimpleNamespace(getDevice=lambda: 0)))
     monkeypatch.setitem(sys.modules, 'cupy', cupy)
-    monkeypatch.setattr(cuda_backend, '_AZIMUTHAL_LINEAR_NATIVE_KERNEL', None)
+    monkeypatch.setattr(cuda_backend, '_AZIMUTHAL_LINEAR_NATIVE_KERNELS', {})
     first = cuda_backend._azimuthal_linear_native_kernel()
     assert first is cuda_backend._azimuthal_linear_native_kernel()
     cupy.RawKernel.assert_called_once()

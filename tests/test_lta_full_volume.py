@@ -473,27 +473,68 @@ class LtaFullVolumeTests(unittest.TestCase):
 
     def test_h100_profile_rejects_pre_hopper_device(self) -> None:
         fake_torch = SimpleNamespace(
-            cuda=SimpleNamespace(get_device_capability=lambda _device: (8, 9))
+            cuda=SimpleNamespace(
+                get_device_name=lambda _device: "NVIDIA GeForce RTX 4090",
+                get_device_capability=lambda _device: (8, 9),
+            )
         )
-        with self.assertRaisesRegex(ValueError, "capability 9"):
+        with self.assertRaisesRegex(ValueError, "requires Hopper or newer"):
             self.tool._resolve_profile(fake_torch, 0, "h100")
-        self.assertEqual(self.tool._resolve_profile(fake_torch, 0, "auto")["name"], "egpu")
+        self.assertEqual(self.tool._resolve_profile(fake_torch, 0, "auto"), {
+            "name": "egpu",
+            "weight_storage": "bfloat16_egpu",
+            "use_fa3": False,
+            "use_rope_real": False,
+            "constrained_batches": True,
+            "sdpa_fallback": True,
+            "attention_backend": "torch_sdpa_flash_efficient_math",
+        })
 
         hopper = SimpleNamespace(
-            cuda=SimpleNamespace(get_device_capability=lambda _device: (9, 0))
+            cuda=SimpleNamespace(
+                get_device_name=lambda _device: "NVIDIA H100",
+                get_device_capability=lambda _device: (9, 0),
+            )
         )
         with mock.patch.dict("os.environ", {"YOLO_TTA_SAM_ATTENTION_BACKEND": "auto"}):
             profile = self.tool._resolve_profile(hopper, 0, "h100")
-        self.assertTrue(profile["use_fa3"])
-        self.assertFalse(profile["use_rope_real"])
-        self.assertTrue(profile["sdpa_fallback"])
-        self.assertEqual(
-            profile["attention_backend"], "meta_fa3_fp8_e4m3fn"
-        )
+        self.assertEqual(profile, {
+            "name": "h100",
+            "weight_storage": "float32",
+            "use_fa3": True,
+            "use_rope_real": False,
+            "constrained_batches": False,
+            "sdpa_fallback": True,
+            "attention_backend": "meta_fa3_fp8_e4m3fn",
+            "attention_qkv_dtype": "float8_e4m3fn",
+            "runtime_autocast_dtype": "bfloat16",
+        })
         with mock.patch.dict("os.environ", {"YOLO_TTA_SAM_ATTENTION_BACKEND": "sdpa"}):
             baseline = self.tool._resolve_profile(hopper, 0, "h100")
-        self.assertFalse(baseline["use_fa3"])
-        self.assertEqual(baseline["weight_storage"], "float32")
+        self.assertEqual(baseline, dict(profile, use_fa3=False,
+            attention_backend="torch_sdpa_flash_efficient_math", attention_qkv_dtype="bfloat16"))
+
+    def test_a100_profile_selects_unconstrained_sdpa(self) -> None:
+        ampere = SimpleNamespace(
+            cuda=SimpleNamespace(
+                get_device_name=lambda _device: "NVIDIA A100-SXM4-80GB",
+                get_device_capability=lambda _device: (8, 0),
+            )
+        )
+        with mock.patch.dict("os.environ", {"YOLO_TTA_SAM_ATTENTION_BACKEND": "auto"}):
+            auto = self.tool._resolve_profile(ampere, 0, "auto")
+            self.assertEqual(auto, self.tool._resolve_profile(ampere, 0, "a100"))
+        self.assertEqual(auto, {
+            "name": "a100",
+            "weight_storage": "float32",
+            "use_fa3": False,
+            "use_rope_real": False,
+            "constrained_batches": False,
+            "sdpa_fallback": True,
+            "attention_backend": "torch_sdpa_flash_efficient_math",
+            "attention_qkv_dtype": "bfloat16",
+            "runtime_autocast_dtype": "bfloat16",
+        })
 
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import sqlite3
 import struct
 import threading
 import weakref
@@ -27,6 +26,9 @@ import zlib
 import numpy as np
 
 from .json_publication import write_json_atomic
+from .sweep_quota import (
+    SweepViewCapacityError, native_fanout_root as _root, native_journal_usage, update_leases as _quota_many,
+)
 
 SCHEMA = 'xta.native_sweep_views/1'
 INDEX = np.dtype([
@@ -48,10 +50,6 @@ _INDEX_CACHE_LOCK = threading.Lock()
 
 class SweepViewIntegrityError(RuntimeError):
     """An acknowledged native product cannot be used exactly."""
-
-
-class SweepViewCapacityError(RuntimeError):
-    """Staging was refused before acknowledgment; scalar fallback is allowed."""
 
 
 class SweepViewRetiredError(RuntimeError):
@@ -82,15 +80,6 @@ def _cents(values):
     if not result or any(type(v) is not int or not 0 <= v <= 100 for v in result) or len(set(result)) != len(result):
         raise ValueError('Native fanout cutoffs must be unique integer hundredths in [0,100]')
     return result
-
-
-def _root(root=None):
-    if root is not None:
-        return Path(root).resolve()
-    work = os.environ.get('XTA_YOLO_SWEEP_WORK_DIR')
-    if not work:
-        raise ValueError('Native fanout requires the family-owned WORK_DIR')
-    return Path(work).resolve() / 'native_fanout'
 
 
 def _family_id():
@@ -126,80 +115,7 @@ def _initialize(root):
 
 
 def _quota(root, key, amount):
-    limit = float(os.environ.get('XTA_YOLO_SWEEP_NATIVE_GIB', '64'))
-    if not math.isfinite(limit) or limit < 0:
-        raise ValueError('XTA_YOLO_SWEEP_NATIVE_GIB must be finite and nonnegative')
-    limit = int(limit * 1024**3)
-    with sqlite3.connect(root / 'quota.sqlite', timeout=30) as db:
-        db.execute('CREATE TABLE IF NOT EXISTS leases (id TEXT PRIMARY KEY, bytes INTEGER NOT NULL)')
-        db.execute('CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, used INTEGER NOT NULL)')
-        db.commit()
-        db.execute('BEGIN IMMEDIATE')
-        current=db.execute('SELECT used FROM usage WHERE id=1').fetchone()
-        if current is None:
-            # One-time migration only; all subsequent reservations are O(1).
-            used=int(db.execute('SELECT COALESCE(SUM(bytes),0) FROM leases').fetchone()[0])
-            db.execute('INSERT INTO usage VALUES (1,?)',(used,))
-        else:used=int(current[0])
-        previous=db.execute('SELECT bytes FROM leases WHERE id=?',(key,)).fetchone()
-        previous=0 if previous is None else int(previous[0])
-        next_used=used-previous+int(amount)
-        if amount and next_used > limit:
-            raise SweepViewCapacityError('Native fanout staging budget exhausted')
-        if amount:
-            db.execute('INSERT OR REPLACE INTO leases VALUES (?,?)', (key, int(amount)))
-        else:
-            db.execute('DELETE FROM leases WHERE id=?', (key,))
-        db.execute('UPDATE usage SET used=? WHERE id=1',(next_used,))
-
-
-_JOURNAL_USAGE_CACHE = {}
-_JOURNAL_USAGE_LOCK = threading.Lock()
-
-
-def native_journal_usage(root=None, *, max_age_seconds=0.5):
-    """Return (reserved_bytes or None when unknown, quota_bytes) of the native journal.
-
-    The scheduler calls this between GPU refills, so it must never wait on a
-    worker's quota transaction: reads use a short busy timeout, are rate-limited
-    to one per ``max_age_seconds`` and return the last known value while a
-    writer holds the lock. Before any task reserves space the usage is zero.
-    """
-    import time
-    limit = float(os.environ.get('XTA_YOLO_SWEEP_NATIVE_GIB', '64'))
-    if not math.isfinite(limit) or limit < 0:
-        raise ValueError('XTA_YOLO_SWEEP_NATIVE_GIB must be finite and nonnegative')
-    quota = int(limit * 1024**3)
-    path = _root(root) / 'quota.sqlite'
-    now = time.monotonic()
-    with _JOURNAL_USAGE_LOCK:
-        cached = _JOURNAL_USAGE_CACHE.get(path)
-    if cached is not None and now - cached[1] < max_age_seconds:
-        return cached[0], quota
-    if not path.is_file():
-        return 0, quota
-    try:
-        # as_uri() percent-encodes '#', '%' and '?' in the workspace path.
-        with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0) as db:
-            row = db.execute('SELECT used FROM usage WHERE id=1').fetchone()
-        used = 0 if row is None else int(row[0])
-    except sqlite3.OperationalError:
-        # Locked by a worker's reservation (or not created yet): reuse the last
-        # known value; with none, report unknown rather than an empty journal.
-        return (cached[0] if cached is not None else None), quota
-    with _JOURNAL_USAGE_LOCK:
-        _JOURNAL_USAGE_CACHE[path] = (used, now)
-    return used, quota
-
-
-def unsupported_task_fanout(task, cfg, *, backend='', reason, native_shape=None):
-    """Return an explicit unsupported observation for stats['sweep_native_fanout']."""
-    model, view = _names(task, cfg)
-    result = dict(status='unsupported', reason=str(reason), model_name=model, view_name=view,
-                  backend=str(backend))
-    if native_shape is not None:
-        result['native_shape'] = list(_shape(native_shape))
-    return result
+    _quota_many(root, ((key, amount),))
 
 
 def cutoffs_for_task(task, cfg, backend=None):
@@ -601,14 +517,10 @@ class NativeTaskFanoutWriter:
             self._raise_encoder_error()
             if np.any((self.index['state'] != 1) & (self.index['state'] != 2) & (self.index['state'] != 4)):
                 raise SweepViewIntegrityError('Native task did not cover all expected real/padding frames')
-            self._stream.flush()
-            os.fsync(self._stream.fileno())
             self._stream.close()
             raw = self.index.tobytes()
             with (self.path / 'index.bin').open('wb') as stream:
                 stream.write(raw)
-                stream.flush()
-                os.fsync(stream.fileno())
             meta = self._metadata('complete')
             meta['index_sha256'] = hashlib.sha256(raw).hexdigest()
             self._metrics['payload_bytes'] = self._used
@@ -803,12 +715,6 @@ def _decision(model_name, view_name, cutoff, native_shape=None, identity=None, r
         return root, meta
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise SweepViewIntegrityError('Native view decision is corrupt') from exc
-
-
-def has_complete_view(model_name, view_name, cutoff, *, native_shape=None, identity=None, root=None):
-    """Read only a bounded view decision, never range indices or payload bytes."""
-    _, meta = _decision(model_name, view_name, cutoff, native_shape, identity, root)
-    return meta is not None and meta['status'] == 'ready' and meta.get('scalar_owned_cutoff')!=cutoff
 
 
 def view_family_status(model_name,view_name,cutoff,*,native_shape=None,identity=None,root=None):
@@ -1257,7 +1163,8 @@ def open_view(model_name, view_name, cutoff, *, native_shape=None, identity=None
     return NativeViewReader(root,meta,cutoff)
 
 
-def hydrate(model_name, view_name, cutoff, union, scores=None, *, targets_zeroed=True, identity=None, root=None):
+def hydrate(model_name, view_name, cutoff, union, scores=None, *, targets_zeroed=True,
+            identity=None, root=None, stop=None):
     """Restore one caller-owned view; default requires freshly zeroed target arrays."""
     if union.dtype!=np.uint8 or union.ndim!=3 or not union.flags.writeable:
         raise ValueError('Native hydration requires a writable uint8 TYX target')
@@ -1271,6 +1178,8 @@ def hydrate(model_name, view_name, cutoff, union, scores=None, *, targets_zeroed
             if scores is not None:scores.fill(0)
         active=np.zeros(union.shape[0],bool);boxes=np.zeros((union.shape[0],4),np.int64)
         for z in range(union.shape[0]):
+            if stop is not None and stop.is_set():
+                raise RuntimeError('Native sweep hydration cancelled')
             contributions=reader.iter_crops(z) if scores is not None else ((*crop,None) for crop in reader.iter_mask_crops(z))
             for y0,y1,x0,x1,mask,score in contributions:
                 union[z,y0:y1,x0:x1] |= mask
@@ -1295,6 +1204,7 @@ def retire_view_payloads(model_name, view_name, expected_cutoffs, *, identity=No
     if meta['status']!='ready':
         raise ValueError('Only durably processed ready native products may be retired')
     freed=0
+    updates = []
     for receipt in meta.get('ranges',[]):
         path=Path(receipt['path']).resolve()
         if path.parent!=(root/'ranges').resolve():
@@ -1302,7 +1212,9 @@ def retire_view_payloads(model_name, view_name, expected_cutoffs, *, identity=No
         for name in ('payload.bin','index.bin'):
             target=path/name
             if target.exists():freed+=target.stat().st_size;target.unlink()
-        _quota(root,path.name,(path/'metadata.json').stat().st_size)
+        updates.append((path.name, (path/'metadata.json').stat().st_size))
+    if updates:
+        _quota_many(root, updates)
     meta['status']=terminal_state
     write_json_atomic(_view_dir(root,model_name,view_name)/'metadata.json',meta)
     return dict(status=terminal_state,freed_bytes=freed)

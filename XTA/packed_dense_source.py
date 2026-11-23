@@ -198,3 +198,25 @@ def encode_dense_u8_packed_block(volume, first, count, *, payload_buffer=None,
     else:
         _encode_dense_strided(source, first, metadata, offsets, payload)
     return tuple(records), payload
+
+
+def encode_owned_u8_projection_plane(plane, z, *, packed):
+    """Compact a worker-owned, contiguous binary uint8 plane into its own buffer."""
+    height, width = plane.shape
+    flat = plane.reshape(-1)
+    metadata = _dense_contiguous_metadata(flat, height, width, 0, 1)
+    y0, y1, x0, x1, foreground = map(int, metadata[0])
+    if foreground == 0:
+        return None
+    crop_width = x1 - x0
+    row_bytes = (crop_width + 7) // 8 if packed else crop_width
+    size = (y1 - y0) * row_bytes
+    # The destination never reaches an unread source pixel: it starts at
+    # byte zero and advances by at most the original row stride per row.
+    if packed:
+        _encode_dense_contiguous(flat, height, width, 0, metadata, np.zeros(1, np.int64), flat)
+    else:
+        for row in range(y1 - y0):
+            start = row * row_bytes
+            flat[start:start + row_bytes] = plane[y0 + row, x0:x1]
+    return PackedOwnerCrop(z, y0, y1, x0, x1, foreground, 0, size), flat[:size]

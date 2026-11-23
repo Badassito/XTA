@@ -77,6 +77,7 @@ def allocation(tmp_path, *, backend='sam', extrapolation=False, ready=False, sha
         args=SimpleNamespace(imgsz=8,min_conf=0.,interpolation_distance=5 if interpolation else 0,
             reconciliation_retain_confidence=True),dense_tiling_active=False,nrrd_layers_needed=False,
         component_layers_needed=False,baseline_union_by_model_view={},baseline_confmap_by_model_view={},
+        view_slice_meta={},
         baseline_union_paths=state.baseline_union_paths,baseline_confmap_paths=state.baseline_confmap_paths,
         baseline_slice_locks_by_model_view={},direct_union_backing_leases=state.direct_union_backing_leases,
         direct_union_inference_views=state.direct_union_inference_views,

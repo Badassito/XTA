@@ -11,12 +11,13 @@ from collections import OrderedDict
 from collections.abc import Mapping
 import json
 import struct
+import sys
 import threading
 
 import numpy as np
 
 from .sam_evidence import (SamEvidenceBundle, _decode_mask, _decode_raw_crop_boundary_contacts_with_foreground,
-    native_output_shape_tyx, _freeze, _plain)
+    native_output_shape_tyx, _freeze, _freeze_owned, _plain)
 from . import sam_filtering as _filtering
 from .artifact_archive import open_artifact
 from .file_hashing import source_sha256
@@ -68,16 +69,17 @@ def _charge(value):
     if isinstance(value, bytes):
         return len(value) + 512
     if isinstance(value, tuple):
-        return 128 + sum(_charge(item) for item in value)
-    # Four times serialized metadata plus entry overhead conservatively includes
-    # bounded component records, Python containers and their scalar objects.
-    return len(json.dumps(_plain(value), separators=(",", ":"), allow_nan=False).encode("utf-8")) * 4 + 1024
+        return max(128, sys.getsizeof(value)) + sum(_charge(item) for item in value)
+    if isinstance(value, Mapping):
+        # Charge the proxy and its backing dict, including sparse table slots.
+        return 128 + sum(128 + _charge(key) + _charge(item) for key, item in value.items())
+    return sys.getsizeof(value)
 
 
 class SamMaskReader:
     """One payload handle and byte-bounded raw/compact product LRUs.
 
-    Arrays are bytes-backed and read-only. Eviction retires cache ownership;
+    Cached arrays are bytes-backed and read-only. Eviction retires cache ownership;
     arrays already returned to callers remain valid. Filter measurements are
     copied on return, so callers cannot mutate another measurement or the cache.
     Mutable receipts are revalidated on every external access. Internal callers
@@ -308,12 +310,10 @@ class SamMaskReader:
             self._stats['packed_boundary_contact_scans'] += 1
             contacts, foreground = _decode_raw_crop_boundary_contacts_with_foreground(self._stream, self.records[key],
                 self.bundle.max_mask_bytes, box, shape[1:])
-            return json.dumps(dict(contacts=contacts, foreground=foreground),
-                separators=(',', ':'), allow_nan=False).encode('utf-8')
-        encoded = self._product(('raw_crop_boundary_contacts_with_foreground', self.evidence_fingerprint,
+            return _freeze_owned(contacts), foreground
+        contacts, foreground = self._product(('raw_crop_boundary_contacts_with_foreground', self.evidence_fingerprint,
             key, box, tuple(shape[1:])), census)
-        decoded = json.loads(encoded)
-        return decoded['contacts'], decoded['foreground']
+        return _plain(contacts), foreground
 
     def candidate_mask(self, run_id, frame):
         return self.mask(self.runs[str(run_id)]["candidate_mask_keys"][str(int(frame))])
@@ -493,7 +493,7 @@ class SamMaskReader:
             raise ValueError('SAM compact filter product has malformed packed bounds')
         unpacked = np.unpackbits(np.frombuffer(packed, dtype=np.uint8, offset=16), count=pixels, bitorder="little")
         self._stats["compact_filter_expansions"] += 1
-        mask = np.frombuffer(unpacked.tobytes(), dtype=np.bool_).reshape(shape)
+        mask = np.frombuffer(memoryview(unpacked).toreadonly(), dtype=np.bool_).reshape(shape)
         return mask, encoded
 
     def measure_effective_raw_mask(self, run_id, frame, value=None):

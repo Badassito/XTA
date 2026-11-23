@@ -341,6 +341,24 @@ class RuntimeAsyncTelemetryTests(unittest.TestCase):
             self.assertEqual([event['sequence'] for row in rows for event in row['events']], [1, 2])
             self.assertTrue(rows[-1]['final'])
 
+    def test_trace_batch_flushes_its_partial_tail_after_idle_wait(self):
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry = self.telemetry(directory)
+            telemetry._trace_batch_limit = 256
+            telemetry._writer_idle_seconds = .01
+            telemetry.flush_seconds = .08
+            try:
+                with telemetry.lock:
+                    for index in range(257):
+                        telemetry.trace_event('work', task_id=index)
+                with telemetry._writer_condition:
+                    self.assertTrue(telemetry._writer_condition.wait_for(
+                        lambda: telemetry._written_sequence == 257, timeout=3))
+                rows = [json.loads(line) for line in telemetry.path.read_text().splitlines()]
+                self.assertEqual([len(row['events']) for row in rows], [256, 1])
+            finally:
+                telemetry.flush(final=True)
+
     def test_slow_sink_does_not_block_four_worker_hotpaths(self):
         with tempfile.TemporaryDirectory() as directory:
             telemetry = self.telemetry(directory)

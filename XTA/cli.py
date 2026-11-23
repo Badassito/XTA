@@ -99,9 +99,21 @@ def _run_tta(arguments: Sequence[str]) -> None:
     parsed = parser.parse_args(mode_arguments)
     from .config import (
         parse_confidence_sweep_options,
+        resolve_auto_positive_int,
+        resolve_backend_batches,
         resolve_backend_devices,
         resolve_backend_models,
+        resolve_backend_precisions,
+        resolve_cartesian_views,
+        resolve_channel_format,
+        resolve_azimuthal_view_requests,
         resolve_interpolation_settings,
+        resolve_postprocessing_options,
+        resolve_radial_view_requests,
+        resolve_save_request,
+        resolve_spherical_view_requests,
+        resolve_tilted_view_groups,
+        resolve_tta_angles,
         activate_sam_crop_mode,
         activate_sam_adaptive_crop,
     )
@@ -109,8 +121,23 @@ def _run_tta(arguments: Sequence[str]) -> None:
     from .reconciliation_policy import resolve_reconciliation
     try:
         parse_confidence_sweep_options(parser, parsed, mode_arguments)
+        save_request = resolve_save_request(parsed.save)
+        resolve_postprocessing_options(parsed.postprocessing)
+        resolve_channel_format(parsed.channel_format)
+        resolve_tta_angles(parsed.angle)
+        resolve_cartesian_views(parsed.enable_cartesian)
+        resolve_tilted_view_groups(parsed.enable_tilted)
+        resolve_azimuthal_view_requests(parsed.enable_azimuthal)
+        resolve_radial_view_requests(parsed.enable_radial)
+        spherical = resolve_spherical_view_requests(parsed.enable_spherical)
+        if spherical and parsed.imgsz <= 0:
+            raise ValueError('Spherical QSC patches require --imgsz > 0')
         devices = resolve_backend_devices(parsed.device)
         models = resolve_backend_models(parsed.model)
+        resolve_backend_precisions(parsed.quantize, devices)
+        resolve_backend_batches(parsed.batch, devices)
+        for field in ('cpu_instances', 'cpu_threads', 'cpu_streams', 'cpu_infer_requests'):
+            resolve_auto_positive_int(getattr(parsed, field), flag_name=f'--{field}')
         interpolation = resolve_interpolation_settings(parsed, models, devices)
         resolve_tta_augmentation(parsed, gpu_devices=devices.gpu_devices, cpu_enabled=devices.cpu)
         resolve_reconciliation(parsed)
@@ -120,13 +147,14 @@ def _run_tta(arguments: Sequence[str]) -> None:
     if parsed.conf_sweep is not None:
         from .confidence_sweep import run_confidence_sweep
 
-        output = Path(parsed.output) if parsed.output else Path.cwd() / Path(parsed.input).expanduser().resolve().stem
+        output = Path(parsed.output).expanduser() if parsed.output else Path.cwd() / Path(parsed.input).expanduser().resolve().stem
         run_confidence_sweep(
             mode_arguments,
             cutoffs_hundredths=parsed.conf_sweep.levels_hundredths,
             output_root=output,
-            temp_root=Path(parsed.temp) if parsed.temp else None,
+            temp_root=Path(parsed.temp).expanduser() if parsed.temp else None,
             min_conf=parsed.min_conf,
+            save_options=save_request.options,
         )
         return
 

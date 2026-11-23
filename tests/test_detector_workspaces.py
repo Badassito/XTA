@@ -1,6 +1,7 @@
 """Actual scheduler and pipeline ownership boundaries for private canvas birth."""
 import ast
 from dataclasses import replace
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import threading
@@ -19,7 +20,7 @@ def _pipeline_helpers(namespace):
     names = {'_detector_future_ram_rights', '_plan_baseline_workspace',
         '_discard_baseline_bundles', '_build_baseline_workspaces', '_adopt_baseline_workspaces',
         '_refresh_workspace_plans', '_rollback_workspace_plans', '_request_baseline_workspaces',
-        '_ensure_baseline_workspaces'}
+        '_ensure_baseline_workspaces', '_request_sweep_hydration'}
     tree = ast.parse(Path('XTA/pipeline.py').read_text())
     functions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name in names]
     for node in functions:
@@ -55,6 +56,7 @@ def workspace(tmp_path):
         capture_memfd_owner_proofs=lambda arrays:(), scratch_unlink_path_for_memmap=lambda *args:None,
         runtime_telemetry=lambda:SimpleNamespace(add=lambda *args:None), bounded_policy_parent_keys=set(),
         baseline_union_by_model_view={}, baseline_confmap_by_model_view={}, baseline_slice_locks_by_model_view={},
+        view_slice_meta={},
         baseline_union_paths=state.baseline_union_paths, baseline_confmap_paths=state.baseline_confmap_paths,
         direct_union_backing_leases=state.direct_union_backing_leases,
         direct_union_inference_views=state.direct_union_inference_views,
@@ -168,6 +170,61 @@ def test_planning_failure_returns_only_this_unpublished_groups_credit(workspace)
     assert not workspace.state.direct_union_backing_leases
     assert not workspace.state.direct_union_inference_bytes
     assert not workspace.state.direct_union_admission_group_by_parent
+    assert not workspace.service.pending
+
+
+@pytest.mark.parametrize('state', ['closed', 'failed_hydration', 'success'])
+def test_sweep_hydration_overlaps_within_dense_credit_and_settles_ownership(workspace, monkeypatch, state):
+    from XTA import sweep_views
+
+    view = _view()
+    key = ('model', view.name)
+    busy = ('model', 'previous')
+    postprocess = workspace.state.direct_union_postprocess_bytes
+    postprocess[busy] = 700
+    workspace.namespace.update(os=os, model_name='model', sweep_cutoff=50,
+        sweep_fanout_plan=SimpleNamespace(cutoffs=(50, 60), identities={view.name: 'sweep-id'}),
+        direct_union_postprocess_bytes=postprocess, direct_union_total_dense_byte_limit=1700,
+        direct_union_inference_view_limit=2)
+    request = workspace.namespace['_request_sweep_hydration']
+
+    def hydrate(model, name, cutoff, union, scores, *, identity, stop):
+        assert (model, name, cutoff, identity) == ('model', view.name, 50, 'sweep-id')
+        assert threading.current_thread().name == 'detector-workspace-birth'
+        assert np.all(union == 0) and scores is None and not stop.is_set()
+        if state == 'failed_hydration':
+            raise OSError('sweep read failed')
+        union[0, 2, 3] = 1
+        return dict(prediction_count=9, slice_any=np.any(union, axis=(1, 2)), slice_bboxes=None)
+    monkeypatch.setattr(sweep_views, 'hydrate', hydrate)
+
+    request(view, key)
+    assert not workspace.service.pending and not workspace.state.direct_union_inference_bytes
+    workspace.namespace['direct_union_total_dense_byte_limit'] = 1724
+    if state == 'closed':
+        workspace.service.shutdown()
+        with pytest.raises(RuntimeError, match='preparation is closed'):
+            request(view, key)
+    else:
+        request(view, key)
+        assert workspace.state.direct_union_inference_bytes == {key: 1024}
+        future = workspace.service.futures[0]
+        if state == 'failed_hydration':
+            with pytest.raises(RuntimeError, match='sweep read failed'):
+                future.result(timeout=3)
+            with pytest.raises(RuntimeError, match='sweep read failed'):
+                workspace.service.drain()
+        else:
+            future.result(timeout=3)
+            assert key not in workspace.namespace['baseline_union_by_model_view']
+            workspace.service.drain()
+            assert workspace.namespace['baseline_union_by_model_view'][key][0, 2, 3] == 1
+            assert workspace.namespace['view_slice_meta'][key]['prediction_count'] == 9
+            assert workspace.state.direct_union_backing_leases[key].phase == 'inference'
+    if state != 'success':
+        assert not workspace.state.direct_union_backing_leases
+        assert not workspace.state.direct_union_inference_bytes
+    assert postprocess == {busy: 700}
     assert not workspace.service.pending
 
 

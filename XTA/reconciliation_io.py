@@ -119,6 +119,33 @@ def _same_geometry(a: ReferenceGeometry, b: ReferenceGeometry) -> bool:
             and np.allclose(a.origin_xyz, b.origin_xyz, rtol=0, atol=1e-9))
 
 
+class _ReadRange:
+    """Present one compressed channel as a file with its own start and EOF."""
+
+    def __init__(self, raw, offset: int, size: int):
+        self._raw = raw
+        self._offset = offset
+        self._size = size
+        self.seek(0)
+
+    def seek(self, offset: int) -> int:
+        if not 0 <= offset <= self._size:
+            raise ValueError("Compressed seek is outside the channel")
+        self._raw.seek(self._offset + offset)
+        return offset
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = max(0, self._offset + self._size - self._raw.tell())
+        return self._raw.read(remaining if size < 0 else min(size, remaining))
+
+
+def open_gzip_range(raw, offset: int, length: int):
+    """Decode concatenated gzip members within a byte range on a borrowed stream."""
+    if offset < 0 or length <= 0:
+        raise ValueError("A grouped gzip channel needs a valid offset and byte count")
+    return gzip.GzipFile(fileobj=_ReadRange(raw, offset, length), mode="rb")
+
+
 def _inspect_layer(path: Path, metadata: dict[str, Any], reference_shape: tuple[int, int, int]):
     header, payload_offset = _read_header(path)
     if header.get("dimension") != "3" or header.get("type", "").lower() not in _U8_TYPES:
@@ -189,6 +216,8 @@ class FileLayer:
     _encoding: str = field(repr=False)
     _empty: bool = field(repr=False)
     _owner: LayerCollection | None = field(default=None, repr=False)
+    _gzip_bytes: int | None = field(default=None, repr=False)
+    _group_stamp: tuple[int, ...] | None = field(default=None, repr=False)
     dtype: np.dtype = field(default_factory=lambda: np.dtype(np.uint8), init=False)
     _source: Any = field(default=None, init=False, repr=False)
     _payload: Any = field(default=None, init=False, repr=False)
@@ -225,11 +254,15 @@ class FileLayer:
             raise OSError(f"Reconciliation exceeded max_open={self._owner.max_open}; increase it or close completed layer readers")
         try:
             self._source = self.path.open("rb")
-            self._source.seek(self._payload_offset)
-            if self._encoding in {"gzip", "gz"}:
+            if self._gzip_bytes is not None:
+                self._check_group_stamp()
+                self._payload = open_gzip_range(self._source, self._payload_offset, self._gzip_bytes)
+            elif self._encoding in {"gzip", "gz"}:
+                self._source.seek(self._payload_offset)
                 reader = self._owner._fast_gzip_reader or gzip.GzipFile
                 self._payload = reader(fileobj=self._source, mode="rb")
             else:
+                self._source.seek(self._payload_offset)
                 self._payload = self._source
         except BaseException as exc:
             # Close on every failure: a leaked handle blocks deletion on Windows.
@@ -273,18 +306,19 @@ class FileLayer:
         # Reading beyond the declared end also validates concatenated-member CRCs.
         if self._payload.read(1):
             raise ValueError(f"NRRD payload exceeds declared shape: {self.path}")
+        self._check_group_stamp()
         self.close()
         self._eof_validated = True
 
-    def read_slab(self, z0: int, z1: int) -> np.ndarray:
-        """Return an owned uint8 slab in the collection's reference grid."""
+    def read_slab(self, z0: int, z1: int, *, stored_xy: bool = False) -> np.ndarray:
+        """Read reference Z slices, optionally retaining their stored XY crop."""
         if self._owner is None or self._owner._closed:
             raise RuntimeError("Layer collection is closed")
         if (isinstance(z0, bool) or isinstance(z1, bool) or not isinstance(z0, (int, np.integer))
                 or not isinstance(z1, (int, np.integer)) or not 0 <= z0 <= z1 <= self.shape_tyx[0]):
             raise ValueError("Slab bounds must satisfy 0 <= z0 <= z1 <= t")
         z0, z1 = int(z0), int(z1)
-        shape = (z1 - z0, *self.shape_tyx[1:])
+        shape = (z1 - z0, *(self.stored_shape_tyx[1:] if stored_xy else self.shape_tyx[1:]))
         if math.prod(shape) > self._owner._budget_bytes:
             raise ValueError("Requested slab exceeds memory_mib; request fewer slices")
         result = np.zeros(shape, dtype=np.uint8)
@@ -299,7 +333,7 @@ class FileLayer:
                 if self._payload is not None and byte_start < self._position:
                     self.close()
                 self._consume(byte_start)
-                if (sy, sx) == self.shape_tyx[1:]:
+                if (sy, sx) == shape[1:]:
                     target = memoryview(result[lo-z0:hi-z0]).cast("B")
                     self._consume((hi - dz) * sy * sx, target)
                 else:
@@ -315,10 +349,18 @@ class FileLayer:
                             target[:] = np.frombuffer(block, dtype=np.uint8).reshape(rows, sx)
             if z1 >= dz + sz and not self._eof_validated:
                 self._validate_eof()
+            else:
+                self._check_group_stamp()
         except BaseException:
             self.close()
             raise
         return result
+
+    def _check_group_stamp(self) -> None:
+        if self._group_stamp is not None and self._source is not None:
+            from .run_transport import _stamp
+            if _stamp(os.fstat(self._source.fileno())) != self._group_stamp:
+                raise ValueError(f"Grouped NRRD changed since verification: {self.path}")
 
     def close(self) -> None:
         """Close the forward decoder; a later read opens it again."""
@@ -337,13 +379,14 @@ class FileLayer:
 class LayerCollection(Sequence[FileLayer]):
     def __init__(self, manifest: dict[str, Any], layers: list[FileLayer], geometry: ReferenceGeometry,
                  workspace: Path, budget_bytes: int, max_open: int, *, manifest_path: Path | None = None,
-                 fast_gzip_reader=None) -> None:
+                 fast_gzip_reader=None, grouped_catalog=None) -> None:
         self.manifest = manifest
         self.layers = tuple(layers)
         self.geometry = geometry
         self.shape_tyx = geometry.shape_tyx
         self.workspace = workspace
         self.manifest_directory = Path(manifest_path).parent if manifest_path is not None else None
+        self.grouped_catalog = grouped_catalog
         self._budget_bytes = budget_bytes
         self._chunk_bytes = min(_MIB, max(1024, budget_bytes // 4))
         self.max_open = max_open
@@ -377,7 +420,7 @@ class LayerCollection(Sequence[FileLayer]):
 
 def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: float = 256,
                         max_open: int = 512, include_all_layers: bool = False,
-                        manifest_bytes: bytes | None = None, prefer_fast_gzip: bool = False) -> LayerCollection:
+                        manifest_bytes: bytes | None = None, prefer_fast_gzip: bool = True) -> LayerCollection:
     """Read additive union descriptors, or all exported layers for review.
 
     Confidence is never synthesized from run thresholds. Missing files are errors,
@@ -395,9 +438,13 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
         raise ValueError("Manifest must declare exported_axes (X, Y, t)")
     if manifest.get("layer_count", len(manifest["layers"])) != len(manifest["layers"]):
         raise ValueError("Manifest layer_count disagrees with layers")
+    grouped = None
+    if manifest.get("layout") == "grouped_sweep_segments":
+        from .sweep_grouped_reader import open_grouped_catalog
+        grouped = open_grouped_catalog(path)
     layers = []
     filenames = set()
-    common_geometry = None
+    common_geometry = grouped.geometry if grouped is not None else None
     for metadata in manifest["layers"]:
         if not isinstance(metadata, dict):
             raise ValueError("Manifest layer entries must be objects")
@@ -425,7 +472,20 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
             raise ValueError(f"Layer output shape disagrees with reference: {filename}")
         if metadata.get("exported_axes") is not None and re.sub(r"\s+", "", str(metadata["exported_axes"])).lower() != "(x,y,t)":
             raise ValueError(f"Layer axes disagree with reference: {filename}")
-        if not layer_path.is_file():
+        if grouped is not None:
+            if grouped.layers.get(filename) != metadata:
+                raise ValueError(f"Grouped layer metadata differs from its authenticated catalogue: {filename}")
+            segment = grouped.segment(filename)
+            prefix = f"Segment{segment.layer}_"
+            header = {key: value for key, value in segment.header.items()
+                      if not re.match(r"Segment\d+_", key)}
+            header.update({"Segment0_" + key[len(prefix):]: value for key, value in segment.header.items()
+                           if key.startswith(prefix)})
+            layer = FileLayer(filename, dict(metadata), reference_shape, segment.path, header,
+                              segment.stored_shape_tyx, tuple(reversed(segment.offset_xyz)),
+                              segment.gzip_offset, "gzip", segment.empty, _gzip_bytes=segment.gzip_bytes,
+                              _group_stamp=segment.stamp)
+        elif not layer_path.is_file():
             if metadata.get("empty_segment") is not True:
                 raise FileNotFoundError(f"Declared layer is missing: {layer_path}")
             layer = FileLayer(filename, dict(metadata), reference_shape, None, {}, reference_shape,
@@ -443,13 +503,17 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
     fast_reader = None
     if prefer_fast_gzip:
         try:
-            from isal.igzip import IGzipFile
+            from isal.igzip import IGzipFile, READ_BUFFER_SIZE
         except (ImportError, OSError):
             pass
         else:
-            fast_reader = IGzipFile
+            compressed_layers = sum(layer.path is not None and layer._encoding in {"gzip", "gz"}
+                                    for layer in layers)
+            # ISA-L holds a larger read buffer for every concurrent forward decoder.
+            if min(max_open, compressed_layers) * READ_BUFFER_SIZE <= budget // 4:
+                fast_reader = IGzipFile
     return LayerCollection(manifest, layers, common_geometry, Path(workspace), budget, max_open,
-                           manifest_path=path, fast_gzip_reader=fast_reader)
+                           manifest_path=path, fast_gzip_reader=fast_reader, grouped_catalog=grouped)
 
 
 def write_seg_nrrd(path: str | Path, *, shape_tyx: tuple[int, int, int],
@@ -488,7 +552,7 @@ def write_seg_nrrd(path: str | Path, *, shape_tyx: tuple[int, int, int],
                 slab = np.asarray(read_slab(z0, z1))
                 if slab.shape != (z1 - z0, *shape[1:]) or slab.dtype not in (np.dtype(np.uint8), np.dtype(bool)):
                     raise ValueError("Writer read_slab must return the requested uint8 or bool TYX shape")
-                if np.any(slab > 1):
+                if slab.dtype == np.uint8 and slab.max() > 1:
                     raise ValueError("Writer requires binary values 0/1")
                 foreground += int(np.count_nonzero(slab))
                 for axis in range(3):
@@ -526,4 +590,5 @@ def write_seg_nrrd(path: str | Path, *, shape_tyx: tuple[int, int, int],
         stage_dir.rmdir()
 
 
-__all__ = ["FileLayer", "LayerCollection", "ReferenceGeometry", "read_layer_manifest", "write_seg_nrrd"]
+__all__ = ["FileLayer", "LayerCollection", "ReferenceGeometry", "open_gzip_range",
+           "read_layer_manifest", "write_seg_nrrd"]

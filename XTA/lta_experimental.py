@@ -146,10 +146,8 @@ def mask_metrics(expected: Any, actual: Any) -> dict[str, Any]:
     actual_pixels = int(np.count_nonzero(right))
     union = true_positive + false_positive + false_negative
     denominator = 2 * true_positive + false_positive + false_negative
-    count, labels = cv2.connectedComponents(right.astype(np.uint8), connectivity=8)
-    component_areas = [
-        int(np.count_nonzero(labels == index)) for index in range(1, int(count))
-    ]
+    count, _, stats, _ = cv2.connectedComponentsWithStats(right.astype(np.uint8), connectivity=8)
+    component_areas = stats[1:, cv2.CC_STAT_AREA]
     return {
         "tp": true_positive,
         "fp": false_positive,
@@ -163,10 +161,10 @@ def mask_metrics(expected: Any, actual: Any) -> dict[str, Any]:
         "area_ratio": (
             None if expected_pixels == 0 else float(actual_pixels / expected_pixels)
         ),
-        "component_count": len(component_areas),
+        "component_count": count - 1,
         "largest_component_fraction": (
-            float(max(component_areas) / actual_pixels)
-            if component_areas and actual_pixels
+            float(component_areas.max() / actual_pixels)
+            if actual_pixels
             else 0.0
         ),
     }
@@ -683,10 +681,10 @@ def run_mask_seed_session(
             seeded_np = np.logical_or.reduce(seeded_arrays)
             seed_metrics = mask_metrics(ground_truth, seeded_np)
             roundtrip_expected_union = np.logical_or.reduce(roundtrip_expected_masks)
-            seed_roundtrip_union_metrics = mask_metrics(
-                roundtrip_expected_union,
-                seeded_np,
-            )
+            if np.array_equal(roundtrip_expected_union, ground_truth):
+                seed_roundtrip_union_metrics = seed_metrics.copy()
+            else:
+                seed_roundtrip_union_metrics = mask_metrics(roundtrip_expected_union, seeded_np)
             if not bool(np.array_equal(roundtrip_expected_union, seeded_np)):
                 raise RuntimeError(
                     "private mask seed materially changed the representable anchor union "

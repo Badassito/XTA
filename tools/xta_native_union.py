@@ -15,9 +15,9 @@ import numpy as np
 
 class UnionSources:
     def __init__(self, receipt_path, specification_path, low_shape, full_shape,
-                 primary_low, primary_full, edits, global_edit):
-        from xta_native_filter import (Nrrd, child, digest, load_json,
-                                       manifest_entries, shape3)
+                 primary_low, primary_full, edits, global_edit, *, verify_native=True):
+        from xta_native_filter import (digest, grouped_catalog, load_json,
+                                       manifest_entries, open_original, shape3)
         self.low_shape, self.full_shape = tuple(low_shape), tuple(full_shape)
         self.receipt_path = Path(receipt_path).resolve()
         self.specification_path = Path(specification_path).resolve()
@@ -84,6 +84,7 @@ class UnionSources:
                 raise ValueError('Union source labels must be unique nonempty strings.')
             labels.add(label)
             paths, manifests, entries = {}, {}, {}
+            grouped_sources = {}
             for kind in ('low', 'full'):
                 path = Path(pair[kind + '_manifest'])
                 if not path.is_absolute():
@@ -107,6 +108,11 @@ class UnionSources:
                         raise ValueError(f'Union {label} has duplicate exact segment names.')
                     by_name[name] = entry
                 paths[kind], manifests[kind], entries[kind] = path, manifest, by_name
+                catalog = grouped_catalog(path, manifest)
+                grouped_sources[kind] = (None if catalog is None else {
+                    entry['filename']: catalog.segment(entry['filename'], verify_payload=kind == 'low' or verify_native)
+                    for entry in by_name.values()
+                })
             if set(entries['low']) != set(entries['full']):
                 raise ValueError(f'Union {label} low/full layer inventories differ.')
             indices = pair['receipt_member_indices']
@@ -129,9 +135,10 @@ class UnionSources:
                         raise ValueError(f'Union {label} low/full layer identity mismatch: {name} ({field}).')
                 if name != global_edit['name'] and entry.get('recomposition_op') != 'union':
                     raise ValueError(f'Union source contains a nonadditive layer: {label}: {name}')
-                Nrrd(child(paths['low'].parent, entry['filename']), self.low_shape)
-                Nrrd(child(paths['full'].parent, other['filename']), self.full_shape)
+                open_original(paths['low'], entry['filename'], self.low_shape, grouped_sources['low'])
+                open_original(paths['full'], other['filename'], self.full_shape, grouped_sources['full'])
             self.pairs.append(dict(label=label, paths=paths, entries=entries,
+                                   grouped_sources=grouped_sources,
                                    global_name=global_edit['name'],
                                    manifest_sha256={k: pair[k + '_manifest_sha256'] for k in paths},
                                    receipt_member_indices=indices))
@@ -201,10 +208,10 @@ class UnionSources:
             packed._mmap.close()
 
     def source(self, pair, kind, name):
-        from xta_native_filter import Nrrd, child
-        return Nrrd(child(pair['paths'][kind].parent,
-                          pair['entries'][kind][name]['filename']),
-                    self.low_shape if kind == 'low' else self.full_shape)
+        from xta_native_filter import open_original
+        return open_original(pair['paths'][kind], pair['entries'][kind][name]['filename'],
+                             self.low_shape if kind == 'low' else self.full_shape,
+                             pair['grouped_sources'][kind])
 
     def low_global(self, pair):
         label = pair['label']
@@ -239,9 +246,10 @@ class UnionSources:
             return
         baseline = after
         if self.reference_entries is not None:
-            from xta_native_filter import Nrrd, child, load_edit
+            from xta_native_filter import load_edit
             entry = self.reference_entries[name]
-            original = Nrrd(child(self.primary_low.parent, entry['source_filename']), self.low_shape)
+            primary = next(pair for pair in self.pairs if pair['paths']['low'] == self.primary_low)
+            original = self.source(primary, 'low', name)
             baseline = load_edit(self.reference_dir, entry, original)
         group = self.groups[name]
         extent = np.asarray(group['reference_extent_xyz'])
@@ -293,6 +301,15 @@ class UnionSources:
             self._hash_cache[path] = digest(Path(path))
         return self._hash_cache[path]
 
+    def source_record(self, source):
+        record = dict(file=str(source.path))
+        grouped = getattr(source, 'source', None)
+        if grouped is None:
+            record['sha256'] = self.sha(source.path)
+        else:
+            record.update(sha256=grouped.sha256, segment_id=grouped.segment_id, layer=grouped.layer)
+        return record
+
     def report(self):
         from xta_native_filter import digest
         report = dict(receipt_sha256=digest(self.receipt_path),
@@ -325,12 +342,12 @@ class NativeUnion:
         rows = []
         for pair in self.pairs:
             native = self.sources.source(pair, 'full', self.name)
-            row = dict(label=pair['label'], file=str(native.path), sha256=self.sources.sha(native.path))
+            row = dict(label=pair['label'], **self.sources.source_record(native))
             low = self.sources.source(pair, 'low', self.name)
-            row['original_preview'] = dict(file=str(low.path), sha256=self.sources.sha(low.path))
+            row['original_preview'] = self.sources.source_record(low)
             if self.name != self.sources.global_name:
                 global_ = self.sources.source(pair, 'full', self.sources.global_name)
-                row['original_global'] = dict(file=str(global_.path), sha256=self.sources.sha(global_.path))
+                row['original_global'] = self.sources.source_record(global_)
                 row['clipping_applied'] = bool(np.any(self.sources.low_global(pair)))
                 row['clipping_reason'] = ('nonempty_original_global' if row['clipping_applied'] else
                                           'empty_original_global_legacy_bypass')

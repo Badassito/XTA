@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import cv2
 import numpy as np
 
 
@@ -14,6 +15,71 @@ IDENTITY_2X3 = np.asarray(
     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
     dtype=np.float32,
 )
+
+
+def test_tilted_gray_tile_matches_full_native_affine_and_limits_scratch():
+    rng = np.random.default_rng(219)
+    volume = rng.integers(0, 256, (19, 61, 75), dtype=np.uint8)
+    views = geometry._build_tilted_view_infos(*volume.shape, tilt_views=('transverse', 'sagittal', 'coronal'),
+                                             tilt_angles=(-37., 37.), tilt_directions=('vertical', 'horizontal'))
+    affines = (
+        [[1., 0., 12.], [0., 1., 4.]],
+        [[.75, .25, 16.296875], [-.25, .75, 7.828125]],
+        [[1., 0., -4.], [.25, 1.25, -2.5]],
+    )
+    for view in views:
+        for source in (volume, volume[:, :, ::-1]):
+            for frame in (0, view.num_slices // 2, view.num_slices - 1):
+                native = geometry.render_tilted_frame_on_grid(
+                    source, view, frame, IDENTITY_2X3, view.src_h, view.src_w,
+                )
+                for affine in affines:
+                    affine = np.asarray(affine, dtype=np.float32)
+                    expected = cv2.warpAffine(native, affine, (13, 8), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+                    with mock.patch.object(geometry, '_tilted_tls_buffer', wraps=geometry._tilted_tls_buffer) as buffers:
+                        actual = geometry.render_tilted_frame_on_grid(source, view, frame, affine, 8, 13)
+                    np.testing.assert_array_equal(actual, expected)
+                    assert all(call.args[1] <= 20 * 20 for call in buffers.call_args_list)
+
+
+def test_tilted_gray_tile_keeps_full_native_warp_for_fractional_rounding():
+    volume = np.random.default_rng(5008).integers(0, 256, (11, 193, 244), dtype=np.uint8)
+    view = geometry._build_tilted_view_infos(*volume.shape, tilt_views=('transverse',),
+                                             tilt_angles=(15.,), tilt_directions=('vertical',))[0]
+    frame = view.num_slices // 2
+    affine = np.asarray([[-.0498046875, -1.06346512, 128.505859],
+                         [-1.16698837, .237297058, 110.881836]], dtype=np.float32)
+    native = geometry.render_tilted_frame_on_grid(volume, view, frame, IDENTITY_2X3, view.src_h, view.src_w)
+    expected = cv2.warpAffine(native, affine, (49, 45), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+    with (mock.patch.object(cv2, 'warpAffine', wraps=cv2.warpAffine) as warp,
+          mock.patch.object(geometry, '_render_tilted_array_on_grid',
+                            wraps=geometry._render_tilted_array_on_grid) as render):
+        actual = geometry.render_tilted_frame_on_grid(volume, view, frame, affine, 45, 49)
+    np.testing.assert_array_equal(actual, expected)
+    assert warp.call_args.args[0].shape == native.shape
+    np.testing.assert_array_equal(warp.call_args.args[1], affine)
+    assert render.call_args.kwargs['_native_window'] is not None
+
+
+def test_tilted_gray_fractional_tiles_reuse_canvas_with_stale_overlapping_pixels():
+    rng = np.random.default_rng(822)
+    volume = rng.integers(0, 256, (12, 89, 99), dtype=np.uint8)
+    view = geometry._build_tilted_view_infos(*volume.shape, tilt_views=('transverse',),
+                                             tilt_angles=(31.,), tilt_directions=('horizontal',))[0]
+    canvas = np.full((view.src_h, view.src_w), 255, dtype=np.uint8)
+    with mock.patch.object(geometry._TILTED_RENDER_TLS, 'warp_canvas', canvas, create=True):
+        retained = []
+        for frame, x, y in ((4, 37.313, 40.128), (8, 44.875, 34.127), (2, -2.591, -4.183),
+                            (7, 94.132, 86.002), (9, -45.975, -41.165)):
+            affine = np.array([[.92735, -.58116, x], [.52947, 1.01863, y]], dtype=np.float32)
+            native = geometry.render_tilted_frame_on_grid(
+                volume, view, frame, IDENTITY_2X3, view.src_h, view.src_w)
+            expected = cv2.warpAffine(native, affine, (22, 19), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+            actual = geometry.render_tilted_frame_on_grid(volume, view, frame, affine, 19, 22)
+            retained.append((actual, expected))
+            assert geometry._TILTED_RENDER_TLS.warp_canvas is canvas
+        for actual, expected in retained:
+            np.testing.assert_array_equal(actual, expected)
 
 
 def _aug_job(view: geometry.ViewInfo, out_size: int, *, angle_deg: float = 0.0) -> geometry.AugJob:

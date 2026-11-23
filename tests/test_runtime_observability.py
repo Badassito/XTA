@@ -99,6 +99,29 @@ def test_tee_preserves_write_result_flush_and_original_stream_attributes():
     assert tee.isatty() == original.isatty()
 
 
+def test_stdio_streams_share_capture_lock(sink, monkeypatch, tmp_path):
+    monkeypatch.setenv('YOLO_TTA_CAPTURE_STDIO_PATH', str(tmp_path / 'capture.log'))
+    with monkeypatch.context() as context:
+        context.setattr(sys, 'stdout', io.StringIO())
+        context.setattr(sys, 'stderr', io.StringIO())
+        with observer._install_stdio_capture(sink):
+            assert sys.stdout.lock is sys.stderr.lock
+            sys.stdout.write('out\n')
+            sys.stderr.write('err\n')
+    assert (tmp_path / 'capture.log').read_text() == 'out\nerr\n'
+
+
+def test_proc_stat_accepts_command_names_with_spaces_and_parentheses(monkeypatch):
+    fields = ' '.join(['R', *(str(index) for index in range(1, 25))])
+    monkeypatch.setattr(Path, 'read_text',
+                        lambda path: f'42 (worker ) name) {fields}' if path.name == 'stat' else '')
+    monkeypatch.setattr(observer.RuntimeSystemSampler, '_read_cgroup_memory_snapshot',
+                        lambda: {'current': None, 'limit': None})
+    result = observer.RuntimeSystemSampler._read_proc()
+    assert result['cpu_ticks'] == 11 + 12
+    assert result['rss_pages'] == 21
+
+
 def test_observer_import_is_independent_and_inert(tmp_path):
     env = dict(os.environ, YOLO_TTA_TELEMETRY_DIR=str(tmp_path),
                YOLO_TTA_CAPTURE_STDIO_PATH=str(tmp_path / 'stdio.log'))

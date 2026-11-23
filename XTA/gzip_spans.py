@@ -144,12 +144,17 @@ class GzipSpanWriter:
         self.stats["data_bytes"] += written
         return written
 
+    def finish_span(self):
+        """Finish every queued member so another span can start at this offset."""
+        self._check_open()
+        self._flush_zeros()
+        self._close_member()
+
     def close(self):
         if self.closed:
             return
         try:
-            self._flush_zeros()
-            self._close_member()
+            self.finish_span()
             if not self.stats["zero_members"] and not self.stats["data_members"]:
                 with gzip.GzipFile(filename="", fileobj=self.stream, mode="wb",
                                    compresslevel=self.compresslevel, mtime=0):

@@ -98,6 +98,9 @@ def invocation(root, output, name):
         policy = ('confidence_core_rescue' if hybrid and not name.endswith('_union')
                   else 'hybrid_with_fill' if name.endswith('_provenance')
                   else 'confidence_core_rescue' if name.endswith('_confidence') else 'union')
+        if policy != 'confidence_core_rescue':
+            # The qualification also checks portable observed scores and generated-only support.
+            argv.append('confidence')
         argv.extend(['--reconciliation', str(POLICIES / f'{policy}.py'), '--reconciliation_memory_mib', '64'])
     if hybrid:
         argv.extend(['--enable_tile', '32:32', '--augmentation_ratio', '3', '--augmentation',

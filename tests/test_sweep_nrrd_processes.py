@@ -385,7 +385,8 @@ def test_producer_falls_back_to_threads_when_worker_pools_cannot_start(tmp_path,
                                  run_id=branch_run_id('family-one', 50))
     publication = ViewMajorPublication(family_root=family, workspace=tmp_path / 'work', sweep_id='family-one',
         cutoffs_hundredths=(50, 70, 100), current_cutoff=50, scalar_sink=sink, source_shape_tyx=shape,
-        model_name='detector', task='segment', min_conf=0., confidence_floor_by_backend={'gpu': .5})
+        model_name='detector', task='segment', min_conf=0., confidence_floor_by_backend={'gpu': .5},
+        retain_confidence=True)
     try:
         assert publication._nrrd_processes is None and publication._evidence_processes is None
         assert all(layers.layer_file_processes is None

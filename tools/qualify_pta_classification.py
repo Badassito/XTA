@@ -36,10 +36,10 @@ def canonical_classification(mask, coverage, plan, index):
         else:
             plane = pta_rendering.resize_centered(
                 pta_rendering.extract_padded_tile(canvas, tile.x, tile.y, tile.cfg.tile_size),
-                tile.out_w, tile.out_h, pta_rendering.cv2.INTER_NEAREST)
+                tile.out_w, tile.out_h, pta_rendering.cv2.INTER_NEAREST_EXACT)
             support = None if coverage is None else pta_rendering.resize_centered(
                 pta_rendering.extract_padded_tile(known_canvas, tile.x, tile.y, tile.cfg.tile_size),
-                tile.out_w, tile.out_h, pta_rendering.cv2.INTER_NEAREST)
+                tile.out_w, tile.out_h, pta_rendering.cv2.INTER_NEAREST_EXACT)
         result[tile.tile_tag] = bool(np.any(plane if support is None else np.logical_and(plane, support)))
     return result
 

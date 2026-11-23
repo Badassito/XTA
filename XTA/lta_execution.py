@@ -62,11 +62,13 @@ from .lta_scheduler import (
 from .lta_tile_tracking import LtaLineageId
 from .lta_tiles import (
     TilePlan,
+    _embed_polygon_region,
+    _polygon_tile_region,
+    _rasterize_source_polygon,
     eight_neighbor_graph,
     polygon_intersects_tile,
-    rasterize_polygons,
+    rasterize_polygon_on_tile,
     rasterize_polygons_to_shape,
-    transform_polygon_to_tile,
 )
 from .lta_windows import (
     AnchorDomain,
@@ -639,6 +641,8 @@ def _annotation_tile_owner_key(annotation: object, polygon: object) -> tuple[obj
 def _authoritative_tile_owners(
     annotations: Sequence[object],
     grid: LtaTileGridPlan,
+    *,
+    owner_masks: dict | None = None,
 ) -> dict[tuple[object, ...], tuple[int, ...]]:
     """Choose one full-mask owner, or every tile required by a clipped mask."""
 
@@ -649,33 +653,34 @@ def _authoritative_tile_owners(
         for polygon in annotation.polygons:
             candidates: list[tuple[int, int, int]] = []
             containing: list[tuple[int, int, int]] = []
-            min_x, min_y, max_x, max_y = (
-                float(value) for value in polygon.box_xyxy
+            source = grid.tiles[0]
+            raster = _rasterize_source_polygon(
+                polygon, height=source.source_height, width=source.source_width,
             )
+            left, top, pixels = raster
+            height, width = pixels.shape
+            regions = {}
             for tile_index, tile in enumerate(grid.tiles):
-                if not polygon_intersects_tile(polygon, tile):
+                region = _polygon_tile_region(raster, tile)
+                if region is None:
                     continue
-                local = transform_polygon_to_tile(polygon, tile)
-                mask = np.asarray(
-                    rasterize_polygons((local,), size=tile.size),
-                    dtype=np.bool_,
-                )
-                rows, columns = np.nonzero(mask)
+                x, y, mask = region
+                rows = np.flatnonzero(mask.any(axis=1))
                 if not len(rows):
                     continue
+                columns = np.flatnonzero(mask.any(axis=0))
                 margin = min(
-                    int(rows.min()),
-                    int(columns.min()),
-                    int(tile.size - 1 - rows.max()),
-                    int(tile.size - 1 - columns.max()),
+                    y + int(rows[0]),
+                    x + int(columns[0]),
+                    tile.size - 1 - y - int(rows[-1]),
+                    tile.size - 1 - x - int(columns[-1]),
                 )
                 score = (int(mask.sum()), margin, -int(tile_index))
                 candidates.append(score)
+                regions[tile_index] = region
                 if (
-                    min_x >= float(tile.left) / float(tile.source_width)
-                    and max_x <= float(tile.left + tile.size) / float(tile.source_width)
-                    and min_y >= float(tile.top) / float(tile.source_height)
-                    and max_y <= float(tile.top + tile.size) / float(tile.source_height)
+                    tile.left <= left and left + width <= tile.left + tile.size
+                    and tile.top <= top and top + height <= tile.top + tile.size
                 ):
                     containing.append(score)
             if not candidates:
@@ -690,7 +695,11 @@ def _authoritative_tile_owners(
                 # fragment is authoritative and must seed its own tracker;
                 # relays cannot reconstruct pixels absent from the owner crop.
                 selected = tuple(sorted(-candidate[2] for candidate in candidates))
-            owners[_annotation_tile_owner_key(annotation, polygon)] = selected
+            key = _annotation_tile_owner_key(annotation, polygon)
+            owners[key] = selected
+            if owner_masks is not None:
+                for index in selected:
+                    owner_masks[key, index] = _embed_polygon_region(regions[index], grid.tiles[index])
     return owners
 
 
@@ -702,6 +711,7 @@ def _seeds_for_tile(
     tile_index: int,
     *,
     authoritative_tile_owners: Mapping[tuple[object, ...], Sequence[int]] | None = None,
+    owner_masks: dict | None = None,
 ) -> dict[int, tuple[LtaMaskSeed, ...]]:
     import numpy as np
 
@@ -710,21 +720,22 @@ def _seeds_for_tile(
     for annotation in annotations:
         visible: list[tuple[object, object]] = []
         for polygon in annotation.polygons:
+            key = _annotation_tile_owner_key(annotation, polygon)
             selected_owners = (
                 None
                 if authoritative_tile_owners is None
-                else authoritative_tile_owners[
-                    _annotation_tile_owner_key(annotation, polygon)
-                ]
+                else authoritative_tile_owners[key]
             )
             if selected_owners is not None and int(tile_index) not in {
                 int(value) for value in selected_owners
             }:
                 continue
+            if owner_masks is not None:
+                visible.append((polygon, owner_masks.pop((key, int(tile_index)))))
+                continue
             if not polygon_intersects_tile(polygon, tile):
                 continue
-            local = transform_polygon_to_tile(polygon, tile)
-            mask = rasterize_polygons((local,), size=tile.size)
+            mask = rasterize_polygon_on_tile(polygon, tile)
             if bool(np.asarray(mask, dtype=bool).any()):
                 visible.append((polygon, mask))
         for polygon, mask in visible:
@@ -842,7 +853,8 @@ def _plan_initial_chains(
     plan_order = 0
     view_key = LtaViewKey(view_plan.volume_id, view_plan.physical_view_id)
     for grid in view_plan.tile_grids:
-        authoritative_tile_owners = _authoritative_tile_owners(annotations, grid)
+        owner_masks = {}
+        authoritative_tile_owners = _authoritative_tile_owners(annotations, grid, owner_masks=owner_masks)
         for tile_index, tile in enumerate(grid.tiles):
             by_frame = _seeds_for_tile(
                 source,
@@ -851,6 +863,7 @@ def _plan_initial_chains(
                 grid,
                 tile_index,
                 authoritative_tile_owners=authoritative_tile_owners,
+                owner_masks=owner_masks,
             )
             for frame, seeds in by_frame.items():
                 seed_inventory[(grid.config_id, tile_index, frame)] = seeds
@@ -1463,19 +1476,15 @@ def _dispatch_available(
 
 def _verified_dogfood_artifacts(
     manifest: Mapping[str, object],
-    payload: Mapping[str, object],
+    input_seeds: Sequence[LtaMaskSeed],
 ) -> dict[int, dict[str, object]]:
     """Admit immutable continuation seeds before unblocking a dependent task."""
 
     records = tuple(manifest.get("dogfood_seed_artifacts", ()))
     if not records:
         return {}
-    incoming = read_seed_artifact(
-        str(payload["seed_artifact_path"]),
-        expected_sha256=str(payload["seed_artifact_sha256"]),
-    )
-    allowed_lineages = {seed.lineage for seed in incoming}
-    expected_shape = tuple(incoming[0].mask.shape)
+    allowed_lineages = {seed.lineage for seed in input_seeds}
+    expected_shape = tuple(input_seeds[0].mask.shape)
     result: dict[int, dict[str, object]] = {}
     for raw in records:
         record = dict(raw)
@@ -1498,7 +1507,7 @@ def _verified_dogfood_artifacts(
 
 def _ingest_lineage_coverage(
     manifest: Mapping[str, object], payload: Mapping[str, object],
-    ledger: object, *, temp_root: Path,
+    ledger: object, *, temp_root: Path, input_lineages: Sequence[LtaLineageId],
 ) -> None:
     receipt = manifest.get("lineage_coverage")
     if receipt is None:
@@ -1515,16 +1524,13 @@ def _ingest_lineage_coverage(
         _artifact_ownership_path(path).relative_to(_artifact_ownership_path(Path(temp_root).resolve(strict=True)))
     except ValueError as error:
         raise RuntimeError("worker lineage coverage artifact is outside its scratch root") from error
-    seeds = read_seed_artifact(
-        str(payload["seed_artifact_path"]), expected_sha256=str(payload["seed_artifact_sha256"]),
-    )
     windows = tuple(payload["windows"])
     ledger.ingest(
         receipt, expected_work_id=str(payload["work_id"]),
         tile_index=int(payload["tile_index"]), tile_config_id=str(payload["tile_config_id"]),
         frame_start=min(int(window["frame_start"]) for window in windows),
         frame_stop=max(int(window["frame_stop"]) for window in windows),
-        expected_lineages=tuple(seed.lineage for seed in seeds),
+        expected_lineages=input_lineages,
     )
     _unlink_consumed_temp_artifacts((path,), temp_root=temp_root)
 
@@ -1824,6 +1830,7 @@ def execute_lta_plan(
                 initial = tuple(_PlannedChain(task.work, {**task.payload, "worker_trace_root": str(trace_dir)}) for task in initial)
             planning["window_count"] = len(initial)
         authoritative_seed_audit = _authoritative_seed_audit(seed_inventory)
+        del seed_inventory
         if dynamic_crops:
             scheduler = DynamicViewCompletion(initial[0].work.view, plan.device_ids)
             authoritative_seed_audit = {**authoritative_seed_audit,

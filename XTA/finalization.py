@@ -2775,7 +2775,7 @@ def _fallback_centerline_samples(
             continue
         largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         component = np.ascontiguousarray(labels == int(largest), dtype=np.uint8)
-        dist = cv2.distanceTransform(component, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        dist = cv2.distanceTransform(np.pad(component, 1), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
         _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(dist)
         if float(max_val) <= 0.0:
             continue
@@ -3753,7 +3753,7 @@ def _watershed_candidate_basin(
         # partition. Mark the complete suspect 2D component so audit-first output
         # is actionable instead of emitting a few seed dots.
         return np.ascontiguousarray(component != 0, dtype=np.uint8)
-    dist = cv2.distanceTransform(component, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    dist = cv2.distanceTransform(np.pad(component, 1), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1]
     max_dist = float(np.max(dist))
     if max_dist <= 0.0:
         return fallback

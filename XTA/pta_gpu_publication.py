@@ -37,7 +37,7 @@ class _GpuBatch:
 
 
 class GpuPublicationResources:
-    """Persistent executors/stream; each frame task gets independent queues."""
+    """Persistent executors, CUDA stream and host queue for a render worker."""
 
     def __init__(self, runtime: dict, *, cpu_threads: int):
         self.runtime = runtime
@@ -55,6 +55,9 @@ class GpuPublicationResources:
             self.stream = self.torch.cuda.Stream(device=self.device)
         self.gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pta-publish-gpu')
         self.host_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pta-publish-host')
+        self.host = OrderedBatchPipeline(
+            self._write_host, capacity=2, max_pending_bytes=self.host_bytes,
+            executor=self.host_executor)
         self.label_executor = ThreadPoolExecutor(max_workers=self.cpu_threads, thread_name_prefix='pta-polygons')
         self.file_executor = ThreadPoolExecutor(max_workers=self.file_threads, thread_name_prefix='pta-files')
         self.poisoned = False
@@ -98,6 +101,10 @@ class GpuPublicationResources:
         with self.lock:
             self.timings[name] = self.timings.get(name, 0.) + float(seconds)
 
+    def _write_host(self, operation):
+        with self.measure('host_publication'):
+            return operation()
+
     def task(self, consume, on_result):
         if self.poisoned or self.closed:
             raise RuntimeError('PTA GPU publication worker is closed or failed')
@@ -139,10 +146,15 @@ class GpuPublicationResources:
             return
         # Keep downstream executors alive until every upstream task has joined.
         self.gpu_executor.shutdown(wait=True)
-        self.host_executor.shutdown(wait=True)
-        self.label_executor.shutdown(wait=True)
-        self.file_executor.shutdown(wait=True)
-        self.closed = True
+        try:
+            self.host.close()
+        finally:
+            self.host_executor.shutdown(wait=True)
+            self.label_executor.shutdown(wait=True)
+            self.file_executor.shutdown(wait=True)
+            self.closed = True
+            final_sample = self.snapshot()
+            runtime_telemetry().register_sample_provider('pta.publication', lambda: final_sample)
         if not self.poisoned:
             try:
                 self.stream.synchronize()
@@ -172,9 +184,7 @@ class GpuPublicationTask:
         self.consume = consume
         self.label_executor = resources.label_executor
         self.file_executor = resources.file_executor
-        self.host = OrderedBatchPipeline(
-            self._write_host, capacity=2, max_pending_bytes=resources.host_bytes,
-            executor=resources.host_executor)
+        self.host = resources.host
         self.gpu = OrderedBatchPipeline(
             self._consume_gpu, capacity=2, max_pending_bytes=resources.gpu_bytes,
             executor=resources.gpu_executor, on_result=on_result)
@@ -247,10 +257,6 @@ class GpuPublicationTask:
         with self.measure('host_queue_wait'):
             return self.host.reserve(0)
 
-    def _write_host(self, operation):
-        with self.measure('host_publication'):
-            return operation()
-
     def _consume_gpu(self, payload):
         resource = self.resources
         if resource.poisoned:
@@ -298,7 +304,8 @@ class GpuPublicationTask:
         try:
             # The GPU consumer was the only host-queue producer. Ownership now
             # transfers to this collector, after that consumer has fully drained.
-            self.host.close()
+            if self.host.pending_count:
+                self.host.drain()
         except BaseException as exc:
             if error is None:
                 error = exc

@@ -8,6 +8,7 @@ touch in frame space cannot invent a previously untraversed transition.
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 import json
 import operator
@@ -26,6 +27,7 @@ from .lta_tile_tracking import LtaLineageId
 COVERAGE_SCHEMA = "lta.lineage-coverage/1"
 _ENCODING = "cropped-flat-packbits-little"
 _DIRECTIONS = {"forward": 1, "backward": -1}
+_PACKED_CROP_CACHE_BYTES = 4 * 1024 * 1024
 
 
 def _index(value: object, name: str, *, minimum: int = 0) -> int:
@@ -79,6 +81,15 @@ def _decode(crop: tuple[int, int, int, int, bytes, int]) -> np.ndarray:
 
 
 def _union_crops(left, right):
+    if left[:4] == right[:4] and left[2] > 0 and left[3] > 0:
+        area = left[2] * left[3]
+        byte_count = (area + 7) // 8
+        if len(left[4]) == len(right[4]) == byte_count:
+            combined = int.from_bytes(left[4], "little") | int.from_bytes(right[4], "little")
+            if combined.bit_length() > area:
+                # The dense path ignores padding above the crop area.
+                combined &= (1 << area) - 1
+            return (*left[:4], combined.to_bytes(byte_count, "little"), combined.bit_count())
     top, column = min(left[0], right[0]), min(left[1], right[1])
     bottom = max(left[0] + left[2], right[0] + right[2])
     edge = max(left[1] + left[3], right[1] + right[3])
@@ -143,16 +154,19 @@ class LtaCoverageBuilder:
                 # transition evidence can be combined.
                 self._observed[key] = _merge_ranges((*self._observed.get(key, ()), (first, last)), touching=False)
 
-    def add_prediction(self, lineage, frame_index, mask) -> None:
+    def add_prediction(self, lineage, frame_index, mask) -> tuple[int, int, np.ndarray] | None:
+        """Record coverage and return the crop origin and a view of the incoming mask."""
         frame = _index(frame_index, "frame_index")
         binary = _binary(mask, self.tile_shape_hw)
         token = self._register(lineage)
         incoming = _crop(binary)
         if incoming is None:
             self._empty_predictions += 1
-            return
+            return None
         key = token, frame
         self._masks[key] = incoming if key not in self._masks else _union_crops(self._masks[key], incoming)
+        top, left, height, width, _, _ = incoming
+        return top, left, binary[top:top + height, left:left + width]
 
     def stats(self) -> dict[str, int]:
         return {
@@ -218,8 +232,11 @@ class LtaCoverageBuilder:
         }
 
 
-def _packet_crop(archive, row, ordinal, shape):
+def _packet_crop(archive, row, ordinal, shape, *, validated=False):
     lineage_index, frame, y, x, height, width, foreground = (int(value) for value in row)
+    if validated:
+        packed = archive[f"mask_{ordinal:08d}"].tobytes()
+        return y, x, height, width, packed, foreground
     if y < 0 or x < 0 or height < 1 or width < 1 or y + height > shape[0] or x + width > shape[1]:
         raise ValueError("coverage crop lies outside its tile geometry")
     packed = archive[f"mask_{ordinal:08d}"]
@@ -235,6 +252,88 @@ def _packet_crop(archive, row, ordinal, shape):
     if not (mask[0].any() and mask[-1].any() and mask[:, 0].any() and mask[:, -1].any()):
         raise ValueError("coverage crop is not tightly bounded")
     return crop
+
+
+@contextmanager
+def _read_coverage_packet(receipt, *, expected_work_id, tile_index, tile_config_id,
+                          frame_count, frame_start, frame_stop, expected_lineages):
+    """Authenticate one worker packet before exposing arrays to the coordinator."""
+    if not isinstance(receipt, Mapping) or receipt.get("schema") != COVERAGE_SCHEMA:
+        raise ValueError("unsupported coverage packet receipt")
+    work, config = str(expected_work_id).strip(), str(tile_config_id).strip()
+    tile = _index(tile_index, "tile_index")
+    start, stop = _index(frame_start, "frame_start"), _index(frame_stop, "frame_stop", minimum=1)
+    if not work or not config or not 0 <= start < stop <= frame_count:
+        raise ValueError("coverage packet expected identity/range is invalid")
+    path = Path(str(receipt["path"])).resolve(strict=True)
+    if not path.is_file() or path.stat().st_size != _index(receipt["file_size_bytes"], "coverage file size"):
+        raise ValueError("coverage packet file size differs from receipt")
+    digest = _sha256(path)
+    if digest != str(receipt["sha256"]):
+        raise RuntimeError("coverage packet digest changed")
+    expected = None if expected_lineages is None else {_lineage(item) for item in expected_lineages}
+    with np.load(path, allow_pickle=False) as archive:
+        encoded = archive["metadata"]
+        if encoded.dtype != np.uint8 or encoded.ndim != 1:
+            raise ValueError("coverage metadata must use byte storage")
+        metadata = json.loads(encoded.tobytes().decode("utf-8"))
+        identity = (metadata.get("work_id"), _index(metadata["tile_index"], "packet tile_index"), metadata.get("tile_config_id"))
+        if metadata.get("schema") != COVERAGE_SCHEMA or metadata.get("encoding") != _ENCODING or identity != (work, tile, config):
+            raise ValueError("coverage packet metadata differs from expected identity")
+        if metadata.get("interval_semantics") != "directed observed frame intervals; half-open":
+            raise ValueError("coverage packet interval semantics are unsupported")
+        if (receipt.get("work_id"), _index(receipt["tile_index"], "receipt tile_index"), receipt.get("tile_config_id")) != identity:
+            raise ValueError("coverage receipt identity differs from its packet")
+        shape = _shape(metadata["tile_shape_hw"])
+        if list(shape) != receipt.get("tile_shape_hw"):
+            raise ValueError("coverage receipt shape differs from its packet")
+        lineages = tuple(LtaLineageId(**item) for item in metadata["lineages"])
+        tokens = [item.token for item in lineages]
+        if not lineages or tokens != sorted(set(tokens)) or any(item.tile_config_id != config for item in lineages):
+            raise ValueError("coverage packet lineage identity/configuration is invalid")
+        if expected is not None and not set(lineages).issubset(expected):
+            raise ValueError("coverage packet contains an unexpected lineage")
+        masks, observed = archive["masks"], archive["observed"]
+        if masks.dtype != np.int64 or masks.ndim != 2 or masks.shape[1] != 7:
+            raise ValueError("coverage mask index must be an Nx7 int64 array")
+        if observed.dtype != np.int64 or observed.ndim != 2 or observed.shape[1] != 4:
+            raise ValueError("coverage observed ranges must be an Nx4 int64 array")
+        if (len(lineages), len(masks), len(observed)) != tuple(_index(receipt[key], key) for key in ("lineage_count", "mask_count", "directed_interval_count")):
+            raise ValueError("coverage packet counts differ from receipt")
+        expected_keys = {"metadata", "masks", "observed"} | {f"mask_{i:08d}" for i in range(len(masks))}
+        if len(archive.files) != len(expected_keys) or set(archive.files) != expected_keys:
+            raise ValueError("coverage packet has missing or unexpected arrays")
+        previous = None
+        packed_bytes = 0
+        stored_bytes = _index(receipt["stored_mask_bytes"], "stored_mask_bytes")
+        cached_crops = [] if stored_bytes <= _PACKED_CROP_CACHE_BYTES else None
+        for ordinal, row in enumerate(masks):
+            lineage_index, frame = int(row[0]), int(row[1])
+            if not 0 <= lineage_index < len(lineages) or not start <= frame < stop:
+                raise ValueError("coverage mask lineage/frame is outside its expected window")
+            key = lineage_index, frame
+            if previous is not None and key <= previous:
+                raise ValueError("coverage mask index is not unique and ordered")
+            previous = key
+            crop = _packet_crop(archive, row, ordinal, shape)
+            packed_bytes += len(crop[4])
+            if packed_bytes > stored_bytes:
+                raise ValueError("coverage packed byte count differs from receipt")
+            if cached_crops is not None:
+                cached_crops.append(crop)
+        if packed_bytes != stored_bytes:
+            raise ValueError("coverage packed byte count differs from receipt")
+        for lineage_index, direction, first, last in observed:
+            if not 0 <= lineage_index < len(lineages) or int(direction) not in (-1, 1) or not start <= first < last <= stop:
+                raise ValueError("coverage directed observation is outside its expected window")
+        if cached_crops is not None:
+            crop_at = tuple(cached_crops).__getitem__
+        else:
+            # shortcut: large packets reread requested crops to bound RAM until packet streaming supports one pass.
+            def crop_at(index):
+                return _packet_crop(archive, masks[index], index, shape, validated=True)
+
+        yield digest, shape, lineages, masks, observed, crop_at
 
 
 class LtaCoverageLedger:
@@ -281,6 +380,10 @@ class LtaCoverageLedger:
             metadata = dict(self._db.execute("SELECT key,value FROM coverage_meta"))
             if metadata != {"schema": COVERAGE_SCHEMA, "frame_count": str(self.frame_count)}:
                 raise ValueError("coverage database schema/frame count differs from this run")
+            if not self._read_only:
+                self._db.execute("PRAGMA locking_mode=EXCLUSIVE")
+                self._db.execute("PRAGMA journal_mode=TRUNCATE")
+                self._db.execute("PRAGMA synchronous=NORMAL")
         except BaseException:
             self._db.close()
             self._closed = True
@@ -352,67 +455,13 @@ class LtaCoverageLedger:
 
     def _ingest(self, receipt, *, expected_work_id, tile_index, tile_config_id,
                 frame_start, frame_stop, expected_lineages):
-        if not isinstance(receipt, Mapping) or receipt.get("schema") != COVERAGE_SCHEMA:
-            raise ValueError("unsupported coverage packet receipt")
-        work, config = str(expected_work_id).strip(), str(tile_config_id).strip()
-        tile = _index(tile_index, "tile_index")
-        start, stop = _index(frame_start, "frame_start"), _index(frame_stop, "frame_stop", minimum=1)
-        if not work or not config or not 0 <= start < stop <= self.frame_count:
-            raise ValueError("coverage packet expected identity/range is invalid")
-        path = Path(str(receipt["path"])).resolve(strict=True)
-        if not path.is_file() or path.stat().st_size != _index(receipt["file_size_bytes"], "coverage file size"):
-            raise ValueError("coverage packet file size differs from receipt")
-        digest = _sha256(path)
-        if digest != str(receipt["sha256"]):
-            raise RuntimeError("coverage packet digest changed")
-        expected = None if expected_lineages is None else {_lineage(item) for item in expected_lineages}
-        with np.load(path, allow_pickle=False) as archive:
-            encoded = archive["metadata"]
-            if encoded.dtype != np.uint8 or encoded.ndim != 1:
-                raise ValueError("coverage metadata must use byte storage")
-            metadata = json.loads(encoded.tobytes().decode("utf-8"))
-            identity = (metadata.get("work_id"), _index(metadata["tile_index"], "packet tile_index"), metadata.get("tile_config_id"))
-            if metadata.get("schema") != COVERAGE_SCHEMA or metadata.get("encoding") != _ENCODING or identity != (work, tile, config):
-                raise ValueError("coverage packet metadata differs from expected identity")
-            if metadata.get("interval_semantics") != "directed observed frame intervals; half-open":
-                raise ValueError("coverage packet interval semantics are unsupported")
-            if (receipt.get("work_id"), _index(receipt["tile_index"], "receipt tile_index"), receipt.get("tile_config_id")) != identity:
-                raise ValueError("coverage receipt identity differs from its packet")
-            shape = _shape(metadata["tile_shape_hw"])
-            if list(shape) != receipt.get("tile_shape_hw"):
-                raise ValueError("coverage receipt shape differs from its packet")
-            lineages = tuple(LtaLineageId(**item) for item in metadata["lineages"])
+        work, config, tile = str(expected_work_id).strip(), str(tile_config_id).strip(), _index(tile_index, "tile_index")
+        with _read_coverage_packet(receipt, expected_work_id=work, tile_index=tile,
+                                   tile_config_id=config, frame_count=self.frame_count,
+                                   frame_start=frame_start, frame_stop=frame_stop,
+                                   expected_lineages=expected_lineages) as packet:
+            digest, shape, lineages, masks, observed, crop_at = packet
             tokens = [item.token for item in lineages]
-            if not lineages or tokens != sorted(set(tokens)) or any(item.tile_config_id != config for item in lineages):
-                raise ValueError("coverage packet lineage identity/configuration is invalid")
-            if expected is not None and not set(lineages).issubset(expected):
-                raise ValueError("coverage packet contains an unexpected lineage")
-            masks, observed = archive["masks"], archive["observed"]
-            if masks.dtype != np.int64 or masks.ndim != 2 or masks.shape[1] != 7:
-                raise ValueError("coverage mask index must be an Nx7 int64 array")
-            if observed.dtype != np.int64 or observed.ndim != 2 or observed.shape[1] != 4:
-                raise ValueError("coverage observed ranges must be an Nx4 int64 array")
-            if (len(lineages), len(masks), len(observed)) != tuple(_index(receipt[key], key) for key in ("lineage_count", "mask_count", "directed_interval_count")):
-                raise ValueError("coverage packet counts differ from receipt")
-            expected_keys = {"metadata", "masks", "observed"} | {f"mask_{i:08d}" for i in range(len(masks))}
-            if len(archive.files) != len(expected_keys) or set(archive.files) != expected_keys:
-                raise ValueError("coverage packet has missing or unexpected arrays")
-            previous = None
-            packed_bytes = 0
-            for ordinal, row in enumerate(masks):
-                lineage_index, frame = int(row[0]), int(row[1])
-                if not 0 <= lineage_index < len(lineages) or not start <= frame < stop:
-                    raise ValueError("coverage mask lineage/frame is outside its expected window")
-                key = lineage_index, frame
-                if previous is not None and key <= previous:
-                    raise ValueError("coverage mask index is not unique and ordered")
-                previous = key
-                packed_bytes += len(_packet_crop(archive, row, ordinal, shape)[4])
-            if packed_bytes != _index(receipt["stored_mask_bytes"], "stored_mask_bytes"):
-                raise ValueError("coverage packed byte count differs from receipt")
-            for lineage_index, direction, first, last in observed:
-                if not 0 <= lineage_index < len(lineages) or int(direction) not in (-1, 1) or not start <= first < last <= stop:
-                    raise ValueError("coverage directed observation is outside its expected window")
             # All packet arrays have now been checked before the first SQL write.
             existing = self._db.execute("SELECT sha256 FROM packets WHERE work_id=?", (work,)).fetchone()
             if existing is not None:
@@ -433,7 +482,7 @@ class LtaCoverageLedger:
                 self._db.executemany("INSERT OR IGNORE INTO lineages VALUES (?,?)", zip(tokens, lineage_metadata))
                 for ordinal, row in enumerate(masks):
                     token, frame = tokens[int(row[0])], int(row[1])
-                    crop = _packet_crop(archive, row, ordinal, shape)
+                    crop = crop_at(ordinal)
                     old = self._db.execute("SELECT y,x,height,width,packed,foreground FROM masks WHERE token=? AND config=? AND tile=? AND frame=?", (token, config, tile, frame)).fetchone()
                     if old is not None:
                         crop = _union_crops(tuple(old), crop)

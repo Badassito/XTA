@@ -11,6 +11,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from XTA import json_publication
@@ -34,6 +35,27 @@ class JsonPublicationTests(unittest.TestCase):
             ("confidence", write_confidence, True, True),
         )
 
+    @unittest.skipUnless(os.name == "posix", "exercise POSIX directory replacement")
+    def test_sweep_directory_falls_back_when_exclusive_rename_is_unavailable(self):
+        from XTA import run_transport
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage, destination = root / "stage", root / "review"
+            stage.mkdir()
+            (stage / "payload").write_bytes(b"complete")
+            with mock.patch.object(run_transport, "_publish_fresh",
+                                   side_effect=run_transport._ExclusiveDirectoryRenameUnavailable("unsupported")):
+                destination.mkdir()
+                existing = destination.stat()
+                with self.assertRaises(FileExistsError):
+                    json_publication._publish_sweep_directory(stage, destination)
+                self.assertTrue(os.path.samestat(existing, destination.stat()))
+                destination.rmdir()
+                json_publication._publish_sweep_directory(stage, destination)
+            self.assertEqual((destination / "payload").read_bytes(), b"complete")
+            self.assertFalse(stage.exists())
+
     def test_writers_keep_their_json_bytes_and_reject_nan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             for name, writer, sorted_keys, newline in self._writers():
@@ -48,6 +70,19 @@ class JsonPublicationTests(unittest.TestCase):
                         writer(destination, {"bad": float("nan")})
                     self.assertEqual(destination.read_bytes(), expected.encode("utf-8"))
             self.assertEqual(list(Path(temp_dir).glob(".*")), [])
+
+    def test_byte_count_matches_published_utf8_for_files_and_members(self) -> None:
+        from XTA.artifact_archive import read_artifact, reference
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in (root / "receipt.json", reference(root / "receipts.tar", "receipt.json")):
+                record = {"name": "\u00b5", "items": [1, 2]}
+                size = json_publication.write_json_atomic(path, record, trailing_newline=True, return_byte_count=True)
+                encoded = read_artifact(path)
+                self.assertEqual(size, len(encoded))
+                self.assertTrue(encoded.endswith(b"\n"))
+                self.assertEqual(json.loads(encoded), record)
 
     def test_file_sync_failure_preserves_previous_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -73,6 +108,23 @@ class JsonPublicationTests(unittest.TestCase):
                     write_lta(destination, {"new": True})
             self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {"new": True})
             self.assertEqual(list(Path(temp_dir).glob(".*")), [])
+
+    def test_directory_sync_ignores_only_unsupported_errors(self) -> None:
+        fake_os = SimpleNamespace(name='posix', O_RDONLY=0, open=mock.Mock(return_value=4),
+                                  fsync=mock.Mock(), close=mock.Mock())
+        with mock.patch.object(json_publication, 'os', fake_os):
+            for number in (errno.EBADF, errno.EROFS, errno.EIO, errno.ENOSPC):
+                with self.subTest(errno=number):
+                    fake_os.close.reset_mock()
+                    failure = OSError(number, 'directory sync failed')
+                    fake_os.fsync.side_effect = failure
+                    if number in (errno.EIO, errno.ENOSPC):
+                        with self.assertRaises(OSError) as caught:
+                            json_publication._fsync_parent_directory(Path('.'))
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        json_publication._fsync_parent_directory(Path('.'))
+                    fake_os.close.assert_called_once_with(4)
 
     def test_replace_failure_preserves_previous_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

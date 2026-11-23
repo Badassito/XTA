@@ -138,18 +138,6 @@ class LtaCompletedViewFillReceipt:
         }
 
 
-def _default_binary_hole_fill(mask_bool: np.ndarray) -> np.ndarray:
-    # Function-local import preserves the dependency-light LTA import boundary.
-    from ._prediction_cleanup import _fill_holes_2d_opencv_u8_inplace
-
-    # Reuse TTA's foreground-bbox plus exterior-halo implementation. Labeling
-    # the full tile for every small instance stalls the next tracker frame;
-    # the halo preserves the same four-connected outside-background domain.
-    binary_u8 = np.ascontiguousarray(mask_bool, dtype=np.uint8)
-    _fill_holes_2d_opencv_u8_inplace(binary_u8)
-    return binary_u8.view(np.bool_)
-
-
 def fill_binary_mask_holes_2d(
     mask: object,
     *,
@@ -166,9 +154,15 @@ def fill_binary_mask_holes_2d(
     if source.ndim != 2 or any(int(value) < 1 for value in source.shape):
         raise ValueError(f"LTA hole fill requires a nonempty 2D mask; got {source.shape}")
     binary = np.ascontiguousarray(source != 0, dtype=np.bool_)
-    fill = _default_binary_hole_fill if operation is None else operation
+    if operation is None:
+        from ._prediction_cleanup import _fill_holes_2d_opencv_u8_inplace
+
+        # The comparison allocated this result. The in-place primitive writes
+        # only 1 into enclosed zeros, so its uint8 view stays a valid bool mask.
+        _fill_holes_2d_opencv_u8_inplace(binary.view(np.uint8))
+        return binary
     filled = np.ascontiguousarray(
-        np.asarray(fill(binary.copy()), dtype=np.bool_),
+        np.asarray(operation(binary.copy()), dtype=np.bool_),
         dtype=np.bool_,
     )
     if filled.shape != binary.shape:
@@ -414,11 +408,16 @@ def _parallel_apply_layer(
     slice_count = int(destination.shape[0])
 
     def _apply(index: int) -> None:
-        incoming = np.asarray(source_array[int(index)]) != 0
+        source_slice = source_array[int(index)]
         output = destination[int(index)]
         if operation is LtaRecompositionOp.SELECT:
-            output[...] = incoming
-        elif operation is LtaRecompositionOp.UNION:
+            if source_array.dtype.kind in "biufc":
+                np.not_equal(source_slice, 0, out=output)
+            else:
+                output[...] = source_slice != 0
+            return
+        incoming = source_slice != 0
+        if operation is LtaRecompositionOp.UNION:
             np.bitwise_or(output, incoming, out=output)
         elif operation is LtaRecompositionOp.SUBTRACT_FROM_PREVIOUS_CHECKPOINT:
             output[incoming] = np.uint8(0)
@@ -473,7 +472,6 @@ def finalize_lta_native_union(
     seen_ids: set[str] = set()
     expected_shape: Optional[tuple[int, int, int]] = None
     composable: list[tuple[LtaLayerRecord, LtaRecompositionOp]] = []
-    initialized = False
     for layer in layer_values:
         if not isinstance(layer, LtaLayerRecord):
             raise TypeError("layers must contain LtaLayerRecord values")
@@ -494,12 +492,12 @@ def finalize_lta_native_union(
             raise ValueError(
                 f"LTA layer {layer.layer_id!r} shape {shape} does not match {expected_shape}"
             )
-        if operation is LtaRecompositionOp.SUBTRACT_FROM_PREVIOUS_CHECKPOINT and not initialized:
+        if operation is LtaRecompositionOp.SUBTRACT_FROM_PREVIOUS_CHECKPOINT and not composable:
             raise ValueError(
                 f"LTA layer {layer.layer_id!r} cannot subtract before a union/checkpoint"
             )
-        initialized = True
-        composable.append((layer, operation))
+        # A first union owns the whole fresh destination, just like a selection.
+        composable.append((layer, operation if composable else LtaRecompositionOp.SELECT))
     if expected_shape is None or not composable:
         raise ValueError("at least one composable LTA layer is required")
 
@@ -529,7 +527,7 @@ def finalize_lta_native_union(
         desc="LTA native terminal union",
         prefer_memory=bool(prefer_memory),
         reserve_bytes=int(reserve_bytes),
-        initialize_zero=True,
+        initialize_zero=False,
     )
     terminal_array = np.asarray(terminal_union)
     if terminal_array.dtype != np.dtype(np.uint8) or tuple(terminal_array.shape) != expected_shape:

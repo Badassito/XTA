@@ -8,7 +8,7 @@ Out-of-source queries remain invalid and are not conflated with that background.
 """
 from __future__ import annotations
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 import hashlib
 import json
@@ -54,6 +54,7 @@ class FieldReference:
         self.empty = bool(manifest['empty_foreground'])
         self.phi = self.cap = self.source_mask = None
         self._planes = OrderedDict()
+        self._plane_builds = {}
         self._plane_lock = threading.RLock()
         self.stats = {'native_voxels':0, 'mixed_interpolated_voxels':0,
                       'uniform_foreground_voxels':0, 'proven_background_voxels':0,
@@ -83,6 +84,8 @@ class FieldReference:
             for value in loaded:
                 value._mmap.close()
             raise
+        plane_bytes = 0 if self.empty else 10 * math.prod(self.cap.shape[1:])
+        self._plane_cache_limit = max(2, min(8, 64*MIB // max(1, plane_bytes)))
         self.provenance = {
             'policy':POLICY, 'algorithm_version':ALGORITHM_VERSION,
             'field_manifest':manifest, 'field_manifest_sha256':_sha(path),
@@ -99,6 +102,13 @@ class FieldReference:
             if index in self._planes:
                 self._planes.move_to_end(index)
                 return self._planes[index]
+            pending = self._plane_builds.get(index)
+            owner = pending is None
+            if owner:
+                pending = self._plane_builds[index] = Future()
+        if not owner:
+            return pending.result()
+        try:
             block = self.source_mask[index-1:index+3]
             any_fg = ndi.maximum_filter(np.any(block,axis=0),size=4,origin=-1,mode='constant',cval=0)
             all_fg = ndi.minimum_filter(np.all(block,axis=0),size=4,origin=-1,mode='constant',cval=0)
@@ -108,10 +118,18 @@ class FieldReference:
             if not np.isfinite(cap_min).all() or not np.isfinite(cap_max).all() or cap_min.min()<0 or cap_max.max()>.5:
                 raise ValueError('Invalid cap coefficients')
             state = (any_fg, all_fg, cap_min, cap_max)
-            self._planes[index] = state
-            while len(self._planes)>2:
-                self._planes.popitem(last=False)
+            with self._plane_lock:
+                self._planes[index] = state
+                while len(self._planes) > self._plane_cache_limit:
+                    self._planes.popitem(last=False)
+            pending.set_result(state)
             return state
+        except BaseException as error:
+            pending.set_exception(error)
+            raise
+        finally:
+            with self._plane_lock:
+                del self._plane_builds[index]
 
     def close(self):
         self._planes.clear()

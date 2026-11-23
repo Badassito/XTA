@@ -224,6 +224,9 @@ class GpuPublicationTests(unittest.TestCase):
         self.addCleanup(self.close_resources)
 
     def close_resources(self):
+        render_pool_finalizer = self.runtime.get('render_pool_finalizer')
+        if render_pool_finalizer is not None:
+            render_pool_finalizer()
         self.resources.finalizer.cancel()
         with redirect_stdout(io.StringIO()):
             self.resources.close()
@@ -503,6 +506,20 @@ class GpuPublicationTests(unittest.TestCase):
 
         return SimpleNamespace(execute=execute, namespace=namespace, calls=calls,
             labels_written=labels_written, second_policy=second_policy, charges=charges)
+
+    def test_worker_reuses_render_and_host_queues_without_deferring_task_results(self):
+        fixture = self.worker_fixture()
+        first = fixture.execute()
+        render_pool = self.runtime['render_pool']
+        host = self.resources.host
+        self.assertEqual(first[0], 2)
+        self.assertEqual(len(fixture.labels_written), 2)
+        second = fixture.execute()
+        self.assertEqual(second[0], first[0])
+        self.assertEqual(len(fixture.labels_written), 4)
+        self.assertIs(self.runtime['render_pool'], render_pool)
+        self.assertIs(self.resources.host, host)
+        self.assertEqual(host.pending_count, 0)
 
     def test_worker_policy_runs_ahead_of_labels_and_last_file_publication_is_drained(self):
         fixture = self.worker_fixture()
@@ -805,6 +822,29 @@ class GpuPublicationTests(unittest.TestCase):
             finally:
                 release_file.set()
         self.assertTrue(self.resources.poisoned)
+
+    def test_worker_cancels_unstarted_render_work_after_a_failure(self):
+        fixture = self.worker_fixture()
+        failed = mock.Mock()
+        failed.result.side_effect = RuntimeError('injected render failure')
+        queued = mock.Mock()
+        self.runtime['render_pool'] = mock.Mock(submit=mock.Mock(side_effect=[failed, queued]))
+
+        def wait_for_render(futures, **kwargs):
+            if kwargs:
+                self.assertEqual(tuple(futures), (failed, queued))
+                return {failed}, {queued}
+            self.assertEqual(tuple(futures), (queued,))
+            queued.cancel.assert_called_once_with()
+
+        fixture.namespace['wait'] = wait_for_render
+        run = extract_worker_functions(fixture.namespace)
+        plan = SimpleNamespace(view=SimpleNamespace(shared_view=None), tile_layout=())
+        task = SimpleNamespace(frames=tuple(SimpleNamespace(plan_idx=0, frame_idx=index,
+            items=(('full', ()),)) for index in range(2)))
+        with mock.patch.object(publication, 'publication_resources', return_value=self.resources):
+            with self.assertRaisesRegex(RuntimeError, 'injected render failure'):
+                run(None, None, (plan,), task)
 
     def test_worker_policy_failure_still_drains_preceding_file_publication(self):
         fixture = self.worker_fixture()

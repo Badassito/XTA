@@ -116,6 +116,7 @@ class ConfidenceEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'identity'):
             publish_confidence_shards(wrong_identity, view=view, model_name='m', temp_dir=self.root)
         ref = publish_confidence_shards(shards, view=view, model_name='m', temp_dir=self.root)
+        self.assertFalse((self.root / 'confidence_evidence').exists())
         scores, known = ref.read(0, 5)
         np.testing.assert_array_equal(scores, native)
         np.testing.assert_array_equal(known, native > 0)
@@ -170,6 +171,55 @@ class ConfidenceEvidenceTests(unittest.TestCase):
                     np.testing.assert_array_equal(score, expected)
                     np.testing.assert_array_equal(known, expected > 0)
                 self.assertFalse(np.any(total[:, 2:4, 8:10]))
+
+    def test_compact_seam_collisions_and_gated_scores_retire_in_place(self):
+        from XTA.confidence_tiles import (capture_consolidated_tile_confidence,
+                                          retire_tile_confidence)
+        shape = (101, 6, 9)
+        view = geometry.get_view_infos(*shape, cartesian_views=('transverse',))[0]
+        configure_confidence_evidence(self.root / 'output', enabled=True)
+        slots = np.zeros((3, 3, 4), np.uint8)
+        scores = slots.copy()
+        slots[0, 1, 1:3] = 1
+        slots[1, 1, 2:4] = 1
+        slots[2, 0, 0] = 1
+        scores[0, 1, 1:3] = [120, 141]
+        scores[1, 1, 2:4] = [130, 167]
+        scores[2, 0, 0] = 211
+        with mock.patch.object(assembly, 'cleanup_view_volume_after_prediction_inplace',
+                wraps=assembly.cleanup_view_volume_after_prediction_inplace) as cleanup:
+            seam = assembly.retire_azimuthal_seam_tile(
+                slots, scores, ((2, 93), (1, 5), (0, 5)),
+                model_name='m', view=view, config_id='c', tile_id='seam',
+                parent_crop=(2, 5, 3, 7), threshold_plane_shape=shape[1:],
+                precleaned=False, min_conf=0, min_radius=0, workers=2, work_dir=self.root,
+            )
+        self.assertEqual(cleanup.call_args.args[0].shape, (2, 3, 4))
+        self.assertEqual(seam.tile_shape, (101, 3, 4))
+        parent, bridge, total = (np.zeros(shape, np.uint8) for _ in range(3))
+        parent[5, 3, 4] = bridge[93, 2, 3] = 1
+        partition = assembly._partition_tile_components_2d
+        calls = []
+        def count_partition(tile, support):
+            calls.append(None)
+            return partition(tile, support)
+        with mock.patch.object(assembly, '_partition_tile_components_2d', new=count_partition):
+            gated = assembly.gate_tile_result_against_parent_mask(seam,
+                parent_mask_support_mm=parent, tile_accumulator_mm=total,
+                tile_accumulator_locks=None, work_dir=self.root, slice_workers=2)
+            assembly.gate_tile_residual_against_parent_bridge(gated.residual_result,
+                parent_bridge_support_mm=bridge, tile_accumulator_mm=total,
+                tile_accumulator_locks=None, work_dir=self.root, slice_workers=2)
+        self.assertEqual(len(calls), 3)
+        ref = capture_consolidated_tile_confidence(total, view=view, model_name='m',
+            config_id='c', category='parent_support', stage='pre', temp_dir=self.root)
+        self.assertFalse((self.root / 'confidence_evidence').exists())
+        retire_tile_confidence('m', view.name, 'c')
+        self.assertFalse(any((self.root / 'tile_confidence').iterdir()))
+        expected = np.zeros(shape, np.uint8)
+        expected[5, 3, 4:7] = [120, 141, 167]
+        expected[93, 2, 3] = 211
+        np.testing.assert_array_equal(ref.read(0, shape[0])[0], expected)
 
     def test_source_projection_matches_thresholded_binary_oracle(self):
         shape = (5, 7, 9)

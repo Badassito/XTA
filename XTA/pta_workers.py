@@ -290,8 +290,9 @@ _WORKER_GPU_RUNTIME: Optional[Dict[str, object]] = None
 _WORKER_GPU_RUNTIME_ERROR: Optional[Exception] = None
 _WORKER_GPU_CODEC_WARNING_EMITTED = False
 _WORKER_GPU_BATCH_CAP_WARNING_EMITTED = False
-# Formatted traceback of a failed spawned-worker static install; every task raises it.
+# Formatted traceback from failed worker setup or teardown; every task raises it.
 _WORKER_INITIALIZER_ERROR: Optional[str] = None
+_WORKER_OBSERVABILITY_FINALIZER = None
 
 
 def _owner_option_enabled(name: str) -> bool:
@@ -311,10 +312,11 @@ def _render_worker_initializer(
 ) -> None:
     global _WORKER_GPU_DEVICE_ID, _WORKER_GPU_RUNTIME, _WORKER_GPU_RUNTIME_ERROR
     global _WORKER_GPU_CODEC_WARNING_EMITTED, _WORKER_GPU_BATCH_CAP_WARNING_EMITTED
-    global _WORKER_INITIALIZER_ERROR
+    global _WORKER_INITIALIZER_ERROR, _WORKER_OBSERVABILITY_FINALIZER
     # Pool exit skips atexit; sample after the GPU publication finalizer (15).
     from multiprocessing.util import Finalize
-    Finalize(None, shutdown_runtime_observability, exitpriority=10)
+    if _WORKER_OBSERVABILITY_FINALIZER is None or not _WORKER_OBSERVABILITY_FINALIZER.still_active():
+        _WORKER_OBSERVABILITY_FINALIZER = Finalize(None, shutdown_runtime_observability, exitpriority=10)
     _WORKER_INITIALIZER_ERROR = None
     if worker_static_payload is not None:
         try:
@@ -325,16 +327,32 @@ def _render_worker_initializer(
             # raises this error, so the run fails through the result path.
             _WORKER_INITIALIZER_ERROR = traceback.format_exc()
             return
-    if _WORKER_GPU_RUNTIME is not None:
-        _join_intensity_prestage(_WORKER_GPU_RUNTIME)
-    if _WORKER_GPU_RUNTIME is not None and _WORKER_GPU_RUNTIME.get("categorical_volume_owner") is not None:
-        from .pta_cuda_masks import retire_gpu_categorical_volume
+    previous_runtime = _WORKER_GPU_RUNTIME
+    if previous_runtime is not None:
+        try:
+            render_pool_finalizer = previous_runtime.get("render_pool_finalizer")
+            if render_pool_finalizer is not None:
+                render_pool_finalizer()
+            _join_intensity_prestage(previous_runtime)
+            publication = previous_runtime.get("publication_resources")
+            if publication is not None:
+                publication.close()
+                publication.finalizer.cancel()
+            if previous_runtime.get("categorical_volume_owner") is not None:
+                from .pta_cuda_masks import retire_gpu_categorical_volume
 
-        retire_gpu_categorical_volume(_WORKER_GPU_RUNTIME)
-    if _WORKER_GPU_RUNTIME is not None:
-        from .spherical_host_cache import close_spherical_host_cache
+                retire_gpu_categorical_volume(previous_runtime)
+            from .spherical_host_cache import close_spherical_host_cache
 
-        close_spherical_host_cache(_WORKER_GPU_RUNTIME.get("azimuthal_renderer"))
+            close_spherical_host_cache(previous_runtime.get("azimuthal_renderer"))
+            for key in ("intensity_prestage_finalizer", "categorical_volume_finalizer",
+                        "spherical_host_cache_finalizer"):
+                finalizer = previous_runtime.get(key)
+                if finalizer is not None:
+                    finalizer.cancel()
+        except Exception:
+            _WORKER_INITIALIZER_ERROR = traceback.format_exc()
+            return
     _WORKER_GPU_DEVICE_ID = None
     _WORKER_GPU_RUNTIME = None
     _WORKER_GPU_RUNTIME_ERROR = None
@@ -742,29 +760,34 @@ def projection_phase_summary(
     return tuple(summary)
 
 
-def _derive_item_arrays(source: RenderFrameSource, plan: RenderPlan, item_key: str) -> Tuple[np.ndarray, np.ndarray]:
+def _derive_item_arrays(
+    source: RenderFrameSource, plan: RenderPlan, item_key: str, *, need_image: bool = True,
+) -> Tuple[Optional[np.ndarray], np.ndarray]:
     if item_key == "full":
-        if source.img_full is None or source.mask_full is None:
+        if source.mask_full is None or (need_image and source.img_full is None):
             raise RuntimeError(f"Full output requested without a rendered full frame for {plan.tag}")
         return source.img_full, source.mask_full
     shared_arrays = source.tile_arrays.get(str(item_key))
     if shared_arrays is not None:
+        if need_image and shared_arrays[0] is None:
+            raise RuntimeError(f"Tile {item_key!r} requested without a rendered image for {plan.tag}")
         return shared_arrays
-    if source.img_canvas is None or source.mask_canvas is None:
+    if source.mask_canvas is None or (need_image and source.img_canvas is None):
         raise RuntimeError(f"Tile output requested without a rendered canvas for {plan.tag}")
     for tile in plan.tile_layout:
         if tile.tile_tag == item_key:
-            tile_img = extract_padded_tile(source.img_canvas, tile.x, tile.y, tile.cfg.tile_size)
+            tile_img_out = None
+            if source.img_canvas is not None:
+                tile_img = extract_padded_tile(source.img_canvas, tile.x, tile.y, tile.cfg.tile_size)
+                tile_img_out = resize_centered(tile_img, tile.out_w, tile.out_h, cv2.INTER_LINEAR)
             tile_mask = extract_padded_tile(source.mask_canvas, tile.x, tile.y, tile.cfg.tile_size)
-            tile_img_out = resize_centered(tile_img, tile.out_w, tile.out_h, cv2.INTER_LINEAR)
-            tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
+            tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT)
             return tile_img_out, tile_mask_out
     raise RuntimeError(f"Unknown tile item {item_key!r} for plan {plan.tag}")
 
 
 def _render_semantic_coverage_item(
     coverage: Optional[np.ndarray], plan: RenderPlan, frame_idx: int, item_key: str,
-    *, gpu_source: bool = False,
 ) -> Optional[np.ndarray]:
     if coverage is None:
         return None
@@ -782,9 +805,7 @@ def _render_semantic_coverage_item(
     if canvas is None:
         raise RuntimeError(f"Semantic coverage tile {plan.tag}/{item_key} has no canvas")
     cropped = extract_padded_tile(canvas, tile.x, tile.y, tile.cfg.tile_size)
-    if gpu_source:
-        return cropped
-    return resize_centered(cropped, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
+    return resize_centered(cropped, tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT)
 
 
 def _require_gpu_semantic_coverage_contract(policy: object, coverage: Optional[np.ndarray]) -> None:
@@ -808,12 +829,7 @@ def _derive_gpu_item_source(
     plan: RenderPlan,
     item_key: str,
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
-    """Return an unresized ROI plus the required output (H,W).
-
-    Full-frame render geometry remains on CPU, but tile crop/resize moves to
-    the GPU policy.  In-bounds tile extraction is a NumPy view (M2); padding is
-    materialized only for a genuine edge tile.
-    """
+    """Return an output-grid ROI, sharing in-bounds crops that need no resize."""
     if item_key == "full":
         if source.img_full is None or source.mask_full is None:
             raise RuntimeError(f"Full output requested without a rendered full frame for {plan.tag}")
@@ -824,6 +840,8 @@ def _derive_gpu_item_source(
     shared_arrays = source.tile_arrays.get(str(item_key))
     if shared_arrays is not None:
         image, mask = shared_arrays
+        if image is None:
+            raise RuntimeError(f"GPU tile input requires a rendered image for {plan.tag}/{item_key}")
         return image, mask, (int(image.shape[0]), int(image.shape[1]))
     if source.img_canvas is None or source.mask_canvas is None:
         raise RuntimeError(f"Tile output requested without a rendered canvas for {plan.tag}")
@@ -831,7 +849,11 @@ def _derive_gpu_item_source(
         if tile.tile_tag == item_key:
             tile_img = extract_padded_tile(source.img_canvas, tile.x, tile.y, tile.cfg.tile_size)
             tile_mask = extract_padded_tile(source.mask_canvas, tile.x, tile.y, tile.cfg.tile_size)
-            return tile_img, tile_mask, (int(tile.out_h), int(tile.out_w))
+            output_size = (int(tile.out_h), int(tile.out_w))
+            if tile_mask.shape != output_size:
+                tile_img = resize_centered(tile_img, tile.out_w, tile.out_h, cv2.INTER_LINEAR)
+                tile_mask = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT)
+            return tile_img, tile_mask, output_size
     raise RuntimeError(f"Unknown tile item {item_key!r} for plan {plan.tag}")
 
 
@@ -1556,51 +1578,55 @@ def _gpu_identity_fast_path_eligible(
 def _apply_gpu_identity_batch_many(
     runtime: Mapping[str, object],
     work: Sequence[_GpuItemWork],
+    *,
+    include_images: bool = True,
 ) -> Tuple[object, object]:
-    """Upload already-rendered originals without building or sampling a grid."""
+    """Upload identity masks and, when requested, already-rendered original images."""
 
     torch = runtime["torch"]
-    channel_kind = str(work[0].channel_kind)
     device = f"cuda:{int(runtime['device_id'])}"
-    cuda_images = [bool(getattr(item.image, "is_cuda", False)) for item in work]
-    if any(cuda_images) and not all(cuda_images):
-        raise ValueError("GPU identity publication cannot mix host and CUDA source images")
-    if all(cuda_images):
-        expected_device = torch.device(device)
-        image_planes = []
-        for item in work:
-            image = item.image
-            if getattr(image, "dtype", None) != torch.uint8:
-                raise TypeError("GPU-rendered identity sources must be torch.uint8")
-            if torch.device(getattr(image, "device", None)) != expected_device:
-                raise ValueError(
-                    "GPU-rendered identity source is on the wrong device: "
-                    f"expected {expected_device}, got {getattr(image, 'device', None)}"
-                )
+    image_sources = None
+    if include_images:
+        channel_kind = str(work[0].channel_kind)
+        cuda_images = [bool(getattr(item.image, "is_cuda", False)) for item in work]
+        if any(cuda_images) and not all(cuda_images):
+            raise ValueError("GPU identity publication cannot mix host and CUDA source images")
+        if all(cuda_images):
+            expected_device = torch.device(device)
+            image_planes = []
+            for item in work:
+                image = item.image
+                if getattr(image, "dtype", None) != torch.uint8:
+                    raise TypeError("GPU-rendered identity sources must be torch.uint8")
+                if torch.device(getattr(image, "device", None)) != expected_device:
+                    raise ValueError(
+                        "GPU-rendered identity source is on the wrong device: "
+                        f"expected {expected_device}, got {getattr(image, 'device', None)}"
+                    )
+                if channel_kind == "gray":
+                    image_planes.append(image.unsqueeze(0))
+                elif channel_kind in {"rgb", "custom"}:
+                    image_planes.append(image.permute(2, 0, 1))
+                else:
+                    raise ValueError(
+                        f"GPU identity publication does not support channel kind {channel_kind!r}"
+                    )
+            image_sources = torch.stack(image_planes, dim=0).contiguous()
+        else:
+            image_arrays = [
+                np.ascontiguousarray(np.asarray(item.image), dtype=np.uint8)
+                for item in work
+            ]
             if channel_kind == "gray":
-                image_planes.append(image.unsqueeze(0))
+                image_nchw = np.stack(image_arrays, axis=0)[:, None, :, :]
             elif channel_kind in {"rgb", "custom"}:
-                image_planes.append(image.permute(2, 0, 1))
+                image_nchw = np.transpose(np.stack(image_arrays, axis=0), (0, 3, 1, 2))
             else:
                 raise ValueError(
                     f"GPU identity publication does not support channel kind {channel_kind!r}"
                 )
-        image_sources = torch.stack(image_planes, dim=0).contiguous()
-    else:
-        image_arrays = [
-            np.ascontiguousarray(np.asarray(item.image), dtype=np.uint8)
-            for item in work
-        ]
-        if channel_kind == "gray":
-            image_nchw = np.stack(image_arrays, axis=0)[:, None, :, :]
-        elif channel_kind in {"rgb", "custom"}:
-            image_nchw = np.transpose(np.stack(image_arrays, axis=0), (0, 3, 1, 2))
-        else:
-            raise ValueError(
-                f"GPU identity publication does not support channel kind {channel_kind!r}"
-            )
-        image_host = torch.from_numpy(np.ascontiguousarray(image_nchw)).pin_memory()
-        image_sources = image_host.to(device, non_blocking=True)
+            image_host = torch.from_numpy(np.ascontiguousarray(image_nchw)).pin_memory()
+            image_sources = image_host.to(device, non_blocking=True)
     source_mask_required = any(
         bool(candidate.label_enabled)
         for item in work
@@ -1646,7 +1672,10 @@ def _apply_gpu_identity_batch_many(
         ).expand(total_candidates, out_h, out_w)
 
     if all(len(item.candidates) == 1 for item in work):
-        return image_sources.contiguous(), mask_sources
+        return image_sources, mask_sources
+
+    if image_sources is None and not source_mask_required:
+        return None, mask_sources
 
     source_indices = torch.as_tensor(
         [
@@ -1658,7 +1687,8 @@ def _apply_gpu_identity_batch_many(
         dtype=torch.int64,
     )
     return (
-        image_sources.index_select(0, source_indices).contiguous(),
+        (image_sources.index_select(0, source_indices).contiguous()
+         if image_sources is not None else None),
         (
             mask_sources.index_select(0, source_indices).contiguous()
             if source_mask_required
@@ -1768,9 +1798,13 @@ def _resolve_gpu_source_foregrounds(runtime, work):
         source = item.mask
         if not bool(getattr(source, "is_cuda", False)):
             source = np.asarray(source)
+            coverage = item.semantic_coverage
             if tuple(source.shape) != tuple(item.output_size):
-                source = resize_centered(source, int(item.output_size[1]), int(item.output_size[0]), cv2.INTER_NEAREST)
-            resolve_deferred_foregrounds(item.candidates, source, item.semantic_coverage)
+                out_h, out_w = item.output_size
+                source = resize_centered(source, out_w, out_h, cv2.INTER_NEAREST_EXACT)
+                if coverage is not None:
+                    coverage = resize_centered(coverage, out_w, out_h, cv2.INTER_NEAREST_EXACT)
+            resolve_deferred_foregrounds(item.candidates, source, coverage)
             if tuple(item.mask.shape) == tuple(item.output_size):
                 known = source if item.semantic_coverage is None else np.logical_and(source, item.semantic_coverage)
                 support[(id(item.mask), id(item.semantic_coverage))] = bool(np.any(known))
@@ -2292,7 +2326,7 @@ def _render_gpu_item_group(
                         if canvas is None:
                             raise RuntimeError("CPR categorical fallback has no parent canvas")
                         cropped = extract_padded_tile(canvas, tile.x, tile.y, tile.cfg.tile_size)
-                        item_mask = resize_centered(cropped, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
+                        item_mask = resize_centered(cropped, tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT)
                     else:
                         item_mask = shared_geometry.render_categorical_dense_tile_for_job(
                             mask,
@@ -2306,11 +2340,8 @@ def _render_gpu_item_group(
                 else:
                     item_mask = _zero_mask_view(*output_size)
                 item_coverage = _render_semantic_coverage_item(
-                    semantic_coverage, plan, int(frame_idx), str(item_key), gpu_source=True,
+                    semantic_coverage, plan, int(frame_idx), str(item_key),
                 )
-                if item_coverage is not None and is_cpr:
-                    item_coverage = resize_centered(
-                        item_coverage, int(output_size[1]), int(output_size[0]), cv2.INTER_NEAREST)
             return (
                 _GpuItemWork(
                     candidates=tuple(candidates),
@@ -2360,7 +2391,7 @@ def _render_gpu_item_group(
                     context=f"{plan.tag}/{item_key}/frame={int(frame_idx) + 1:04d}",
                     channel_count=plan_channel_count,
                     semantic_coverage=_render_semantic_coverage_item(
-                        semantic_coverage, plan, int(frame_idx), str(item_key), gpu_source=True,
+                        semantic_coverage, plan, int(frame_idx), str(item_key),
                     ),
                 ),
             )
@@ -2386,29 +2417,10 @@ def _render_gpu_item_group(
             if image_canvas is not None
             else None
         )
+    source = RenderFrameSource(image_full, mask_full, image_canvas, mask_canvas)
     rendered: List[_GpuItemWork] = []
     for item_key, candidates in items:
-        if str(item_key) == "full":
-            item_image = image_full
-            item_mask = mask_full
-            output_size = (int(image_full.shape[0]), int(image_full.shape[1]))
-        else:
-            tile = tile_by_tag[str(item_key)]
-            if image_canvas is None or mask_canvas is None:
-                raise RuntimeError(f"Tile output requested without a rendered canvas for {plan.tag}")
-            item_image = extract_padded_tile(
-                image_canvas,
-                tile.x,
-                tile.y,
-                tile.cfg.tile_size,
-            )
-            item_mask = extract_padded_tile(
-                mask_canvas,
-                tile.x,
-                tile.y,
-                tile.cfg.tile_size,
-            )
-            output_size = (int(tile.out_h), int(tile.out_w))
+        item_image, item_mask, output_size = _derive_gpu_item_source(source, plan, str(item_key))
         rendered.append(
             _GpuItemWork(
                 candidates=tuple(candidates),
@@ -2419,7 +2431,7 @@ def _render_gpu_item_group(
                 context=f"{plan.tag}/{item_key}/frame={int(frame_idx) + 1:04d}",
                 channel_count=plan_channel_count,
                 semantic_coverage=_render_semantic_coverage_item(
-                    semantic_coverage, plan, int(frame_idx), str(item_key), gpu_source=True,
+                    semantic_coverage, plan, int(frame_idx), str(item_key),
                 ),
             )
         )
@@ -2555,6 +2567,17 @@ def _publish_gpu_policy_batch(
     with (publication.measure('mask_download') if publication is not None else nullcontext()):
         # A device-side reduction is enough for background/flip decisions. Full
         # masks cross PCIe only when labels or binary masks were requested.
+        mask_indices = [
+            index for index, candidate in enumerate(candidates)
+            if (save_labels or save_binary or save_semantic) and bool(candidate.label_enabled)
+            # Known-empty sources already produce empty polygon labels. Keep
+            # the output occupancy reduction above to reject synthesized masks,
+            # and retain full planes for binary/semantic/coverage contracts.
+            and (save_binary or save_semantic or semantic_coverage_masks is not None
+                 or bool(source_mask_nonempty[index]))
+        ]
+        crop_label_masks = bool(mask_indices and not (save_binary or save_semantic)
+                                and semantic_coverage_masks is None)
         mask_semantics_required = any(
             bool(candidate.label_enabled) or not bool(candidate.foreground)
             for candidate in candidates
@@ -2566,10 +2589,13 @@ def _publish_gpu_policy_batch(
                 if int(coverage_for_decision.ndim) == 4 and int(coverage_for_decision.shape[1]) == 1:
                     coverage_for_decision = coverage_for_decision[:, 0]
                 decision_masks = batch_masks * (coverage_for_decision > 0)
-            # Foreground bounds also crop polygon-only downloads below.
-            with runtime_telemetry().span('pta.publish.mask_bounds'):
-                mask_bounds = _gpu_mask_bounds(torch, decision_masks.detach()).to("cpu").tolist()
-            mask_nonempty = [bounds[1] >= 0 for bounds in mask_bounds]
+            if crop_label_masks:
+                with runtime_telemetry().span('pta.publish.mask_bounds'):
+                    mask_bounds = _gpu_mask_bounds(torch, decision_masks.detach()).to("cpu").tolist()
+                mask_nonempty = [bounds[1] >= 0 for bounds in mask_bounds]
+            else:
+                with runtime_telemetry().span('pta.publish.mask_occupancy'):
+                    mask_nonempty = decision_masks.detach().any(dim=2).any(dim=1).to("cpu").tolist()
         else:
             # Unlabeled candidates carry no mask-dependent keep/drop semantics.
             # Avoid launching a reduction over the expanded zero-mask view.
@@ -2579,15 +2605,6 @@ def _publish_gpu_policy_batch(
             for index, candidate in enumerate(candidates)
             if save_labels and bool(candidate.label_enabled)
         ]
-        mask_indices = [
-            index for index, candidate in enumerate(candidates)
-            if (save_labels or save_binary or save_semantic) and bool(candidate.label_enabled)
-            # Known-empty sources already produce empty polygon labels. Keep
-            # the output occupancy reduction above to reject synthesized masks,
-            # and retain full planes for binary/semantic/coverage contracts.
-            and (save_binary or save_semantic or semantic_coverage_masks is not None
-                 or bool(source_mask_nonempty[index]))
-        ]
         host_label_masks: Dict[int, np.ndarray] = {}
         label_origins: Dict[int, Tuple[int, int]] = {}
         host_semantic_masks: Dict[int, np.ndarray] = {}
@@ -2595,7 +2612,7 @@ def _publish_gpu_policy_batch(
         frame_shape = (int(batch_masks.shape[1]), int(batch_masks.shape[2]))
         # Polygon-only exports need just each foreground window. Without
         # coverage the bounds above are those of each validated uint8 label mask.
-        if mask_indices and not (save_binary or save_semantic) and semantic_coverage_masks is None:
+        if crop_label_masks:
             windows = []
             for index in mask_indices:
                 window = yolo_label_window(mask_bounds[index], frame_shape)
@@ -2941,6 +2958,10 @@ def execute_gpu_frame_batch_task(
                                 ) for item in batch)
                             if _gpu_identity_fast_path_eligible(batch, seeds):
                                 result = _apply_gpu_identity_batch_many(runtime, batch)
+                                if coverage_batch is not None:
+                                    _, semantic_coverage_masks = _apply_gpu_identity_batch_many(
+                                        runtime, coverage_batch, include_images=False,
+                                    )
                             else:
                                 policy_images, zero_copy_cuda_sources = _gpu_policy_source_images(
                                     policy,
@@ -2973,12 +2994,7 @@ def execute_gpu_frame_batch_task(
                                     output_size=batch[0].output_size,
                                     **extra_policy_masks,
                                 )
-                            if coverage_batch is not None and not coverage_warped:
-                                if _gpu_identity_fast_path_eligible(batch, seeds):
-                                    _coverage_images, semantic_coverage_masks = _apply_gpu_identity_batch_many(
-                                        runtime, coverage_batch,
-                                    )
-                                else:
+                                if coverage_batch is not None and not coverage_warped:
                                     _coverage_images, semantic_coverage_masks = apply_batch_many(
                                         images=policy_images,
                                         masks=_gpu_policy_source_masks(
@@ -2988,13 +3004,13 @@ def execute_gpu_frame_batch_task(
                                         seeds=seeds,
                                         output_size=batch[0].output_size,
                                     )
-                                if not bool(runtime["torch"].equal(result[0], _coverage_images)):
-                                    raise RuntimeError(
-                                        "GPU policy changed image geometry when semantic coverage replaced "
-                                        "the foreground mask. Forced partial semantic export requires "
-                                        "mask-independent GPU geometry."
-                                    )
-                                _coverage_images = None
+                                    if not bool(runtime["torch"].equal(result[0], _coverage_images)):
+                                        raise RuntimeError(
+                                            "GPU policy changed image geometry when semantic coverage replaced "
+                                            "the foreground mask. Forced partial semantic export requires "
+                                            "mask-independent GPU geometry."
+                                        )
+                                    _coverage_images = None
                     except Exception as exc:
                         if _is_cuda_out_of_memory(exc) and len(flat_candidates) > 1:
                             # Release a successful first pass before retrying failed coverage work.
@@ -3071,22 +3087,22 @@ def execute_gpu_frame_batch_task(
             if canvas_group:
                 render_jobs.append((plan, int(frame_task.frame_idx), tuple(canvas_group)))
 
-        render_threads = min(
-            len(render_jobs),
-            max(1, int(_WORKER_STATIC.get("gpu_render_threads", 1))),
-        )
+        render_threads = max(1, int(_WORKER_STATIC.get("gpu_render_threads", 1)))
         # Keep at most two render jobs per thread live. A job can produce host
         # or CUDA tensors; completed results stay in this bounded window while
         # policy execution and publication consume earlier work.
-        max_in_flight = max(1, render_threads * 2)
+        max_in_flight = 2 * render_threads
         next_job = 0
         ready: List[_GpuItemWork] = []
-        with ThreadPoolExecutor(
-            max_workers=max(1, render_threads),
-            thread_name_prefix="pta-gpu-render",
-        ) as executor:
-            pending: Dict[Future, int] = {}
+        executor = runtime.get("render_pool")
+        if executor is None and render_jobs:
+            from multiprocessing.util import Finalize
 
+            executor = ThreadPoolExecutor(max_workers=render_threads, thread_name_prefix="pta-gpu-render")
+            runtime["render_pool"] = executor
+            runtime["render_pool_finalizer"] = Finalize(None, executor.shutdown, exitpriority=16)
+        pending: Dict[Future, int] = {}
+        try:
             def _fill_render_window() -> None:
                 nonlocal next_job
                 while next_job < len(render_jobs) and len(pending) < max_in_flight:
@@ -3145,6 +3161,12 @@ def execute_gpu_frame_batch_task(
                         else:
                             retained.extend(batch)
                     ready = retained
+        finally:
+            # The task's source arrays must remain live until every render settles.
+            if pending:
+                for future in pending:
+                    future.cancel()
+                wait(tuple(pending))
 
     if (
         bool(runtime.get("cpr_renderer_announced"))
@@ -3270,13 +3292,17 @@ def execute_gpu_render_task(
     for item_key, candidates in task.items:
         item_image, item_mask, output_size = _derive_gpu_item_source(source, plan, str(item_key))
         item_coverage = _render_semantic_coverage_item(
-            semantic_coverage, plan, int(task.frame_idx), str(item_key), gpu_source=True,
+            semantic_coverage, plan, int(task.frame_idx), str(item_key),
         ) if save_semantic else None
         if any(candidate.foreground_deferred for candidate in candidates):
             classification_mask = item_mask
+            classification_coverage = item_coverage
             if tuple(item_mask.shape) != tuple(output_size):
-                classification_mask = resize_centered(item_mask, int(output_size[1]), int(output_size[0]), cv2.INTER_NEAREST)
-            resolve_deferred_foregrounds(candidates, classification_mask, item_coverage)
+                out_h, out_w = output_size
+                classification_mask = resize_centered(item_mask, out_w, out_h, cv2.INTER_NEAREST_EXACT)
+                if item_coverage is not None:
+                    classification_coverage = resize_centered(item_coverage, out_w, out_h, cv2.INTER_NEAREST_EXACT)
+            resolve_deferred_foregrounds(candidates, classification_mask, classification_coverage)
         source_nonempty = bool(np.any(item_mask if item_coverage is None
                                      else np.logical_and(item_mask, item_coverage)))
         for chunk_start in range(0, len(candidates), gpu_batch_size):
@@ -3468,7 +3494,7 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
 
     def _write_versions(
         candidates: Sequence[OutputCandidate],
-        item_image: np.ndarray,
+        item_image: Optional[np.ndarray],
         item_mask: np.ndarray,
         item_coverage: Optional[np.ndarray],
     ) -> None:
@@ -3505,13 +3531,18 @@ def execute_render_task(volume: np.ndarray, mask: np.ndarray, plans: Sequence[Re
         plan = plans[int(task.plan_idx)]
         item_keys = {str(item_key) for item_key, _ in task.items}
         plan = replace(plan, tile_layout=tuple(tile for tile in plan.tile_layout if str(tile.tile_tag) in item_keys))
+        # CPU augmentation policies can use intensity to transform masks even
+        # when image publication is disabled. Identity versions consume only masks.
+        need_image = bool(static.get("save_images", True)) or any(
+            int(candidate.augmentation_index) > 0 for _, candidates in task.items for candidate in candidates
+        )
         source = render_plan_frame_source(
-            volume=volume, mask=mask, plan=plan, idx=int(task.frame_idx),
+            volume=volume, mask=mask, plan=plan, idx=int(task.frame_idx), need_image=need_image,
             need_canvas=any(item_key != "full" for item_key, _ in task.items),
             need_full="full" in item_keys,
         )
         for item_key, candidates in task.items:
-            item_image, item_mask = _derive_item_arrays(source, plan, str(item_key))
+            item_image, item_mask = _derive_item_arrays(source, plan, str(item_key), need_image=need_image)
             if str(item_key) == "full":
                 item_plan = plan.canonical_plan
             else:

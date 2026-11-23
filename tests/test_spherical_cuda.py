@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
 import importlib.util
 from itertools import product
 import math
 import os
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -14,6 +16,37 @@ import numpy as np
 
 from XTA import spherical_cuda
 from XTA.qsc import qsc_inverse
+
+
+def test_kernel_compilation_is_cached_by_device_and_precision(monkeypatch):
+    active, builds = [], []
+
+    @contextmanager
+    def device(index):
+        active.append(index)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    def module(**kwargs):
+        builds.append((active[-1], kwargs['options'][-1]))
+        if active[-1] == 0:
+            raise RuntimeError('unavailable device')
+        return SimpleNamespace(get_function=lambda name: name)
+
+    import pytest
+
+    monkeypatch.setitem(sys.modules, 'cupy', SimpleNamespace(
+        RawModule=module, cuda=SimpleNamespace(Device=device, runtime=SimpleNamespace(getDevice=lambda: 1))))
+    monkeypatch.setattr(spherical_cuda, '_KERNELS', {})
+    monkeypatch.setattr(spherical_cuda, '_KERNEL_ERRORS', {})
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match='unavailable device'):
+            spherical_cuda._spherical_kernels(0)
+    assert spherical_cuda._spherical_kernels() is spherical_cuda._spherical_kernels(1)
+    assert spherical_cuda._spherical_fp32_kernels(1).kernel == 'spherical_virtual_fp32'
+    assert builds == [(0, '--fmad=false'), (1, '--fmad=false'), (1, '--fmad=true')]
 
 
 def spherical_view(shape=(9, 11, 13), *, face=0, radii=(0., .63, 2.5, 7.),
@@ -336,9 +369,13 @@ class SphericalResidentNumericalTests(unittest.TestCase):
         def kernel(grid, block, args, *, stream):
             calls.append((grid, block, args, stream))
             args[3].zero_()
-        kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda value: value), kernel=kernel)
+        kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda value: value,
+                                  cuda=SimpleNamespace(Device=nullcontext)), kernel=kernel)
+        render_stream = nullcontext()
+        render_stream.enter_result = render_stream
         with (mock.patch.object(spherical_cuda, '_spherical_kernels', return_value=kernels),
-              mock.patch('XTA.geometry._cupy_external_stream', return_value='render-stream')):
+              mock.patch.object(engine.torch.cuda, 'stream', return_value=nullcontext()),
+              mock.patch('XTA.geometry._cupy_external_stream', return_value=render_stream)):
             for index in (0, 1):
                 spherical_cuda._render_spherical_native_cuda(engine, view, index)
         self.assertEqual(len(calls), 2)
@@ -347,7 +384,7 @@ class SphericalResidentNumericalTests(unittest.TestCase):
         self.assertIs(calls[0][2][2], calls[1][2][2])
         self.assertEqual(calls[0][2][-1], np.float64(0))
         self.assertEqual(calls[1][2][-1], np.float64(.63))
-        self.assertEqual(calls[0][3], 'render-stream')
+        self.assertIs(calls[0][3], render_stream)
 
     def test_contract_rejects_bad_geometry_before_sampling(self):
         engine = resident_engine(np.zeros((9, 11, 13), np.uint8))

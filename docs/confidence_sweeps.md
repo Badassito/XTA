@@ -26,10 +26,10 @@ An empty result at a high cutoff is a valid computed branch.
 
 For eligible ranges the lowest-cutoff child dispatches **view batches**. The
 worker renders and preprocesses the batch once, evaluates the model once, and
-uses the live outputs to produce each cutoff's native mask and observed scores.
+uses the live outputs to produce each cutoff's native mask and any requested observed scores.
 The scalar writer already owns the lowest-cutoff pixels, so its entry in the
 shared journal carries frame counts only. Higher cutoffs retain their exact
-mask and score crops and can share a stored crop when the decoder proves the
+mask crops and any requested score crops and can share a stored crop when the decoder proves the
 accepted predictions are identical. For a
 long grid, the tiled direct CUDA decoder can group candidates by score and
 accumulate prototype maxima from higher to lower thresholds. Small grids and
@@ -37,9 +37,9 @@ the TensorRT ring use their native cutoff decoding on the shared forward.
 
 With NRRD decomposition and interpolation/extrapolation off, the normal scalar
 route handles the lowest cutoff. Compatible higher-cutoff masks from the same
-view share a categorical geometry traversal. The publisher writes their
-complete native and requested preview NRRDs into their own cutoff directories
-as views finish. Masks which cross between cutoffs can require more than one
+view share a categorical geometry traversal. The publisher stages layers
+on family scratch as views finish. The final native and preview NRRDs are
+grouped by cutoff. Masks which cross between cutoffs can require more than one
 geometry traversal. Radial sibling traversals evaluate only the output voxels
 their shell patch and native boxes can reach; the result is identical to the
 full traversal. Projected sibling stores use row-packed bits on scratch.
@@ -77,7 +77,7 @@ planes on up to 4 host threads. The scheduler also keeps going when the bytes
 above the journal mark could not be freed by the queued publications (workers
 then take the exact scalar route if the quota fills). Sibling NRRD encoding uses one
 shared pool sized to what concurrent publications can queue (at most a third
-of the CPUs); each cutoff's observed evidence is written beside those encodes.
+of the CPUs). Requested observed evidence is written beside those encodes.
 The family `manifest.json` reports `upstream_fanout.early_publication` with
 the backlog peak, the journal's peak fill and the seconds the scheduler waited.
 A nonzero wait means publication, not inference, limited the run.
@@ -87,7 +87,7 @@ per-family `sweep.publication.<family>_seconds`, per-stage
 `sweep.publication.stage[.<family>].{rank_input,projection,confidence_thread,layers_barrier}_seconds`,
 `sweep.publication.scheduler_wait_seconds` and `sweep.rank_gpu.*` admission counters.
 
-Sibling confidence evidence and journal decoding run outside the producer's
+Requested sibling confidence evidence and journal decoding run outside the producer's
 Python interpreter lock. Each sibling's journal rows are decoded by nogil
 kernels that call the native zlib (`Native view journal decode:` in the log
 names the backend; when the library does not qualify the Python route is used
@@ -135,11 +135,18 @@ recorded no detector fallback and published its shared source (and resized
 cube), they run concurrently; their output lines carry a `[conf 0.NN]` prefix.
 `XTA_YOLO_SWEEP_CONSUMER_PARALLEL` takes a positive integer or `auto` (the
 default), which admits one concurrent cutoff per three source-volume sizes of
-available memory, capped by the job's cgroup headroom. Otherwise they run in
-cutoff order. `manifest.json` records the decision in `consumer_execution`. The
-Slicer bundle is assembled after those branches settle.
+available memory, capped by the job's cgroup headroom. When memory is known,
+each concurrent child budgets about 40% of its share for dense workspaces and
+40% for transient parent work. Inference counts toward the dense budget.
+Smaller explicit limits still apply. Where physical-core topology is available,
+active children use disjoint CPU masks that keep SMT siblings together.
+Existing augmentation, interpolation and output worker overrides are divided
+among the slots. SAM, CUDA SDF, CUDA `keep_objects` and retained native views
+that can backproject on CUDA run in cutoff order when they share GPUs.
+`manifest.json` records the decision in `consumer_execution`. The Slicer
+bundle is assembled after those branches settle.
 
-For SDF or SAM, retained native masks and scores let later children bypass
+For SDF or SAM, the shared native masks let later children bypass
 the detector on covered views. Tracking, bridge decisions, interpolation and
 publication of their results remain independent per cutoff. The same applies
 where a policy needs branch-specific processing. An uncaptured view runs the
@@ -169,33 +176,66 @@ retired one view at a time after early projection/publication. Projected stores
 are retained for the corresponding cutoff's finalization. Their admission uses
 available scratch with headroom; `XTA_YOLO_SWEEP_PROJECTED_GIB` can set an
 explicit cap. `fanout_storage.json` records their live, peak and retired bytes
-when early publication is active. For comparison or diagnosis,
+when early publication is active. With no cap, the producer writes these
+counters after the floor views settle or when an unfinished producer closes.
+Set `XTA_YOLO_SWEEP_QUOTA_DIR=/dev/shm` on a single Linux node to place just
+the shared SQLite reservation ledger and its journal on tmpfs. Leave `--temp`
+on a disk with room for the mask, score and replay payloads. The sweep creates
+a private directory when the quota root differs from `--temp`, records it in
+`work_storage.native_quota`, and passes the same database path to every branch.
+The coordinator removes the directory after the workers settle.
+For comparison or diagnosis,
 `XTA_YOLO_SWEEP_VIEW_MAJOR=0` selects the previous cutoff-major execution order.
 Eligible scalar fallback uses its separate transient raw-forward cache
 (`XTA_YOLO_SWEEP_CACHE_GIB`, default 64 GiB). Its reuse still depends on
 matching device, precision, renderer, batch and available space. Source/model
 fingerprints are reused across cutoffs.
 
-Each scalar result is in `confidence_cutoffs/conf_NNN/`, where `NNN` is the
-integer cutoff in hundredths. The top-level `manifest.json` gives the status,
-branch paths and forward-cache statistics. A successful NRRD review has
-`review/manifest.json`, stock grouped `.seg.nrrd` files and per-cutoff direct
-coverage labelmaps. Each requested preview tier is a grouped review grid:
-each `.seg.nrrd` group holds one cutoff, so Slicer's per-cutoff loading can
-choose a subset of cutoffs. When a preview tier exists, the native grid is
-reference-only. The review lists its per-cutoff source manifests and segment
-identities for edit export, but never reads or re-encodes the native masks;
-they stay in the branch NRRDs. Without a preview tier, native is the grouped review grid. Keep
-the review and its corresponding branch directories together for edit export
-and native handoff. A store-backed Slicer review writes its edit log beside
+The top-level `manifest.json` records the family status, cutoff receipts and
+forward-cache statistics. Branch receipts and per-cutoff binary media live in
+`confidence_cutoffs/conf_NNN/`, where `NNN` is the integer cutoff in
+hundredths. With `--save nrrd`, the canonical segmentations live in
+`review/`. Open `review/manifest.json` to select the native grid or a requested
+preview grid. Each grouped `.seg.nrrd` holds layers from one cutoff. Groups
+can be split to bound their size and the space occupied by distant crops.
+The catalogue records segment identity, channel and reference geometry for
+edit export and native recovery. Keep the review and branch receipts together.
+A Python reader can pass a `review/<grid>/sources/conf_NNN/*_nrrd_manifest.json`
+catalogue to `XTA.reconciliation_io.read_layer_manifest` and read the selected
+layer by slabs. The group index identifies its gzip byte range. Readers that
+stop after the first gzip member, including `pynrrd` 1.1.3's ordinary
+`nrrd.read`, cannot decode every layer of a multi-member group.
+A store-backed Slicer review writes its edit log beside
 the sweep folder, in `<sweep folder>.cutoff_edits/`; keep that folder with the
 sweep.
+
+`--save summary` writes one family `summary.txt` with the existing scalar
+summary text under a heading for each validated cutoff in requested order.
+`--save high_quality` writes `heatmaps/native.mkv`; `--save low_quality`
+writes `heatmaps/low_quality/<token>.mp4` for each preview tier. Each video
+shows how many finalized cutoff masks contain each voxel on that grid.
+Zero support preserves the gray source. The `heatmaps` records in the family
+manifest give the exact cutoffs, colors, frame rate and opacity.
+The separate binary exports preserve eligibility at each cutoff, including
+non-nested results.
+
+For requested NRRDs or heatmaps the coordinator tests directory publication
+on the output filesystem before it launches a cutoff. On a POSIX filesystem
+that rejects exclusive rename, the publisher reserves the final directory
+name with `mkdir` and renames the completed directory over its own empty
+reservation. If that promotion fails, the family manifest records the completed
+output-side stage in `completed_publication_stages`, relative to the family
+root. This stage survives cleanup of node-local `--temp`. Failures while
+generating a product can still require the original scratch inputs.
+The family manifest records elapsed seconds for attempted heatmap and review
+publication in `publication_seconds`. The job log also reports each completed
+review grid's elapsed time and compressed group bytes.
 
 When a scalar cutoff exits normally and records omitted SAM work, XTA retains
 its outputs and continues through the remaining cutoffs. The family finishes
 with a warning and status `incomplete`. Its manifest lists the affected cutoffs
-and their SAM omissions. Every branch remains available in its scalar directory.
-The grouped Slicer review requires a complete family, so XTA skips it in this case.
+and their SAM omissions. Check family status and the published cutoff list
+before using partial results.
 Set `YOLO_TTA_SAM_REQUIRE_COMPLETE=1` to make a SAM omission fail its scalar
 process. A nonzero scalar exit stops the sweep.
 
@@ -215,8 +255,9 @@ per cutoff, at most 8 and at most the CPU count, each with its own
 Slicer opens such a review as per-cutoff segments, because masks from
 independent runs need not nest across cutoffs.
 
-Sweeps retain observed numeric evidence. For a single scalar run request
-`--save confidence` to keep it independently of reconciliation. The manifest
+Confidence-mode reconciliation retains observed numeric evidence. Use
+`--save confidence` to keep it independently of reconciliation in scalar runs
+or confidence sweeps. The manifest
 in `reconciliation_evidence/` identifies the model, layer, task-specific score
 meaning and coordinate space. These bytes describe surviving observed
 predictions before interpolation. Zero includes unknown support. Generated
@@ -237,8 +278,8 @@ bundle can supply the input manifest for an export at its own resolution.
 1. Load the matching intensity volume. Install/load the XTA toolbar as described
    in the [Slicer cleanup guide](slicer_pta_cleanup.md). Use **Importer** with
    the sweep's `review/manifest.json`. Importer offers only grouped grids,
-   with the smallest LQ tier first; a reference-only native grid is never
-   loaded. By default it opens the grid **store-backed**: every cutoff is read
+   with the smallest LQ tier first. Older reviews can describe the native grid
+   by reference to scalar NRRDs. By default it opens the grid **store-backed**: every cutoff is read
    into one in-memory store and stays editable. Importer asks which cutoff to
    display, with the review default first, and, when the grid has an edit log,
    whether to resume it or start fresh. In the Slicer Python console the

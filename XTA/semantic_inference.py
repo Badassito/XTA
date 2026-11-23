@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Iterator, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -88,6 +88,40 @@ def semantic_foreground_probability_numpy(
     return result
 
 
+def semantic_native_cutoff_planes(
+    probability: np.ndarray,
+    cutoffs: Sequence[int],
+    *,
+    M_out_to_native: np.ndarray,
+    native_h: int,
+    native_w: int,
+    has_scores: bool,
+) -> Iterator[tuple[int, np.ndarray, Optional[np.ndarray], int]]:
+    """Yield ordinary semantic sibling products after one nearest native warp."""
+    # Nearest sampling commutes with the cutoff and score quantization. Use a
+    # NaN border so samples outside the source fail even a zero cutoff.
+    native = cv2.warpAffine(
+        np.asarray(probability, dtype=np.float32), M_out_to_native,
+        dsize=(int(native_w), int(native_h)), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=float('nan'),
+    )
+    quantized = None
+    if has_scores:
+        # NaN and negative samples contribute zero confidence. Retain the
+        # scalar path's FP32 scale and rounding order for every positive sample.
+        rounded = np.fmax(native, 0.0)
+        rounded *= 255.0
+        np.rint(rounded, out=rounded)
+        np.minimum(rounded, 255.0, out=rounded)
+        quantized = rounded.astype(np.uint8)
+        del rounded
+    for cutoff in cutoffs:
+        mask = (native >= int(cutoff) / 100.0).view(np.uint8)
+        count = int(np.any(mask))
+        scores = None if quantized is None else quantized * mask
+        yield int(cutoff), mask, scores, count
+
+
 def accumulate_semantic_probability_frame(
     probability: np.ndarray,
     *,
@@ -105,7 +139,9 @@ def accumulate_semantic_probability_frame(
     if prob.ndim != 2:
         raise ValueError(f'Semantic probability plane must be 2-D; got {prob.shape}')
     mask = (prob >= float(conf_threshold)).astype(np.uint8)
-    conf = np.where(mask > 0, np.clip(np.rint(prob * 255.0), 0, 255), 0).astype(np.uint8)
+    conf = None
+    if view_confmap_mm is not None or restore_planes is not None:
+        conf = np.where(mask > 0, np.clip(np.rint(prob * 255.0), 0, 255), 0).astype(np.uint8)
     if restore_planes is not None:
         mask, conf = restore_planes([mask, conf])
     native_mask = cv2.warpAffine(

@@ -13,7 +13,6 @@ import tempfile
 import time
 import weakref
 from concurrent.futures import Future
-from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from typing import (
     Iterator,
@@ -106,6 +105,7 @@ from .cuda_d1 import (
 )
 from .backprojection import (
     SinkOnlyProjectionResult,
+    _try_acquire_main_process_gpu_stage,
     backproject_azimuthal_volume_to_volume,
     backproject_radial_volume_to_volume,
     backproject_spherical_volume_to_volume,
@@ -2652,6 +2652,7 @@ def gate_tile_components_against_support_inplace(
     retain_rejected_components: bool,
     workers: int = 1,
     desc: str = 'Tile component support gate',
+    confidence_result: Optional[TilePostprocessResult] = None,
 ) -> Dict[str, int]:
     """Gate every 2-D component from one original tile against one immutable support.
 
@@ -2707,63 +2708,26 @@ def gate_tile_components_against_support_inplace(
             dst_view = dst_mm[int(idx), py0:py1, px0:px1]
             np.bitwise_or(dst_view, plane_u8, out=dst_view)
 
-    def _process(idx: int) -> Tuple[int, int, int, int]:
+    per_slice = np.zeros((int(tile.shape[0]), 4), dtype=np.int64)
+
+    def _process(idx: int):
         tile_slice = np.asarray(tile[int(idx)], dtype=np.uint8) > 0
         if not bool(np.any(tile_slice)):
             tile[int(idx)] = np.uint8(0)
-            return (0, 0, 0, 0)
-
-        num_labels, labels2d, stats, _centroids = cv2.connectedComponentsWithStats(
-            np.ascontiguousarray(tile_slice, dtype=np.uint8),
-            connectivity=8,
-            ltype=cv2.CV_32S,
-        )
-        num_labels = int(num_labels)
-        if num_labels <= 1:
-            tile[int(idx)] = np.uint8(0)
-            return (0, 0, 0, 0)
-
-        sizes = np.asarray(stats[:num_labels, cv2.CC_STAT_AREA], dtype=np.int64)
-        present = sizes > 0
-        present[0] = False
+            return None
         support_slice = _read_binary_volume_slice_crop_bool(
             support_mm, int(idx), int(py0), int(py1), int(px0), int(px1),
         )
-        if tuple(int(v) for v in support_slice.shape) != expected_local:
-            raise ValueError(
-                f'{desc}: support crop shape {tuple(int(v) for v in support_slice.shape)} '
-                f'does not match tile plane {expected_local}'
-            )
-        hits = np.bincount(labels2d[support_slice], minlength=num_labels)[:num_labels] > 0
-        accepted_labels = present & hits
-        rejected_labels = present & (~accepted_labels)
-        accepted_plane = accepted_labels[labels2d].astype(np.uint8, copy=False)
-        rejected_plane = rejected_labels[labels2d].astype(np.uint8, copy=False)
-
+        accepted_plane, rejected_plane, stats = _partition_tile_components_2d(tile_slice, support_slice)
+        per_slice[idx] = stats
         _or_crop(accepted_total_mm, accepted_total_locks, total_lock_count, int(idx), accepted_plane)
         _or_crop(accepted_category_mm, accepted_category_locks, category_lock_count, int(idx), accepted_plane)
         tile[int(idx)] = rejected_plane if bool(retain_rejected_components) else accepted_plane
+        return 0, 0, accepted_plane
 
-        return (
-            int(np.count_nonzero(accepted_labels)),
-            int(np.count_nonzero(rejected_labels)),
-            int(sizes[accepted_labels].sum()) if bool(np.any(accepted_labels)) else 0,
-            int(sizes[rejected_labels].sum()) if bool(np.any(rejected_labels)) else 0,
-        )
-
-    totals = np.zeros((4,), dtype=np.int64)
-    worker_count = choose_slice_parallel_workers(int(workers), max(1, int(tile.shape[0])))
-    if worker_count <= 1:
-        for idx in range(int(tile.shape[0])):
-            totals += np.asarray(_process(int(idx)), dtype=np.int64)
-    else:
-        for values in parallel_map_in_order(
-            _process,
-            range(int(tile.shape[0])),
-            max_workers=int(worker_count),
-            max_pending=max(int(worker_count), int(worker_count) * 2),
-        ):
-            totals += np.asarray(values, dtype=np.int64)
+    category = 'parent_mask' if retain_rejected_components else 'parent_bridge'
+    _run_tile_gate_slices(confidence_result, category, int(tile.shape[0]), _process, workers, desc)
+    totals = per_slice.sum(axis=0)
 
     return {
         'accepted_components': int(totals[0]),
@@ -2771,6 +2735,19 @@ def gate_tile_components_against_support_inplace(
         'accepted_voxels': int(totals[2]),
         'rejected_voxels': int(totals[3]),
     }
+
+
+def _run_tile_gate_slices(result, category, depth, gate_slice, workers, desc):
+    from .confidence_tiles import confidence_evidence_enabled, record_tile_confidence_gate
+    workers = choose_slice_parallel_workers(int(workers), max(1, int(depth)))
+    if result is not None and confidence_evidence_enabled():
+        record_tile_confidence_gate(result, category, gate_slice, workers=workers)
+    else:
+        parallel_for_indices_chunked(
+            depth, gate_slice, max_workers=workers, desc=desc, show_progress=False,
+            target_chunks_per_worker=2,
+        )
+
 
 def _partition_tile_components_2d(
     tile_plane: np.ndarray,
@@ -2851,8 +2828,6 @@ def gate_raw_bbox_tile_store_against_parent_mask(
     store = result.tile_mask_store
     if store is None:
         raise ValueError('Sparse parent tile gate requires tile_mask_store')
-    from .confidence_tiles import record_tile_confidence_gate
-    record_tile_confidence_gate(result, parent_mask_support_mm, 'parent_mask')
     py0, py1, px0, px1 = (int(v) for v in result.parent_crop)
     support_shape = _volume_shape_tuple(parent_mask_support_mm)
     if tuple(int(v) for v in tile_accumulator_mm.shape) != support_shape:
@@ -2876,10 +2851,11 @@ def gate_raw_bbox_tile_store_against_parent_mask(
     )
     per_slice = np.zeros((int(store.shape[0]), 4), dtype=np.int64)
 
-    def _encode_residual(idx: int) -> RawBBoxSlicePayload:
+    def _encode_residual(idx: int):
         decoded = store.decode_slice_crop(int(idx), dtype=np.uint8)
         if decoded is None:
-            return RawBBoxSlicePayload(idx=int(idx), is_empty=True)
+            writer.consume_empty_range(idx, 1)
+            return None
         local_y0, local_x0, local_y1, local_x1, tile_crop = decoded
         global_y0 = int(py0) + int(local_y0)
         global_y1 = int(py0) + int(local_y1)
@@ -2907,28 +2883,21 @@ def gate_raw_bbox_tile_store_against_parent_mask(
             x0=int(global_x0), x1=int(global_x1),
             crop_u8=accepted,
         )
-        payload = _encode_bool_mask_slice_payload(int(idx), rejected)
-        if bool(payload.is_empty):
-            return payload
-        return dataclasses_replace(
-            payload,
-            y0=int(payload.y0) + int(local_y0),
-            y1=int(payload.y1) + int(local_y0),
-            x0=int(payload.x0) + int(local_x0),
-            x1=int(payload.x1) + int(local_x0),
+        writer.consume_sparse_slice(
+            idx, local_y0, local_y1, local_x0, local_x1, rejected,
         )
+        return local_y0, local_x0, accepted
 
+    writer = None
     try:
-        residual_stats = _write_raw_bbox_payload_store(
+        writer = IncrementalRawBBoxMaskStoreWriter(
             shape=tuple(int(v) for v in store.shape),
             store_dir=residual_dir,
-            encode_slice=_encode_residual,
             format_name=CTILE_FORMAT,
             desc=(
                 f'Parent-failed tile residual {result.model_name}/'
                 f'{result.view_name}/{result.tile_id}'
             ),
-            workers=int(slice_workers),
             extra_meta={
                 'parent_crop': [int(py0), int(py1), int(px0), int(px1)],
                 'tta_aug_id': str(result.aug_id),
@@ -2937,6 +2906,13 @@ def gate_raw_bbox_tile_store_against_parent_mask(
                 'gate': 'parent_mask',
             },
         )
+        _run_tile_gate_slices(result, 'parent_mask', store.shape[0], _encode_residual,
+            slice_workers, writer.desc)
+        residual_stats = writer.finalize()
+    except BaseException:
+        if writer is not None:
+            writer.discard()
+        raise
     finally:
         store.unlink()
 
@@ -2995,8 +2971,6 @@ def gate_raw_bbox_tile_store_against_parent_bridge(
     store = result.tile_mask_store
     if store is None:
         raise ValueError('Sparse bridge tile gate requires tile_mask_store')
-    from .confidence_tiles import record_tile_confidence_gate
-    record_tile_confidence_gate(result, parent_bridge_support_mm, 'parent_bridge')
     py0, py1, px0, px1 = (int(v) for v in result.parent_crop)
     support_shape = _volume_shape_tuple(parent_bridge_support_mm)
     if tuple(int(v) for v in tile_accumulator_mm.shape) != support_shape:
@@ -3013,7 +2987,7 @@ def gate_raw_bbox_tile_store_against_parent_bridge(
 
     per_slice = np.zeros((int(store.shape[0]), 4), dtype=np.int64)
 
-    def _process(idx: int) -> None:
+    def _process(idx: int):
         decoded = store.decode_slice_crop(int(idx), dtype=np.uint8)
         if decoded is None:
             return
@@ -3044,21 +3018,11 @@ def gate_raw_bbox_tile_store_against_parent_bridge(
             x0=int(global_x0), x1=int(global_x1),
             crop_u8=accepted,
         )
+        return local_y0, local_x0, accepted
 
     try:
-        parallel_for_indices_chunked(
-            int(store.shape[0]),
-            _process,
-            max_workers=choose_slice_parallel_workers(
-                int(slice_workers), max(1, int(store.shape[0])),
-            ),
-            desc=(
-                f'Sparse parent-bridge tile gate '
-                f'{result.model_name}/{result.view_name}/{result.tile_id}'
-            ),
-            show_progress=False,
-            target_chunks_per_worker=2,
-        )
+        _run_tile_gate_slices(result, 'parent_bridge', store.shape[0], _process, slice_workers,
+            f'Sparse parent-bridge tile gate {result.model_name}/{result.view_name}/{result.tile_id}')
     finally:
         store.unlink()
 
@@ -3077,6 +3041,86 @@ def gate_raw_bbox_tile_store_against_parent_bridge(
             'rejected_voxels': int(totals[3]),
         },
     )
+
+def retire_azimuthal_seam_tile(
+    padding_mask: np.ndarray,
+    padding_scores: Optional[np.ndarray],
+    slots: Sequence[Tuple[int, int]],
+    *,
+    model_name: str,
+    view: ViewInfo,
+    config_id: str,
+    tile_id: str,
+    parent_crop: Tuple[int, int, int, int],
+    threshold_plane_shape: Tuple[int, int],
+    precleaned: bool,
+    min_conf: float,
+    min_radius: float,
+    workers: int,
+    work_dir: Path,
+) -> Optional[DeferredTilePostprocessResult]:
+    """Clean populated seam planes, then encode them at their destinations."""
+    from .confidence_tiles import capture_tile_confidence, discard_unpublished_tile_confidence
+
+    destinations = {z: i for i, z in enumerate(sorted({z for _, z in slots}))}
+    py0, py1, px0, px1 = parent_crop
+    plane_shape = (py1 - py0, px1 - px0)
+    if tuple(padding_mask.shape[1:]) != plane_shape:
+        raise ValueError(f'{tile_id}: seam tile crop differs from its padding sink')
+    mask = np.zeros((len(destinations), *plane_shape), dtype=np.uint8)
+    scores = np.zeros_like(mask) if padding_scores is not None else None
+    for ordinal, z in slots:
+        local = destinations[z]
+        np.bitwise_or(mask[local], padding_mask[ordinal], out=mask[local])
+        if scores is not None:
+            np.maximum(scores[local], padding_scores[ordinal], out=scores[local])
+
+    cleanup_view_volume_after_prediction_inplace(
+        mask, scores, view, min_conf, min_radius, workers=workers,
+        precleaned_slice_cleanup=precleaned, threshold_plane_shape=threshold_plane_shape,
+    )
+    if not mask.any():
+        return None
+    shape = (int(view.num_slices), *plane_shape)
+    store_dir = work_dir / 'waiting_tiles' / model_name / view.name / config_id / f'{tile_id}.ctile'
+    result = DeferredTilePostprocessResult(
+        model_name=model_name, view_name=view.name, aug_id=view.tta_aug_id,
+        angle_deg=view.tta_angle_deg, config_id=config_id, tile_id=tile_id,
+        parent_crop=parent_crop, tile_mask_path=store_dir, tile_shape=shape,
+        storage_format=CTILE_FORMAT,
+    )
+    capture_tile_confidence(
+        TilePostprocessTask(
+            model_name=model_name, view_name=view.name, aug_id=view.tta_aug_id,
+            angle_deg=view.tta_angle_deg, config_id=config_id, tile_id=tile_id,
+            parent_crop=parent_crop, tile_mask_mm=mask, tile_confmap_mm=scores,
+            tile_mask_path=store_dir, tile_confmap_path=None,
+        ),
+        view=view, work_dir=work_dir, destinations=destinations,
+    )
+    try:
+        stats = _write_raw_bbox_payload_store(
+            shape=shape, store_dir=store_dir, format_name=CTILE_FORMAT,
+            encode_slice=lambda z: _encode_bool_mask_slice_payload(z, mask[destinations[z]]),
+            desc=f'Waiting azimuthal seam tile {model_name}/{view.name}/{tile_id}',
+            workers=workers, slice_indices=tuple(destinations),
+            extra_meta={
+                'waiting_tile_id': tile_id, 'parent_crop': list(parent_crop),
+                'tta_aug_id': view.tta_aug_id, 'tta_angle_deg': float(view.tta_angle_deg),
+            },
+        )
+        runtime_telemetry().add('tile.ctile_logical_dense_bytes_retired', int(mask.nbytes))
+        runtime_telemetry().add('tile.ctile_payload_bytes', int(stats['raw_payload_bytes']))
+    except BaseException as error:
+        for cleanup in (_delete_tile_result_storage, discard_unpublished_tile_confidence):
+            try:
+                cleanup(result)
+            except Exception as cleanup_error:
+                if hasattr(error, 'add_note'):
+                    error.add_note(f'Partial seam result cleanup failed: {cleanup_error}')
+        raise
+    return result
+
 
 def postprocess_tile_volume_after_inference(
     task: TilePostprocessTask,
@@ -3328,8 +3372,6 @@ def gate_tile_result_against_parent_mask(
             tile_parent_mask_accumulator_locks=tile_parent_mask_accumulator_locks,
         )
 
-    from .confidence_tiles import record_tile_confidence_gate
-    record_tile_confidence_gate(result, parent_mask_support_mm, 'parent_mask')
     gate_stats = gate_tile_components_against_support_inplace(
         dense_tile,
         parent_mask_support_mm,
@@ -3341,6 +3383,7 @@ def gate_tile_result_against_parent_mask(
         retain_rejected_components=True,
         workers=int(slice_workers),
         desc=f'Parent-YOLO tile gate {result.model_name}/{result.view_name}/{result.tile_id}',
+        confidence_result=result,
     )
 
     residual_result: Optional[TilePostprocessResult]
@@ -3413,8 +3456,6 @@ def gate_tile_residual_against_parent_bridge(
         )
 
     try:
-        from .confidence_tiles import record_tile_confidence_gate
-        record_tile_confidence_gate(result, parent_bridge_support_mm, 'parent_bridge')
         gate_stats = gate_tile_components_against_support_inplace(
             dense_tile,
             parent_bridge_support_mm,
@@ -3426,6 +3467,7 @@ def gate_tile_residual_against_parent_bridge(
             retain_rejected_components=False,
             workers=int(slice_workers),
             desc=f'Parent-bridge tile gate {result.model_name}/{result.view_name}/{result.tile_id}',
+            confidence_result=result,
         )
         return TileGateResult(
             model_name=str(result.model_name),
@@ -3483,6 +3525,7 @@ def finalize_consolidated_tile_volume_for_parent(
  tile support is written separately for tiles accepted by parent YOLO masks and by parent
  interpolation bridges; tile interpolation bridges are then exported per configuration/pass."""
     # Local import keeps the package dependency graph acyclic.
+    from .confidence_tiles import retire_tile_confidence
     from .finalization import union_volume_into_volume
 
     backend = str(interpolation_backend)
@@ -3522,6 +3565,7 @@ def finalize_consolidated_tile_volume_for_parent(
             )
             if empty_ref is not None:
                 nrrd_layers.append(empty_ref)
+        retire_tile_confidence(model_name, view.name, config_id)
         if bool(internal_final_layer_enabled):
             internal_ref = materialize_internal_final_view_layer(
                 destination_mm,
@@ -3599,6 +3643,8 @@ def finalize_consolidated_tile_volume_for_parent(
             if layer_ref is not None:
                 nrrd_layers.append(layer_ref)
 
+
+    retire_tile_confidence(model_name, view.name, config_id)
 
     observation_inventory = None
     if (backend == 'sam' and int(extrapolation_distance) > 0 and int(interpolate_passes) > 0
@@ -3821,15 +3867,21 @@ def _try_get_gpu_gaussian_backend() -> Optional[Tuple[object, object]]:
         return None
     return cp, cpx_ndi
 
-def _gaussian_gpu_core_depth(shape_tyx: Tuple[int, int, int], sigma: float, truncate: float = 4.0) -> Tuple[int, int]:
+def _gaussian_gpu_core_depth(
+    shape_tyx: Tuple[int, int, int], sigma: float, truncate: float = 4.0,
+    *, free_bytes: Optional[int] = None,
+) -> Tuple[int, int]:
     z_dim, h_dim, w_dim = (int(shape_tyx[0]), int(shape_tyx[1]), int(shape_tyx[2]))
     halo = max(0, int(math.ceil(float(truncate) * float(sigma))))
     target_bytes = int(gaussian_smoothing_gpu_chunk_mib()) * 1024 * 1024
-    bytes_per_slice = max(1, int(h_dim) * int(w_dim) * np.dtype(np.float32).itemsize)
-    # cupyx.ndimage may allocate temporaries; budget input/output plus one scratch-equivalent.
-    max_read_slices = max(1, int(target_bytes // max(1, bytes_per_slice * 3)))
-    core_depth = max(1, int(max_read_slices) - 2 * int(halo))
-    return min(max(1, int(core_depth)), max(1, int(z_dim))), int(halo)
+    if free_bytes is not None:
+        target_bytes = min(target_bytes, max(0, int(free_bytes) * 3 // 4 - 256 * 1024 * 1024))
+    # One uint8 upload and three float32 buffers for input, output and scratch.
+    bytes_per_slice = max(1, h_dim * w_dim * (1 + 3 * np.dtype(np.float32).itemsize))
+    max_read_slices = target_bytes // bytes_per_slice
+    if z_dim <= max_read_slices:
+        return max(1, z_dim), halo
+    return max(0, max_read_slices - 2 * halo), halo
 
 def _try_apply_gaussian_smoothing_gpu_chunked_inplace(
     mask_mm: np.ndarray,
@@ -3861,94 +3913,96 @@ def _try_apply_gaussian_smoothing_gpu_chunked_inplace(
     if sigma_f <= 0.0 or passes_i <= 0:
         return stats
 
-    smooth_dir = temp_dir / 'gaussian_smoothing'
-    smooth_dir.mkdir(parents=True, exist_ok=True)
     shape = tuple(int(x) for x in np.asarray(mask_mm).shape)
     if len(shape) != 3:
         raise ValueError(f'Gaussian smoothing expects a 3D volume, got shape {shape}')
-    num_slices = int(shape[0])
-    core_depth, halo = _gaussian_gpu_core_depth(shape, sigma_f, truncate=4.0)
-    stats['backend'] = 'cupy_chunked_gpu'
-    stats['chunk_core_slices'] = int(core_depth)
-    stats['halo_slices'] = int(halo)
-    print(
-        'Gaussian smoothing GPU backend active: '
-        f'shape={shape}, sigma={sigma_f:g}, passes={passes_i}, core_slices={core_depth}, '
-        f'halo={halo}, chunk_budget={gaussian_smoothing_gpu_chunk_mib()} MiB'
-    )
+    import torch
 
-    for pass_idx in range(1, passes_i + 1):
-        print(f'Gaussian smoothing GPU pass {int(pass_idx)}/{int(passes_i)} (sigma={sigma_f:g} voxels)')
-        source_path = smooth_dir / f'pass{int(pass_idx):02d}_source.u8.dat'
-        source_mm = copy_workspace_array(
-            np.asarray(mask_mm, dtype=np.uint8),
-            source_path,
-            desc=f'Gaussian smoothing GPU pass {int(pass_idx)} source snapshot',
-            prefer_memory=False,
+    num_slices = int(shape[0])
+    lease = _try_acquire_main_process_gpu_stage(torch, 'Gaussian smoothing')
+    if lease is None:
+        return None
+
+    def _publish_pass(pass_index: int) -> None:
+        if nrrd_layers is None:
+            return
+        layer_ref = materialize_nrrd_global_layer(
+            mask_mm,
+            model_name=str(nrrd_model_name),
+            source='global',
+            mask_kind='smoothing_result',
+            pass_index=pass_index,
+            stage='gaussian_smoothing',
+            description='Full-volume result after this GPU Gaussian smoothing pass.',
+            temp_dir=temp_dir,
             workers=int(workers),
         )
-        added_by_slice = np.zeros((num_slices,), dtype=np.int64)
-        removed_by_slice = np.zeros((num_slices,), dtype=np.int64)
+        if layer_ref is not None:
+            nrrd_layers.append(layer_ref)
+
+    with lease, cp.cuda.Device(lease.device_index):
+        memory_info = getattr(getattr(cp.cuda, 'runtime', None), 'memGetInfo', None)
         try:
-            ranges = [(int(z0), int(min(num_slices, z0 + core_depth))) for z0 in range(0, num_slices, core_depth)]
-            for z0, z1 in tqdm(ranges, desc=f'Gaussian smoothing GPU pass {int(pass_idx)}: chunked filter'):
-                read0 = max(0, int(z0) - int(halo))
-                read1 = min(num_slices, int(z1) + int(halo))
-                core0 = int(z0) - int(read0)
-                core1 = core0 + int(z1 - z0)
-                chunk_cpu = np.ascontiguousarray(np.asarray(source_mm[int(read0):int(read1)], dtype=np.float32))
-                chunk_gpu = cp.asarray(chunk_cpu)
-                smoothed_gpu = binary_gaussian_pass(
-                    chunk_gpu,
-                    sigma=float(sigma_f),
-                    gaussian_filter=cpx_ndi.gaussian_filter,
-                    array_module=cp,
-                )
-                core_bool = cp.asnumpy(smoothed_gpu[int(core0):int(core1)]).astype(bool, copy=False)
-                old_bool = np.asarray(source_mm[int(z0):int(z1)], dtype=bool)
-                for local_z in range(int(z1 - z0)):
-                    new = core_bool[int(local_z)]
-                    old = old_bool[int(local_z)]
-                    added_by_slice[int(z0) + int(local_z)] = np.int64(np.count_nonzero(new & (~old)))
-                    removed_by_slice[int(z0) + int(local_z)] = np.int64(np.count_nonzero(old & (~new)))
-                mask_mm[int(z0):int(z1), :, :] = core_bool.astype(np.uint8, copy=False)
-                try:
-                    del chunk_gpu, smoothed_gpu, core_bool, chunk_cpu
-                    free_all = getattr(cp.get_default_memory_pool(), 'free_all_blocks', None)
-                    if callable(free_all):
-                        free_all()
-                except Exception:
-                    pass
+            free_bytes = int(memory_info()[0]) if callable(memory_info) else None
+        except Exception as exc:
+            print(f'Warning: could not query Gaussian GPU memory ({exc}); falling back to CPU.')
+            return None
+        core_depth, halo = _gaussian_gpu_core_depth(shape, sigma_f, free_bytes=free_bytes)
+        if core_depth == 0:
+            print('Warning: Gaussian GPU budget cannot fit the halo; falling back to CPU.')
+            return None
+        stats['backend'] = 'cupy_chunked_gpu'
+        stats['chunk_core_slices'] = core_depth
+        stats['halo_slices'] = halo
+        print(
+            'Gaussian smoothing GPU backend active: '
+            f'shape={shape}, sigma={sigma_f:g}, passes={passes_i}, core_slices={core_depth}, '
+            f'halo={halo}, configured_chunk_budget={gaussian_smoothing_gpu_chunk_mib()} MiB'
+        )
+        try:
+            previous = np.empty((min(halo, num_slices), *shape[1:]), dtype=np.uint8)
+            ranges = [(z0, min(num_slices, z0 + core_depth)) for z0 in range(0, num_slices, core_depth)]
+            for pass_idx in range(1, passes_i + 1):
+                added = removed = 0
+                for z0, z1 in tqdm(ranges, desc=f'Gaussian smoothing GPU pass {pass_idx}/{passes_i}'):
+                    read1 = min(num_slices, z1 + halo)
+                    core0 = min(z0, halo)
+                    core1 = core0 + z1 - z0
+                    chunk_cpu = np.empty((core0 + read1 - z0, *shape[1:]), dtype=np.uint8)
+                    chunk_cpu[:core0] = previous[:core0]
+                    chunk_cpu[core0:] = mask_mm[z0:read1]
+                    chunk_gpu = cp.asarray(chunk_cpu)
+                    smoothed_gpu = binary_gaussian_pass(
+                        chunk_gpu, sigma=sigma_f, gaussian_filter=cpx_ndi.gaussian_filter,
+                        array_module=cp,
+                    )
+                    core_bool = cp.asnumpy(smoothed_gpu[core0:core1]).astype(bool, copy=False)
+                    del chunk_gpu, smoothed_gpu
+                    for source_slice, new in zip(chunk_cpu[core0:core1], core_bool):
+                        old = source_slice != 0
+                        added += int(np.count_nonzero(new & ~old))
+                        removed += int(np.count_nonzero(old & ~new))
+                    # Preserve the previous halo even when this core is shallower than it.
+                    next_halo = min(z1, halo)
+                    previous[:next_halo] = chunk_cpu[core1 - next_halo:core1]
+                    mask_mm[z0:z1] = core_bool
+                    del chunk_cpu, core_bool
+
+                if pass_idx < passes_i:
+                    _publish_pass(pass_idx)
+
+                stats[f'pass{pass_idx}_added_voxels'] = added
+                stats[f'pass{pass_idx}_removed_voxels'] = removed
+                stats['total_added_voxels'] = int(stats.get('total_added_voxels', 0)) + added
+                stats['total_removed_voxels'] = int(stats.get('total_removed_voxels', 0)) + removed
+                stats['passes_completed'] = pass_idx
         finally:
-            close_memmap_array(source_mm, unlink_path=source_path)
             try:
-                source_path.unlink(missing_ok=True)
+                cp.get_default_memory_pool().free_all_blocks()
             except Exception:
                 pass
 
-        if nrrd_layers is not None:
-            layer_ref = materialize_nrrd_global_layer(
-                mask_mm,
-                model_name=str(nrrd_model_name),
-                source='global',
-                mask_kind='smoothing_result',
-                pass_index=int(pass_idx),
-                stage='gaussian_smoothing',
-                description='Full-volume result after this GPU Gaussian smoothing pass.',
-                temp_dir=temp_dir,
-                workers=int(workers),
-            )
-            if layer_ref is not None:
-                nrrd_layers.append(layer_ref)
-
-        added = int(np.sum(added_by_slice, dtype=np.int64))
-        removed = int(np.sum(removed_by_slice, dtype=np.int64))
-        stats[f'pass{int(pass_idx)}_added_voxels'] = int(added)
-        stats[f'pass{int(pass_idx)}_removed_voxels'] = int(removed)
-        stats['total_added_voxels'] = int(stats.get('total_added_voxels', 0)) + int(added)
-        stats['total_removed_voxels'] = int(stats.get('total_removed_voxels', 0)) + int(removed)
-        stats['passes_completed'] = int(pass_idx)
-
+    _publish_pass(passes_i)
     return stats
 
 def apply_gaussian_smoothing_inplace(

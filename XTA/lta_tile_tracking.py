@@ -62,6 +62,18 @@ def rebase_tile_mask(mask: Any, source: TilePlan, destination: TilePlan) -> Any:
 
     import numpy as np
 
+    port = rebase_tile_mask_port(mask, source, destination)
+    output = np.zeros((destination.height, destination.width), dtype=np.bool_)
+    if port is not None:
+        destination_slice, source_crop = port
+        output[destination_slice] = source_crop
+    return output
+
+
+def rebase_tile_mask_port(mask: Any, source: TilePlan, destination: TilePlan):
+    """Return the destination slices and source view for a shared tile port."""
+    import numpy as np
+
     source_mask = np.asarray(mask, dtype=bool)
     if source_mask.shape != (source.height, source.width):
         raise ValueError(
@@ -72,9 +84,8 @@ def rebase_tile_mask(mask: Any, source: TilePlan, destination: TilePlan) -> Any:
     dx0, dy0, dx1, dy1 = destination.xyxy
     gx0, gy0 = max(sx0, dx0), max(sy0, dy0)
     gx1, gy1 = min(sx1, dx1), min(sy1, dy1)
-    output = np.zeros((destination.height, destination.width), dtype=np.bool_)
     if gx1 < gx0 or gy1 < gy0:
-        return output
+        return None
 
     if gx1 > gx0:
         source_x = slice(gx0 - sx0, gx1 - sx0)
@@ -86,7 +97,7 @@ def rebase_tile_mask(mask: Any, source: TilePlan, destination: TilePlan) -> Any:
         source_x = slice(0, 1)
         destination_x = slice(destination.width - 1, destination.width)
     else:
-        return output
+        return None
 
     if gy1 > gy0:
         source_y = slice(gy0 - sy0, gy1 - sy0)
@@ -98,10 +109,9 @@ def rebase_tile_mask(mask: Any, source: TilePlan, destination: TilePlan) -> Any:
         source_y = slice(0, 1)
         destination_y = slice(destination.height - 1, destination.height)
     else:
-        return output
+        return None
 
-    output[destination_y, destination_x] = source_mask[source_y, source_x]
-    return output
+    return (destination_y, destination_x), source_mask[source_y, source_x]
 
 
 __all__ = (

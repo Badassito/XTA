@@ -10,6 +10,7 @@ from collections import OrderedDict
 from functools import lru_cache
 from types import SimpleNamespace
 import math
+import threading
 import time
 
 import numpy as np
@@ -21,10 +22,9 @@ from .geometry_quality import spherical_fp32_requested, spherical_fp32_shape_eli
 
 _DIRECTION_CACHE_BYTES = 256 * 1024**2
 _ROW_BLOCK = 64
-_KERNELS = None
-_KERNEL_ERROR = ''
-_FP32_KERNELS = None
-_FP32_KERNEL_ERROR = ''
+_KERNELS = {}
+_KERNEL_ERRORS = {}
+_KERNEL_LOCK = threading.Lock()
 
 
 def clear_spherical_render_cache(engine):
@@ -321,6 +321,7 @@ __device__ __forceinline__ float spherical_logical_voxel(
     int t1 = spherical_clip(t0 + 1, native_t);
     float alpha = __double2float_rn(fmin(1.0, fmax(0.0, rf - (double)t0)));
     float f0 = (float)source[(unsigned long long)t0 * stride + spatial];
+    if (t0 == t1 || alpha == 0.0f) return f0;
     float f1 = (float)source[(unsigned long long)t1 * stride + spatial];
     float value = __fadd_rn(f0, __fmul_rn(alpha, __fsub_rn(f1, f0)));
     return (float)__float2uint_rn(fminf(255.0f, fmaxf(0.0f, value)));
@@ -348,18 +349,19 @@ extern "C" __global__ void spherical_native_f32(
     for (int it = 0; it < 2; ++it) {
         int ti = t0 + it;
         float wt = it ? dt : __fsub_rn(1.0f, dt);
+        if (wt == 0.0f || ti < 0 || ti >= logical_t) continue;
         #pragma unroll
         for (int iy = 0; iy < 2; ++iy) {
             int yi = y0 + iy;
             float wy = iy ? dy : __fsub_rn(1.0f, dy);
+            if (wy == 0.0f || yi < 0 || yi >= height) continue;
             #pragma unroll
             for (int ix = 0; ix < 2; ++ix) {
                 int xi = x0 + ix;
                 float wx = ix ? dx : __fsub_rn(1.0f, dx);
-                if (ti >= 0 && ti < logical_t && yi >= 0 && yi < height && xi >= 0 && xi < width) {
-                    float voxel = spherical_logical_voxel(source, ti, yi, xi, native_t, logical_t, height, width);
-                    value = __fadd_rn(value, __fmul_rn(voxel, __fmul_rn(__fmul_rn(wt, wy), wx)));
-                }
+                if (wx == 0.0f || xi < 0 || xi >= width) continue;
+                float voxel = spherical_logical_voxel(source, ti, yi, xi, native_t, logical_t, height, width);
+                value = __fadd_rn(value, __fmul_rn(voxel, __fmul_rn(__fmul_rn(wt, wy), wx)));
             }
         }
     }
@@ -368,64 +370,72 @@ extern "C" __global__ void spherical_native_f32(
 '''
 
 
-def _spherical_kernels():
-    global _KERNELS, _KERNEL_ERROR
-    if _KERNELS is not None:
-        return _KERNELS
-    if _KERNEL_ERROR:
-        raise RuntimeError(_KERNEL_ERROR)
-    try:
-        import cupy as cp
-        module = cp.RawModule(code=_KERNEL_SOURCE, options=('--std=c++11', '--fmad=false'))
-        _KERNELS = SimpleNamespace(cp=cp, module=module, kernel=module.get_function('spherical_native_f32'))
-        return _KERNELS
-    except Exception as exc:
-        _KERNEL_ERROR = f'Spherical CuPy/NVRTC kernel unavailable: {type(exc).__name__}: {exc}'
-        raise RuntimeError(_KERNEL_ERROR) from exc
+def _get_spherical_kernels(device_index, fp32):
+    import cupy as cp
+
+    device_index = cp.cuda.runtime.getDevice() if device_index is None else int(device_index)
+    key = (device_index, fp32)
+    with _KERNEL_LOCK:
+        kernels = _KERNELS.get(key)
+        if kernels is not None:
+            return kernels
+        if key in _KERNEL_ERRORS:
+            raise RuntimeError(_KERNEL_ERRORS[key])
+        try:
+            if fp32:
+                from .spherical_sampling_cuda import SPHERICAL_FP32_SOURCE
+                source, kernel_name, fmad = SPHERICAL_FP32_SOURCE, 'spherical_virtual_fp32', '--fmad=true'
+            else:
+                source, kernel_name, fmad = _KERNEL_SOURCE, 'spherical_native_f32', '--fmad=false'
+            with cp.cuda.Device(device_index):
+                module = cp.RawModule(code=source, options=('--std=c++11', fmad))
+                kernels = SimpleNamespace(cp=cp, module=module, kernel=module.get_function(kernel_name))
+        except Exception as error:
+            _KERNEL_ERRORS[key] = f'Spherical CuPy/NVRTC kernel unavailable: {type(error).__name__}: {error}'
+            raise RuntimeError(_KERNEL_ERRORS[key]) from error
+        _KERNELS[key] = kernels
+        return kernels
 
 
-def _render_spherical_native_cuda(engine, view, index):
+def _spherical_kernels(device_index=None):
+    return _get_spherical_kernels(device_index, False)
+
+
+def _spherical_fp32_kernels(device_index=None):
+    return _get_spherical_kernels(device_index, True)
+
+
+def _launch_spherical_cuda(engine, view, radius, shape, key, kernels, dtype):
     from .geometry import _cupy_external_stream
-    radius, shape, key = _render_contract(engine, view, index)
-    kernels = _spherical_kernels()
-    output = engine.torch.empty((int(view.src_h), int(view.src_w)), dtype=engine.torch.float32, device=engine.device)
-    source_ref = engine._fused_cupy_volume(kernels)
-    output_ref = kernels.cp.asarray(output)
-    stream = _cupy_external_stream(kernels.cp, engine._stream)
-    for row0, directions, valid in _direction_blocks(engine, key):
-        # Typed cache entries can be evicted while this reference kernel is
-        # queued on the render stream. Track those CuPy reads explicitly even
-        # when the plans/output were allocated on another Torch stream.
-        for tensor in (directions, valid, output):
-            if bool(tensor.is_cuda):
+
+    source = engine._volume_gpu
+    cp, torch = kernels.cp, engine.torch
+    with cp.cuda.Device(source.device.index), torch.cuda.stream(engine._stream), _cupy_external_stream(cp, engine._stream) as stream:
+        output = torch.empty((int(view.src_h), int(view.src_w)), dtype=torch.float32, device=engine.device)
+        source_ref = engine._fused_cupy_volume(kernels)
+        output_ref = cp.asarray(output)
+        for tensor in (source, output):
+            if tensor.is_cuda:
                 tensor.record_stream(engine._stream)
-        count = int(valid.numel())
-        kernels.kernel(
-            ((count + 255) // 256,), (256,),
-            (source_ref, kernels.cp.asarray(directions), kernels.cp.asarray(valid), output_ref,
-             np.int32(engine._volume_gpu.shape[0]), np.int32(shape[0]), np.int32(shape[1]), np.int32(shape[2]),
-             np.uint64(count), np.uint64(row0 * int(view.src_w)), np.float64(radius)), stream=stream,
-        )
+        for row0, directions, valid in _direction_blocks(engine, key, dtype=dtype):
+            # The direction cache can evict a tensor while the CuPy reader is queued.
+            for tensor in (directions, valid):
+                if tensor.is_cuda:
+                    tensor.record_stream(engine._stream)
+            count = int(valid.numel())
+            kernels.kernel(
+                ((count + 255) // 256,), (256,),
+                (source_ref, cp.asarray(directions), cp.asarray(valid), output_ref,
+                 np.int32(source.shape[0]), *(np.int32(size) for size in shape),
+                 np.uint64(count), np.uint64(row0 * int(view.src_w)), dtype(radius)), stream=stream,
+            )
     return output
 
 
-def _spherical_fp32_kernels():
-    global _FP32_KERNELS, _FP32_KERNEL_ERROR
-    if _FP32_KERNELS is not None:
-        return _FP32_KERNELS
-    if _FP32_KERNEL_ERROR:
-        raise RuntimeError(_FP32_KERNEL_ERROR)
-    try:
-        import cupy as cp
-        from .spherical_sampling_cuda import SPHERICAL_FP32_SOURCE
-        module = cp.RawModule(code=SPHERICAL_FP32_SOURCE, options=('--std=c++11', '--fmad=true'))
-        _FP32_KERNELS = SimpleNamespace(cp=cp, module=module,
-                                       kernel=module.get_function('spherical_virtual_fp32'))
-        return _FP32_KERNELS
-    except Exception as exc:
-        _FP32_KERNEL_ERROR = f'Spherical FP32 kernel unavailable: {type(exc).__name__}: {exc}'
-        raise RuntimeError(_FP32_KERNEL_ERROR) from exc
-
+def _render_spherical_native_cuda(engine, view, index):
+    radius, shape, key = _render_contract(engine, view, index)
+    kernels = _spherical_kernels(engine._volume_gpu.device.index)
+    return _launch_spherical_cuda(engine, view, radius, shape, key, kernels, np.float64)
 
 def _spherical_fp32_eligible(engine):
     volume = engine._volume_gpu
@@ -435,7 +445,6 @@ def _spherical_fp32_eligible(engine):
 
 def _render_spherical_fp32_cuda(engine, view, index):
     """Sample the same virtual gray8 cube using FP32 coordinates and FMA."""
-    from .geometry import _cupy_external_stream
     from .geometry_quality import SPHERICAL_FP32_BACKEND
     from .unification.contracts import DataRole
     from .unification.sampling import require_forward_sampling
@@ -443,26 +452,8 @@ def _render_spherical_fp32_cuda(engine, view, index):
     if not _spherical_fp32_eligible(engine):
         raise ValueError('Spherical FP32 sampling requires source axes in [1,4096]')
     require_forward_sampling(SPHERICAL_FP32_BACKEND, DataRole.INTENSITY)
-    kernels = _spherical_fp32_kernels()
-    output = engine.torch.empty((int(view.src_h), int(view.src_w)), dtype=engine.torch.float32, device=engine.device)
-    source_ref = engine._fused_cupy_volume(kernels)
-    output_ref = kernels.cp.asarray(output)
-    stream = _cupy_external_stream(kernels.cp, engine._stream)
-    for row0, directions, valid in _direction_blocks(engine, key, dtype=np.float32):
-        # Cache entries may be evicted before queued CuPy readers finish, and
-        # callers can allocate on a different Torch stream than the renderer.
-        for tensor in (directions, valid, output):
-            if bool(tensor.is_cuda):
-                tensor.record_stream(engine._stream)
-        count = int(valid.numel())
-        kernels.kernel(
-            ((count + 255) // 256,), (256,),
-            (source_ref, kernels.cp.asarray(directions), kernels.cp.asarray(valid), output_ref,
-             np.int32(engine._volume_gpu.shape[0]), np.int32(shape[0]), np.int32(shape[1]), np.int32(shape[2]),
-             np.uint64(count), np.uint64(row0 * int(view.src_w)), np.float32(radius)), stream=stream,
-        )
-    return output
-
+    kernels = _spherical_fp32_kernels(engine._volume_gpu.device.index)
+    return _launch_spherical_cuda(engine, view, radius, shape, key, kernels, np.float32)
 
 def render_spherical_native_resident(engine, view, index):
     """Render one radius into float32 gray8 on the engine's active render stream."""

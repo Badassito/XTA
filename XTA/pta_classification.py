@@ -30,9 +30,15 @@ def _axis_matrix(matrix: np.ndarray) -> Optional[tuple[np.ndarray, bool]]:
     return None
 
 
+def _sampled_axis(indices: np.ndarray, extent: int) -> np.ndarray:
+    """Only membership in the native axis matters for a foreground query."""
+    return np.unique(indices[(indices >= 0) & (indices < extent)])
+
+
 @lru_cache(maxsize=256)
 def _axis_indices(
     matrix_values: tuple[float, ...], source_h: int, source_w: int, out_h: int, out_w: int,
+    sampled_only: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Ask OpenCV for its exact INTER_NEAREST source indices on each axis."""
     m = np.asarray(matrix_values, dtype=np.float32).reshape(2, 3)
@@ -44,11 +50,16 @@ def _axis_indices(
                        borderMode=cv2.BORDER_CONSTANT, borderValue=-1).reshape(-1)
     y = cv2.warpAffine(y_ramp, y_transform, (1, int(out_h)), flags=cv2.INTER_NEAREST,
                        borderMode=cv2.BORDER_CONSTANT, borderValue=-1).reshape(-1)
-    return x.astype(np.int32, copy=False), y.astype(np.int32, copy=False)
+    x = x.astype(np.int32, copy=False)
+    y = y.astype(np.int32, copy=False)
+    if sampled_only:
+        return _sampled_axis(x, source_w), _sampled_axis(y, source_h)
+    return x, y
 
 
 def _lookup_for_matrix(
     matrix: np.ndarray, native_h: int, native_w: int, out_h: int, out_w: int,
+    *, sampled_only: bool = False,
 ) -> Optional[tuple[np.ndarray, np.ndarray, bool]]:
     axis = _axis_matrix(matrix)
     if axis is None:
@@ -56,18 +67,15 @@ def _lookup_for_matrix(
     diagonal, swap = axis
     source_h, source_w = (native_w, native_h) if swap else (native_h, native_w)
     x, y = _axis_indices(tuple(float(v) for v in diagonal.reshape(-1)),
-                         int(source_h), int(source_w), int(out_h), int(out_w))
+                         int(source_h), int(source_w), int(out_h), int(out_w), sampled_only)
     return x, y, swap
 
 
 def _resize_tile_indices(tile_size: int, out_h: int, out_w: int) -> tuple[np.ndarray, np.ndarray]:
     size = int(tile_size)
-    x_ramp = np.arange(size, dtype=np.int32).reshape(1, -1)
-    y_ramp = np.arange(size, dtype=np.int32).reshape(-1, 1)
-    # OpenCV does not resize CV_32S. Float32 represents PTA raster indices
-    # exactly and reproduces resize_centered(..., INTER_NEAREST).
-    x = cv2.resize(x_ramp.astype(np.float32), (int(out_w), 1), interpolation=cv2.INTER_NEAREST).reshape(-1)
-    y = cv2.resize(y_ramp.astype(np.float32), (1, int(out_h)), interpolation=cv2.INTER_NEAREST).reshape(-1)
+    ramp = np.arange(size, dtype=np.float32)
+    x = cv2.resize(ramp[None, :], (int(out_w), 1), interpolation=cv2.INTER_NEAREST_EXACT).reshape(-1)
+    y = cv2.resize(ramp[:, None], (1, int(out_h)), interpolation=cv2.INTER_NEAREST_EXACT).reshape(-1)
     return x.astype(np.int32, copy=False), y.astype(np.int32, copy=False)
 
 
@@ -87,24 +95,38 @@ def _tile_axis_indices(
     return x, y
 
 
-def _any_sampled(
-    known: np.ndarray, x_indices: np.ndarray, y_indices: np.ndarray,
-    row_any: np.ndarray, col_any: np.ndarray,
-) -> bool:
-    valid_x = x_indices[(x_indices >= 0) & (x_indices < known.shape[1])]
-    valid_y = y_indices[(y_indices >= 0) & (y_indices < known.shape[0])]
-    if valid_x.size == 0 or valid_y.size == 0:
-        return False
-    xs = np.unique(valid_x)
-    ys = np.unique(valid_y)
-    xs = xs[col_any[xs]]
-    ys = ys[row_any[ys]]
-    if xs.size == 0 or ys.size == 0:
-        return False
-    for start in range(0, len(ys), 64):
-        if np.any(known[np.ix_(ys[start:start + 64], xs)]):
+class _NativeOccupancy:
+    """Answer tile queries on one native plane already known to contain foreground."""
+
+    def __init__(self, known: np.ndarray):
+        self.known = known
+        self.rows: Optional[np.ndarray] = None
+        self.columns: Optional[np.ndarray] = None
+
+    def any_sampled(self, xs: np.ndarray, ys: np.ndarray, swap: bool) -> bool:
+        if swap:
+            xs, ys = ys, xs
+        if not xs.size or not ys.size:
+            return False
+        height, width = self.known.shape
+        if xs.size == width and ys.size == height:
             return True
-    return False
+        if ys.size != height and self.rows is None:
+            self.rows = np.any(self.known, axis=1)
+        if xs.size != width and self.columns is None:
+            self.columns = np.any(self.known, axis=0)
+        if xs.size == width:
+            return bool(np.any(self.rows[ys]))
+        if ys.size == height:
+            return bool(np.any(self.columns[xs]))
+        xs = xs[self.columns[xs]]
+        ys = ys[self.rows[ys]]
+        if not xs.size or not ys.size:
+            return False
+        for start in range(0, len(ys), 64):
+            if np.any(self.known[np.ix_(ys[start:start + 64], xs)]):
+                return True
+        return False
 
 
 def _warp_any(known: np.ndarray, matrix: np.ndarray, out_h: int, out_w: int) -> bool:
@@ -154,27 +176,21 @@ def classify_semantic_plan_frame(
             metrics['native_planes'] = int(metrics.get('native_planes', 0)) + 1
         if native_coverage.shape != native_mask.shape:
             raise ValueError('semantic coverage native frame differs from mask shape')
-        known = np.ascontiguousarray(native_mask & native_coverage, dtype=np.uint8)
-    else:
-        known = native_mask
-    if not np.any(known):
-        return result
+        np.bitwise_and(native_mask, native_coverage, out=native_mask)
+        if not np.any(native_mask):
+            return result
+    known = native_mask
     native_h, native_w = known.shape
-    row_any = np.any(known, axis=1)
-    col_any = np.any(known, axis=0)
+    occupancy = _NativeOccupancy(known)
 
     aff = plan.aff
     if include_full:
         full_lookup = _lookup_for_matrix(aff.M_src_to_out, native_h, native_w,
-                                         int(aff.out_h), int(aff.out_w))
+                                         int(aff.out_h), int(aff.out_w), sampled_only=True)
         if full_lookup is None:
             result['full'] = _warp_any(known, aff.M_src_to_out, int(aff.out_h), int(aff.out_w))
         else:
-            x, y, swap = full_lookup
-            active = known.T if swap else known
-            result['full'] = _any_sampled(active, x, y,
-                                          col_any if swap else row_any,
-                                          row_any if swap else col_any)
+            result['full'] = occupancy.any_sampled(*full_lookup)
 
     canvas_tiles = [tile for tile in tiles if tile.shared_job is None]
     canvas_lookup = None
@@ -192,32 +208,26 @@ def classify_semantic_plan_frame(
         if tile.shared_job is not None:
             job = tile.shared_job
             lookup = _lookup_for_matrix(job.M_src_to_out, native_h, native_w,
-                                        int(job.out_size), int(job.out_size))
+                                        int(job.out_size), int(job.out_size), sampled_only=True)
             if lookup is None:
                 result[str(tile.tile_tag)] = _warp_any(
                     known, job.M_src_to_out, int(job.out_size), int(job.out_size),
                 )
             else:
-                x, y, swap = lookup
-                active = known.T if swap else known
-                result[str(tile.tile_tag)] = _any_sampled(
-                    active, x, y, col_any if swap else row_any,
-                    row_any if swap else col_any,
-                )
+                result[str(tile.tile_tag)] = occupancy.any_sampled(*lookup)
         elif canvas_lookup is not None:
             canvas_x, canvas_y, swap = canvas_lookup
             x, y = _tile_axis_indices(canvas_x, canvas_y, x0=int(tile.x), y0=int(tile.y),
                                       tile_size=int(tile.cfg.tile_size),
                                       out_h=int(tile.out_h), out_w=int(tile.out_w))
-            active = known.T if swap else known
-            result[str(tile.tile_tag)] = _any_sampled(
-                active, x, y, col_any if swap else row_any,
-                row_any if swap else col_any,
+            source_h, source_w = (native_w, native_h) if swap else (native_h, native_w)
+            result[str(tile.tile_tag)] = occupancy.any_sampled(
+                _sampled_axis(x, source_w), _sampled_axis(y, source_h), swap,
             )
         else:
             assert canvas_dense is not None
             cropped = extract_padded_tile(canvas_dense, tile.x, tile.y, tile.cfg.tile_size)
-            tile_mask = resize_centered(cropped, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
+            tile_mask = resize_centered(cropped, tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT)
             result[str(tile.tile_tag)] = bool(np.any(tile_mask))
     return result
 

@@ -4,7 +4,7 @@ import io
 import os
 import threading
 import time
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -70,15 +70,18 @@ class SphericalFp32PlanTests(unittest.TestCase):
         self.engine._stream = object()
         self.engine._fused_cupy_volume = mock.Mock(return_value='source')
         kernel = mock.Mock(side_effect=lambda grid, block, args, **kwargs: args[3].fill_(127))
-        kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda value: value), kernel=kernel)
+        kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda value: value,
+                                  cuda=SimpleNamespace(Device=nullcontext)), kernel=kernel)
+        render_stream = object()
         with mock.patch.object(sc, '_spherical_fp32_kernels', return_value=kernels), \
                 mock.patch.dict(os.environ, {'YOLO_TTA_GPU_SPHERICAL_FP32': '1'}), \
-                mock.patch('XTA.geometry._cupy_external_stream', return_value='render-stream'):
+                mock.patch.object(self.engine.torch.cuda, 'stream', return_value=nullcontext()), \
+                mock.patch('XTA.geometry._cupy_external_stream', return_value=nullcontext(render_stream)):
             output = sc._render_spherical_fp32_cuda(self.engine, self.view, 1)
         args = kernel.call_args.args[2]
         self.assertEqual(args[1].dtype, self.engine.torch.float32)
         self.assertIsInstance(args[-1], np.float32)
-        self.assertEqual(kernel.call_args.kwargs['stream'], 'render-stream')
+        self.assertIs(kernel.call_args.kwargs['stream'], render_stream)
         self.assertTrue(bool((output == 127).all()))
 
 

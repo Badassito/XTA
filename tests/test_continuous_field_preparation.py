@@ -1,6 +1,7 @@
 """Continuous-field preparation, reuse, derived crops and staged-pair verification."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 import gzip
 import importlib.util
@@ -8,6 +9,7 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -208,6 +210,32 @@ class ContinuousFieldPreparationTests(unittest.TestCase):
         prep.save_json(receipt_path, receipt)
         with self.assertRaisesRegex(ValueError, 'provenance differs; nothing overwritten'):
             self.run_cli()
+
+    def test_plane_cache_builds_distinct_planes_concurrently_without_duplicate_work(self):
+        from tools.continuous_field_reconstruction import radius_upscaler
+
+        module, _ = prep.continuous_field_contract()
+        module.build_field_reference(self.mask, NATIVE, self.root / 'field')
+        reference = radius_upscaler.FieldReference(self.root / 'field')
+        maximum_filter = radius_upscaler.ndi.maximum_filter
+        distinct_planes = threading.Barrier(2)
+
+        def filter_plane(values, **kwargs):
+            if values.dtype == np.dtype(bool):
+                distinct_planes.wait(timeout=5)
+            return maximum_filter(values, **kwargs)
+
+        try:
+            with patch.object(radius_upscaler.ndi, 'maximum_filter', side_effect=filter_plane) as filtered:
+                with ThreadPoolExecutor(max_workers=3) as workers:
+                    first = workers.submit(reference._plane_state, 1)
+                    duplicate = workers.submit(reference._plane_state, 1)
+                    second = workers.submit(reference._plane_state, 2)
+                    self.assertIs(first.result(), duplicate.result())
+                    self.assertIsNot(first.result(), second.result())
+                self.assertEqual(filtered.call_count, 4)
+        finally:
+            reference.close()
 
     def test_field_cache_is_reused_across_outputs_and_guarded(self):
         cache = self.root / 'field-cache'

@@ -33,9 +33,11 @@ def test_parent_stages_record_calls_and_errors_without_starting_sampler(monkeypa
     assert telemetry._writer_thread is None
 
 
-def test_worker_finalizer_is_registered_without_initializing_telemetry():
+def test_worker_finalizer_is_registered_without_initializing_telemetry(monkeypatch):
+    monkeypatch.setattr(pta_workers, '_WORKER_OBSERVABILITY_FINALIZER', None)
     with (mock.patch('multiprocessing.util.Finalize') as finalize,
           mock.patch.object(runtime, 'initialize_runtime_observability') as initialize):
+        pta_workers._render_worker_initializer()
         pta_workers._render_worker_initializer()
     finalize.assert_called_once_with(None, pta_workers.shutdown_runtime_observability,
                                      exitpriority=10)

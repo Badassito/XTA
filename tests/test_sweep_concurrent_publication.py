@@ -173,7 +173,8 @@ def _owner(root, cent):
         low_quality_root=branch / "low_quality", run_id=branch_run_id("family-one", cent))
     owner = ViewMajorPublication(family_root=family, workspace=work, sweep_id="family-one",
         cutoffs_hundredths=CUTS, current_cutoff=cent, scalar_sink=sink, source_shape_tyx=SHAPE,
-        model_name="detector", task="segment", min_conf=0., confidence_floor_by_backend={"gpu": .5})
+        model_name="detector", task="segment", min_conf=0., confidence_floor_by_backend={"gpu": .5},
+        retain_confidence=True)
     return owner, sink
 
 
@@ -197,7 +198,8 @@ def _publish(owner, view):
         counts_by_cutoff={50: 9, 70: 6, 100: 0})
 
 
-def test_distinct_views_project_concurrently_and_publish_completely(tmp_path, monkeypatch):
+@pytest.mark.parametrize('cap', [None, '1'])
+def test_distinct_views_project_concurrently_and_publish_completely(tmp_path, monkeypatch, cap):
     from XTA import assembly
     real = assembly.project_sweep_view
     barrier = threading.Barrier(2, timeout=20)
@@ -207,6 +209,10 @@ def test_distinct_views_project_concurrently_and_publish_completely(tmp_path, mo
         return real(**kwargs)
 
     monkeypatch.setattr(assembly, "project_sweep_view", overlapping)
+    if cap is None:
+        monkeypatch.delenv("XTA_YOLO_SWEEP_PROJECTED_GIB", raising=False)
+    else:
+        monkeypatch.setenv("XTA_YOLO_SWEEP_PROJECTED_GIB", cap)
     producer, floor = _owner(tmp_path, 50)
     results, errors = {}, []
 
@@ -226,8 +232,10 @@ def test_distinct_views_project_concurrently_and_publish_completely(tmp_path, mo
         assert all(results[aug][70] is not None and results[aug][100] is None for aug in ("a0", "a1"))
         native = sorted((tmp_path / "family/confidence_cutoffs/conf_070/nrrd").glob("*.seg.nrrd"))
         assert len(native) == 2
-        receipts = list((tmp_path / "work/view_publication/published/conf_070").glob("*.json"))
+        receipts = list((tmp_path / "work/view_publication/published/by_view").glob("*.zip"))
         assert len(receipts) == 2
+        assert producer.storage_path.exists() is (cap is not None)
+        producer.close()
         storage = json.loads(producer.storage_path.read_text())
         assert storage["published_views"] == 2 and storage["live_bytes"] > 0
     finally:
@@ -526,8 +534,8 @@ def test_simultaneous_failures_report_every_root_cause(monkeypatch, tmp_path):
     _ready(plan, "v1", publication)
     with pytest.raises(RuntimeError, match="failure in v") as caught:
         plan.close()
-    notes = " ".join(getattr(caught.value, "__notes__", ()))
-    assert "also failed" in notes
+    if callable(getattr(caught.value, "add_note", None)):
+        assert any("also failed" in note for note in caught.value.__notes__)
 
 
 def test_lifecycle_cancel_prevents_queued_publications(monkeypatch, tmp_path):
@@ -628,12 +636,12 @@ def test_receipt_waits_for_durable_confidence_and_failures_leave_no_receipt(tmp_
     try:
         with pytest.raises(OSError, match="evidence volume full"):
             _publish(producer, _view("a0"))
-        assert not list((tmp_path / "work/view_publication/published/conf_070").glob("*.json"))
+        assert not list((tmp_path / "work/view_publication/published/by_view").glob("*.zip"))
         # The shared NRRD barrier owner stays healthy for other views.
         monkeypatch.setattr(sweep_confidence.SweepObservedConfidenceWriter, "publish_view", real)
         refs = _publish(producer, _view("a1"))
         assert refs[70] is not None
-        assert len(list((tmp_path / "work/view_publication/published/conf_070").glob("*.json"))) == 1
+        assert len(list((tmp_path / "work/view_publication/published/by_view").glob("*.zip"))) == 1
     finally:
         try:
             producer.close()

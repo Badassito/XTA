@@ -9,11 +9,10 @@ a live SAM session.
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 import math
 import operator
-from itertools import islice
 from typing import Deque, Iterable, Mapping, Sequence
 
 
@@ -343,6 +342,12 @@ class LtaViewAffinityScheduler:
             )
             for device in self.device_ids
         }
+        # A queued item has already satisfied its work-id dependencies.
+        # Count those items by readiness gate for per-result diagnostics.
+        self._queued_by_generation = Counter(
+            (item.view, item.relay_generation)
+            for queue in self._queues.values() for item in queue
+        )
         self._allow_tail_assist = bool(allow_tail_assist)
         self._projection_ready: set[LtaViewKey] = set()
         self._active_by_slot: dict[tuple[int, int], LtaWorkClaim] = {}
@@ -398,7 +403,20 @@ class LtaViewAffinityScheduler:
                 for dependency in remaining:
                     self._dependency_children.setdefault(dependency, []).append(item)
 
+    def _account_queued_work(self, item: LtaSessionWork, delta: int) -> None:
+        key = item.view, item.relay_generation
+        self._queued_by_generation[key] += delta
+        if not self._queued_by_generation[key]:
+            del self._queued_by_generation[key]
+
+    def _remove_queued_work(
+        self, queue: Deque[LtaSessionWork], position: int, item: LtaSessionWork,
+    ) -> None:
+        del queue[position]
+        self._account_queued_work(item, -1)
+
     def _activate_dependents(self, work_id: str) -> None:
+        touched_owners: set[int] = set()
         for child in self._dependency_children.pop(work_id, ()):
             remaining = self._waiting_dependencies[child.work_id]
             remaining.remove(work_id)
@@ -406,8 +424,11 @@ class LtaViewAffinityScheduler:
                 continue
             del self._waiting_dependencies[child.work_id]
             owner = self._owner_by_view[child.view]
+            self._queues[owner].append(child)
+            self._account_queued_work(child, 1)
+            touched_owners.add(owner)
+        for owner in touched_owners:
             queue = self._queues[owner]
-            queue.append(child)
             self._queues[owner] = deque(sorted(queue, key=lambda item: item.plan_order))
 
     def _generation_work_ids(self, view: LtaViewKey, generation: int) -> set[str]:
@@ -515,10 +536,10 @@ class LtaViewAffinityScheduler:
         self._plan_orders.update(new_orders)
         self._register_dependency_state(items)
         owner = self.owner_for_view(resolved_view)
-        self._queues[owner].extend(
-            item for item in sorted(items, key=lambda item: item.plan_order)
-            if item.work_id not in self._waiting_dependencies
-        )
+        for item in sorted(items, key=lambda item: item.plan_order):
+            if item.work_id not in self._waiting_dependencies:
+                self._queues[owner].append(item)
+                self._account_queued_work(item, 1)
         return items
 
     def seal_generation(self, view: LtaViewKey, generation: int) -> None:
@@ -590,15 +611,17 @@ class LtaViewAffinityScheduler:
     def _generation_ready(self, item: LtaSessionWork) -> bool:
         """Keep relay-derived work behind committed prior generations."""
 
-        generation = int(item.relay_generation)
         if any(work_id not in self._completed for work_id in item.dependency_work_ids):
             return False
-        if (item.view, generation) not in self._sealed_generations:
+        return self._generation_ready_for_queue(item.view, item.relay_generation)
+
+    def _generation_ready_for_queue(self, view: LtaViewKey, generation: int) -> bool:
+        if (view, generation) not in self._sealed_generations:
             return False
         if generation == 0:
             return True
         return all(
-            self._generation_is_settled(item.view, prior)
+            self._generation_is_settled(view, prior)
             for prior in range(generation)
         )
 
@@ -606,7 +629,7 @@ class LtaViewAffinityScheduler:
         queue = self._queues[device_id]
         for position, item in enumerate(queue):
             if item.view in self._projection_ready and self._generation_ready(item):
-                del queue[position]
+                self._remove_queued_work(queue, position, item)
                 return item
         return None
 
@@ -619,35 +642,33 @@ class LtaViewAffinityScheduler:
         # while its owner is still preparing the shared render cache.
         if self._queues[device_id]:
             return None
-        candidates: list[tuple[float, LtaViewKey, int, int, LtaSessionWork]] = []
+        candidates: list[tuple[int, int, LtaSessionWork]] = []
         for owner, queue in self._queues.items():
             if owner == device_id:
                 continue
-            remaining_cost = sum(item.estimated_cost for item in queue)
-            positions = (
-                range(len(queue) - 1, -1, -1)
-                if self.helper_queue_order == "tail"
-                else range(len(queue))
-            )
-            for position in positions:
-                item = queue[position]
+            if self.helper_queue_order == "tail":
+                entries = zip(range(len(queue) - 1, -1, -1), reversed(queue))
+            else:
+                entries = enumerate(queue)
+            for position, item in entries:
                 if (
                     item.tail_eligible
                     and item.view in self._projection_ready
                     and self._generation_ready(item)
                 ):
-                    candidates.append(
-                        (remaining_cost, item.view, owner, position, item)
-                    )
+                    candidates.append((owner, position, item))
                     break
         if not candidates:
             return None
-        _cost, _view, owner, position, item = min(
-            candidates,
-            key=lambda value: (-value[0], value[1].token, value[2]),
-        )
-        queue = self._queues[owner]
-        del queue[position]
+        if len(candidates) == 1:
+            owner, position, item = candidates[0]
+        else:
+            def donor_priority(candidate):
+                donor, _position, work = candidate
+                return -sum(queued.estimated_cost for queued in self._queues[donor]), work.view.token, donor
+
+            owner, position, item = min(candidates, key=donor_priority)
+        self._remove_queued_work(self._queues[owner], position, item)
         return owner, item
 
     def claim(self, device_id: int, *, worker_index: int = 0) -> LtaWorkClaim | None:
@@ -712,6 +733,7 @@ class LtaViewAffinityScheduler:
         self._active_ids.remove(claim.work.work_id)
         if retry:
             self._queues[claim.owner_device_id].appendleft(claim.work)
+            self._account_queued_work(claim.work, 1)
 
     def skip_pending(self, work_id: str, result: object) -> None:
         """Settle an unopened continuation after its verified boundary is empty."""
@@ -724,7 +746,7 @@ class LtaViewAffinityScheduler:
                     continue
                 if not self._generation_ready(item):
                     raise ValueError("skipped work must have completed dependencies")
-                del queue[position]
+                self._remove_queued_work(queue, position, item)
                 self._completed[work_id] = result
                 self._activate_dependents(work_id)
                 return
@@ -736,7 +758,8 @@ class LtaViewAffinityScheduler:
         if self._active_commit_claim is not None:
             raise RuntimeError("an LTA commit batch is already active")
         ready: list[tuple[LtaSessionWork, object]] = []
-        for item in islice(self.work, self._commit_cursor, None):
+        for position in range(self._commit_cursor, len(self.work)):
+            item = self.work[position]
             if item.work_id not in self._completed:
                 break
             ready.append((item, self._completed[item.work_id]))
@@ -840,11 +863,11 @@ class LtaViewAffinityScheduler:
         """Return compact scheduling state without enumerating blocked work ids."""
 
         ready = sum(
-            item.view in self._projection_ready and self._generation_ready(item)
-            for queue in self._queues.values() for item in queue
+            count for (view, generation), count in self._queued_by_generation.items()
+            if view in self._projection_ready and self._generation_ready_for_queue(view, generation)
         )
         return {
-            "ready": int(ready),
+            "ready": ready,
             "blocked": len(self._waiting_dependencies),
             "active": len(self._active_ids),
             "completed_awaiting_commit": len(self._completed) - len(self._committed_ids),

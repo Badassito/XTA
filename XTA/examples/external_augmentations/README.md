@@ -152,6 +152,9 @@ TorchInductor fusion enabled and explicitly disables CUDA graph capture so that
 augmentation can overlap PTA rendering and JPEG publication on other streams.
 Custom policies used with asynchronous PTA must also avoid CUDA stream capture;
 publication can synchronize or download tensors while the next policy call runs.
+PTA passes canvas tiles on the output grid so the image, mask, and semantic
+coverage share one resize. GPU policies must accept inputs already at the
+requested `output_size`, as they do for full frames and directly rendered tiles.
 
 For forced partial semantic labels, PTA warps annotation coverage with the
 foreground mask. A GPU policy that declares `supports_extra_masks = True`

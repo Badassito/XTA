@@ -1,4 +1,4 @@
-"""Disk-backed full-seed mailboxes for canonical, bounded LTA relay waves.
+"""Full-seed mailboxes for canonical, bounded LTA relay waves.
 
 Keys retain exact lineage, tile, prompt frame and direction, but never a route
 or generation. Canonical 29-frame advances join downstream arrivals at shared
@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict, dataclass
 import hashlib
+from itertools import chain
 import json
 import math
 import operator
@@ -31,6 +32,9 @@ FRONTIER_SCHEMA = "lta.canonical-frontier/1"
 _ADVANCE = LTA_SESSION_FRAMES - 1
 _DIRECTIONS = {"forward": 0, "backward": 1}
 _PROVENANCES = tuple(value.value for value in LtaSeedProvenance)
+_PAGE_BYTES = 4096
+_DISK_CACHE_BYTES = 4 * 1024**2
+MIN_FRONTIER_DATABASE_BYTES = 16 * _PAGE_BYTES
 
 
 def _index(value, name, *, minimum=0):
@@ -82,6 +86,31 @@ class FrontierEntry:
     revision_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedOffer:
+    tile: int
+    frame: int
+    direction: str
+    generation: int
+    provenance_bit: int
+    probability: float
+    visited: tuple[int, ...]
+    shape: tuple[int, int]
+    crop: tuple[int, int, int, int, bytes, int]
+    lineage_record: str
+    token: str
+    scope: str
+    identity: str
+    key: str
+    sweep: int
+
+    @property
+    def staging_bytes(self):
+        visited_bytes = sum(48 + (index.bit_length() + 7) // 8 for index in self.visited)
+        return (len(self.crop[4]) + visited_bytes + len(self.lineage_record)
+                + len(self.token) + len(self.scope) + len(self.identity) + 1024)
+
+
 class CanonicalFrontier:
     """One coordinator's SQLite frontier, with at most one outstanding wave.
 
@@ -89,21 +118,31 @@ class CanonicalFrontier:
     dirty mailbox. Offers during a lease cannot change its frozen seed;
     ``complete`` leaves any subsequently added bits dirty. Taking another wave
     before completing the outstanding lease is rejected. Closing and reopening
-    retains dirty inputs, but process-local attempt counters restart.
+    an on-disk frontier retains dirty inputs, but process-local attempt counters
+    restart. Owners of disposable frontiers can opt into a bounded in-memory
+    database. It spills once to the given path when its budget cannot fit.
     """
 
-    def __init__(self, path, frame_count):
+    def __init__(self, path, frame_count, *, memory_database_bytes=0):
         self.path = Path(path).resolve(strict=False)
         self.frame_count = _index(frame_count, "frame_count", minimum=1)
+        memory_database_bytes = _index(memory_database_bytes, "memory_database_bytes")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._closed = False
         self._lease: tuple[FrontierEntry, ...] = ()
         self._audit = Counter()
-        self._db = sqlite3.connect(str(self.path))
+        self._memory_page_limit = (
+            memory_database_bytes // _PAGE_BYTES
+            if memory_database_bytes >= MIN_FRONTIER_DATABASE_BYTES and not self.path.exists() else 0
+        )
+        self._db = sqlite3.connect(":memory:" if self._memory_page_limit else str(self.path))
         self._db.row_factory = sqlite3.Row
         try:
-            self._db.execute("PRAGMA cache_size=-4096")
-            self._db.execute("PRAGMA temp_store=FILE")
+            if self._memory_page_limit:
+                self._db.execute(f"PRAGMA page_size={_PAGE_BYTES}")
+                self._memory_page_limit = self._db.execute(
+                    f"PRAGMA max_page_count={self._memory_page_limit}"
+                ).fetchone()[0]
             tables = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if tables and "frontier_meta" not in tables:
                 raise ValueError("frontier path contains an unrelated SQLite database")
@@ -129,8 +168,8 @@ class CanonicalFrontier:
             metadata = dict(self._db.execute("SELECT key,value FROM frontier_meta"))
             if metadata != {"schema": FRONTIER_SCHEMA, "frame_count": str(self.frame_count)}:
                 raise ValueError("frontier database schema/frame count differs from this run")
-            self._db.execute("PRAGMA journal_mode=WAL")
-            self._db.execute("PRAGMA synchronous=NORMAL")
+            if not self._memory_page_limit:
+                self._configure_disk(self._db)
             count, dirty, stored, foreground = self._db.execute(
                 "SELECT COUNT(*),COALESCE(SUM(dirty),0),COALESCE(SUM(length(packed)),0),COALESCE(SUM(foreground),0) FROM mailboxes"
             ).fetchone()
@@ -145,9 +184,84 @@ class CanonicalFrontier:
         if self._closed:
             raise RuntimeError("canonical frontier is closed")
 
+    @staticmethod
+    def _configure_disk(db):
+        db.execute(f"PRAGMA cache_size=-{_DISK_CACHE_BYTES // 1024}")
+        db.execute("PRAGMA temp_store=FILE")
+        db.execute("PRAGMA locking_mode=EXCLUSIVE")
+        db.execute("PRAGMA journal_mode=TRUNCATE")
+        db.execute("PRAGMA synchronous=NORMAL")
+
+    def _spill_to_disk(self):
+        # Leave the memory connection and its committed state usable if a
+        # scratch file cannot be created or the backup fails.
+        with self.path.open("xb"):
+            pass
+        try:
+            db = sqlite3.connect(str(self.path))
+            try:
+                db.row_factory = sqlite3.Row
+                self._configure_disk(db)
+                self._db.backup(db)
+            except BaseException:
+                db.close()
+                raise
+        except BaseException:
+            self.path.unlink(missing_ok=True)
+            raise
+        self._db.close()
+        self._db = db
+        self._memory_page_limit = 0
+
+    def _with_disk_fallback(self, operation):
+        try:
+            return operation()
+        except sqlite3.OperationalError as error:
+            is_full = (getattr(error, "sqlite_errorcode", None) == getattr(sqlite3, "SQLITE_FULL", 13)
+                       or str(error) == "database or disk is full")
+            if not self._memory_page_limit or not is_full:
+                raise
+        self._spill_to_disk()
+        return operation()
+
     def offer(self, seed, *, tile_index, direction):
         """Merge a seed at its actual frame; never move pixels between frames."""
+        novel, = self.offer_many((seed,), tile_index=tile_index, direction=direction)
+        return novel
+
+    def offer_many(self, seeds, *, tile_index=None, direction=None):
+        """Merge seeds with shared coordinates or individual (seed, tile, direction) tuples."""
         self._ensure_open()
+        offers = seeds if tile_index is None and direction is None else (
+            (seed, tile_index, direction) for seed in seeds
+        )
+        prepared = (self._prepare_offer(seed, tile_index=tile, direction=travel)
+                    for seed, tile, travel in offers)
+        if not self._memory_page_limit:
+            return self._apply_offers(prepared)
+        # Hold only a bounded batch of packed inputs so a full SQLite
+        # transaction can be rolled back and retried without repeating the
+        # producer or retaining all of its dense masks.
+        staging_limit = self._memory_page_limit * _PAGE_BYTES // 4
+        staged, staged_bytes = [], 0
+        for item in prepared:
+            staged_bytes += item.staging_bytes
+            if staged_bytes > staging_limit:
+                self._spill_to_disk()
+                return self._apply_offers(chain(staged, (item,), prepared))
+            staged.append(item)
+        return self._with_disk_fallback(lambda: self._apply_offers(staged))
+
+    def _apply_offers(self, offers):
+        audit, totals = self._audit.copy(), self._totals.copy()
+        try:
+            with self._db:
+                return tuple(self._offer(offer) for offer in offers)
+        except BaseException:
+            self._audit, self._totals = audit, totals
+            raise
+
+    def _prepare_offer(self, seed, *, tile_index, direction):
         if not isinstance(seed, LtaMaskSeed) or not isinstance(seed.lineage, LtaLineageId):
             raise TypeError("frontier offers require an LtaMaskSeed with an LtaLineageId")
         if direction not in _DIRECTIONS:
@@ -177,41 +291,49 @@ class CanonicalFrontier:
                           "frame_index": frame, "direction": direction})
         key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         _window, sweep = _canonical_window(frame, direction, self.frame_count)
-        with self._db:
-            known_lineage = self._db.execute("SELECT metadata FROM lineages WHERE token=?", (token,)).fetchone()
-            if known_lineage is not None and known_lineage[0] != lineage_record:
-                raise ValueError("frontier lineage token collides with different metadata")
-            known_shape = self._db.execute("SELECT height,width FROM tiles WHERE scope=?", (scope,)).fetchone()
-            if known_shape is not None and tuple(known_shape) != shape:
-                raise ValueError("frontier seed shape differs from its tile geometry")
-            previous = self._db.execute("SELECT * FROM mailboxes WHERE key=?", (key,)).fetchone()
-            if previous is not None and previous["identity"] != identity:
-                raise ValueError("frontier key collides with different metadata")
-            if previous is not None:
-                old_crop = tuple(previous[name] for name in ("y", "x", "height", "width", "packed", "foreground"))
-                if _revision(shape, old_crop) != previous["revision"]:
-                    raise RuntimeError("frontier stored mask revision changed")
-                crop = _union_crops(old_crop, crop)
-                novel = crop[5] > old_crop[5]
-                probability = max(probability, previous["probability"])
-                visited = sorted(set(visited) | set(json.loads(previous["visited"])))
-                provenance_bit |= previous["provenances"]
-                generation = max(generation, previous["generation"])
-            else:
-                novel = True
-            revision = _revision(shape, crop)
-            dirty = int(novel or (previous is not None and previous["dirty"]))
-            self._db.execute("INSERT OR IGNORE INTO lineages VALUES (?,?)", (token, lineage_record))
-            self._db.execute("INSERT OR IGNORE INTO tiles VALUES (?,?,?)", (scope, *shape))
-            self._db.execute("""
-                INSERT INTO mailboxes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(key) DO UPDATE SET y=excluded.y,x=excluded.x,height=excluded.height,
-                    width=excluded.width,packed=excluded.packed,foreground=excluded.foreground,
-                    probability=excluded.probability,visited=excluded.visited,provenances=excluded.provenances,
-                    generation=excluded.generation,revision=excluded.revision,dirty=excluded.dirty
-            """, (key, identity, token, scope, tile, frame, direction, _DIRECTIONS[direction], sweep,
-                  *crop, probability, _json(visited), provenance_bit, generation, revision,
-                  None if previous is None else previous["processed_revision"], dirty))
+        return _PreparedOffer(tile, frame, direction, generation, provenance_bit, probability, tuple(visited),
+                              shape, crop, lineage_record, token, scope, identity, key, sweep)
+
+    def _offer(self, offer):
+        probability, visited, provenance_bit, generation = (
+            offer.probability, offer.visited, offer.provenance_bit, offer.generation,
+        )
+        shape, crop = offer.shape, offer.crop
+        known_lineage = self._db.execute("SELECT metadata FROM lineages WHERE token=?", (offer.token,)).fetchone()
+        if known_lineage is not None and known_lineage[0] != offer.lineage_record:
+            raise ValueError("frontier lineage token collides with different metadata")
+        known_shape = self._db.execute("SELECT height,width FROM tiles WHERE scope=?", (offer.scope,)).fetchone()
+        if known_shape is not None and tuple(known_shape) != shape:
+            raise ValueError("frontier seed shape differs from its tile geometry")
+        previous = self._db.execute("SELECT * FROM mailboxes WHERE key=?", (offer.key,)).fetchone()
+        if previous is not None and previous["identity"] != offer.identity:
+            raise ValueError("frontier key collides with different metadata")
+        if previous is not None:
+            old_crop = tuple(previous[name] for name in ("y", "x", "height", "width", "packed", "foreground"))
+            if _revision(shape, old_crop) != previous["revision"]:
+                raise RuntimeError("frontier stored mask revision changed")
+            crop = _union_crops(old_crop, crop)
+            novel = crop[5] > old_crop[5]
+            probability = max(probability, previous["probability"])
+            visited = sorted(set(visited) | set(json.loads(previous["visited"])))
+            provenance_bit |= previous["provenances"]
+            generation = max(generation, previous["generation"])
+        else:
+            novel = True
+        revision = _revision(shape, crop)
+        dirty = int(novel or (previous is not None and previous["dirty"]))
+        self._db.execute("INSERT OR IGNORE INTO lineages VALUES (?,?)", (offer.token, offer.lineage_record))
+        self._db.execute("INSERT OR IGNORE INTO tiles VALUES (?,?,?)", (offer.scope, *shape))
+        self._db.execute("""
+            INSERT INTO mailboxes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(key) DO UPDATE SET y=excluded.y,x=excluded.x,height=excluded.height,
+                width=excluded.width,packed=excluded.packed,foreground=excluded.foreground,
+                probability=excluded.probability,visited=excluded.visited,provenances=excluded.provenances,
+                generation=excluded.generation,revision=excluded.revision,dirty=excluded.dirty
+        """, (offer.key, offer.identity, offer.token, offer.scope, offer.tile, offer.frame,
+              offer.direction, _DIRECTIONS[offer.direction], offer.sweep,
+              *crop, probability, _json(visited), provenance_bit, generation, revision,
+              None if previous is None else previous["processed_revision"], dirty))
         self._audit["offer_count"] += 1
         self._audit["novel_offer_count" if novel else "metadata_only_offer_count"] += 1
         self._totals["mailbox_count"] += previous is None
@@ -278,6 +400,9 @@ class CanonicalFrontier:
         if not self._lease or len(values) != len(self._lease) or any(
                 supplied is not leased for supplied, leased in zip(values, self._lease)):
             raise ValueError("frontier completion does not match the outstanding lease")
+        self._with_disk_fallback(lambda: self._complete_leased(values))
+
+    def _complete_leased(self, values):
         dirty_delta = 0
         with self._db:
             for entry in values:
@@ -296,13 +421,18 @@ class CanonicalFrontier:
 
     def stats(self):
         self._ensure_open()
+        in_memory = bool(self._memory_page_limit)
+        database_bytes = (self._db.execute("PRAGMA page_count").fetchone()[0] * _PAGE_BYTES
+                          if in_memory else self.path.stat().st_size)
+        wal_path = Path(str(self.path) + "-wal")
         return {"schema": FRONTIER_SCHEMA, **self._totals,
                 **{key: self._audit[key] for key in ("offer_count", "novel_offer_count", "metadata_only_offer_count",
                                                     "wave_count", "completed_entry_count")},
                 "leased_count": len(self._lease), "frame_count": self.frame_count,
-                "database_bytes": self.path.stat().st_size,
-                "wal_bytes": Path(str(self.path) + "-wal").stat().st_size if Path(str(self.path) + "-wal").exists() else 0,
-                "page_cache_limit_bytes": 4 * 1024 * 1024,
+                "database_backing": "memory" if in_memory else "file",
+                "database_bytes": database_bytes,
+                "wal_bytes": wal_path.stat().st_size if not in_memory and wal_path.exists() else 0,
+                "page_cache_limit_bytes": self._memory_page_limit * _PAGE_BYTES if in_memory else _DISK_CACHE_BYTES,
                 "attempt_bound": "new foreground can revisit existing mailboxes; no per-mailbox attempt cap"}
 
     def close(self):

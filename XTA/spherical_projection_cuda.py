@@ -420,6 +420,10 @@ class SphericalCudaProjector:
             first, count = self._validate_block(first, count)
             if count == 0:
                 return np.empty((0, *self.contract.output_shape[1:]), np.uint8)
+            z0, z1, y0, y1, x0, x1 = self.output_bounds.block(first, count)
+            if z0 == z1 or y0 == y1 or x0 == x1:
+                self.roi_skipped_blocks += 1
+                return np.zeros((count, *self.contract.output_shape[1:]), np.uint8)
             try:
                 with self._cp.cuda.Device(self.device_index), self._cp.cuda.using_allocator(self._pool.malloc), self._stream:
                     return self._run_block(first, count)

@@ -216,7 +216,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         self.assertTrue(all(slot.render_expected_key is not None for slot in slots))
 
     def test_direct_azimuthal_and_tilted_pixel_kernels_use_2d_coordinates(self) -> None:
-        kernel_source = inspect.getsource(cuda_backend._fused_direct_render_kernels)
+        kernel_source = inspect.getsource(cuda_backend._compile_fused_direct_render_kernels)
         self.assertNotIn('int oy = q / ow', kernel_source)
         self.assertIn(
             'int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;',
@@ -239,7 +239,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         self.assertIn('np.int32(1)', pta_tilted_launch)
 
     def test_tilted_azimuthal_texture_sampler_shears_each_tilt_axis_tap(self) -> None:
-        kernel_source = inspect.getsource(cuda_backend._fused_direct_render_kernels)
+        kernel_source = inspect.getsource(cuda_backend._compile_fused_direct_render_kernels)
         sampler = kernel_source.split('float azimuthal_texture_sample(', 1)[1].split(
             'float azimuthal_texture_direct_value(', 1)[0]
         upright, tilted = sampler.split('if (tan_tilt == 0.0f) {', 1)[1].split(

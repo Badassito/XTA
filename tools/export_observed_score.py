@@ -15,7 +15,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from XTA.confidence_evidence import ConfidenceEvidenceRef
-from XTA.confidence_export import EXPORT_SCHEMA, SUPPORTED_EVIDENCE_SCHEMAS, _inside, _shape
+from XTA.confidence_export import EXPORT_SCHEMA, SUPPORTED_EVIDENCE_SCHEMAS, _inside, _shape, retained_evidence_manifest
 
 
 def export_score(run_manifest, model, layer, output, *, memory_mib=256, max_staging_mib=32768,
@@ -29,8 +29,9 @@ def export_score(run_manifest, model, layer, output, *, memory_mib=256, max_stag
     run = json.loads(run_manifest.read_bytes())
     if run.get("status") != "complete":
         raise ValueError("Score export requires a completed TTA run or portable compact package")
-    folder = run_manifest.parent / "reconciliation_evidence"
-    catalog = json.loads((folder / "manifest.json").read_bytes())
+    catalog_path = retained_evidence_manifest(run_manifest)
+    folder = catalog_path.parent
+    catalog = json.loads(catalog_path.read_bytes())
     if catalog.get("schema") not in SUPPORTED_EVIDENCE_SCHEMAS:
         raise ValueError("Unsupported confidence evidence catalog")
     if catalog.get("run_id") != run.get("run_id"):

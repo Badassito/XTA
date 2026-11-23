@@ -394,21 +394,30 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
         angular = is_azimuthal_view(view)
         trajectory = ((plan.raw_angles_f64, plan.plan_sources, plan.plan_reverses)
                       if angular and plan.raw_angles_f64 is not None else None)
-        destination_bbox = _encoded_destination_bbox(store, view, output_shape, trajectory=trajectory)
+        if angular:
+            destination_bbox = _encoded_destination_bbox(store, view, output_shape, trajectory=trajectory)
+        else:
+            from .sweep_native_projection import _tilted_certificate
+
+            boxes = np.stack([store.index[field] for field in ('y0', 'y1', 'x0', 'x1')], axis=1)
+            boxes[store.index['kind'] == 0] = 0
+            destination_bbox = _tilted_certificate(view, store.shape, output_shape, boxes).bbox
+            if destination_bbox == (0, 0, 0, 0, 0, 0):
+                destination_bbox = None
         bbox_array = np.asarray(destination_bbox or (0, 0, 0, 0, 0, 0), np.int64)
+        first_z, stop_z = (destination_bbox[0], destination_bbox[3]) if destination_bbox else (0, 0)
         timings['destination_bounds'] = time.perf_counter() - phase_started
         plane_bytes = output_shape[1] * output_shape[2]
         # The writer scans the borrowed plane and normalizes <=1 MiB row slabs.
         # One consumer plane can overlap the bounded unfinished worker window.
         per_worker = plane_bytes + 3 * max(1024**2, output_shape[2]) + plan.temporary_strip_bytes
         allowance = max(1, _env_int('YOLO_TTA_NATIVE_PULL_WORKSPACE_MIB', 256)) * 1024**2
-        if per_worker + plane_bytes > allowance:
+        if first_z < stop_z and per_worker + plane_bytes > allowance:
             raise NativePullPlanUnavailable('Encoded Tilted worker exceeds its workspace allowance')
         gpu_workspace = dict(allowed=True, host_bytes=0, block_depth=0, max_payload_bytes=0,
                              pinned_bytes=0, reason=None)
         gpu_candidate = False
-        remaining_planes = (0 if destination_bbox is None else
-            max(0, min(output_shape[0], destination_bbox[3]) - max(0, destination_bbox[0])))
+        remaining_planes = stop_z - first_z
         minimum_gpu_voxels = max(0, _env_int('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', 64 * 1024**2))
         if (_native_pull_cuda_stage_enabled(view, plan)
                 and remaining_planes * plane_bytes >= minimum_gpu_voxels and destination_bbox is not None):
@@ -420,8 +429,8 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
         gpu_host_reserve = int(gpu_workspace['host_bytes']) if gpu_workspace['allowed'] else 0
         scheduler = get_native_pull_scheduler()
         limit = scheduler.max_workers if scheduler is not None else max(1, int(workers))
-        count = max(1, min(limit, output_shape[0],
-                          (allowance - plane_bytes - gpu_host_reserve) // per_worker))
+        count = min(limit, remaining_planes,
+                    max(0, (allowance - plane_bytes - gpu_host_reserve) // per_worker))
         source_shape = np.asarray(store.shape, np.int64)
         def warm_cpu():
             # A CUDA-ready parent must not wait for an unused CPU signature's
@@ -485,8 +494,6 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
                 def project_plane(z, stage=None):
                     nonlocal gpu_dense_d2h_bytes
                     projection_started = time.perf_counter()
-                    if destination_bbox is None or not destination_bbox[0] <= z < destination_bbox[3]:
-                        return None, 0, 0
                     plane = np.empty(output_shape[1:], np.uint8)
                     flat = plane.reshape(-1)
                     addresses = reads = 0
@@ -528,13 +535,12 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
                 def ordered_projection():
                     nonlocal active_gpu, gpu_planes, handoff_plane, gpu_encoded_blocks, gpu_payload_d2h_bytes
                     nonlocal active_encoded_depth
+                    if not remaining_planes:
+                        return
                     cpu_stream = gpu_stream = stage = None
                     retry = {'retryable': False}
                     def acquire(first_plane):
-                        if destination_bbox is None:
-                            return None
-                        remaining = max(0, min(output_shape[0], destination_bbox[3])
-                            - max(first_plane, destination_bbox[0]))
+                        remaining = stop_z - first_plane
                         minimum = max(0, _env_int('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', 64 * 1024**2))
                         if remaining * plane_bytes < minimum:
                             retry['retryable'] = False
@@ -555,19 +561,19 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
                                 retry_state=retry, **admission)
                         finally:
                             timings['gpu_admission'] += time.perf_counter() - phase_started
-                    first_gpu = 0
+                    first_gpu = first_z
                     try:
-                        stage = acquire(0)
+                        stage = acquire(first_z)
                         if stage is None:
-                            if destination_bbox is not None:
-                                warm_cpu()
-                            cpu_stream = _native_pull_ordered_planes(output_shape[0], project_plane,
-                                count, scheduler=scheduler)
+                            warm_cpu()
+                            cpu_stream = _native_pull_ordered_planes(remaining_planes,
+                                lambda index: project_plane(first_z + index), count, scheduler=scheduler)
                             next_probe = time.monotonic() + 1.
-                            for z, result in cpu_stream:
+                            for index, result in cpu_stream:
+                                z = first_z + index
                                 yield z, result
                                 first_gpu = z + 1
-                                if first_gpu == output_shape[0]:
+                                if first_gpu == stop_z:
                                     break
                                 if retry['retryable'] and time.monotonic() >= next_probe:
                                     stage = acquire(first_gpu)
@@ -589,10 +595,10 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
                                 if (not gpu_candidate or encoded_depth > int(gpu_workspace['block_depth'])
                                         or int(stage.encoded_host_bytes) > gpu_host_reserve):
                                     raise RuntimeError('Native CUDA encoded staging exceeds its CPU-window reservation')
-                                gpu_stream = _native_pull_gpu_ordered_blocks(first_gpu, output_shape[0],
+                                gpu_stream = _native_pull_gpu_ordered_blocks(first_gpu, stop_z,
                                     encoded_depth, lambda first, depth: project_encoded(first, depth, stage))
                             else:
-                                gpu_stream = _native_pull_gpu_ordered_planes(first_gpu, output_shape[0],
+                                gpu_stream = _native_pull_gpu_ordered_planes(first_gpu, stop_z,
                                     lambda z: project_plane(z, stage))
                             active_encoded_depth = encoded_depth
                             progress('running')
@@ -631,32 +637,28 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
                 packed_plane_bound = output_shape[1] * ((output_shape[2] + 7) // 8)
                 memory_probe_planes = max(1, (32 * 1024**2) // max(1, packed_plane_bound))
                 next_memory_probe = 0
+                if first_z:
+                    consume_started = time.perf_counter()
+                    writer.consume_empty_range(0, first_z)
+                    timings['writer_consume'] += time.perf_counter() - consume_started
+                    completed = first_z
                 for z, (plane, addresses, reads) in stream:
                     consume_started = time.perf_counter()
-                    encoded_block = plane is not None and not isinstance(plane, np.ndarray)
+                    encoded_block = not isinstance(plane, np.ndarray)
                     consumed_planes = len(plane.records) if encoded_block else 1
-                    if plane is None:
-                        writer.consume_empty_range(z, 1)
+                    if writer._ram_payload:
+                        exceeded = writer._next_offset + consumed_planes * packed_plane_bound > payload_limit
+                        pressure = False
+                        if z >= next_memory_probe:
+                            growth = max(consumed_planes, min(memory_probe_planes, stop_z - z)) * packed_plane_bound
+                            pressure = publication_ram_headroom() < memory_reserve + growth
+                            next_memory_probe = z + memory_probe_planes
+                        if exceeded or pressure:
+                            writer.spill_payload_to_disk()
+                    if encoded_block:
+                        writer.consume_encoded_block(z, plane.records, plane.payload, packed=True)
                     else:
-                        if writer._ram_payload:
-                            exceeded = writer._next_offset + consumed_planes * packed_plane_bound > payload_limit
-                            pressure = False
-                            if z >= next_memory_probe:
-                                # Like Radial publication, fund a bounded growth
-                                # window before touching its pages. All future
-                                # worst-case payload grants already share one plan.
-                                growth = max(consumed_planes,
-                                    min(memory_probe_planes, output_shape[0] - z)) * packed_plane_bound
-                                pressure = publication_ram_headroom() < memory_reserve + growth
-                                next_memory_probe = z + memory_probe_planes
-                            if exceeded or pressure:
-                                # The ordered consumer is the sole writer. Spill
-                                # only between complete callback transactions.
-                                writer.spill_payload_to_disk()
-                        if encoded_block:
-                            writer.consume_encoded_block(z, plane.records, plane.payload, packed=True)
-                        else:
-                            writer.consume(z, plane[None])
+                        writer.consume(z, plane[None])
                     timings['writer_consume'] += time.perf_counter() - consume_started
                     plane = None
                     total_addresses += addresses
@@ -665,6 +667,11 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
                     if time.perf_counter() - last_progress >= 2.:
                         progress('running')
                         last_progress = time.perf_counter()
+                if stop_z < output_shape[0]:
+                    consume_started = time.perf_counter()
+                    writer.consume_empty_range(stop_z, output_shape[0] - stop_z)
+                    timings['writer_consume'] += time.perf_counter() - consume_started
+                    completed = output_shape[0]
                 finalize_started = time.perf_counter()
                 stats = writer.finalize()
                 timings['writer_finalize'] += time.perf_counter() - finalize_started

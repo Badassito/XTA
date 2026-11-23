@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -24,6 +25,72 @@ def test_logits_fill_is_per_object_and_retains_open_background_and_scores():
     assert bool((logits[1] == original[1]).all())
     assert bool((logits[original > 0] == original[original > 0]).all())
     assert logits[0, 0, 0, 0] == original[0, 0, 0, 0]
+
+
+@pytest.mark.parametrize('failure', [
+    'torch-oom', 'cupy-compile', 'runtime-oom', 'illegal-address', 'unexpected',
+])
+def test_legacy_torch_cuda_failures_preserve_the_host_fallback(monkeypatch, failure):
+    torch = pytest.importorskip('torch')
+    cp = pytest.importorskip('cupy')
+
+    class CudaSetupProbe(torch.Tensor):
+        @property
+        def is_cuda(self):
+            return True
+
+    errors = {
+        'torch-oom': torch.cuda.OutOfMemoryError('injected Torch allocator error'),
+        'cupy-compile': cp.cuda.compiler.CompileException('injected compiler error', '', 'probe', ()),
+        'runtime-oom': cp.cuda.runtime.CUDARuntimeError(2),
+        'illegal-address': cp.cuda.runtime.CUDARuntimeError(700),
+        'unexpected': RuntimeError('unexpected CUDA setup error'),
+    }
+
+    def fail_setup(_device):
+        raise errors[failure]
+
+    logits = torch.tensor(np.where(_donut(), 2.5, -3.5)).as_subclass(CudaSetupProbe)
+    monkeypatch.delattr(torch, 'OutOfMemoryError', raising=False)
+    monkeypatch.setattr(torch.cuda, 'current_stream', fail_setup)
+    if failure in ('illegal-address', 'unexpected'):
+        with pytest.raises(type(errors[failure])) as caught:
+            fill_sam_mask_logits_inplace(logits)
+        assert caught.value is errors[failure]
+    else:
+        assert fill_sam_mask_logits_inplace(logits) is logits
+        assert logits[4, 4] == 10.0
+
+
+@pytest.mark.skipif(os.environ.get('XTA_TEST_NATIVE_PULL_CUDA') != '1', reason='CUDA opt-in')
+@pytest.mark.parametrize('fail_allocator', [False, True])
+def test_cuda_logit_hole_fill_matches_host_in_a_side_stream(monkeypatch, fail_allocator):
+    torch = pytest.importorskip('torch')
+    cp = pytest.importorskip('cupy')
+    from XTA import _prediction_cleanup, lta_postprocessing
+
+    masks = np.stack((_donut(), _donut()))
+    masks[1, :5, 4] = False
+    logits = torch.tensor(np.where(masks[:, None], 2.5, -3.5))
+    expected = fill_sam_mask_logits_inplace(logits.clone())
+
+    def reject_host_fallback(*args):
+        raise AssertionError('CUDA SAM logits used host hole filling')
+
+    def fail_device_allocation(*_args):
+        raise torch.cuda.OutOfMemoryError('injected Torch allocator error')
+
+    if fail_allocator:
+        monkeypatch.setattr(_prediction_cleanup, '_device_enclosed_background', fail_device_allocation)
+    else:
+        monkeypatch.setattr(lta_postprocessing, 'fill_binary_mask_holes_2d', reject_host_fallback)
+    pool_bytes_before = cp.get_default_memory_pool().total_bytes()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        actual = fill_sam_mask_logits_inplace(logits.to('cuda'))
+    stream.synchronize()
+    assert torch.equal(actual.cpu(), expected)
+    assert cp.get_default_memory_pool().total_bytes() == pool_bytes_before
 
 
 @pytest.mark.parametrize('wrapped', [False, True])

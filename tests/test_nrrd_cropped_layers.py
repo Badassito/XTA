@@ -8,6 +8,7 @@ the historical raster byte for byte.
 from __future__ import annotations
 
 import contextlib
+import gzip
 import io
 import json
 from pathlib import Path
@@ -22,9 +23,11 @@ from XTA.interpolation import (
     CVOL_FORMAT,
     INTERNAL_PACKED_CVOL_FORMAT,
     NrrdLayerRef,
+    RawBBoxMaskStore,
     write_raw_bbox_mask_store,
 )
 from XTA.reconciliation_io import _read_header, read_layer_manifest
+from XTA.nrrd_spans import stream_native_crop_spans
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import xta_native_filter as native_filter  # noqa: E402
@@ -276,6 +279,46 @@ def test_crop_adapter_matches_direct_crop_for_arbitrary_write_boundaries():
         t_lo, t_hi = max(z0, lo[0]), min(z1, hi[0])
         expected = (volume[t_lo:t_hi, lo[1]:hi[1], lo[2]:hi[2]].tobytes() if t_hi > t_lo else b'')
         assert b''.join(recorder.parts) == expected
+
+
+def test_native_crop_span_batch_preserves_reference_observer_coordinates(tmp_path):
+    shape = (9, 19, 23)
+    volume = _box_volume(shape, (3, 7, 6, 11, 8, 14), seed=7)
+    volume[4] = 0
+    ref = _store_ref(tmp_path, 'cropped', volume, INTERNAL_PACKED_CVOL_FORMAT)
+    observed = np.zeros_like(volume)
+
+    def observe(z, y, x, crop):
+        observed[z, y:y + crop.shape[0], x:x + crop.shape[1]] = crop
+
+    sink = io.BytesIO()
+    codec = nrrd_compression._nrrd_member_codec_spec('zlib')
+    store = RawBBoxMaskStore.open(ref.path, mmap_payload=True)
+    try:
+        with nrrd_compression._MemberParallelGzipPayloadWriter(sink, codec_spec=codec) as inner:
+            writer = outputs._CroppedNrrdPayloadWriter(
+                inner, shape, (2, 4, 5), (6, 9, 11), logical_start=19 * 23,
+            )
+            with mock.patch.object(writer, '_write_reference_bytes', side_effect=AssertionError):
+                stream_native_crop_spans(store, writer, 1, 9, 46, observe, batch_bytes=92)
+                assert writer.finish() == 6 * 9 * 11
+            assert inner._writer_stats['owned_member_batches'] > 1
+    finally:
+        store.close()
+    np.testing.assert_array_equal(observed, volume)
+    assert gzip.decompress(sink.getvalue()) == volume[2:8, 4:13, 5:16].tobytes()
+
+
+def test_sharded_layer_sync_failure_preserves_previous_output(tmp_path, zlib_codec, monkeypatch):
+    ref = _live('sharded', _box_volume(SHAPE, (0, 11, 4, 9, 2, 14), seed=9))
+    target = tmp_path / 'sharded.nrrd'
+    target.write_bytes(b'previous output')
+    monkeypatch.setattr(outputs, '_nrrd_zshard_capacity', lambda: 3)
+    with mock.patch.object(outputs.os, 'fsync', side_effect=OSError('file sync failed')):
+        with pytest.raises(OSError, match='file sync failed'):
+            outputs.write_single_layer_nrrd_from_ref(ref, SHAPE, target, layout='full', z_shards=3)
+    assert target.read_bytes() == b'previous output'
+    assert list(tmp_path.iterdir()) == [target]
 
 
 def test_crop_adapter_rejects_outside_foreground_and_incomplete_streams():

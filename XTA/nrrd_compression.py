@@ -13,7 +13,6 @@ import io
 import json
 import os
 import re
-import struct
 import sys
 import threading
 import time
@@ -235,35 +234,6 @@ def shutdown_nrrd_gzip_executors() -> None:
         _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED.clear()
         _NRRD_MEMBER_GZIP_ANNOUNCED = False
         _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED = False
-
-_GZIP_MEMBER_HEADER = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
-
-_NRRD_ZERO_MEMBER_CACHE: Dict[int, bytes] = {}
-
-_NRRD_ZERO_MEMBER_LOCK = threading.Lock()
-
-def _gzip_member_from_raw_stream(raw_stream: bytes, crc: int, length: int) -> bytes:
-    """Frame one raw RFC-1951 stream as a complete RFC-1952 gzip member."""
-    return (
-        _GZIP_MEMBER_HEADER
-        + raw_stream
-        + struct.pack('<II', int(crc) & 0xFFFFFFFF, int(length) & 0xFFFFFFFF)
-    )
-
-def _zero_gzip_member(length: int) -> bytes:
-    """Return a cached complete gzip member representing ``length`` zero bytes."""
-    ln = max(0, int(length))
-    with _NRRD_ZERO_MEMBER_LOCK:
-        cached = _NRRD_ZERO_MEMBER_CACHE.get(ln)
-    if cached is not None:
-        return cached
-    zeros = bytes(ln)
-    cobj = zlib.compressobj(1, zlib.DEFLATED, -15)
-    raw = cobj.compress(zeros) + cobj.flush(zlib.Z_FINISH)
-    member = _gzip_member_from_raw_stream(raw, zlib.crc32(zeros), ln)
-    with _NRRD_ZERO_MEMBER_LOCK:
-        _NRRD_ZERO_MEMBER_CACHE[ln] = member
-    return member
 
 _NRRD_MEMBER_CODEC_SETTING_WARNED = False
 
@@ -716,7 +686,7 @@ class _MemberParallelGzipPayloadWriter:
         return member_sequence, int(ln)
 
     def _compress_member_batch(self, payload: object,
-                               segments: Tuple[Tuple[int, int, int], ...]) -> Tuple[bytes, int]:
+                               segments: list[tuple[int, int, int]]) -> Tuple[bytes, int]:
         """Encode one batch: per segment, canonical zeros then one complete member.
 
  Each nonempty range is compressed by its own codec call, so the concatenation is
@@ -756,11 +726,6 @@ class _MemberParallelGzipPayloadWriter:
         telemetry.add(f'nrrd.compression.{self.backend}.logical_requests', int(members))
         telemetry.add(f'nrrd.compression.{self.backend}.batched_jobs', 1)
         return b''.join(parts), int(total_in)
-
-    def _enqueue_completed(self, member: bytes) -> None:
-        seq = int(self._next_sequence)
-        self._next_sequence += 1
-        self._completed[seq] = (member, 0)
 
     def _enqueue_repeated_zeros(self, member: bytes, count: int, *, members_per_repeat: int = 1) -> None:
         if not member or int(count) <= 0:
@@ -817,7 +782,7 @@ class _MemberParallelGzipPayloadWriter:
         self._hardware_lookbehind = None
         self._hardware_lookbehind_is_zero = False
         if is_zero:
-            self._enqueue_completed(_zero_gzip_member(len(memoryview(owner).cast('B'))))
+            self._queue_zero_run(len(memoryview(owner).cast('B')))
         else:
             self._enqueue_owned_chunk(owner)
 
@@ -1063,18 +1028,21 @@ class _MemberParallelGzipPayloadWriter:
 
  Equivalent to, per segment, ``write_canonical_zeros(zero_bytes)`` then
  ``write_owned_known_nonzero(data[start:stop])``. The software path emits the same
- gzip bytes with one compression job, Future and completion per batch; writers
- with pending sub-minimum bytes or a hardware minimum replay the per-segment calls."""
+ gzip bytes with one compression job per group of segments between large zero gaps.
+ Writers with pending sub-minimum bytes or a hardware minimum replay the per-segment calls."""
         if self.closed:
             raise RuntimeError('Cannot write to a closed gzip payload stream')
         mv = data if isinstance(data, memoryview) else memoryview(data)  # type: ignore[arg-type]
         mv = mv.cast('B')
-        items = tuple((int(z), int(a), int(b)) for z, a, b in segments)  # type: ignore[union-attr]
-        for zeros, start, stop in items:
+        items = [(int(z), int(a), int(b)) for z, a, b in segments]  # type: ignore[union-attr]
+        large_gaps = []
+        for i, (zeros, start, stop) in enumerate(items):
             if zeros < 0:
                 raise ValueError('A zero run cannot have negative length')
             if start < 0 or stop < start or stop > len(mv):
                 raise ValueError('Member batch segment lies outside its buffer')
+            if zeros >= 64 * 1024 * 1024:
+                large_gaps.append(i)
         if (self._small_pending or int(self.minimum_input_bytes) > 1
                 or self._hardware_lookbehind_enabled()):
             written = 0
@@ -1084,6 +1052,17 @@ class _MemberParallelGzipPayloadWriter:
                 if stop > start:
                     written += int(self.write_owned_known_nonzero(mv[start:stop]))
             return int(written)
+        written = batch_start = 0
+        for i in large_gaps:
+            if i > batch_start:
+                written += self._submit_owned_member_batch(mv, items[batch_start:i])
+            zeros, start, stop = items[i]
+            written += self.write_canonical_zeros(zeros)
+            items[i] = (0, start, stop)
+            batch_start = i
+        return written + self._submit_owned_member_batch(mv, items[batch_start:] if batch_start else items)
+
+    def _submit_owned_member_batch(self, mv: memoryview, items: list[tuple[int, int, int]]) -> int:
         try:
             zero_total = 0
             zero_members = 0
@@ -1121,94 +1100,25 @@ class _MemberParallelGzipPayloadWriter:
             raise
         return int(zero_total + charged)
 
-    def write_canonical_zeros(self, nbytes: int) -> int:
-        """Use at most 21 reusable zero-member sizes for arbitrary sparse gaps.
+    def _queue_zero_run(self, nbytes: int) -> None:
+        """Represent a zero run with at most two descriptors and 21 member sizes."""
+        self._writer_stats['canonical_zero_logical_bytes'] += nbytes
+        full_members, remaining = divmod(nbytes, 1024 * 1024)
+        if full_members:
+            self._enqueue_repeated_zeros(canonical_zero_member(1024 * 1024), full_members)
+        if remaining:
+            self._enqueue_repeated_zeros(
+                canonical_zero_run_bytes(remaining), 1,
+                members_per_repeat=canonical_zero_run_member_count(remaining),
+            )
 
-        Software codecs accept these small complete gzip members. Hardware codecs
-        retain their existing minimum-input/lookbehind policy through write_zeros.
-        """
-        if self.closed:
-            raise RuntimeError('Cannot write to a closed gzip payload stream')
-        remaining = int(nbytes)
-        if remaining < 0:
-            raise ValueError('A zero run cannot have negative length')
-        if remaining == 0:
-            return 0
-        if self.minimum_input_bytes > 1:
-            return self.write_zeros(remaining)
-        try:
-            self._writer_stats['canonical_zero_logical_bytes'] += remaining
-            full_members, remaining = divmod(remaining, 1024 * 1024)
-            if full_members:
-                self._enqueue_repeated_zeros(canonical_zero_member(1024 * 1024), full_members)
-            tail_members = []
-            while remaining:
-                size = 1 << (remaining.bit_length() - 1)
-                tail_members.append(canonical_zero_member(size))
-                remaining -= size
-            if tail_members:
-                self._enqueue_repeated_zeros(b''.join(tail_members), 1,
-                                             members_per_repeat=len(tail_members))
-            # A whole run owns at most two tiny descriptors, independent of its
-            # logical size. Wait only until the ready map is bounded; close()
-            # remains the only unconditional full drain.
-            if len(self._completed) >= 128:
-                self._drain_zero_descriptor_pressure()
-            else:
-                self._drain(block=False)
-        except BaseException:
-            self.closed = True
-            self._abandon_and_settle()
-            raise
-        return int(nbytes)
+    def write_canonical_zeros(self, nbytes: int) -> int:
+        return self.write_zeros(nbytes)
 
     def write_aligned_zeros(self, nbytes: int) -> int:
-        """Emit one complete cached zero member matching a whole-slice sparse member."""
-        if self.closed:
-            raise RuntimeError('Cannot write to a closed gzip payload stream')
-        requested = int(nbytes)
-        ln = int(requested)
-        if ln <= 0:
-            return 0
-        if self._small_pending:
-            take = min(ln, int(self.minimum_input_bytes) - len(self._small_pending))
-            self._small_pending.extend(bytes(int(take)))
-            ln -= int(take)
-            if len(self._small_pending) >= int(self.minimum_input_bytes):
-                self._queue_data_chunk(memoryview(bytes(self._small_pending)))
-                self._small_pending.clear()
-                self._drain(block=False)
-        if ln <= 0:
-            return int(nbytes)
-        if self._hardware_lookbehind_enabled() and ln < int(self.minimum_input_bytes):
-            if self._hardware_lookbehind is None:
-                self._small_pending.extend(bytes(int(ln)))
-            else:
-                self._hardware_lookbehind = (
-                    bytes(memoryview(self._hardware_lookbehind).cast('B'))
-                    + bytes(int(ln))
-                )
-            return int(requested)
-        self._submit_hardware_lookbehind()
-        if self._hardware_lookbehind_enabled():
-            # Retain the final hardware-sized zero span so a later sub-threshold
-            # nonzero write can be appended without reordering bytes or falling back
-            # to software. Most of a large zero run still uses the cached member.
-            cached = int(ln) - int(self.minimum_input_bytes)
-            if cached > 0:
-                self._enqueue_completed(_zero_gzip_member(int(cached)))
-            self._hardware_lookbehind = bytes(int(self.minimum_input_bytes))
-            self._hardware_lookbehind_is_zero = True
-        else:
-            self._enqueue_completed(_zero_gzip_member(int(ln)))
-        self._drain(block=False)
-        return int(requested)
+        return self.write_zeros(nbytes)
 
-    def write_zeros(self, nbytes: int) -> int:
-        """Emit cached all-zero members without materializing the zeros."""
-        if self.closed:
-            raise RuntimeError('Cannot write to a closed gzip payload stream')
-        remaining = int(nbytes)
+    def _write_zeros_impl(self, remaining: int) -> None:
         if self._small_pending and remaining > 0:
             take = min(remaining, int(self.minimum_input_bytes) - len(self._small_pending))
             self._small_pending.extend(bytes(int(take)))
@@ -1236,21 +1146,32 @@ class _MemberParallelGzipPayloadWriter:
             # tiny, close() merges it into this hardware-eligible span; if there is no
             # next call, _submit_hardware_lookbehind() emits it from the zero cache.
             retained = int(self.minimum_input_bytes)
-            cached_remaining = int(remaining) - retained
-            while cached_remaining > 0:
-                ln = min(self.chunk_bytes, cached_remaining)
-                self._enqueue_completed(_zero_gzip_member(int(ln)))
-                cached_remaining -= int(ln)
-                self._drain(block=False)
+            self._queue_zero_run(remaining - retained)
             self._hardware_lookbehind = bytes(retained)
             self._hardware_lookbehind_is_zero = True
             remaining = 0
-        while remaining > 0:
-            ln = min(self.chunk_bytes, remaining)
-            self._enqueue_completed(_zero_gzip_member(int(ln)))
-            remaining -= int(ln)
+        if remaining:
+            self._queue_zero_run(remaining)
+        if len(self._completed) >= 128:
+            self._drain_zero_descriptor_pressure()
+        else:
             self._drain(block=False)
-        return int(nbytes)
+
+    def write_zeros(self, nbytes: int) -> int:
+        """Emit reusable zero members while preserving the hardware lookbehind tail."""
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed gzip payload stream')
+        count = int(nbytes)
+        if count < 0:
+            raise ValueError('A zero run cannot have negative length')
+        if count:
+            try:
+                self._write_zeros_impl(count)
+            except BaseException:
+                self.closed = True
+                self._abandon_and_settle()
+                raise
+        return count
 
     def close(self) -> None:
         if self.closed:
@@ -1336,8 +1257,7 @@ _NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK = threading.Lock()
 def _after_nrrd_compression_fork_child() -> None:
     """Discard parent compressor pools, locks, and policy caches in a fork child."""
     global _NRRD_GZIP_EXECUTORS
-    global _NRRD_GZIP_EXECUTOR_LOCK, _NRRD_ZERO_MEMBER_LOCK
-    global _NRRD_ZERO_MEMBER_CACHE, _NRRD_MEMBER_CODEC_SETTING_WARNED
+    global _NRRD_GZIP_EXECUTOR_LOCK, _NRRD_MEMBER_CODEC_SETTING_WARNED
     global _NRRD_MEMBER_GZIP_OK, _NRRD_MEMBER_GZIP_FAILURE_REASONS
     global _NRRD_MEMBER_GZIP_TEST_LOCK, _NRRD_MEMBER_GZIP_ANNOUNCED
     global _NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED
@@ -1351,8 +1271,6 @@ def _after_nrrd_compression_fork_child() -> None:
     # those locks in the child; replace the complete process-local state directly.
     _NRRD_GZIP_EXECUTORS = {}
     _NRRD_GZIP_EXECUTOR_LOCK = threading.Lock()
-    _NRRD_ZERO_MEMBER_CACHE = {}
-    _NRRD_ZERO_MEMBER_LOCK = threading.Lock()
     _NRRD_MEMBER_CODEC_SETTING_WARNED = False
     _NRRD_MEMBER_GZIP_OK = {}
     _NRRD_MEMBER_GZIP_FAILURE_REASONS = {}

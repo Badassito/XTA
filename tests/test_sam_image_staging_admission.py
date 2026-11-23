@@ -71,6 +71,36 @@ def test_physical_probe_failure_and_existing_image_promises_decline_more_credit(
     assert resources.sam_parent_promised_bytes(pool) == 0
 
 
+@pytest.mark.parametrize('image_only', [False, True])
+def test_probe_releases_condition_and_resamples_changed_promises(image_only):
+    pool = _ByteAdmissionPool(16*GIB, 'parent')
+    probing = threading.Event()
+    finish_probe = threading.Event()
+    promises = []
+
+    def probe():
+        promises.append(resources.sam_parent_promised_bytes(pool))
+        if len(promises) == 1:
+            probing.set()
+            assert finish_probe.wait(5)
+        return 64*GIB
+
+    def admit():
+        reservation = (_try_image_profile(pool, GIB, 'images', probe) if image_only
+                       else resources.admit_sam_parent_resources(pool, GIB, 'parent', headroom_probe=probe))
+        with reservation as profile:
+            assert profile is not None
+            return profile.other_promised_bytes
+
+    with ThreadPoolExecutor(1) as workers:
+        pending = workers.submit(admit)
+        assert probing.wait(5)
+        with pool.reserve(GIB, 'concurrent parent'):
+            finish_probe.set()
+            assert pending.result(5) == GIB
+    assert promises == [0, GIB]
+
+
 def test_parent_extra_and_sdk_bank_deduct_staging_promises():
     pool = _ByteAdmissionPool(64*GIB, 'parent')
     with _try_image_profile(pool, 4*GIB, 'images', lambda:128*GIB) as images:

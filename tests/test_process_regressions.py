@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import gc
 import os
+import signal
 import tempfile
 import threading
 import types
 import unittest
+from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from unittest import mock
 import weakref
@@ -121,6 +124,182 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
     def test_preflight_surfaces_pickle_failure_synchronously(self) -> None:
         with self.assertRaisesRegex(TypeError, 'not serializable'):
             runtime.preflight_multiprocessing_payload({'callback': lambda: None})
+
+    def test_interpolation_backing_requires_complete_root_memfd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backing = Path(directory) / 'volume.u8'
+            original = np.memmap(backing, dtype=np.uint8, mode='w+', shape=(4, 2, 2))
+            copy = np.memmap(backing, dtype=np.uint8, mode='c', shape=original.shape)
+            with mock.patch.object(runtime, '_memfd_backing_path_from_array', return_value=backing):
+                self.assertEqual(runtime._interpolation_array_backing_path(original), backing)
+                self.assertIsNone(runtime._interpolation_array_backing_path(original[1:3]))
+                self.assertIsNone(runtime._interpolation_array_backing_path(copy))
+            original._mmap.close()
+            copy._mmap.close()
+
+    def test_aux_interpolation_transfers_only_after_preflight_and_rolls_back_put(self) -> None:
+        events = []
+        with tempfile.TemporaryFile() as data:
+            descriptor = os.dup(data.fileno())
+            pool = runtime._GpuWorkerAuxInterpolationPool({
+                0: types.SimpleNamespace(put=mock.Mock(side_effect=RuntimeError('queue closed'))),
+            })
+            kwargs = {'mask_path': 'test-owner'}
+            def preflight(envelope):
+                self.assertNotIn('mask_fd', envelope['aux_kwargs'])
+                events.append('preflight')
+            def duplicate(_path):
+                events.append('duplicate')
+                return _DetachHandle(descriptor)
+            with mock.patch.object(runtime, 'preflight_multiprocessing_payload', side_effect=preflight), \
+                    mock.patch.object(runtime, '_duplicate_memfd_path_for_child', side_effect=duplicate):
+                self.assertIsNone(pool.try_submit(kwargs))
+                self.assertEqual(events, [])
+                pool.enable_worker(0)
+                self.assertIsNone(pool.try_submit(kwargs))
+            self.assertEqual(events, ['preflight', 'duplicate'])
+            self.assertEqual(pool.outstanding(), 0)
+            self.assertNotIn('mask_fd', kwargs)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_aux_interpolation_does_not_transfer_after_pool_invalidates_preflight_reservation(self) -> None:
+        task_queue = mock.Mock()
+        pool = runtime._GpuWorkerAuxInterpolationPool({0: task_queue})
+        pool.enable_worker(0)
+        with mock.patch.object(runtime, 'preflight_multiprocessing_payload',
+                               side_effect=lambda _: pool.mark_failed('worker exited')), \
+                mock.patch.object(runtime, '_duplicate_memfd_path_for_child') as duplicate:
+            self.assertIsNone(pool.try_submit({'mask_path': 'test-owner'}))
+        duplicate.assert_not_called()
+        task_queue.put.assert_not_called()
+
+    def test_aux_failure_rolls_back_committed_descriptor(self) -> None:
+        with tempfile.TemporaryFile() as data:
+            descriptor = os.dup(data.fileno())
+            pool = runtime._GpuWorkerAuxInterpolationPool({0: mock.Mock()})
+            pool.enable_worker(0)
+            with mock.patch.object(runtime, '_duplicate_memfd_path_for_child',
+                                   return_value=_DetachHandle(descriptor)):
+                handle = pool.try_submit({'mask_path': 'test-owner'})
+            self.assertIsNotNone(handle)
+            pool.mark_failed('worker exited')
+            with self.assertRaisesRegex(RuntimeError, 'worker exited'):
+                pool.wait(handle)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_broken_interpolation_pool_reclaims_transfer_and_preserves_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            backing = work_dir / 'volume.u8'
+            original = np.memmap(backing, dtype=np.uint8, mode='w+', shape=(2, 2, 2))
+            descriptor = os.open(backing, os.O_RDWR | getattr(os, 'O_BINARY', 0))
+            failure = BrokenProcessPool('worker exited')
+            future = Future()
+            future.set_exception(failure)
+            executor = types.SimpleNamespace(submit=mock.Mock(return_value=future))
+            runtime.set_interpolation_process_executor(executor, 1)
+            try:
+                with mock.patch.dict(os.environ, {
+                        'YOLO_TTA_INTERPOLATION_PROCESS_BACKEND': '1',
+                        'YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK': '0',
+                    }), mock.patch.object(assembly, 'view_interpolation_wrap_axis', return_value=False), \
+                        mock.patch.object(runtime, '_duplicate_memfd_path_for_child', return_value=_DetachHandle(descriptor)):
+                    with self.assertRaisesRegex(RuntimeError, 'Interpolation process worker failed') as raised:
+                        runtime.interpolate_view_volume_pass_maybe_process(
+                            original, types.SimpleNamespace(name='test-view'), work_dir,
+                            'broken-pool', 3, 15.0, 1, 2, 0.0, workers=1,
+                        )
+                self.assertIs(raised.exception.__cause__, failure)
+                self.assertIn('mask_fd', executor.submit.call_args.kwargs)
+                self.assertTrue(backing.exists())
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+            finally:
+                original._mmap.close()
+
+    def test_interpolation_opens_transferred_descriptor_without_parent_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            backing = work_dir / 'volume.u8'
+            original = np.memmap(backing, dtype=np.uint8, mode='w+', shape=(2, 2, 2))
+            descriptor = os.open(backing, os.O_RDWR | getattr(os, 'O_BINARY', 0))
+            def interpolate(*, mask_mm, **_unused):
+                mask_mm[:] = 7
+                return {}
+            try:
+                with mock.patch.object(interpolation, 'interpolate_view_volume_pass_inplace', new=interpolate), \
+                        mock.patch.object(runtime, '_INTERPOLATION_PROCESS_WORKER', False):
+                    runtime._interpolation_process_entry(
+                        mask_path=str(work_dir / 'missing-parent-file'), mask_shape=original.shape,
+                        mask_dtype='uint8', work_dir=str(work_dir), pass_tag='fd-transfer',
+                        max_slice_distance=1, search_angle_deg=10., interpolation_walk_back=1,
+                        interpolation_candidates=2, interpolate_min_radius=0., reserve_bytes=0,
+                        workers=1, wrap_axis=False, mask_fd=_DetachHandle(descriptor),
+                    )
+                np.testing.assert_array_equal(original, np.full(original.shape, 7, np.uint8))
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+            finally:
+                original._mmap.close()
+
+    def test_termination_watchdog_installs_without_unique_scratch_and_restores_handlers(self) -> None:
+        original = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+        called = threading.Event()
+        with mock.patch.object(runtime, '_force_termination_watchdog', side_effect=lambda *_args: called.set()) as watchdog:
+            with runtime.run_termination_watchdog():
+                with self.assertRaises(KeyboardInterrupt):
+                    signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+                for signum in original:
+                    self.assertIsNot(signal.getsignal(signum), original[signum])
+                self.assertTrue(called.wait(5))
+        self.assertEqual(watchdog.call_args.args[0], signal.SIGTERM)
+        self.assertEqual({signum: signal.getsignal(signum) for signum in original}, original)
+
+    def test_run_and_sweep_watchdogs_preserve_ignored_signal(self) -> None:
+        from XTA.confidence_sweep import _cancel_signals
+
+        original = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            for install in (runtime.run_termination_watchdog, _cancel_signals):
+                with self.subTest(watchdog=install.__name__), install():
+                    self.assertEqual(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
+        finally:
+            signal.signal(signal.SIGINT, original)
+
+    def test_failed_process_pass_retires_its_copied_input_with_live_exception(self) -> None:
+        original = np.zeros((2, 2, 2), np.uint8)
+        for fallback in ('0', '1'):
+            with self.subTest(fallback=fallback), tempfile.TemporaryDirectory() as directory:
+                work_dir = Path(directory)
+                executor = types.SimpleNamespace(
+                    submit=mock.Mock(side_effect=RuntimeError('submit failure sentinel')),
+                )
+                runtime.set_interpolation_process_executor(executor, 1)
+
+                def fail_in_process(*, mask_mm, **_kwargs):
+                    mask_mm[:] = 1
+                    raise ValueError('fallback failure sentinel')
+
+                with mock.patch.dict(os.environ, {
+                        'YOLO_TTA_INTERPOLATION_PROCESS_BACKEND': '1',
+                        'YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK': fallback,
+                    }), mock.patch.object(assembly, 'view_interpolation_wrap_axis', return_value=False), \
+                        mock.patch.object(interpolation, 'interpolate_view_volume_pass_inplace', new=fail_in_process):
+                    try:
+                        runtime.interpolate_view_volume_pass_maybe_process(
+                            original, types.SimpleNamespace(name='test-view'), work_dir,
+                            'copied-input', 3, 15.0, 1, 2, 0.0, workers=1,
+                        )
+                    except (RuntimeError, ValueError) as failure:
+                        detail = failure if fallback == '1' else failure.__cause__
+                        self.assertIn('fallback failure' if fallback == '1' else 'submit failure', str(detail))
+                        runtime.wait_for_retired_memmap_unlinks(under=work_dir, timeout_s=5.0)
+                        self.assertEqual(list(work_dir.glob('*.u8.dat')), [])
+                    else:
+                        self.fail('interpolation failure did not propagate')
+        self.assertFalse(original.any())
 
     def test_partial_memfd_materialization_closes_detached_descriptors(self) -> None:
         first_fd, first_writer = os.pipe()

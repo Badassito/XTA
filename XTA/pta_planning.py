@@ -19,7 +19,7 @@ from .geometry import _affine2x3_to_3x3 as affine2x3_to_3x3
 from .pta_publication import output_image_suffix, parse_output_image_format
 from .pta_rendering import (
     DEFAULT_CHANNEL_VARIANT, AffineSpec, ChannelVariant, RenderPlan,
-    RenderTileItem, TileConfig, ViewInfo, encoded_channel_source_positions,
+    EncodedSliceIndices, RenderTileItem, TileConfig, ViewInfo, encoded_channel_source_positions,
 )
 from .pta_workers import WarningLog
 from .runtime import runtime_telemetry_phase
@@ -381,7 +381,8 @@ def build_render_plan(
                 f"{normalized_eligible[:24]}"
             )
         eligible_count = len(normalized_eligible)
-    normalized_encoded = tuple(int(x) for x in source_encoded_indices)
+    normalized_encoded = (source_encoded_indices if isinstance(source_encoded_indices, EncodedSliceIndices)
+                          else tuple(int(x) for x in source_encoded_indices))
     if normalized_encoded and len(normalized_encoded) != int(view.num_slices):
         raise ValueError(
             f"Encoded-index mapping for {view.name} has {len(normalized_encoded)} entries, "
@@ -506,15 +507,9 @@ def build_plans_for_views(
         if center_eligible_frame_indices is None
         else tuple(sorted({int(x) for x in center_eligible_frame_indices}))
     )
-    normalized_encoded = tuple(int(x) for x in transverse_source_encoded_indices)
-    if normalized_encoded and any(
-        normalized_encoded[i] >= normalized_encoded[i + 1]
-        for i in range(len(normalized_encoded) - 1)
-    ):
-        raise ValueError(
-            f"{stem}: transverse encoded image indices must be strictly increasing; "
-            f"got {normalized_encoded[:24]}"
-        )
+    normalized_encoded = EncodedSliceIndices(
+        transverse_source_encoded_indices, description=f"{stem}: transverse encoded image indices",
+    )
     warned_discontinuity_formats: set[str] = set()
 
     for view in views:

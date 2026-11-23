@@ -20,14 +20,17 @@ from tests.test_view_prepare_input_retirement import _task
 from tests.test_sam_parent_staging_adversarial import admit, queue
 
 
-def test_error_logging_failure_keeps_primary_and_still_cancels():
+@pytest.mark.parametrize('disable_notes', [False, True])
+def test_error_logging_failure_keeps_primary_and_still_cancels(disable_notes):
     class BrokenStderr:
         def write(self, _text):
             raise OSError('log destination unavailable')
 
     primary = ValueError('original planning error')
-    context = SimpleNamespace(cancel=mock.Mock())
-    stager = SimpleNamespace(abort=mock.Mock())
+    if disable_notes:
+        primary.add_note = None
+    context = SimpleNamespace(cancel=mock.Mock(side_effect=RuntimeError('SAM cancellation refused')))
+    stager = SimpleNamespace(abort=mock.Mock(side_effect=RuntimeError('checkpoint cancellation refused')))
     queued = Future()
     with redirect_stderr(BrokenStderr()), pytest.raises(ValueError) as caught:
         try:
@@ -36,7 +39,12 @@ def test_error_logging_failure_keeps_primary_and_still_cancels():
             pipeline._cancel_scheduler_prepares(primary, sam_context=context,
                 sam_parent_staging=stager, view_processing_futures={queued: ('model', 'view')})
     assert caught.value is primary
-    assert any('log destination unavailable' in note for note in primary.__notes__)
+    if callable(getattr(primary, 'add_note', None)):
+        assert primary.__notes__ == [
+            'Scheduler error logging also failed: log destination unavailable',
+            'SAM cancellation also failed: SAM cancellation refused',
+            'Parent checkpoint cancellation also failed: checkpoint cancellation refused',
+        ]
     context.cancel.assert_called_once()
     stager.abort.assert_called_once()
     assert queued.cancelled()
@@ -217,7 +225,8 @@ def test_cancellation_cleanup_error_preserves_primary_and_retains_dense_credit(t
             pipeline._cancel_scheduler_prepares(primary, sam_context=None,
                 sam_parent_staging=stage, view_processing_futures={future: key})
         assert future.cancelled()
-        assert 'checkpoint cancellation refused' in primary.__notes__[0]
+        if callable(getattr(primary, 'add_note', None)):
+            assert 'checkpoint cancellation refused' in primary.__notes__[0]
         assert str(primary) == 'original failure'
         assert str(future._xta_cancelled_prepare_cleanup_error) == 'mapping retirement refused'
         assert not leases.retire_cancelled(key, future, retired_callback=lambda *_args: None)

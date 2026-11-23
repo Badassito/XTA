@@ -236,7 +236,9 @@ def physical_sam_headroom():
             for child in process.children(recursive=True):
                 try:
                     resident += int(child.memory_info().rss)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                except psutil.NoSuchProcess:
+                    continue
+                except psutil.AccessDenied:
                     return 0
         except (ImportError, OSError, ValueError, AttributeError):
             return 0
@@ -425,17 +427,26 @@ class SamTrackerScopeAdmission:
         with self._lock:
             if self._preparation is not None and not self._preparation.settled:
                 raise RuntimeError('SAM input producer is still active; scope/source credit retained')
-        for packing in tuple(self._packing_admissions):
-            packing.close()
+            packings = tuple(self._packing_admissions)
+        error = None
+        for packing in packings:
+            try:
+                packing.close()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
         with self._lock:
-            if not self._scope_active:
-                return
-            self._require_minted()
-            self._scope_active = False
-            with self._profile._lease.pool.condition:
-                self._profile._lease.scope_holds -= 1
-                _return_parent_credit_if_settled(self._profile._lease)
-            self._return_bank_if_settled()
+            # A failed future is settled, but an interrupted or unproven wait
+            # leaves its packing in the set and must retain the scope charge.
+            if self._scope_active and not self._packing_admissions:
+                self._require_minted()
+                self._scope_active = False
+                with self._profile._lease.pool.condition:
+                    self._profile._lease.scope_holds -= 1
+                    _return_parent_credit_if_settled(self._profile._lease)
+                self._return_bank_if_settled()
+        if error is not None:
+            raise error
 
     def _return_bank_if_settled(self):
         if self._creator_active or self._scope_active or self._returned:
@@ -1460,17 +1471,27 @@ def admit_sam_parent_resources(pool, base_bytes, scope_id, *, worker_count=1,
             pending = _bounded_parent_protections(pool)
             protected = sum(amount for token, amount in pending.items()
                             if token != protection_token)
+            in_use = int(pool.in_use)
+            other_promised = sam_parent_promised_bytes(pool)
             base_charge = min(base, capacity)
-            if (protected > 0 and int(pool.in_use)+base_charge+image_debt > capacity-protected
-                    or int(pool.in_use) > 0 and int(pool.in_use)+base_charge+image_debt > capacity
-                    or base > capacity and sam_parent_promised_bytes(pool) > 0):
+            if (protected > 0 and in_use+base_charge+image_debt > capacity-protected
+                    or in_use > 0 and in_use+base_charge+image_debt > capacity
+                    or base > capacity and other_promised > 0):
                 waiting_at = time.monotonic()
                 pool.condition.wait(timeout=.1 if cancel_event is not None else None)
                 wait_seconds += time.monotonic()-waiting_at
                 wait_count += 1
                 continue
-            physical = max(0, int(probe()))
-            other_promised = sam_parent_promised_bytes(pool)
+            pool.condition.release()
+            try:
+                physical = max(0, int(probe()))
+            finally:
+                pool.condition.acquire()
+            if (capacity != max(1, int(pool.capacity)) or in_use != int(pool.in_use)
+                    or other_promised != sam_parent_promised_bytes(pool)
+                    or protected != sum(amount for token, amount in _bounded_parent_protections(pool).items()
+                                        if token != protection_token)):
+                continue
             if image_phase and physical < required_base+other_promised:
                 if not other_promised:
                     raise SamMandatoryImageAdmissionError('isolated_physical_headroom',
@@ -1481,7 +1502,7 @@ def admit_sam_parent_resources(pool, base_bytes, scope_id, *, worker_count=1,
                 wait_seconds += time.monotonic()-waiting_at
                 wait_count += 1
                 continue
-            free_pool = max(0, capacity-int(pool.in_use)-base_charge-image_debt-protected)
+            free_pool = max(0, capacity-in_use-base_charge-image_debt-protected)
             unpromised_ram = max(0, physical-required_base-other_promised)
             fixed_allowance = min(base_charge, max(0, int(base_allowance_bytes)))
             nominal_cpu_wave = max(0, min(fixed_allowance, 4*GIB)-2*GIB)

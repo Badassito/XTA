@@ -7,6 +7,7 @@ transpose, CPU coordinate image, or intermediate canvas is built per item.
 from __future__ import annotations
 
 import math
+import threading
 from functools import lru_cache
 from typing import Optional
 
@@ -104,18 +105,25 @@ __global__ void pta_categorical_cartesian(
 '''
 
 
-@lru_cache(maxsize=1)
-def _kernel():
+_KERNEL_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=None)
+def _kernel(device_index):
     import cupy as cp
 
-    return cp.RawKernel(
-        _CUDA_SOURCE, "pta_categorical_cartesian", options=("--std=c++11", "--fmad=false"),
-    )
+    with cp.cuda.Device(device_index):
+        kernel = cp.RawKernel(
+            _CUDA_SOURCE, "pta_categorical_cartesian", options=("--std=c++11", "--fmad=false"),
+        )
+        kernel.compile()
+        return kernel
 
 
 def _cupy_view(tensor, cp):
     """Wrap a Torch u8 CUDA allocation without a transfer or stream handshake."""
-    memory = cp.cuda.UnownedMemory(int(tensor.data_ptr()), int(tensor.numel()), tensor)
+    memory = cp.cuda.UnownedMemory(int(tensor.data_ptr()), int(tensor.numel()), tensor,
+                                  device_id=tensor.device.index)
     pointer = cp.cuda.MemoryPointer(memory, 0)
     return cp.ndarray((int(tensor.numel()),), dtype=cp.uint8, memptr=pointer)
 
@@ -186,7 +194,10 @@ def _render(mask_tyx, coverage_tyx, view, matrix, frame_idx, out_h, out_w,
     center = np.float32((int(view.src_h if direction == "vertical" else view.src_w) - 1) / 2.0)
 
     chosen_stream = stream if stream is not None else torch.cuda.current_stream(mask_tyx.device)
-    with torch.cuda.stream(chosen_stream):
+    if chosen_stream.device != mask_tyx.device:
+        raise ValueError('Categorical stream must belong to the volume CUDA device')
+    device_index = mask_tyx.device.index
+    with cp.cuda.Device(device_index), torch.cuda.stream(chosen_stream), _cupy_external_stream(cp, chosen_stream):
         output = torch.empty((out_h, out_w), dtype=torch.uint8, device=mask_tyx.device)
         coverage_output = (
             torch.empty_like(output) if coverage_tyx is not None else None
@@ -206,8 +217,12 @@ def _render(mask_tyx, coverage_tyx, view, matrix, frame_idx, out_h, out_w,
             *(np.float32(value) for value in mat.reshape(-1)),
             tan_alpha, center,
         )
-        with _cupy_external_stream(cp, chosen_stream):
-            _kernel()(((out_h * out_w + 255) // 256,), (256,), launch_args)
+        for tensor in (mask_tyx, coverage_tyx, output, coverage_output):
+            if tensor is not None:
+                tensor.record_stream(chosen_stream)
+        with _KERNEL_LOCK:
+            kernel = _kernel(device_index)
+        kernel(((out_h * out_w + 255) // 256,), (256,), launch_args)
     return (output, coverage_output) if coverage_tyx is not None else output
 
 

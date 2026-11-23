@@ -535,12 +535,17 @@ def _slurm_allocated_cpu_count() -> Optional[int]:
     return None
 
 def _cpu_count() -> int:
-    try:
-        affinity = os.sched_getaffinity(0)
-        if affinity:
-            return max(1, int(len(affinity)))
-    except Exception:
-        pass
+    if os.name == 'nt':
+        from .runtime import _current_process_cpu_affinity
+
+        affinity = _current_process_cpu_affinity()
+    else:
+        try:
+            affinity = os.sched_getaffinity(0)
+        except (AttributeError, OSError):
+            affinity = None
+    if affinity:
+        return len(affinity)
 
     slurm_cpus = _slurm_allocated_cpu_count()
     if slurm_cpus is not None:

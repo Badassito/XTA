@@ -196,3 +196,48 @@ def test_manifest_failure_does_not_register_an_unpublished_reference(tmp_path):
         with pytest.raises(OSError,match='manifest write'):
             evidence._register_confidence_reference(reference)
     assert evidence.lookup_confidence_evidence('k','m') is None
+
+
+@pytest.mark.parametrize('settle', ['drain_confidence_publication', 'shutdown_confidence_publication'])
+def test_background_manifest_coalesces_registered_layers_at_settlement(tmp_path, settle):
+    evidence.configure_confidence_evidence(tmp_path/'out', enabled=True, background_publication=True)
+    manifest = tmp_path/'out/reconciliation_evidence/manifest.json'
+    view = geometry.get_view_infos(1, 8, 10, cartesian_views=('transverse',))[0]
+    mask = np.ones((1, 8, 10), np.uint8)
+    with mock.patch.object(evidence, '_write_confidence_manifest',
+            wraps=evidence._write_confidence_manifest) as write_manifest:
+        for key in ('first', 'second'):
+            scores = np.full_like(mask, 101)
+            ref = evidence.capture_prediction_confidence(mask, scores, view=view, model_name='m',
+                temp_dir=tmp_path, layer_key=key)
+            assert evidence.lookup_confidence_evidence(key, 'm') == ref
+        assert not manifest.exists()
+        getattr(evidence, settle)()
+        getattr(evidence, settle)()
+        write_manifest.assert_called_once()
+    assert [item['layer_key'] for item in json.loads(manifest.read_text())['layers']] == ['first', 'second']
+
+
+@pytest.mark.parametrize('failure_owner', [None, 'capture', 'publisher', 'suppressed'])
+def test_shutdown_flushes_only_after_successful_strict_close(monkeypatch, failure_owner):
+    actions = []
+    failure = OSError('confidence queue failed')
+
+    def close(name, *, raise_errors):
+        actions.append(name)
+        if raise_errors and failure_owner == name:
+            raise failure
+
+    with monkeypatch.context() as patch:
+        patch.setattr(evidence, '_CAPTURE_QUEUE', mock.Mock(close=lambda **kw: close('capture', **kw)))
+        patch.setattr(evidence, '_PUBLICATION', mock.Mock(close=lambda **kw: close('publisher', **kw)))
+        patch.setattr(evidence, '_MANIFEST_DIRTY', True)
+        patch.setattr(evidence, '_write_confidence_manifest', lambda *args: actions.append('flush'))
+        if failure_owner in ('capture', 'publisher'):
+            with pytest.raises(OSError) as caught:
+                evidence.shutdown_confidence_publication()
+            assert caught.value is failure
+        else:
+            evidence.shutdown_confidence_publication(raise_errors=failure_owner is None)
+        evidence.shutdown_confidence_publication()
+    assert actions == ['capture', 'publisher'] + (['flush'] if failure_owner is None else [])

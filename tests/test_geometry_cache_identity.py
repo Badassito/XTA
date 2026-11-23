@@ -305,3 +305,47 @@ def test_dense_signature_binds_source_and_reversal():
     changed_reverse = [replace(original[0], reverse_u=True), *original[1:]]
     assert bp._azimuthal_plan_signature(original) != bp._azimuthal_plan_signature(changed_source)
     assert bp._azimuthal_plan_signature(original) != bp._azimuthal_plan_signature(changed_reverse)
+
+
+def test_dense_azimuthal_cache_evicts_lru_and_keeps_live_map(monkeypatch):
+    views, plans = dense_pair()
+    args = views[0], plans[0]
+    monkeypatch.setattr(bp, '_DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_MAX_BYTES', 2 * 9 * 9 * 9)
+    cache = bp._DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE
+    first = bp.build_dense_azimuthal_backprojection_map(*args, out_shape_hw=(9, 9))
+    second = bp.build_dense_azimuthal_backprojection_map(*args, out_shape_hw=(7, 9))
+    assert bp.build_dense_azimuthal_backprojection_map(*args, out_shape_hw=(9, 9)) is first
+    third = bp.build_dense_azimuthal_backprojection_map(*args, out_shape_hw=(8, 9))
+    assert [id(value) for value in cache.values()] == [id(first), id(third)]
+    assert second.valid_mask.any()
+    assert not second.source_idx_map.flags.writeable
+    oversized = bp.build_dense_azimuthal_backprojection_map(*args, out_shape_hw=(20, 9))
+    assert oversized.nbytes > bp._DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_MAX_BYTES
+    assert [id(value) for value in cache.values()] == [id(first), id(third)]
+
+
+def test_dense_azimuthal_cache_shares_same_key_build_without_blocking_other_keys():
+    views, plans = dense_pair()
+    started, finish = threading.Event(), threading.Event()
+    real_make = bp._make_dense_azimuthal_backprojection_map
+
+    def make(*args):
+        if args[3] == (9, 9):
+            started.set()
+            assert finish.wait(5)
+        return real_make(*args)
+
+    with (mock.patch.object(bp, '_make_dense_azimuthal_backprojection_map', side_effect=make) as build,
+          ThreadPoolExecutor(max_workers=3) as executor):
+        first = executor.submit(bp.build_dense_azimuthal_backprojection_map, views[0], plans[0])
+        try:
+            assert started.wait(5)
+            same = executor.submit(bp.build_dense_azimuthal_backprojection_map, views[0], plans[0])
+            other = executor.submit(bp.build_dense_azimuthal_backprojection_map,
+                                    views[0], plans[0], out_shape_hw=(8, 9))
+            assert other.result(5).valid_mask.shape == (8, 9)
+        finally:
+            finish.set()
+        assert same.result(5) is first.result(5)
+    assert build.call_count == 2
+    assert not bp._DENSE_AZIMUTHAL_BACKPROJECT_MAP_BUILDS

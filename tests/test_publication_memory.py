@@ -53,13 +53,16 @@ def _verify_concurrent_cached_exports(root, volumes):
         with ExitStack() as stack:
             for ref in refs:
                 reader = RawBBoxMaskStore.open(ref.path, cache_payload_in_ram=True)
-                stack.callback(interpolation._release_raw_store_chunks_ram_cache, reader.chunks_path)
                 stack.callback(reader.close)
             with ThreadPoolExecutor(max_workers=len(refs)) as pool:
                 futures = [pool.submit(export, i, 'cached') for i in range(len(refs))]
                 actual = [future.result() for future in futures]
             if actual != expected:
                 raise AssertionError('Cached layer or low-quality mirror contains another layer payload')
+        for ref in refs:
+            key = interpolation._raw_store_chunks_cache_key(ref.path / 'chunks.bin')
+            if key in interpolation._NRRD_RAW_STORE_CHUNKS_RAM_CACHE:
+                raise AssertionError('Closed layer retained a cached chunks.bin mapping')
 
 
 def _verify_cached_exports_in_subprocess(root, *, emulate_memfd_resolution):

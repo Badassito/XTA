@@ -3,13 +3,16 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from multiprocessing.util import Finalize
 from types import SimpleNamespace
 import threading
+from unittest import mock
 
 import numpy as np
 import pytest
 
 from XTA import pta_cuda_masks, pta_gpu_classification, pta_workers
+from XTA.pta_batch_pipeline import OrderedBatchPipeline
 from XTA.pta_gpu_publication import GpuPublicationTask, _GpuBatch
 
 
@@ -309,6 +312,10 @@ def test_next_serial_entry_waits_for_previous_host_publication_drain(monkeypatch
             ThreadPoolExecutor(max_workers=1) as gpu_executor, \
             ThreadPoolExecutor(max_workers=1) as host_executor:
         resources.gpu_executor, resources.host_executor = gpu_executor, host_executor
+        resources.host = OrderedBatchPipeline(
+            lambda operation: operation(), capacity=2, max_pending_bytes=resources.host_bytes,
+            executor=host_executor,
+        )
         first = serial_rank.submit(pta_workers._render_task_entry, ('a', 1, object()))
         try:
             assert host_started.wait(10), 'actual publication consumer did not start'
@@ -320,3 +327,37 @@ def test_next_serial_entry_waits_for_previous_host_publication_drain(monkeypatch
         assert first.result(timeout=10) == second.result(timeout=10) == 'rendered'
     assert worker.events.index('host_finished') < worker.events.index('fence')
     assert worker.events.index('fence') < worker.events.index(('attach', 1))
+
+
+def test_worker_reinitialization_drains_and_deregisters_prior_owners(monkeypatch, worker):
+    monkeypatch.setattr(pta_workers, '_WORKER_INITIALIZER_ERROR', None)
+    worker.resources.close = lambda: worker.events.append('publication_closed')
+    worker.resources.finalizer = Finalize(None, worker.resources.close, exitpriority=15)
+    worker.runtime['intensity_prestage'] = SimpleNamespace(join=lambda: worker.events.append('prestage_joined'))
+    worker.runtime['render_pool_finalizer'] = Finalize(
+        None, worker.events.append, args=('render_joined',), exitpriority=16,
+    )
+    for key in ('intensity_prestage_finalizer', 'categorical_volume_finalizer', 'spherical_host_cache_finalizer'):
+        worker.runtime[key] = Finalize(None, worker.events.append, args=(key,), exitpriority=13)
+    prior = [value for value in worker.runtime.values() if isinstance(value, Finalize)]
+    prior.append(worker.resources.finalizer)
+
+    try:
+        pta_workers._render_worker_initializer()
+        assert pta_workers._WORKER_GPU_RUNTIME is None
+        assert not any(finalizer.still_active() for finalizer in prior)
+        assert worker.events == ['render_joined', 'prestage_joined', 'publication_closed', 'category_retire']
+    finally:
+        for finalizer in prior:
+            finalizer.cancel()
+
+
+def test_worker_reinitialization_surfaces_a_teardown_failure(monkeypatch, worker):
+    monkeypatch.setattr(pta_workers, '_WORKER_INITIALIZER_ERROR', None)
+    worker.resources.close = mock.Mock(side_effect=RuntimeError('failed publication drain'))
+
+    pta_workers._render_worker_initializer()
+
+    assert pta_workers._WORKER_GPU_RUNTIME is worker.runtime
+    with pytest.raises(RuntimeError, match='failed publication drain'):
+        pta_workers._render_task_entry(('payload', 1, object()))

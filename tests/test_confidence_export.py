@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -139,6 +140,73 @@ def test_selected_observed_score_scalar_roundtrip_on_source_and_compact_grid(tmp
     np.testing.assert_array_equal(nrrd.read(str(compact_nrrd),index_order="C")[0],
                                   brute_pool(native[0],masks[0],masks[0].shape))
     assert compact["grid"]=="compact_source" and compact["run_id"]=="score-test"
+
+
+def test_compact_export_from_grouped_review_retains_exact_masks_and_scores(tmp_path):
+    from XTA.reconciliation_io import read_layer_manifest
+    from XTA.sweep_grouped_reader import locate_run_layer_catalog, open_grouped_catalog
+    from XTA.sweep_publication import publish_sweep_review
+    from tools.compare_reconciliation import discover_geometry_context
+
+    original, compact, scores, masks = make_run(tmp_path)
+    evidence = original.parent / "reconciliation_evidence" / "manifest.json"
+    for path in (original, compact, evidence):
+        data = json.loads(path.read_bytes())
+        data["run_id"] = "grouped-export"
+        if path == original:
+            data["confidence_sweep"] = dict(sweep_id="export-test", cutoff_hundredths=50, nrrd_storage="grouped")
+        path.write_text(json.dumps(data), encoding="utf-8")
+    root = tmp_path / "sweep"
+    branch = root / "confidence_cutoffs" / "conf_050"
+    branch.parent.mkdir(parents=True)
+    stage = tmp_path / "scratch"
+    staged_branch = stage / branch.name
+    staged_branch.mkdir(parents=True)
+    original.parent.rename(branch)
+    (branch / "low_quality").rename(staged_branch / "low_quality")
+    review = publish_sweep_review(root, [(50, branch)], sweep_id="export-test", nrrd_stage_root=stage)
+    (root / "manifest.json").write_text(json.dumps({
+        "schema": "xta.confidence_sweep/1",
+        "review_manifest": "review/manifest.json",
+        "review_manifest_sha256": hashlib.sha256(review.read_bytes()).hexdigest(),
+    }), encoding="utf-8")
+
+    run = branch / "manifest.json"
+    catalogue = locate_run_layer_catalog(run, "low_quality/0p50")
+    context, linked_run, _ = discover_geometry_context(catalogue)
+    assert linked_run == run and context["source_shape_tyx"] == list(scores[0].shape)
+    grouped = open_grouped_catalog(catalogue)
+    assert grouped.segment("prediction_0.seg.nrrd").path == grouped.segment("prediction_1.seg.nrrd").path
+    with read_layer_manifest(catalogue, workspace=tmp_path, memory_mib=1) as layers:
+        for index, layer in enumerate(layers):
+            np.testing.assert_array_equal(layer.read_slab(1, 3), masks[index][1:3])
+            np.testing.assert_array_equal(layer.read_slab(0, 4), masks[index])
+    output = tmp_path / "portable"
+    result = export_compact_evidence(run, catalogue, output, memory_mib=8)
+    assert locate_run_layer_catalog(output / "manifest.json") == output / result["paths"]["nrrd_manifest"]
+    with read_layer_manifest(output / result["paths"]["nrrd_manifest"], workspace=tmp_path) as layers:
+        assert layers.grouped_catalog is None
+        for index, layer in enumerate(layers):
+            np.testing.assert_array_equal(layer.read_slab(0, 4), masks[index])
+    for index, entry in enumerate(result["confidence_layers"]):
+        ref = ConfidenceEvidenceRef.open(output / "reconciliation_evidence" / entry["directory"])
+        with ref.reader() as reader:
+            actual, _ = reader(0, 4)
+        np.testing.assert_array_equal(actual, brute_pool(scores[index], masks[index], masks[index].shape))
+
+    corrupt = grouped.segment("prediction_0.seg.nrrd").path
+    with corrupt.open("r+b") as stream:
+        stream.seek(-1, 2)
+        value = stream.read(1)[0]
+        stream.seek(-1, 2)
+        stream.write(bytes([value ^ 1]))
+    rejected = tmp_path / "rejected"
+    with pytest.raises(ValueError, match="checksum"):
+        export_compact_evidence(run, catalogue, rejected, memory_mib=8)
+    assert not rejected.exists()
+    review.write_bytes(review.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="family receipt"):
+        open_grouped_catalog(catalogue)
 
 
 def test_compact_export_rejects_cross_run_masks_with_identical_grid(tmp_path):

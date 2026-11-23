@@ -89,23 +89,61 @@ class LtaUnionWriter:
             raise ValueError("union chunks must use uint8 or bool binary masks")
         if values.dtype == np.uint8 and bool(np.any(values > 1)):
             raise ValueError("union chunks must contain only zero and one")
-        stop = start + int(values.shape[0])
+        stop = self._owned_chunk_stop(start, values.shape[0])
+
+        def frame_crops():
+            for ordinal, frame in enumerate(values):
+                ys = np.flatnonzero(np.any(frame, axis=1))
+                if not len(ys):
+                    continue
+                top, bottom = int(ys[0]), int(ys[-1]) + 1
+                xs = np.flatnonzero(np.any(frame[top:bottom], axis=0))
+                left, right = int(xs[0]), int(xs[-1]) + 1
+                yield ordinal, top, left, frame[top:bottom, left:right]
+
+        self._append_crops(start, stop, frame_crops())
+
+    def append_cropped_chunk(
+        self, frame_start: int, frame_crops: Sequence[tuple[int, int, np.ndarray] | None],
+    ) -> None:
+        """Append a tight boolean crop or an empty entry per owned frame."""
+        if self._stream.closed:
+            raise RuntimeError("union writer is closed")
+        start = _index(frame_start, "chunk frame_start")
+        if not 1 <= len(frame_crops) <= MAX_CHUNK_FRAMES:
+            raise ValueError("union chunks must contain one to thirty TYX frames")
+        stop = self._owned_chunk_stop(start, len(frame_crops))
+        crops = []
+        for ordinal, entry in enumerate(frame_crops):
+            if entry is None:
+                continue
+            top, left, crop = entry
+            top, left = _index(top, "crop top"), _index(left, "crop left")
+            crop = np.asarray(crop)
+            if crop.ndim != 2 or crop.dtype != np.bool_ or not crop.size:
+                raise ValueError("union crops must be nonempty two-dimensional boolean arrays")
+            height, width = crop.shape
+            if top + height > self.shape[1] or left + width > self.shape[2]:
+                raise ValueError("union crop lies outside its logical tile")
+            if not all(np.any(edge) for edge in (crop[0], crop[-1], crop[:, 0], crop[:, -1])):
+                raise ValueError("union crop must tightly bound its foreground")
+            crops.append((ordinal, top, left, crop))
+        self._append_crops(start, stop, crops)
+
+    def _owned_chunk_stop(self, start: int, frame_count: int) -> int:
+        stop = start + frame_count
         if not self.frame_start <= start < stop <= self.frame_start + self.shape[0]:
             raise ValueError("union chunk lies outside its logical frame range")
         if any(start < prior_stop and prior_start < stop for prior_start, prior_stop in self._ranges):
             raise ValueError("union chunks must own disjoint frame ranges")
+        return stop
+
+    def _append_crops(self, start, stop, crops) -> None:
         try:
-            for ordinal, frame in enumerate(values):
-                pixels = int(np.count_nonzero(frame))
-                if not pixels:
-                    continue
-                ys = np.flatnonzero(np.any(frame, axis=1))
-                xs = np.flatnonzero(np.any(frame, axis=0))
-                top, bottom = int(ys[0]), int(ys[-1]) + 1
-                left, right = int(xs[0]), int(xs[-1]) + 1
-                crop = frame[top:bottom, left:right]
+            for ordinal, top, left, crop in crops:
+                pixels = int(np.count_nonzero(crop))
                 packed = np.packbits(crop, axis=1, bitorder="little")
-                data = packed.tobytes(order="C")
+                data = memoryview(np.ascontiguousarray(packed)).cast("B")
                 if self._stream.write(data) != len(data):
                     raise OSError("incomplete sparse union payload write")
                 self._digest.update(data)
@@ -114,7 +152,7 @@ class LtaUnionWriter:
                     "offset_bytes": self._size,
                     "size_bytes": len(data),
                     "crop_yx": [top, left],
-                    "shape_yx": [bottom - top, right - left],
+                    "shape_yx": list(crop.shape),
                     "row_stride_bytes": int(packed.shape[1]),
                     "foreground_pixels": pixels,
                 })
@@ -188,17 +226,19 @@ class ValidatedUnionArtifact:
             raise RuntimeError("union artifact changed after verification")
 
 
-def _decode(data: bytes, frame: _Frame):
+def _decode(data: bytes, frame: _Frame, *, unpack=True):
     packed = np.frombuffer(data, dtype=np.uint8).reshape(frame.height, frame.stride)
     remainder = frame.width % 8
     if remainder and bool(np.any(packed[:, -1] & (255 ^ ((1 << remainder) - 1)))):
         raise ValueError("sparse union row padding must be zero")
-    decoded = np.unpackbits(packed, axis=1, count=frame.width, bitorder="little")
-    if int(np.count_nonzero(decoded)) != frame.foreground:
+    if int.from_bytes(data, "little").bit_count() != frame.foreground:
         raise ValueError("sparse union foreground count differs from its payload")
-    if not all(bool(np.any(edge)) for edge in (decoded[0], decoded[-1], decoded[:, 0], decoded[:, -1])):
+    right_bit = 1 << ((frame.width - 1) % 8)
+    edges = (packed[0], packed[-1], packed[:, 0] & 1, packed[:, -1] & right_bit)
+    if not all(bool(np.any(edge)) for edge in edges):
         raise ValueError("sparse union crop must tightly bound its foreground")
-    return decoded
+    if unpack:
+        return np.unpackbits(packed, axis=1, count=frame.width, bitorder="little")
 
 
 def validate_union_artifact(descriptor: Mapping[str, object] | ValidatedUnionArtifact, *, frame_start=None):
@@ -279,7 +319,7 @@ def validate_union_artifact(descriptor: Mapping[str, object] | ValidatedUnionArt
                 if len(data) != frame.size:
                     raise RuntimeError("sparse union payload ended before its indexed extent")
                 actual.update(data)
-                _decode(data, frame)
+                _decode(data, frame, unpack=False)
         if actual.hexdigest() != digest:
             raise RuntimeError("union artifact SHA256 differs from its descriptor")
         result = ValidatedUnionArtifact(path, shape, start, UNION_ENCODING, digest, size,

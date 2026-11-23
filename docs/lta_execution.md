@@ -5,6 +5,15 @@ window graph, then continues through the canonical temporal frontier in
 `XTA/lta_frontier_execution.py`. The dynamic crop backend retains its own
 sealed predecessor scheduling in `XTA/lta_dynamic_execution.py`.
 
+The tiled relay frontier is a coordinator-local SQLite database. It starts in
+memory when the live host and cgroup budget allow it. The database is limited
+to a 16 MiB default or one sixty-fourth of available allocation headroom,
+whichever is smaller. A separate bounded retry buffer holds packed seed offers.
+An oversized batch or a full database moves the committed state to the run's
+scratch directory and continues there. Set `XTA_LTA_FRONTIER_MEMORY_MIB=0` to
+start on the filesystem selected by `--temp`. Frontier diagnostics record the
+active backing and database size.
+
 `XTA/lta_window_execution.py` owns the shared window graph execution: worker
 dispatch and leases, immediate native union reduction, verified dogfood
 continuations, coverage ledger and snapshot lifetimes, and ordered audit and

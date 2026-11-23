@@ -49,7 +49,7 @@ def test_sam_presets_declare_quality_ablation_without_changing_source_union():
         assert bridge['branch_aware_selection'] == (name != 'sam_raw_candidates')
 
 
-def test_snapshotted_custom_presets_load_outside_the_example_directory(tmp_path):
+def test_copied_custom_presets_load_outside_the_example_directory(tmp_path):
     sample = block()
     sample['candidate'][:, 3:14, 3:18] = True
     sample['score'][sample['candidate']] = 3.

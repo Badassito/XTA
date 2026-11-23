@@ -61,7 +61,7 @@ def _binary_mask_copy(mask: object, *, name: str) -> Any:
     array = np.asarray(mask)
     if array.ndim != 2 or any(int(value) < 1 for value in array.shape):
         raise ValueError(f"{name} must be a nonempty two-dimensional mask")
-    output = np.ascontiguousarray(array != 0, dtype=np.bool_).copy()
+    output = np.ascontiguousarray(array != 0, dtype=np.bool_)
     if not bool(output.any()):
         raise ValueError(f"{name} must contain foreground")
     output.setflags(write=False)
@@ -402,9 +402,7 @@ def write_seed_artifact(path: str | Path, seeds: Sequence[LtaMaskSeed]) -> LtaSe
         with stage.open("wb") as handle:
             np.savez_compressed(
                 handle,
-                masks=np.stack(
-                    [np.asarray(seed.mask, dtype=np.uint8) for seed in ordered]
-                ),
+                masks=np.asarray([seed.mask for seed in ordered], dtype=np.uint8),
                 metadata_utf8=np.frombuffer(
                     json.dumps(
                         metadata,
@@ -494,11 +492,6 @@ def _expected_frames(request: LtaPropagationRequest) -> set[int]:
     return set(range(request.session.frame_start, request.prompt_frame + 1))
 
 
-def _binary_mask_copy_for_propagation(mask: object) -> Any:
-    import numpy as np
-    return np.ascontiguousarray(mask, dtype=np.bool_).copy()
-
-
 def run_mask_injected_session(
     measured_predictor: object,
     raw_predictor: object,
@@ -521,8 +514,8 @@ def run_mask_injected_session(
 
     import numpy as np
 
-    if fill_mask is None:
-        fill_mask = _fill_binary_mask if enable_2D_hole_fill else _binary_mask_copy_for_propagation
+    if fill_mask is None and enable_2D_hole_fill:
+        fill_mask = _fill_binary_mask
 
     if not isinstance(request, LtaPropagationRequest):
         raise TypeError("request must be an LtaPropagationRequest")
@@ -537,13 +530,15 @@ def run_mask_injected_session(
     filled_seeds: list[LtaMaskSeed] = []
     seed_added_pixels = 0
     for seed in request.seeds:
-        filled = np.ascontiguousarray(fill_mask(seed.mask), dtype=np.bool_)
+        filled = (seed.mask if fill_mask is None
+                  else np.ascontiguousarray(fill_mask(seed.mask), dtype=np.bool_))
         if filled.shape != seed.mask.shape:
             raise RuntimeError(
                 f"injection hole filling changed seed mask shape from "
                 f"{seed.mask.shape} to {filled.shape}"
             )
-        added = int(np.count_nonzero(filled & ~np.asarray(seed.mask, dtype=bool)))
+        added = (0 if fill_mask is None
+                 else int(np.count_nonzero(filled & ~np.asarray(seed.mask, dtype=bool))))
         seed_added_pixels += added
         filled_seeds.append(
             LtaMaskSeed(
@@ -635,13 +630,17 @@ def run_mask_injected_session(
                 f"mask propagation returned mask shape {raw_mask.shape}; "
                 f"expected seed mask shape {seed.mask.shape}"
             )
-        filled = np.ascontiguousarray(fill_mask(prediction.binary_mask), dtype=np.bool_)
-        if filled.shape != raw_mask.shape:
-            raise RuntimeError(
-                f"prediction hole filling changed mask shape from "
-                f"{raw_mask.shape} to {filled.shape}"
-            )
-        added = int(np.count_nonzero(filled & ~raw_mask))
+        if fill_mask is None:
+            filled = raw_mask.copy(order="C")
+            added = 0
+        else:
+            filled = np.ascontiguousarray(fill_mask(prediction.binary_mask), dtype=np.bool_)
+            if filled.shape != raw_mask.shape:
+                raise RuntimeError(
+                    f"prediction hole filling changed mask shape from "
+                    f"{raw_mask.shape} to {filled.shape}"
+                )
+            added = int(np.count_nonzero(filled & ~raw_mask))
         prediction_added_pixels += added
         canonical = SamFramePrediction(
             sequence_id=prediction.sequence_id,
@@ -791,7 +790,8 @@ def run_mask_injected_session(
                 lineage=item.lineage,
                 frame_index=boundary_frame,
                 object_id=item.prediction.object_id,
-                mask=fill_mask(item.prediction.binary_mask),
+                mask=(item.prediction.binary_mask if fill_mask is None
+                      else fill_mask(item.prediction.binary_mask)),
                 provenance=LtaSeedProvenance.TEMPORAL_DOGFOOD,
                 tracker_probability=(
                     item.prediction.frame_tracker_score

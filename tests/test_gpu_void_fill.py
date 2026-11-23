@@ -9,6 +9,7 @@ from scipy import ndimage
 
 from XTA import topology
 from XTA.config import GIB
+from XTA.runtime import wait_for_retired_memmap_unlinks
 from XTA import topology_gpu_voidfill as gpu
 
 
@@ -36,8 +37,7 @@ def _fake_cupy(shape, block):
 
     cp = SimpleNamespace(
         cuda=SimpleNamespace(Device=Device), asarray=array, asnumpy=np.asarray,
-        int32=np.int32, unique=lambda a: array(np.unique(a)),
-        concatenate=lambda a: array(np.concatenate(a)),
+        int32=np.int32, bool_=np.bool_, zeros=np.zeros, flatnonzero=np.flatnonzero,
         get_default_memory_pool=lambda: SimpleNamespace(free_all_blocks=lambda: None),
     )
 
@@ -93,6 +93,7 @@ def test_slab_faces_are_not_global_boundaries_and_memmap_is_cleaned(tmp_path):
     mask[2:7, 2:6, 2:5] = 0
     actual, _ = _run(mask, tmp_path, disk=True)
     assert np.all(actual)
+    wait_for_retired_memmap_unlinks(under=tmp_path)
     assert not list(tmp_path.glob('*.dat'))
 
 
@@ -134,6 +135,23 @@ def test_partial_gpu_labels_are_discarded_on_label_failure(tmp_path):
     assert len(calls) == 2
     assert stats['backend'] == 'cpu'
     np.testing.assert_array_equal(mask, ndimage.binary_fill_holes(original))
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_disk_backed_gid_store_retires_on_success_or_failure(tmp_path, fail):
+    mask = np.ones((5, 5, 5), np.uint8)
+    mask[2, 2, 2] = 0
+    prefix = tmp_path / 'void'
+    gid_path = prefix.with_suffix('.bg_gid.u32.dat')
+    if fail:
+        with mock.patch.object(topology.cv2, 'connectedComponents', side_effect=OSError('label failed')):
+            with pytest.raises(OSError, match='label failed'):
+                topology.fill_3d_voids_inplace_streaming(mask, prefix, prefer_memory=False)
+    else:
+        topology.fill_3d_voids_inplace_streaming(mask, prefix, prefer_memory=False)
+        assert mask[2, 2, 2] == 1
+    wait_for_retired_memmap_unlinks(path=gid_path)
+    assert not gid_path.exists()
 
 
 def test_default_background_connectivity_fills_closed_diagonal_shell(tmp_path):

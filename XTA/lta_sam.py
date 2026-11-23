@@ -51,11 +51,11 @@ _SAM_INPUT_PREPARATION_SHA256 = source_sha256(__file__)
 
 
 def cuda_capability_supports_fa3(major: int, minor: int = 0) -> bool:
-    """Return the pinned FA3 policy (Hopper+, not Ada/4090)."""
+    """Return whether the device is in the pinned Hopper FA3 policy."""
 
     if isinstance(major, bool) or isinstance(minor, bool):
         raise TypeError("CUDA capability fields must be integers")
-    return int(major) >= 9
+    return int(major) == 9
 
 
 def configure_constrained_gpu_batches(predictor: object) -> dict[str, object]:
@@ -87,23 +87,35 @@ def install_sdpa_fallback(decoder_module: object | None = None) -> Callable[[], 
 
     if decoder_module is None:
         decoder_module = importlib.import_module("sam3.model.decoder")
-    original = getattr(decoder_module, "sdpa_kernel", None)
-    backend = getattr(decoder_module, "SDPBackend", None)
-    if not callable(original) or backend is None:
-        raise RuntimeError("the pinned SAM decoder exposes no SDPA backend boundary")
-    choices = [
-        backend.FLASH_ATTENTION,
-        backend.EFFICIENT_ATTENTION,
-        backend.MATH,
-    ]
+    with _sam_sdk.SAM_SDK_PATCH_LOCK:
+        kernel = getattr(decoder_module, "sdpa_kernel", None)
+        backend = getattr(decoder_module, "SDPBackend", None)
+        if not callable(kernel) or backend is None:
+            raise RuntimeError("the pinned SAM decoder exposes no SDPA backend boundary")
+        original = getattr(kernel, "_xta_sdpa_original", None)
+        if original is None:
+            original = kernel
+            choices = [backend.FLASH_ATTENTION, backend.EFFICIENT_ATTENTION, backend.MATH]
 
-    def compatible_sdpa_kernel(_requested: object):
-        return original(choices, set_priority=True)
+            def kernel(_requested: object):
+                return original(choices, set_priority=True)
 
-    decoder_module.sdpa_kernel = compatible_sdpa_kernel
+            kernel._xta_sdpa_original = original
+            kernel._xta_sdpa_users = 0
+            decoder_module.sdpa_kernel = kernel
+        kernel._xta_sdpa_users += 1
+
+    restored = False
 
     def restore() -> None:
-        decoder_module.sdpa_kernel = original
+        nonlocal restored
+        with _sam_sdk.SAM_SDK_PATCH_LOCK:
+            if restored:
+                return
+            restored = True
+            kernel._xta_sdpa_users -= 1
+            if kernel._xta_sdpa_users == 0 and decoder_module.sdpa_kernel is kernel:
+                decoder_module.sdpa_kernel = original
 
     return restore
 
@@ -118,9 +130,9 @@ def resolve_sam_attention_backend(
     if backend not in {"auto", "sdpa", "fa3_fp8"}:
         raise ValueError("SAM attention_backend must be auto, sdpa, or fa3_fp8")
     if backend == "auto":
-        backend = "fa3_fp8" if capability[0] >= 9 else "sdpa"
-    if backend == "fa3_fp8" and capability[0] < 9:
-        raise ValueError("SAM fa3_fp8 attention requires Hopper or newer")
+        backend = "fa3_fp8" if cuda_capability_supports_fa3(capability[0]) else "sdpa"
+    if backend == "fa3_fp8" and not cuda_capability_supports_fa3(capability[0]):
+        raise ValueError("SAM fa3_fp8 attention requires Hopper (compute capability 9.x)")
     return backend
 
 
@@ -128,8 +140,8 @@ def preflight_sam_fa3(runtime_torch: object, device_id: int) -> dict[str, object
     """Execute the pinned native FP8 kernels before allocating the SAM model."""
     device = int(device_id)
     capability = tuple(runtime_torch.cuda.get_device_capability(device))
-    if capability[0] < 9:
-        raise ValueError("SAM fa3_fp8 attention requires Hopper or newer")
+    if not cuda_capability_supports_fa3(capability[0]):
+        raise ValueError("SAM fa3_fp8 attention requires Hopper (compute capability 9.x)")
     try:
         resolve_pinned_sam_runtime_provenance()
         distribution = importlib.metadata.distribution("flash-attn-3")
@@ -217,7 +229,7 @@ def resolve_sam_device_profile(
     requested: str = "auto",
     attention_backend: str | None = None,
 ) -> dict[str, object]:
-    """Resolve the production H100 or bounded eGPU storage/runtime profile."""
+    """Resolve the datacenter or bounded eGPU storage/runtime profile."""
 
     device = int(device_id)
     name = str(torch_module.cuda.get_device_name(device))
@@ -225,15 +237,20 @@ def resolve_sam_device_profile(
     attention = resolve_sam_attention_backend(capability, attention_backend)
     profile = str(requested).strip().lower()
     if profile == "auto":
-        profile = "h100" if capability[0] >= 9 else "egpu"
-    if profile == "h100":
-        if capability[0] < 9:
+        if capability == (8, 0) and "a100" in name.lower():
+            profile = "a100"
+        else:
+            profile = "h100" if capability[0] >= 9 else "egpu"
+    if profile in {"h100", "a100"}:
+        if profile == "h100" and capability[0] < 9:
             raise ValueError(
                 f"the h100 profile requires Hopper or newer; cuda:{device} "
                 f"reports {capability[0]}.{capability[1]}"
             )
+        if profile == "a100" and (capability != (8, 0) or "a100" not in name.lower()):
+            raise ValueError(f"the a100 profile requires an NVIDIA A100; cuda:{device} reports {name!r}")
         return {
-            "name": "h100",
+            "name": profile,
             "device_name": name,
             "capability": capability,
             "weight_storage": "float32",
@@ -275,7 +292,7 @@ def resolve_sam_device_profile(
             "attention_qkv_dtype": "bfloat16",
             "runtime_autocast_dtype": "bfloat16",
         }
-    raise ValueError("requested SAM device profile must be auto, h100, or egpu")
+    raise ValueError("requested SAM device profile must be auto, h100, a100, or egpu")
 
 
 @dataclass(frozen=True)
@@ -698,17 +715,19 @@ def prepare_sam_video_frames(predictor, resource, *, torch_module=None, cuda_quo
         cuda = False
         workspace = 12*height*width + 12*height*side + 32*side*side
         if torch_module is not None and _env_flag("YOLO_TTA_SAM_GPU_IMAGES", True):
-            free, total = torch_module.cuda.mem_get_info(0)
-            allocated = int(torch_module.cuda.memory_allocated(0))
-            reusable = max(0, int(torch_module.cuda.memory_reserved(0))-allocated)
+            device_index = int(torch_module.cuda.current_device())
+            free, total = torch_module.cuda.mem_get_info(device_index)
+            allocated = int(torch_module.cuda.memory_allocated(device_index))
+            reusable = max(0, int(torch_module.cuda.memory_reserved(device_index))-allocated)
             available = int(free)+reusable
             if cuda_quota_bytes is not None:
                 available = min(available, max(0, int(cuda_quota_bytes)-allocated))
             cuda = available >= workspace + max(2*1024**3, int(total*.15))
         if cuda:
-            device_lookup = lookup.to(device="cuda:0")
+            device = f"cuda:{device_index}"
+            device_lookup = lookup.to(device=device)
             for index, frame in enumerate(resource):
-                pixels = _resize_sam_rgb_u8(np.array(frame), side, torch_module, "cuda:0")
+                pixels = _resize_sam_rgb_u8(np.array(frame), side, torch_module, device)
                 normalized = torch_module.stack([device_lookup[channel, pixels[channel].long()]
                     for channel in range(3)])
                 images[index].copy_(normalized)
@@ -820,11 +839,12 @@ def build_local_sam_predictor(
                 f"{int(runtime_torch.cuda.device_count())}"
             )
         runtime_torch.cuda.set_device(resolved_device_id)
-        if use_fa3 is None:
+        if use_fa3 is None or use_fa3:
             capability = runtime_torch.cuda.get_device_capability(resolved_device_id)
-            use_fa3 = cuda_capability_supports_fa3(
-                int(capability[0]), int(capability[1])
-            )
+            supports_fa3 = cuda_capability_supports_fa3(int(capability[0]), int(capability[1]))
+            if use_fa3 and not supports_fa3:
+                raise ValueError("SAM fa3_fp8 attention requires Hopper (compute capability 9.x)")
+            use_fa3 = supports_fa3
         # Bind CUDA ownership before importing SAM: model_builder performs
         # import-time CUDA capability setup and must observe the worker device.
         try:

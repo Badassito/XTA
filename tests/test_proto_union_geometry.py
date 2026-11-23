@@ -68,6 +68,22 @@ def quantized(payload):
 FILLED = np.full((1, PROTO, PROTO), 5.0, np.float32)
 
 
+def test_cpu_retina_mask_only_skips_score_quantization():
+    pred, _, proto = _inputs([[4.4, 7.6, 30.0, 40.0]], [.9], FILLED)
+    payload = inference.CpuRetinaMaskPayload(
+        proto=proto.numpy(), coeffs=pred[:, 6:].numpy(), boxes_xyxy=pred[:, :4].numpy(),
+        confs=pred[:, 4].numpy(), orig_shape=(IMG, IMG), img_shape=(IMG, IMG), frame_path='x')
+    affine = np.array([[1, 0, 2], [0, 1, 1]], dtype=np.float32)
+    scored = np.zeros((1, IMG, IMG), dtype=np.uint8)
+    mask_only = np.zeros_like(scored)
+    counts = inference._process_cpu_retina_prediction_frame(
+        0, payload, IMG, scored, np.zeros_like(scored), affine, IMG, IMG)
+    with mock.patch.object(inference, 'quantize_conf_to_u8', side_effect=AssertionError('unrequested scores')):
+        assert inference._process_cpu_retina_prediction_frame(
+            0, payload, IMG, mask_only, None, affine, IMG, IMG) == counts == (1, 1)
+    np.testing.assert_array_equal(mask_only, scored)
+
+
 @pytest.mark.parametrize('x1,x2', [(4.4, 7.6), (5.0, 7.0), (9.2, 11.8), (6.4, 7.6), (8.2, 9.8)])
 def test_boxes_narrower_than_one_proto_cell_keep_their_detection(x1, x2):
     # The last two hold no proto cell centre; only the box-centre cell keeps them.

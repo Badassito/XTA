@@ -61,15 +61,18 @@ def prepare_gpu_void_fill(
                     del background
                     # Transfer directly into the admitted RAM/memmap workspace.
                     labels.get(out=np.asarray(labels_store[z0:z1]).view(np.int32))
-                    faces = [labels[:, 0, :].ravel(), labels[:, -1, :].ravel(),
-                             labels[:, :, 0].ravel(), labels[:, :, -1].ravel()]
+                    touches = cp.zeros(int(count) + 1, dtype=cp.bool_)
+                    # Repeated IDs all scatter the same value, so their order is irrelevant.
+                    for face in (labels[:, 0, :], labels[:, -1, :], labels[:, :, 0], labels[:, :, -1]):
+                        touches[face] = True
                     if z0 == 0:
-                        faces.append(labels[0].ravel())
+                        touches[labels[0]] = True
                     if z1 == depth:
-                        faces.append(labels[-1].ravel())
-                    boundary_ids = cp.asnumpy(cp.unique(cp.concatenate(faces)))
+                        touches[labels[-1]] = True
+                    touches[0] = False
+                    boundary_ids = cp.asnumpy(cp.flatnonzero(touches))
                     results.append((z0, z1, int(count), boundary_ids))
-                    del labels, faces, boundary_ids
+                    del labels, face, touches, boundary_ids
                 del device_structure
                 return results
             finally:

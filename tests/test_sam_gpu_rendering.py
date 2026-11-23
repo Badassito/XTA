@@ -254,7 +254,7 @@ def test_real_fused_tilted_sam_crops_keep_cpu_geometry_and_small_pixel_delta(tmp
     source[:] = np.random.default_rng(571).integers(0, 256, source.shape, dtype=np.uint8)
     source.flush()
     kernels = cuda_backend._fused_direct_render_kernels()
-    assert kernels is not None, cuda_backend._FUSED_DIRECT_RENDER_KERNELS_ERROR
+    assert kernels is not None, cuda_backend._FUSED_DIRECT_RENDER_KERNELS_ERRORS
     deltas, old_deltas, cpu_deltas = [], [], []
     for logical_t in (17, 25):
         cube = (np.asarray(source) if logical_t == source.shape[0] else

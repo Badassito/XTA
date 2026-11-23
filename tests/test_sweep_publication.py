@@ -2,6 +2,7 @@
 import gzip
 import hashlib
 import json
+import os
 
 import numpy as np
 import pytest
@@ -21,14 +22,20 @@ def read_nrrd(path):
             return np.frombuffer(encoded.read(), dtype=dtypes[h["type"]]).reshape(sizes), h
 
 
-def scalar(root, cent, *, grids=("native", "low_quality/half"), shifted=False, transfer_fixture=False):
+def scalar(root, cent, *, grids=("native", "low_quality/half"), shifted=False, transfer_fixture=False,
+           stage_root=None, incomplete=False):
     branch = root / "confidence_cutoffs" / f"conf_{cent:03d}"
     branch.mkdir(parents=True)
-    (branch / "manifest.json").write_text(json.dumps({"status":"complete", "confidence_sweep":{
-        "sweep_id":"sweep-test", "cutoff_hundredths":cent}}))
+    ownership = {"sweep_id": "sweep-test", "cutoff_hundredths": cent}
+    if stage_root is not None:
+        ownership["nrrd_storage"] = "grouped"
+    (branch / "manifest.json").write_text(json.dumps({
+        "status": "incomplete" if incomplete else "complete", "confidence_sweep": ownership,
+    }))
+    backing = stage_root / branch.name if stage_root is not None else branch
     expected = {}
     for grid_id in grids:
-        folder = branch / ("nrrd" if grid_id == "native" else f"{grid_id}/nrrd")
+        folder = backing / ("nrrd" if grid_id == "native" else f"{grid_id}/nrrd")
         folder.mkdir(parents=True)
         shape = (7,10,11) if grid_id == "native" else (6,8,9)
         if transfer_fixture:
@@ -149,6 +156,109 @@ def test_real_scalar_branches_become_color_preserving_grouped_masks_and_direct_c
         publish_sweep_review(tmp_path,[b50,b80],sweep_id="sweep-test")
 
 
+@pytest.mark.parametrize("incomplete", [False, True])
+def test_staged_sweep_groups_native_and_preview_with_indexed_mask_payloads(tmp_path, incomplete):
+    root = tmp_path / "output"
+    staging = tmp_path / "scratch"
+    branches, masks = [], {}
+    for cent in (50, 80):
+        branch, expected = scalar(root, cent, stage_root=staging, incomplete=incomplete and cent == 80)
+        branches.append(branch)
+        masks[cent] = expected
+        private_catalog = staging / branch[1].name / "nrrd" / "volume_nrrd_manifest.json"
+        doc = json.loads(private_catalog.read_bytes())
+        archive = branch[1] / "sam-artifacts.tar"
+        doc["layers"][2]["proposal_evidence_path"] = str(archive) + "#/sam_interpolation/fixture"
+        doc["layers"][2]["extrapolation"] = {
+            "evidence_path": os.path.relpath(archive, private_catalog.parent) + "#/sam_extrapolation/fixture",
+            "evidence_path_base": "manifest_directory",
+        }
+        private_catalog.write_text(json.dumps(doc))
+    published = publish_sweep_review(root, branches, sweep_id="sweep-test", memory_mib=2,
+                                     nrrd_stage_root=staging,
+                                     sweep_status="incomplete" if incomplete else "complete")
+    review = json.loads(published.read_bytes())
+    assert review["status"] == "complete"
+    assert review["sweep_status"] == ("incomplete" if incomplete else "complete")
+    assert review["source_storage"] == "grouped"
+    assert {grid["grid_id"] for grid in review["grids"]} == {"native", "low_quality/half"}
+    assert not list((root / "confidence_cutoffs").rglob("*.nrrd"))
+    for grid in review["grids"]:
+        check_grouped_grid(published, grid, masks)
+        for origin in grid["branches"]:
+            assert origin["source_storage"] == "grouped"
+            catalogue = published.parent / origin["source_manifest"]
+            raw_catalogue = catalogue.read_bytes()
+            assert hashlib.sha256(raw_catalogue).hexdigest() == origin["source_manifest_sha256"]
+            source = json.loads(raw_catalogue)
+            assert source["layout"] == "grouped_sweep_segments"
+            assert source["grid_id"] == grid["grid_id"]
+            assert source["cutoff_cent"] == origin["cutoff_cent"]
+            assert (catalogue.parent / source["review_manifest"]).resolve() == published
+            assert catalogue.name == "volume_nrrd_manifest.json"
+            if grid["grid_id"] == "native":
+                relative, member = source["layers"][2]["proposal_evidence_path"].split("#/")
+                branch = dict(branches)[origin["cutoff_cent"]]
+                assert (catalogue.parent / relative).resolve() == branch / "sam-artifacts.tar"
+                assert member == "sam_interpolation/fixture"
+                assert source["layers"][2]["proposal_evidence_path_base"] == "manifest_directory"
+                tail = source["layers"][2]["extrapolation"]
+                tail_path, tail_member = tail["evidence_path"].split("#/")
+                assert (catalogue.parent / tail_path).resolve() == branch / "sam-artifacts.tar"
+                assert tail_member == "sam_extrapolation/fixture"
+                assert tail["evidence_path_base"] == "manifest_directory"
+        for group in grid["groups"]:
+            path = published.parent / group["path"]
+            raw_group = path.read_bytes()
+            independent, _ = read_nrrd(path)
+            assert hashlib.sha256(raw_group).hexdigest() == group["sha256"]
+            for segment in group["segments"]:
+                start = segment["gzip_offset"]
+                stop = start + segment["gzip_bytes"]
+                assert segment["label_value"] == 1
+                assert gzip.decompress(raw_group[start:stop]) == independent[segment["layer"]].tobytes()
+
+
+def test_grouped_publication_refuses_a_destination_created_during_staging(tmp_path, monkeypatch):
+    from XTA import sweep_publication as writer
+    from XTA.run_transport import TransportError
+
+    root = tmp_path / "output"
+    branch, _ = scalar(root, 50, stage_root=tmp_path / "scratch")
+    destination = root / "review"
+    before_publication = writer._copy_index_to_grid_folders
+
+    def compete(stage, products):
+        before_publication(stage, products)
+        destination.mkdir()
+
+    monkeypatch.setattr(writer, "_copy_index_to_grid_folders", compete)
+    with pytest.raises((FileExistsError, TransportError), match="Destination appeared|already exists"):
+        publish_sweep_review(root, [branch], sweep_id="sweep-test", nrrd_stage_root=tmp_path / "scratch")
+    assert destination.is_dir() and not list(destination.iterdir())
+
+
+def test_complete_review_stage_survives_directory_promotion_failure(tmp_path, monkeypatch):
+    import errno
+    from XTA import json_publication
+    from XTA.run_transport import TransportError
+
+    branch, _ = scalar(tmp_path, 50, grids=("native",))
+
+    def unavailable(stage, destination):
+        raise OSError(errno.ENOTSUP, "cannot publish directory", str(destination))
+
+    monkeypatch.setattr(json_publication, "_publish_sweep_directory", unavailable)
+    with pytest.raises(TransportError, match="Completed sweep products remain at") as failure:
+        publish_sweep_review(tmp_path, [branch], sweep_id="sweep-test")
+    [stage] = tmp_path.glob(".review.atomic-result-*/review")
+    assert str(stage) in str(failure.value)
+    record = json.loads((stage / "manifest.json").read_bytes())
+    assert record["status"] == "complete"
+    assert (stage / record["grids"][0]["groups"][0]["path"]).is_file()
+    assert not (tmp_path / "review").exists()
+
+
 def test_reference_native_rows_equal_grouped_native_identities(tmp_path):
     with_preview, only_native = tmp_path / "with-preview", tmp_path / "only-native"
     branches = {}
@@ -242,7 +352,7 @@ def test_one_failed_cutoff_worker_publishes_nothing(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="cutoff 65"):
         publish_sweep_review(tmp_path, branches, sweep_id="sweep-test", memory_mib=2, workers=3)
     assert not (tmp_path / "review").exists()
-    assert not list(tmp_path.glob(".xta-review-*"))
+    assert not list(tmp_path.glob(".review.atomic-result-*"))
 
 
 @pytest.mark.parametrize("workers", [0, -1, True, 1.5])
@@ -264,7 +374,7 @@ def test_empty_saves_and_failures_cannot_publish_partial_family(tmp_path):
     with pytest.raises(ValueError,match="geometry"):
         publish_sweep_review(tmp_path,[b80,b81],sweep_id="sweep-test")
     assert not (tmp_path/"review").exists()
-    assert not list(tmp_path.glob(".xta-review-*"))
+    assert not list(tmp_path.glob(".review.atomic-result-*"))
 
 
 @pytest.mark.parametrize("explicit_temp", [True,False])
@@ -300,7 +410,7 @@ def test_review_spools_are_private_on_fast_temp_and_publication_is_adjacent(
         result = publish_sweep_review(output,[branch],sweep_id="sweep-test",temp_dir=override)
         assert result.is_file()
     assert captured and not any(p.exists() for p in captured)
-    assert not list(output.glob(".xta-review-*"))
+    assert not list(output.glob(".review.atomic-result-*"))
     assert list((override or fast).iterdir()) == []
 
 

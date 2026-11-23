@@ -350,9 +350,11 @@ class LtaGpuSmokeTests(unittest.TestCase):
         )
 
         restore = self.tool.install_sdpa_fallback(decoder)
+        restore_second = self.tool.install_sdpa_fallback(decoder)
+        restore()
         self.assertEqual(decoder.sdpa_kernel("flash-only"), "context")
         self.assertEqual(calls, [("flash", "efficient", "math"), True])
-        restore()
+        restore_second()
         self.assertIs(decoder.sdpa_kernel, original)
 
     def test_window_and_useful_output_acceptance_fail_before_expensive_work(self) -> None:

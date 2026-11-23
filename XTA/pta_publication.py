@@ -756,7 +756,7 @@ def publish_semantic_mask_payloads(
 def write_selected_candidate_version(
     *,
     cand: OutputCandidate,
-    image: np.ndarray,
+    image: Optional[np.ndarray],
     mask: np.ndarray,
     out_dir: Path,
     split_active: bool,
@@ -779,6 +779,8 @@ def write_selected_candidate_version(
     written so an augmented background can never enter ahead of the
     unique-source background ordering or exceed the cap.
     """
+    if image is None and (save_images or int(cand.augmentation_index) > 0):
+        raise ValueError("PTA image publication and augmentation require a rendered image")
     resolve_deferred_foregrounds((cand,), mask, semantic_coverage)
     image_out = image
     mask_out = mask

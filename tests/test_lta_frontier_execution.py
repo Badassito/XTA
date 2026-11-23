@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -288,6 +289,25 @@ class LtaFrontierExecutionTests(unittest.TestCase):
         self.assertEqual(self.logical_tasks(serial), self.logical_tasks(reordered))
         self.assertEqual(serial.generation, reordered.generation)
         self.assertEqual(reordered.pool.maximum_active, 4)
+
+    def test_frontier_admits_memory_from_live_headroom_and_preserves_results(self):
+        offerings = [("same", 3, "forward", self.mask((1, 3)))]
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with mock.patch.dict(os.environ, {"XTA_LTA_FRONTIER_MEMORY_MIB": "16"}):
+                with mock.patch("XTA.publication_memory.publication_ram_headroom", return_value=128 * 1024**2):
+                    memory = self.run_frontier(root / "memory", offerings, count=40)
+                with mock.patch("XTA.publication_memory.publication_ram_headroom", return_value=0):
+                    disk = self.run_frontier(root / "file", offerings, count=40)
+            self.assertFalse((root / "memory" / "canonical_frontier.sqlite3").exists())
+            self.assertTrue((root / "file" / "canonical_frontier.sqlite3").is_file())
+
+        memory_stats = memory.audit["canonical_frontier"]["frontier"]
+        self.assertEqual(memory_stats["database_backing"], "memory")
+        self.assertEqual(memory_stats["page_cache_limit_bytes"], 2 * 1024**2)
+        self.assertEqual(disk.audit["canonical_frontier"]["frontier"]["database_backing"], "file")
+        self.assertEqual(self.logical_tasks(memory), self.logical_tasks(disk))
+        np.testing.assert_array_equal(memory.union, disk.union)
 
     def test_more_than_one_wave_keeps_boundary_fanin_and_slot_independent_batches(self):
         offerings = [(f"lineage-{row}", frame, "forward", self.mask((row, 3)))

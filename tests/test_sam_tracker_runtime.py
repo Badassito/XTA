@@ -5,6 +5,8 @@ import tempfile
 import threading
 import time
 import unittest
+import weakref
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -183,6 +185,24 @@ class SamTrackerArtifactTests(unittest.TestCase):
             self.assertTrue(result.receipt["prediction_valid"])
             self.assertTrue(all(value < 0.1 for value in result.tracker_scores.values()))
             self.assertTrue(all(value == "observed" for value in result.observation_status.values()))
+
+    def test_worker_releases_each_observed_mask_after_packing(self):
+        observed = []
+
+        def track(*args, raw_observation_callback, **kwargs):
+            def forward(item):
+                mask = item.binary_mask.copy()
+                observed.append(weakref.ref(mask))
+                raw_observation_callback(replace(item, binary_mask=mask))
+                del mask
+                self.assertIsNone(observed[-1]())
+            return run_mask_seed_session(*args, raw_observation_callback=forward, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+                "XTA.lta_experimental.run_mask_seed_session", new=track):
+            result = self._execute(directory)
+        self.assertEqual(len(observed), 3)
+        self.assertEqual(tuple(result.frames), (0, 1, 2))
 
     def test_decoded_boolean_history_borrows_frozen_owned_unpack_and_outlives_packet(self):
         unpacked=[]

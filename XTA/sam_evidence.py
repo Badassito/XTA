@@ -54,7 +54,8 @@ def _mask_packing_pool(max_workers):
                 thread_name_prefix='sam-mask-pack')
         return _MASK_PACKING_POOL
 
-from .artifact_archive import (artifact_exists, artifact_size, open_artifact,
+from .artifact_archive import (artifact_exists, artifact_sha256 as _file_hash, artifact_size,
+                               artifact_stage_parent, open_artifact,
     publish_directory, read_artifact, reference, split_reference)
 
 SCHEMA = "xta.sam_proposals/1"
@@ -140,14 +141,6 @@ def _write_index(path, index):
 def fingerprint(value):
     """Stable fingerprint of a JSON-compatible generation or policy snapshot."""
     return hashlib.sha256(_json_bytes(value)).hexdigest()
-
-
-def _file_hash(path):
-    result = hashlib.sha256()
-    with open_artifact(path) as stream:
-        while block := stream.read(1024 * 1024):
-            result.update(block)
-    return result.hexdigest()
 
 
 def _bundle_path(directory):
@@ -335,7 +328,7 @@ class SamEvidenceWriter:
         if artifact_exists(self.directory):
             raise FileExistsError(f"SAM evidence destination must be fresh: {self.directory}")
         if split_reference(self.directory):
-            self.staging = Path(tempfile.mkdtemp(prefix="xta-sam-"))
+            self.staging = Path(tempfile.mkdtemp(prefix="xta-sam-", dir=artifact_stage_parent(self.directory)))
         else:
             self.directory.parent.mkdir(parents=True, exist_ok=True)
             self.staging = self.directory.parent / ("." + self.directory.name + ".stage-" + uuid.uuid4().hex)
@@ -1274,11 +1267,14 @@ class SamEvidenceBundle:
             if ((not split_reference(path) and not path.resolve().is_relative_to(self.directory))
                     or artifact_size(path) != entry["bytes"]):
                 raise ValueError("Missing or escaped SAM evidence payload")
-            if verify and _file_hash(path) != entry["sha256"]:
+            if name == "index.json":
+                if entry["bytes"] > INDEX_MAX_BYTES:
+                    raise _index_budget_error(entry["bytes"])
+                encoded_index = read_artifact(path, max_bytes=INDEX_MAX_BYTES)
+                if verify and hashlib.sha256(encoded_index).hexdigest() != entry["sha256"]:
+                    raise ValueError("SAM evidence file checksum mismatch")
+            elif verify and _file_hash(path) != entry["sha256"]:
                 raise ValueError("SAM evidence file checksum mismatch")
-        if manifest["files"]["index.json"]["bytes"] > INDEX_MAX_BYTES:
-            raise _index_budget_error(manifest["files"]["index.json"]["bytes"])
-        encoded_index = read_artifact(self.directory / "index.json", max_bytes=INDEX_MAX_BYTES)
         text = encoded_index.decode(json.detect_encoding(encoded_index), 'surrogatepass')
         del encoded_index
         index = json.loads(text)
@@ -1596,16 +1592,16 @@ def export_sam_evidence(source, destination):
         receipt_path = bundle.directory.parent / "selection.json"
     receipt_bytes = None
     if artifact_exists(receipt_path):
-        if artifact_size(receipt_path) > 64 * 1024**2:
+        if artifact_size(receipt_path) > INDEX_MAX_BYTES:
             raise ValueError("SAM online selection receipt exceeds its bounded metadata budget")
-        receipt_bytes = read_artifact(receipt_path, max_bytes=64 * 1024**2)
+        receipt_bytes = read_artifact(receipt_path, max_bytes=INDEX_MAX_BYTES)
         receipt = json.loads(receipt_bytes)
         if (receipt.get("schema") != "xta.sam_selection/1"
                 or receipt.get("evidence_fingerprint") != bundle.evidence_fingerprint
                 or set(receipt.get("selected_run_ids", ())) - set(bundle.runs)):
             raise ValueError("SAM online selection receipt does not belong to its proposal bundle")
         if exported_receipt:
-            exported = json.loads(read_artifact(export_path, max_bytes=64 * 1024**2))
+            exported = json.loads(read_artifact(export_path, max_bytes=INDEX_MAX_BYTES))
             expected = exported.get("online_selection", {})
             if (exported.get("schema") != "xta.sam_export/1"
                     or exported.get("evidence_fingerprint") != bundle.evidence_fingerprint
@@ -1617,7 +1613,7 @@ def export_sam_evidence(source, destination):
     if artifact_exists(destination):
         raise FileExistsError("SAM evidence export destination must be fresh")
     if split_reference(destination):
-        staging = Path(tempfile.mkdtemp(prefix="xta-sam-export-"))
+        staging = Path(tempfile.mkdtemp(prefix="xta-sam-export-", dir=artifact_stage_parent(destination)))
     else:
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = destination.parent / ("." + destination.name + ".export-" + uuid.uuid4().hex)
@@ -1635,7 +1631,7 @@ def export_sam_evidence(source, destination):
                 semantics="Retained online measurements and selection; raw bundle unchanged.")))
         SamEvidenceBundle.open(staging)
         bundle.assert_unchanged()
-        if receipt_bytes is not None and read_artifact(receipt_path, max_bytes=64 * 1024**2) != receipt_bytes:
+        if receipt_bytes is not None and read_artifact(receipt_path, max_bytes=INDEX_MAX_BYTES) != receipt_bytes:
             raise RuntimeError("SAM online selection changed during export")
         if split_reference(destination):
             publish_directory(staging, destination)

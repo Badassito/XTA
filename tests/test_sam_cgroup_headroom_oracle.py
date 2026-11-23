@@ -70,6 +70,22 @@ def test_verified_job_charge_avoids_shared_process_rss_phantom_zero(monkeypatch)
     assert not calls
 
 
+def test_slurm_rss_fallback_skips_exited_children(monkeypatch):
+    import psutil
+
+    slurm_and_host(monkeypatch)
+    monkeypatch.setattr(workspace, '_cgroup_memory_budget', lambda: (None, None))
+
+    def exited():
+        raise psutil.NoSuchProcess(42)
+
+    child = SimpleNamespace(memory_info=exited)
+    process = SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=300*GIB),
+                              children=lambda recursive: [child])
+    monkeypatch.setattr(psutil, 'Process', lambda: process)
+    assert sam_resources.physical_sam_headroom() == 300*GIB
+
+
 def test_parent_scope_headroom_and_smallest_enforced_cap_are_both_retained(monkeypatch):
     files, node, _ = fake_procfs(monkeypatch, limit=400*GIB, usage=100*GIB)
     parent = node.rsplit('/', 1)[0]

@@ -1,4 +1,9 @@
-TTA retains SAM evidence during execution in `OUTPUT/sam-artifacts.tar`.
+TTA publishes retained SAM evidence in `OUTPUT/sam-artifacts.tar`. A fresh
+archive uses an explicitly selected disk-backed `--temp` during execution and
+appears in the output directory after archive producers and readers settle.
+Set `YOLO_TTA_SAM_ARCHIVE_LIVE_OUTPUT=1` for external readers that need the
+public archive during execution. The startup log identifies the working archive
+for recovery after an interrupted transfer.
 `sam-artifacts.tar.lock` coordinates writers and reader snapshots; writers need a
 writable companion lock, and a reader that cannot open it (read-only media)
 indexes the archive without it. A committed member is read without that lock when the
@@ -17,7 +22,8 @@ not record. Long interpolation and extrapolation scope paths are
 logical TAR/PAX members, addressed as
 `OUTPUT/sam-artifacts.tar#/sam_interpolation/.../evidence` or
 `OUTPUT/sam-artifacts.tar#/sam_extrapolation/.../evidence`.
-Evidence bundles, CVOL stores and JSON receipts commit as they become available.
+Evidence bundles, CVOL stores and JSON receipts commit to the working archive
+as they become available.
 Active builders use short temporary stages; successful stages retire after
 publication. Public NRRDs, telemetry and ordinary run manifests remain files
 outside this container.
@@ -43,6 +49,8 @@ python tools/run_transport.py unpack C:/XTA/run-diagnostics.zip C:/XTA/restored
 ```
 
 Choose a fresh archive outside the source folder and a fresh extraction directory.
+On POSIX, unpacking requires exclusive directory renames on the destination
+filesystem. An unsupported destination fails before publishing the extraction.
 Use a short extraction root on Windows. The utility uses extended Windows API
 paths, but external viewers and copy programs may still require shorter paths.
 Packing preserves the source run files, including its live-format SAM container.

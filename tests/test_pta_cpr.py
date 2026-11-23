@@ -602,6 +602,7 @@ def test_threaded_extraction_stops_failed_component_at_the_same_branch(monkeypat
     _assert_same_geometries(results[1][0], results[4][0])
     assert results[1][1:] == results[4][1:]
     assert len(results[1][1]) == 1 and "synthetic branch failure" in results[1][1][0]
+    assert "keeping earlier branches" in results[1][1][0]
     assert len(results[1][0]) < len(complete)
 
 
@@ -765,9 +766,32 @@ def test_trim_and_prune_removes_end_hooks_and_reversals():
     assert np.array_equal(trim(duplicate, np.ones(7, bool)), line)
     assert len(trim(np.array([[0.0, 0, 0], [10, 0, 0], [0.5, 0, 0]]), np.ones(3, bool))) == 2
     tiny = np.array([[0.0, 0, 0], [0.3, 0, 0], [0.6, 0, 0]])         # trimming would leave < 1 voxel
-    assert np.array_equal(trim(tiny, np.ones(3, bool)), tiny)
+    assert np.array_equal(trim(tiny, np.ones(3, bool)), tiny[[0, 2]])
+    tiny_loop = np.array([[0.0, 0, 0], [0.6, 0, 0], [0.0, 0, 0]])
+    assert np.array_equal(trim(tiny_loop, np.ones(3, bool)), tiny_loop[:2])
     stub = np.array([[87.0, 7, 97], [84.1, 13.69, 102], [87, 7, 107]])  # only the middle seed met foreground
     assert np.array_equal(trim(stub, np.array([False, True, False])), stub)
+    far = np.vstack(([[50.0, 0, 0]], stub, [[150.0, 0, 0]]))
+    assert np.array_equal(trim(far, [False, False, True, False, False]), stub)
+    short_hook = np.array([[0.0, 0, 0], [1.2, 0, 0], [0.4, 0, 0]])
+    assert np.array_equal(trim(short_hook, np.ones(3, bool)), short_hook[:2])
+    with pytest.raises(ValueError, match="met no foreground voxels"):
+        trim(line, np.zeros(6, bool))
+
+
+def test_trim_keeps_tangents_for_equal_length_hooks_and_coincident_hits():
+    from XTA.pta_cpr import _trim_and_prune_centerline as trim
+
+    end_hook = np.column_stack(([0., 2., 4., 2.], np.zeros(4), np.zeros(4)))
+    np.testing.assert_array_equal(trim(end_hook, np.ones(4, bool)), end_hook[:3])
+    np.testing.assert_array_equal(trim(end_hook[::-1], np.ones(4, bool)), end_hook[:3][::-1])
+    symmetric = end_hook[1:]
+    np.testing.assert_array_equal(trim(symmetric, np.ones(3, bool)), symmetric[:2])
+
+    seeds = np.column_stack(([0., 1., 3., 3., 5., 6.], np.zeros(6), np.zeros(6)))
+    found = [False, False, True, True, False, False]
+    np.testing.assert_array_equal(trim(seeds, found), seeds[1:5])
+    assert np.ptp(resample_centerline(trim(seeds, found))[0][:, 0]) == 4.
 
 
 def _distance_tube(path, radius, size):

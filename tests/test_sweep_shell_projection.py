@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 import os
 import sys
 import json
+import threading
 
 import numpy as np
 import pytest
@@ -240,6 +242,33 @@ def test_numeric_mode_cannot_enter_boolean_encoder(projector_type):
     projector.scalar_max=False
     with pytest.raises(ValueError,match='scalar_max=True'):
         projector.project_rank_crops(0,1)
+
+
+@pytest.mark.parametrize('stored_width', (1024, 2048))
+def test_spherical_rank_probes_accept_padded_and_rescaled_chart_edges(stored_width):
+    view = replace(next(view for view in _views() if view.family == 'spherical'),
+                   spherical_face=3, spherical_face_intervals=2046, spherical_u_origin=0,
+                   spherical_v_origin=0, src_h=2048, src_w=2048, spherical_radii=(1.5,))
+    source = np.zeros((1, stored_width, stored_width), np.uint8)
+    source[0, -1, -1] = 5
+    assert rank_source_probe_planes(source, view, (7, 9, 11), _boxes(source))
+
+
+def test_spherical_dense_empty_roi_returns_zeros_without_cuda():
+    from XTA.spherical_projection_bounds import SphericalOutputBounds
+
+    projector = SphericalCudaProjector.__new__(SphericalCudaProjector)
+    projector._lock = threading.RLock()
+    projector._closed = projector._failed = False
+    projector.max_block_depth = 2
+    projector.contract = SimpleNamespace(output_shape=(5, 11, 13))
+    projector.output_bounds = SphericalOutputBounds(2, 5, 1, 9, 1, 9)
+    projector.roi_skipped_blocks = 0
+    try:
+        np.testing.assert_array_equal(projector.project(0, 2), np.zeros((2, 11, 13), np.uint8))
+        assert projector.roi_skipped_blocks == 1
+    finally:
+        projector._closed = True
 
 
 @pytest.mark.parametrize('family',['radial','spherical'])

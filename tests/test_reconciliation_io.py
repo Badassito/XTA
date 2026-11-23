@@ -47,15 +47,21 @@ def manifest_file(directory, entries, *, shape=None):
     return path
 
 
-def test_concatenated_gzip_slab_major_reads_once_per_layer_and_rewinds(tmp_path):
+@pytest.mark.parametrize("prefer_fast_gzip,memory_mib,fast_gzip", [
+    (False, 256, False), (True, 256, True), (True, 1, False),
+])
+def test_concatenated_gzip_slab_major_reads_once_per_layer_and_rewinds(tmp_path, prefer_fast_gzip, memory_mib, fast_gzip):
     a = np.zeros((7, 4, 5), dtype=np.uint8)
     b = a.copy()
     a[::2, 1:3, 2] = 1
     b[1::2, 2, 1:4] = 1
     entries = [layer_file(tmp_path, "a.seg.nrrd", a, member_bytes=17), layer_file(tmp_path, "b.seg.nrrd", b, member_bytes=23)]
     manifest = manifest_file(tmp_path, entries)
-    with mock.patch("XTA.reconciliation_io.gzip.GzipFile", wraps=gzip.GzipFile) as decoder:
-        with read_layer_manifest(manifest, workspace=tmp_path / "workspace") as layers:
+    backend = pytest.importorskip("isal.igzip") if fast_gzip else gzip
+    name = "IGzipFile" if fast_gzip else "GzipFile"
+    with mock.patch.object(backend, name, wraps=getattr(backend, name)) as decoder:
+        with read_layer_manifest(manifest, workspace=tmp_path / "workspace", memory_mib=memory_mib,
+                                 prefer_fast_gzip=prefer_fast_gzip) as layers:
             for z in range(7):
                 np.testing.assert_array_equal(layers[0].read_slab(z, z+1), a[z:z+1])
                 np.testing.assert_array_equal(layers[1].read_slab(z, z+1), b[z:z+1])
@@ -94,8 +100,10 @@ def test_crop_offset_uses_spatial_origin_and_not_segment_extent(tmp_path):
     crop_entry["output_shape_tyx"] = list(full.shape)
     expected = np.zeros_like(full)
     expected[4:6, 2:5, 3:7] = crop
-    with read_layer_manifest(manifest_file(tmp_path, [full_entry, crop_entry]), workspace=tmp_path) as layers:
+    with read_layer_manifest(manifest_file(tmp_path, [full_entry, crop_entry]), workspace=tmp_path,
+                             prefer_fast_gzip=False) as layers:
         assert layers[1].offset_tyx == (4, 2, 3)
+        np.testing.assert_array_equal(layers[1].read_slab(3, 7, stored_xy=True), expected[3:7, 2:5, 3:7])
         with mock.patch("XTA.reconciliation_io.gzip.GzipFile", wraps=gzip.GzipFile) as decoder:
             for z in range(8):
                 np.testing.assert_array_equal(layers[1].read_slab(z, z+1), expected[z:z+1])

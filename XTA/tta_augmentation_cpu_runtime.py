@@ -35,7 +35,8 @@ class CpuPolicyBatchSource:
 
 def predict_cpu_policy_source(runner: Any, source: Any, *, task: dict[str, Any], cfg: Any,
                               predict_kwargs: dict[str, Any]) -> dict[str, Any]:
-    settings = task['augmentation_settings'].for_backend('cpu')
+    seed_settings = task['augmentation_settings']
+    settings = seed_settings.for_backend('cpu')
     settings.assert_unchanged()
     adapter = worker_cpu_policy(settings)
     pass_tasks = [task, *task['augmentation_pass_tasks']]
@@ -78,7 +79,7 @@ def predict_cpu_policy_source(runner: Any, source: Any, *, task: dict[str, Any],
                 active, replay = original, None
                 if i:
                     trajectory = f'{task["view"].name}/{task["kind"]}/{task["job_id"]}'
-                    seeds = [policy_seed(settings, trajectory=trajectory, pass_index=i,
+                    seeds = [policy_seed(seed_settings, trajectory=trajectory, pass_index=i,
                                          slice_index=(int(spec.global_destination_index) if spec else
                                                       int(task.get('slice_start', 0)) + total - 1),
                                          lease_start=int(task.get('slice_start', 0))) for spec in specs]

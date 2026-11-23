@@ -55,6 +55,8 @@ def aligned_builder(original, mode):
                 index = int(np.argmin(np.sum((yx - center) ** 2, axis=1)))
                 anchor = tuple(map(int, yx[index] + np.asarray(record.bbox[:2])))
             points.append((z, int(anchor[0]), int(anchor[1])))
+        if mode == "area":
+            kwargs["allow_active_crop"] = False
         plan = original(labels_real, source_label, target_label,
                         points[0], points[1], **kwargs)
         if plan is None:
@@ -125,8 +127,10 @@ def main():
     def cached_radius(plan, **kwargs):
         if len(plan.cached_sections) != plan.steps + 1:
             return original_radius(plan, **kwargs)
-        radius = (min(float(plan.sdf0.max()), float(plan.sdf1.max()))
-                  + interpolation.SDF_EDT_RADIUS_OFFSET)
+        radius = plan.endpoint_radius
+        if radius is None:
+            radius = (min(float(plan.sdf0.max()), float(plan.sdf1.max()))
+                      + interpolation.SDF_EDT_RADIUS_OFFSET)
         for section in plan.cached_sections[1:-1]:
             radius = min(radius, interpolation._component_max_radius(section))
         return radius

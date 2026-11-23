@@ -119,7 +119,7 @@ def main():
     parser.add_argument('--model',required=True)
     parser.add_argument('--fixtures',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--profile',choices=('auto','egpu','h100'),default='auto')
+    parser.add_argument('--profile',choices=('auto','egpu','h100','a100'),default='auto')
     parser.add_argument('--device',type=int,default=0)
     args=parser.parse_args()
     root=args.output.resolve()

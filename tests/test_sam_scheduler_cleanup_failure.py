@@ -66,8 +66,9 @@ def test_cleanup_failure_preserves_primary_and_allows_independent_teardown(clean
             independently_closed.append('finalization and reduction executors')
 
     assert caught.value is primary
-    assert primary.__notes__ == [
-        f'SAM context cleanup also failed: {cleanup_type.__name__}: {secondary}']
+    if callable(getattr(primary, 'add_note', None)):
+        assert primary.__notes__ == [
+            f'SAM context cleanup also failed: {cleanup_type.__name__}: {secondary}']
     assert independently_closed == ['finalization and reduction executors']
     assert context.close_calls == 1 and not context.closed
     assert context.source is source and context.retained_owners == owners
@@ -104,8 +105,9 @@ def test_fully_closed_context_with_reported_shutdown_error_is_not_retained(retai
     primary = RuntimeError('scheduler failed')
     close_after_scheduler()(context, primary)
     assert context.closed and not retained_contexts
-    assert primary.__notes__ == [
-        'SAM context cleanup also failed: RuntimeError: settled worker reported a shutdown error']
+    if callable(getattr(primary, 'add_note', None)):
+        assert primary.__notes__ == [
+            'SAM context cleanup also failed: RuntimeError: settled worker reported a shutdown error']
 
 
 def test_closed_flag_before_final_source_retirement_still_retains_context(retained_contexts):

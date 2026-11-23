@@ -419,7 +419,7 @@ def main(argv=None):
     execute.add_argument("--model", type=Path, required=True)
     execute.add_argument("--output", type=Path, required=True, help="Fresh arm directory")
     execute.add_argument("--attention-backend", choices=("sdpa", "fa3_fp8"), required=True)
-    execute.add_argument("--profile", choices=("auto", "egpu", "h100"), default="auto")
+    execute.add_argument("--profile", choices=("auto", "egpu", "h100", "a100"), default="auto")
     execute.add_argument("--device", type=int, default=0)
     execute.add_argument("--cache-mib", type=int, default=0,
                          help="Cross-session visual cache budget; default0 retains fresh encoder work after warmup. Use1024 separately to measure hot recurrent work")

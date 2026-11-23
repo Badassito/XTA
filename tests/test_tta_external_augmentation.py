@@ -519,9 +519,15 @@ def test_runtime_fanout_uses_one_render_and_independent_masks(tmp_path,family,co
     views=expand_views_into_policy_variants(expand_views_into_tta_variants([
         ViewInfo('transverse',count,size,size,'clamp',family=family)], [0]),3)
     cfg=SimpleNamespace(device='0',batch=batch,quantize='fp32')
+    seed_settings = resolve_tta_augmentation(
+        SimpleNamespace(augmentation=[f'gpu:{POLICIES / "GPU_light.py"}',
+                                      f'cpu:{POLICIES / "CPU_light.py"}'],
+                        augmentation_ratio=3, augmentation_coverage=coverage),
+        gpu_devices=('0',), cpu_enabled=True,
+    )
     task=dict(task_id=4,view=views[0],job_id='a0',kind='fullframe',slice_start=0,slice_count=count,
               M_out_to_processing=np.eye(3,dtype=np.float32)[:2],parent_crop=None,
-              augmentation_settings=settings(coverage=coverage),augmentation_support_dir=str(tmp_path/'support'))
+              augmentation_settings=seed_settings,augmentation_support_dir=str(tmp_path/'support'))
     siblings=[dict(task,view=v,result_mask_path=str(tmp_path/f'p{i}.dat'),result_conf_path=None)
               for i,v in enumerate(views[1:],1)]
     task['augmentation_pass_tasks']=siblings
@@ -570,11 +576,14 @@ def test_runtime_fanout_uses_one_render_and_independent_masks(tmp_path,family,co
     assert len(result['augmentation_records'])==(2 if coverage=='packed' else 0)
     if coverage=='none':
         assert not (tmp_path/'support').exists()
-    for record in result['augmentation_records']:
+    for pass_index, record in enumerate(result['augmentation_records'], start=1):
         with np.load(record['path'],allow_pickle=False) as packed:
             support=np.unpackbits(packed['validity_bits'],axis=-1,count=size,bitorder='big')
             assert support.all() and support.shape[0]==count+source.azimuthal_padding_count
-            assert len(packed['seeds'])==support.shape[0]
+            expected = [policy_seed(seed_settings, trajectory=f'{views[0].name}/fullframe/a0',
+                                    pass_index=pass_index, slice_index=int(index), lease_start=0)
+                        for index in packed['global_destinations']]
+            np.testing.assert_array_equal(packed['seeds'], np.asarray(expected, dtype=np.uint64))
     assert not list(tmp_path.rglob('*.partial*'))
 
 
@@ -609,6 +618,8 @@ def test_tile_memory_reservation_accounts_for_all_passes():
     baseline=scheduler.tile_dense_result_task_bytes(task)
     task['augmentation_pass_tasks']=[{},{}]
     assert scheduler.tile_dense_result_task_bytes(task)==3*baseline
+    scheduler.tile_task_azimuthal_padding_count = lambda task: 2
+    assert scheduler.tile_dense_result_task_bytes(task) == 3 * (baseline + 2 * 2 * 12 * 12 * 2)
 
 
 def test_tile_reservation_waits_for_every_policy_result():
@@ -766,3 +777,42 @@ def test_fullframe_memory_guard_does_not_suggest_incompatible_direct_union():
     with pytest.raises(RuntimeError,match='External-policy passes') as raised:
         native_fullframe_dense_reserve([base],total_dense_limit=200)
     assert 'reduce --augmentation_ratio' in str(raised.value)
+
+
+@pytest.mark.parametrize('axis', [0, 1])
+def test_elastic_fold_at_last_pixel_is_invalid(axis):
+    from XTA.tta_augmentation_cpu import inverse_policy_grid_cpu
+
+    height, width = 6, 7
+    yy, xx = np.indices((height, width))
+    field = np.zeros((height, width, 2), dtype=np.float32)
+    field[..., axis] = 2 * ((width - 1 - xx) if axis == 0 else (height - 1 - yy))
+    _, valid_cpu = inverse_policy_grid_cpu(np.eye(3), field, height, width)
+    _, valid_torch = inverse_policy_grid(torch.eye(3), torch.from_numpy(field).movedim(-1, 0), height, width)
+    edge = (slice(None), -1) if axis == 0 else (-1, slice(None))
+    assert not valid_cpu[edge].any()
+    assert not valid_torch[edge].any()
+
+
+@pytest.mark.parametrize('profile', ['light', 'baseline', 'heavy', 'superheavy', 'sweep'])
+def test_shipped_policy_resizes_both_masks_at_pixel_centers(profile):
+    policy, _ = cpu_policy(profile)
+    mask = np.tile(np.asarray([0, 1, 0, 1, 0, 1], dtype=np.uint8), (4, 1))
+    with patch.object(torch.Tensor, 'pin_memory', lambda value: value):
+        _, resized, coverage = policy.apply_batch_many(
+            images=(mask * 255,), masks=(mask,), extra_masks=(1 - mask,),
+            seeds=((None,),), output_size=(2, 3),
+        )
+    assert resized.all()
+    assert not coverage.any()
+
+
+@pytest.mark.parametrize('slope', [-2., 0.])
+def test_torch_elastic_halo_preserves_edge_orientation(slope):
+    h, w = 5, 7
+    field = torch.zeros(2, h, w)
+    field[0] = 1.5 + slope * (torch.arange(w) - (w - 1))
+    forward = torch.eye(3)
+    forward[0, 2] = 1.50005
+    _, valid = inverse_policy_grid(forward, field, h, w)
+    assert bool(valid[:, -1].all()) == (slope == 0.)

@@ -311,6 +311,17 @@ class CompressionLifecycleTests(unittest.TestCase):
         nrrd_compression.shutdown_nrrd_gzip_executors()
         intel_compression._reset_for_tests()
 
+    def test_larger_gzip_budget_creates_pool_without_invalidating_old_submissions(self) -> None:
+        codec = ('zlib', 3, bytes)
+        with mock.patch.object(nrrd_compression, 'nrrd_gzip_workers', return_value=4) as workers:
+            startup = nrrd_compression._nrrd_gzip_executor(codec)
+            workers.return_value = 12
+            tail = nrrd_compression._nrrd_gzip_executor(codec)
+            self.assertIs(tail, nrrd_compression._nrrd_gzip_executor(codec))
+        self.assertIsNot(startup, tail)
+        self.assertEqual(startup.submit(bytes, b'first').result(timeout=5), b'first')
+        self.assertEqual(tail.submit(bytes, b'second').result(timeout=5), b'second')
+
     def test_intel_fork_child_replaces_lock_and_discards_module_state(self) -> None:
         fake = _FakeHardwareCodec()
         intel_compression._set_test_module('qat', fake)
@@ -334,11 +345,9 @@ class CompressionLifecycleTests(unittest.TestCase):
 
         inherited = InheritedExecutor()
         old_executor_lock = nrrd_compression._NRRD_GZIP_EXECUTOR_LOCK
-        old_zero_lock = nrrd_compression._NRRD_ZERO_MEMBER_LOCK
         old_test_lock = nrrd_compression._NRRD_MEMBER_GZIP_TEST_LOCK
         old_announce_lock = nrrd_compression._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK
         nrrd_compression._NRRD_GZIP_EXECUTORS[('qat', 1)] = inherited
-        nrrd_compression._NRRD_ZERO_MEMBER_CACHE[8] = b'parent member'
         nrrd_compression._NRRD_MEMBER_CODEC_SETTING_WARNED = True
         nrrd_compression._NRRD_MEMBER_GZIP_OK[('parent', 1)] = True
         nrrd_compression._NRRD_MEMBER_GZIP_FAILURE_REASONS[('parent', 1)] = 'failure'
@@ -350,7 +359,6 @@ class CompressionLifecycleTests(unittest.TestCase):
 
         self.assertEqual(inherited.shutdown_calls, 0)
         self.assertEqual(nrrd_compression._NRRD_GZIP_EXECUTORS, {})
-        self.assertEqual(nrrd_compression._NRRD_ZERO_MEMBER_CACHE, {})
         self.assertEqual(nrrd_compression._NRRD_MEMBER_GZIP_OK, {})
         self.assertEqual(nrrd_compression._NRRD_MEMBER_GZIP_FAILURE_REASONS, {})
         self.assertEqual(nrrd_compression._NRRD_MEMBER_CODEC_FAILURES_ANNOUNCED, set())
@@ -358,7 +366,6 @@ class CompressionLifecycleTests(unittest.TestCase):
         self.assertFalse(nrrd_compression._NRRD_MEMBER_GZIP_ANNOUNCED)
         self.assertFalse(nrrd_compression._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCED)
         self.assertIsNot(nrrd_compression._NRRD_GZIP_EXECUTOR_LOCK, old_executor_lock)
-        self.assertIsNot(nrrd_compression._NRRD_ZERO_MEMBER_LOCK, old_zero_lock)
         self.assertIsNot(nrrd_compression._NRRD_MEMBER_GZIP_TEST_LOCK, old_test_lock)
         self.assertIsNot(
             nrrd_compression._NRRD_CPU_DEFLATE_BACKEND_ANNOUNCE_LOCK,

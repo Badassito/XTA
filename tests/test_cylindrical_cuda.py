@@ -144,6 +144,8 @@ class RadialGpuRoutingContracts(unittest.TestCase):
 @unittest.skipUnless(importlib.util.find_spec('torch') is not None, 'Torch is optional')
 class RadialTorchNumericalTests(unittest.TestCase):
     def test_native_kernel_launch_uses_scalar_metadata_and_no_host_coordinate_maps(self):
+        from contextlib import nullcontext
+
         volume = np.zeros((11, 13, 15), dtype=np.uint8)
         engine = resident_engine(volume)
         engine._stream = object()
@@ -153,11 +155,13 @@ class RadialTorchNumericalTests(unittest.TestCase):
         def kernel(grid, block, args, *, stream):
             calls.append((grid, block, args, stream))
             args[1].zero_()
-        kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda tensor: tensor), radial_native_f32=kernel)
+        kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda tensor: tensor,
+                                  cuda=SimpleNamespace(Device=nullcontext)), radial_native_f32=kernel)
+        render_stream = nullcontext()
         view = replace(shell_views()[0], radial_tilted_source=True,
                        tilt_angle_deg=30.0, tilt_direction='vertical')
         with (mock.patch.object(cuda_backend, '_radial_native_kernels', return_value=kernels),
-              mock.patch.object(cuda_backend, '_cupy_external_stream', return_value='render-stream'),
+              mock.patch.object(cuda_backend, '_cupy_external_stream', return_value=render_stream),
               mock.patch.object(cuda_backend, 'radial_shell_coordinates', side_effect=AssertionError('host coordinate map')),
               mock.patch('builtins.print')):
             out = engine._render_radial_native_resident_cuda(view, 0)
@@ -166,9 +170,10 @@ class RadialTorchNumericalTests(unittest.TestCase):
         self.assertEqual(calls[0][:2], ((1, 1), (32, 8)))
         self.assertIs(calls[0][2][0], source_ref)
         self.assertTrue(all(isinstance(arg, np.generic) for arg in calls[0][2][2:]))
-        self.assertEqual(len(calls[0][2]), 17)
+        self.assertEqual(len(calls[0][2]), 18)
         self.assertEqual(int(calls[0][2][6]), 0)  # Full-source time-window origin.
-        self.assertEqual(calls[0][3], 'render-stream')
+        self.assertEqual(int(calls[0][2][7]), volume.shape[0])
+        self.assertIs(calls[0][3], render_stream)
 
     def test_thin_tilted_source_retains_boundary_taps_without_height_padding_leaks(self):
         assert_thin_shell_boundaries(self)

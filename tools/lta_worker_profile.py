@@ -177,7 +177,7 @@ def main():
     parser.add_argument("--fixtures", type=Path, required=True,
                         help="JSON list of name/cache/cache_shape/seed plus optional neighbors")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("auto", "egpu", "h100"), default="auto")
+    parser.add_argument("--profile", choices=("auto", "egpu", "h100", "a100"), default="auto")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--heat-seconds", type=float, default=60)
     parser.add_argument("--repeats", type=int, default=3)

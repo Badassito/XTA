@@ -460,7 +460,9 @@ def rank_source_probe_planes(source, view, shape, boxes):
             from .qsc import qsc_inverse
             u = 2. * (float(view.spherical_u_origin) + native_column) / int(view.spherical_face_intervals) - 1.
             v = 1. - 2. * (float(view.spherical_v_origin) + native_row) / int(view.spherical_face_intervals)
-            point = np.asarray(view.spherical_rotation_xyz).reshape(3, 3) @ qsc_inverse(int(view.spherical_face), u, v)
+            # Padded and rescaled edge pixels can lie beyond the closed chart.
+            direction = qsc_inverse(int(view.spherical_face), min(1., max(-1., u)), min(1., max(-1., v)))
+            point = np.asarray(view.spherical_rotation_xyz).reshape(3, 3) @ direction
             work_z = (int(view.full_t) - 1) / 2. + float(view.spherical_radii[shell]) * float(point[2])
         center = int(round((work_z + .5) * shape[0] / int(view.full_t) - .5))
         probes.update(z for z in (center-1, center, center+1) if 0 <= z < shape[0])
@@ -499,7 +501,7 @@ class RadialCudaProjector:
     def __init__(self, source, plan, metadata_tuple, view, output_shape,
                  bboxes=None, use_bboxes=False, device_index=0, *,
                  block_bytes=_BLOCK_BYTES, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES,
-                 use_graphs=False, skip_empty_blocks=False, scalar_max=False, max_device_bytes=None):
+                 use_graphs=False, skip_empty_blocks=True, scalar_max=False, max_device_bytes=None):
         started = time.perf_counter()
         self.scalar_max = bool(scalar_max)
         if self.scalar_max and use_graphs:

@@ -171,24 +171,30 @@ def write_native_pieces(path, pieces, *, native_shape, source_shape, layer_key, 
 
 
 class NativePieceReader:
-    def __init__(self,reference):
-        from .confidence_evidence import ConfidenceEvidenceRef
-        self.reference,self.shape = reference,reference.storage_shape
-        self.pieces=[]
-        self.readers=OrderedDict()
-        self._closed=False
-        for record in reference.metadata.get('pieces',()):
-            path=(reference.path/str(record['directory'])).resolve()
-            if not path.is_relative_to(reference.path.resolve()) or path==reference.path.resolve():
-                raise ValueError('Native confidence piece escapes its parent directory')
-            ref=ConfidenceEvidenceRef.open(path)
-            offset=tuple(map(int,record['offset_tyx']))
-            if (ref.model_name!=reference.model_name or ref.layer_key!=record['layer_key']
-                    or ref.storage_shape!=tuple(map(int,record['stored_shape_tyx']))
-                    or len(offset)!=3 or any(a<0 or a+b>c for a,b,c in zip(offset,ref.storage_shape,self.shape))):
-                raise ValueError('Native confidence piece identity or grid is inconsistent')
-            self.pieces.append((ref,offset))
-        if reference.metadata.get('piece_contract')=='disjoint_frame_leases':
+    def __init__(self, reference=None, *, pieces=(), shape=None):
+        self.reference = reference
+        self.readers = OrderedDict()
+        self._closed = False
+        if reference is not None:
+            from .confidence_evidence import ConfidenceEvidenceRef
+            shape = reference.storage_shape
+            pieces = []
+            for record in reference.metadata.get('pieces', ()):
+                path = (reference.path / str(record['directory'])).resolve()
+                if not path.is_relative_to(reference.path.resolve()) or path == reference.path.resolve():
+                    raise ValueError('Native confidence piece escapes its parent directory')
+                ref = ConfidenceEvidenceRef.open(path)
+                offset = tuple(map(int, record['offset_tyx']))
+                if (ref.model_name != reference.model_name or ref.layer_key != record['layer_key']
+                        or ref.storage_shape != tuple(map(int, record['stored_shape_tyx']))):
+                    raise ValueError('Native confidence piece identity or grid is inconsistent')
+                pieces.append((ref, offset))
+        self.shape = tuple(shape)
+        self.pieces = tuple(pieces)
+        if any(len(offset) != 3 or any(a < 0 or a + b > c for a, b, c in
+                zip(offset, ref.storage_shape, self.shape)) for ref, offset in self.pieces):
+            raise ValueError('Native confidence piece identity or grid is inconsistent')
+        if reference is not None and reference.metadata.get('piece_contract') == 'disjoint_frame_leases':
             expected=0
             for ref,offset in sorted(self.pieces,key=lambda piece:piece[1][0]):
                 if offset!=(expected,0,0) or ref.storage_shape[1:]!=self.shape[1:]:

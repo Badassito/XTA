@@ -349,7 +349,7 @@ def _parser():
     parser.add_argument("--repeats", type=int, default=3, help="Unprofiled timed repetitions; exact prediction evidence is collected separately")
     parser.add_argument("--heat-seconds", type=float, default=60, help="Sustained GPU heatsoak before warmup/timing; minimum 30 seconds")
     parser.add_argument("--sample-interval", type=float, default=0.5, help="nvidia-smi sampling interval; sampled peaks may miss brief allocations")
-    parser.add_argument("--profile", choices=("auto", "egpu", "h100"), default="auto")
+    parser.add_argument("--profile", choices=("auto", "egpu", "h100", "a100"), default="auto")
     return parser
 
 

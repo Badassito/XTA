@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import pytest
 from scipy import ndimage as ndi
 
 from XTA.sam_bridge_planning import (
-    SAM_CROP_PLANNING_CONTRACT_VERSION, SamObservation, SamPlanningLimits, _corridor,
+    SAM_CROP_PLANNING_CONTRACT_VERSION, SamObservation, SamPlanningLimits, _cone_candidates, _corridor,
     _identity, _paint_shifted, _swept_endpoint_bbox, _swept_family_bbox, plan_sam_bridges,
 )
 
@@ -25,6 +26,36 @@ def _plan(volume, **kwargs):
 
 def _patch(volume, frame, y, x, radius=2, value=True):
     volume[frame, y-radius:y+radius+1, x-radius:x+radius+1] = value
+
+
+@pytest.mark.parametrize('angle', [-60., -30., 0., 30., 60.])
+@pytest.mark.parametrize('full_canvas', [False, True])
+def test_cone_candidates_match_signed_edt_at_anisotropic_canvas_boundary(angle, full_canvas):
+    canvas = (7, 9)
+    spacing = (1.25, .75, 1.5)
+    mask = np.ones(canvas, dtype=bool)
+    if not full_canvas:
+        mask[3:, 2:] = False
+        mask[0, 3:] = False
+    source = SamObservation('source', 0, 1, 0, (0, 0, *canvas), mask)
+    observations = []
+    expected = []
+    padded = np.pad(mask, 1)
+    sdf = (ndi.distance_transform_edt(padded, sampling=spacing[1:])
+           - ndi.distance_transform_edt(~padded, sampling=spacing[1:]))[1:-1, 1:-1]
+    sy, sx = source.anchor_yx
+    for y, x in np.ndindex(canvas):
+        frame = 2 + (y + x) % 3
+        identity = f'{y}:{x}'
+        index = len(observations)
+        observations.append(SamObservation(identity, frame, 1, 0, (y, x, y+1, x+1),
+                                           np.ones((1, 1), dtype=bool)))
+        if sdf[y, x] >= -math.tan(math.radians(angle)) * frame * spacing[0]:
+            distance_sq = ((y - sy) * spacing[1]) ** 2 + ((x - sx) * spacing[2]) ** 2
+            expected.append((frame, distance_sq, identity, index))
+    assert _cone_candidates(source, range(len(observations)), observations, 4, angle,
+                            spacing, canvas, SamPlanningLimits()) == (
+                                [item[-1] for item in sorted(expected)], None)
 
 
 def test_one_to_one_preserves_original_masks_and_has_independent_runs():

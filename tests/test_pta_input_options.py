@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
@@ -125,7 +126,7 @@ def test_resolve_volume_options_defaults_and_overrides():
     assert volume_args is not args and args.enable_cpr is True
 
 
-def test_discovery_ignores_options_file_as_data_and_tags_only_its_directory(tmp_path):
+def test_discovery_ignores_options_file_as_data_and_tags_only_its_directory(tmp_path, monkeypatch):
     first, second = sequence(tmp_path / "first", "a"), sequence(tmp_path / "second", "b")
     before = pta.discover_volume_specs([first, second], force=False, warnings=pta.WarningLog())
     write_options(first, {"fraction": 0.5})
@@ -138,7 +139,17 @@ def test_discovery_ignores_options_file_as_data_and_tags_only_its_directory(tmp_
     assert records[0]["input_options"]["path"] == str((first / PTA_INPUT_OPTIONS_FILENAME).resolve())
     assert records[1]["input_options"] is None
     pta.assert_v18_pta_inputs_unchanged(records)
-    write_options(first, {"fraction": 0.25, "enable_cpr": True})
+    options_path = first / PTA_INPUT_OPTIONS_FILENAME
+    initial_stat = options_path.stat()
+    records[0]["input_options"]["change_or_creation_time_ns"] -= 1
+    # Option content verification streams the file through the shared hash reader.
+    def require_streaming(*args, **kwargs):
+        pytest.fail("PTA provenance verification should hash in bounded reads")
+
+    monkeypatch.setattr(Path, "read_bytes", require_streaming)
+    pta.assert_v18_pta_inputs_unchanged(records)
+    write_options(first, {"fraction": 0.6})
+    os.utime(options_path, ns=(initial_stat.st_atime_ns, initial_stat.st_mtime_ns))
     with pytest.raises(RuntimeError, match="changed during execution"):
         pta.assert_v18_pta_inputs_unchanged(records)
 

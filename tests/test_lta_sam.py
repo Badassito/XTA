@@ -326,12 +326,12 @@ class LtaSamBoundaryTests(unittest.TestCase):
         self.assertEqual(model.new_det_thresh, 0.7)
         self.assertIn("model.score_threshold_detection", updated)
 
-    def test_fa3_policy_targets_hopper_not_4090_ada(self) -> None:
+    def test_fa3_policy_targets_hopper(self) -> None:
         from XTA.lta_sam import cuda_capability_supports_fa3
 
         self.assertFalse(cuda_capability_supports_fa3(8, 9))
         self.assertTrue(cuda_capability_supports_fa3(9, 0))
-        self.assertTrue(cuda_capability_supports_fa3(10, 0))
+        self.assertFalse(cuda_capability_supports_fa3(10, 0))
 
     def test_production_device_profiles_are_explicit_and_fail_closed(self) -> None:
         from XTA.lta_sam import resolve_sam_device_profile
@@ -373,8 +373,16 @@ class LtaSamBoundaryTests(unittest.TestCase):
 
         Cuda.name = "NVIDIA A100-SXM4-80GB"
         Cuda.capability = (8, 0)
-        with self.assertRaisesRegex(ValueError, "4090"):
-            resolve_sam_device_profile(torch, 0)
+        a100 = resolve_sam_device_profile(torch, 0, attention_backend="auto")
+        self.assertEqual(a100["name"], "a100")
+        self.assertEqual(a100["weight_storage"], "float32")
+        self.assertFalse(a100["constrained_batches"])
+        self.assertFalse(a100["use_fa3"])
+
+        Cuda.capability = (10, 0)
+        self.assertFalse(resolve_sam_device_profile(torch, 0, attention_backend="auto")["use_fa3"])
+        with self.assertRaisesRegex(ValueError, "Hopper"):
+            resolve_sam_device_profile(torch, 0, attention_backend="fa3_fp8")
 
     def test_local_bpe_resolution_and_init_state_signature_filter(self) -> None:
         from XTA.lta_sam import (

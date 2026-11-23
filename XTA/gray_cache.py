@@ -62,6 +62,16 @@ def _busy(error):
     return False
 
 
+def _retry_busy(operation):
+    try:
+        return operation()
+    except (sqlite3.Error, GrayCacheUnavailable) as error:
+        if not _busy(error):
+            raise
+        time.sleep(.025)
+        return operation()
+
+
 def _integer(value):
     if isinstance(value, (bool, np.bool_)):
         raise GrayCacheError('Gray cache integer fields cannot be Boolean')
@@ -132,12 +142,17 @@ def _content_digest(connection, metadata, shape, centers):
     digest = hashlib.sha256(metadata['spec_digest'].encode())
     seen = set()
     declared = set(centers)
-    if connection.execute("SELECT 1 FROM packets WHERE typeof(id)!='integer' OR typeof(first_frame)!='integer' LIMIT 1").fetchone():
-        raise GrayCacheError('Gray packet identifiers exceed their type bound')
-    for packet, frame_type,frame_bytes in connection.execute('SELECT id,typeof(frames),length(CAST(frames AS BLOB)) FROM packets ORDER BY first_frame'):
-        if frame_type != 'text' or not 0 < frame_bytes <= 512:
+    # Return only bounded metadata to Python, including when validating an
+    # existing cache. Each index range is visited once within this snapshot.
+    packets = connection.execute('''SELECT
+        CASE WHEN typeof(id)='integer' AND typeof(first_frame)='integer' THEN id END,
+        CASE WHEN typeof(frames)='text' AND length(CAST(frames AS BLOB)) BETWEEN 1 AND 512 THEN frames END
+        FROM packets ORDER BY first_frame''')
+    for packet, frame_json in packets:
+        if packet is None:
+            raise GrayCacheError('Gray packet identifiers exceed their type bound')
+        if frame_json is None:
             raise GrayCacheError('Gray packet frame index exceeds its metadata bound')
-        frame_json = connection.execute('SELECT frames FROM packets WHERE id=?',(packet,)).fetchone()[0]
         try:
             ids = tuple(_integer(x) for x in json.loads(frame_json))
         except (TypeError, ValueError) as error:
@@ -146,23 +161,26 @@ def _content_digest(connection, metadata, shape, centers):
                 or not set(ids).issubset(declared)):
             raise GrayCacheError('Gray packets have invalid or overlapping coverage')
         seen.update(ids)
-        bad_mapping = connection.execute('''SELECT count(*),sum(typeof(frame)!='integer' OR typeof(plane)!='integer')
-            FROM frames WHERE packet=?''',(packet,)).fetchone()
-        if bad_mapping[0] != len(ids) or bad_mapping[1]:
-            raise GrayCacheError('Gray frame index exceeds its type or coverage bound')
-        mapping = connection.execute('SELECT frame,plane FROM frames WHERE packet=? ORDER BY plane', (packet,)).fetchall()
+        mapping = connection.execute('''SELECT
+            CASE WHEN typeof(frame)='integer' THEN frame END,
+            CASE WHEN typeof(plane)='integer' THEN plane END
+            FROM frames WHERE packet=? ORDER BY plane LIMIT ?''', (packet, len(ids)+1)).fetchall()
         if mapping != [(frame, index) for index, frame in enumerate(ids)]:
             raise GrayCacheError('Gray frame index disagrees with packet coverage')
         digest.update(frame_json.encode())
         count = 0
-        bad = connection.execute('''SELECT 1 FROM chunks WHERE packet=? AND
-            (typeof(y)!='integer' OR typeof(x)!='integer' OR typeof(h)!='integer' OR typeof(w)!='integer'
-             OR typeof(raw_size)!='integer' OR typeof(codec)!='text' OR length(CAST(codec AS BLOB))>8
-             OR typeof(sha)!='text' OR length(CAST(sha AS BLOB))!=64 OR typeof(data)!='blob') LIMIT 1''',(packet,)).fetchone()
-        if bad:
-            raise GrayCacheError('Gray chunk fields exceed their type or metadata bounds')
-        for y,x,h,w,raw_size,codec,sha,length in connection.execute(
-                'SELECT y,x,h,w,raw_size,codec,sha,length(data) FROM chunks WHERE packet=? ORDER BY y,x', (packet,)):
+        chunks = connection.execute('''SELECT
+            CASE WHEN typeof(y)='integer' THEN y END, CASE WHEN typeof(x)='integer' THEN x END,
+            CASE WHEN typeof(h)='integer' THEN h END, CASE WHEN typeof(w)='integer' THEN w END,
+            CASE WHEN typeof(raw_size)='integer' THEN raw_size END,
+            CASE WHEN typeof(codec)='text' AND length(CAST(codec AS BLOB))<=8 THEN codec END,
+            CASE WHEN typeof(sha)='text' AND length(CAST(sha AS BLOB))=64 THEN sha END,
+            CASE WHEN typeof(data)='blob' THEN length(data) END
+            FROM chunks WHERE packet=? ORDER BY y,x''', (packet,))
+        for row in chunks:
+            if None in row:
+                raise GrayCacheError('Gray chunk fields exceed their type or metadata bounds')
+            y,x,h,w,raw_size,codec,sha,length = row
             if (y < 0 or x < 0 or y % TILE or x % TILE or h != min(TILE,shape[1]-y)
                     or w != min(TILE,shape[2]-x) or not 1 <= h <= TILE or not 1 <= w <= TILE
                     or raw_size != len(ids)*h*w or raw_size > MAX_CHUNK_BYTES
@@ -189,7 +207,7 @@ def _log_gray_encoder(codec, info):
 def _checked_gray_encoder(codec, provider, version, compress, fallbacks, requested):
     raw = b'\0'*8192+bytes(range(256))*32+b'\xff'*4096
     try:
-        encoded = bytes(compress(raw))
+        encoded = bytes(compress(memoryview(raw)))
         _decode(encoded, codec, len(raw), hashlib.sha256(raw).hexdigest())
     except (ImportError, AttributeError, NotImplementedError):
         raise
@@ -260,7 +278,13 @@ def _encode(raw, codec):
         raise GrayCacheError('Unknown requested gray codec')
     with _GRAY_ENCODER_RESOLUTION_LOCK:
         actual, compress, _info = _resolve_gray_encoder(codec)
-    encoded = bytes(compress(raw))
+    return _encode_chunk(raw, actual, compress)
+
+
+def _encode_chunk(raw, actual, compress):
+    if actual == 'raw':
+        return 'raw', raw
+    encoded = compress(raw)
     return (actual, encoded) if len(encoded) < len(raw) else ('raw', raw)
 
 
@@ -291,6 +315,7 @@ class GrayCacheWriter:
     def __init__(self, path, spec, codec='auto', *, min_free_bytes=DEFAULT_DISK_FLOOR_BYTES):
         self.path = Path(path)
         self.spec, encoded, self.shape, self.centers = _spec(spec)
+        self._unsealed_identity = (SCHEMA, encoded.decode('ascii'), hashlib.sha256(encoded).hexdigest())
         self.codec, self.min_free_bytes = codec, _integer(min_free_bytes)
         if self.min_free_bytes < 0 or codec not in ('auto','raw','zlib','zstd'):
             raise GrayCacheError('Invalid gray cache writer limits')
@@ -324,7 +349,7 @@ class GrayCacheWriter:
                         if statement.strip():
                             self._connection.execute(statement)
                     self._connection.execute('INSERT INTO header VALUES(1,?,?,?,0,NULL)',
-                        (SCHEMA,encoded.decode(),hashlib.sha256(encoded).hexdigest()))
+                        self._unsealed_identity)
                     self._connection.commit()
                 else:
                     self._connection.rollback()
@@ -342,6 +367,28 @@ class GrayCacheWriter:
                 raise GrayCacheUnavailable('Gray cache initialization declined after lock contention') from error
             raise
 
+    def _is_sealed(self):
+        # Match the live row exactly before reusing its authenticated canonical
+        # identity. Sealed, noncanonical or malformed rows use full validation.
+        try:
+            unsealed = self._connection.execute('''
+                SELECT 1 FROM header
+                WHERE id=1 AND typeof(schema)='text' AND schema COLLATE BINARY=?
+                    AND typeof(spec)='text' AND spec COLLATE BINARY=?
+                    AND typeof(spec_digest)='text' AND spec_digest COLLATE BINARY=?
+                    AND typeof(sealed)='integer' AND sealed=0 AND content_digest IS NULL
+                    AND (SELECT count(*) FROM sqlite_master WHERE type='table'
+                         AND name IN ('header','packets','frames','chunks'))=4
+                ''', self._unsealed_identity).fetchone()
+        except sqlite3.Error as error:
+            if _busy(error):
+                raise GrayCacheUnavailable('Gray cache header is busy') from error
+            # Full validation classifies missing and malformed schemas.
+            unsealed = None
+        if unsealed is not None:
+            return False
+        return _header(self._connection)[0]['sealed']
+
     def write_frames(self, frame_ids, gray_u8_NHW):
         ids = tuple(_integer(x) for x in frame_ids)
         values = gray_u8_NHW
@@ -352,7 +399,7 @@ class GrayCacheWriter:
             raise GrayCacheError('Gray packet has invalid dtype, shape, coverage or size')
         with self._lock:
             try:
-                if _header(self._connection)[0]['sealed']:
+                if _retry_busy(self._is_sealed):
                     raise GrayCacheError('Cannot mutate a sealed gray cache')
             except GrayCacheUnavailable as error:
                 if not _busy(error):
@@ -370,20 +417,26 @@ class GrayCacheWriter:
         chunks = []
         encode_started = time.perf_counter()
         encode_cpu_started = time.thread_time()
+        with _GRAY_ENCODER_RESOLUTION_LOCK:
+            actual, compress, _info = _resolve_gray_encoder(self.codec)
         for y in range(0,self.shape[1],TILE):
             for x in range(0,self.shape[2],TILE):
-                crop = np.ascontiguousarray(values[:,y:y+TILE,x:x+TILE])
-                raw = crop.tobytes()
-                codec, encoded = _encode(raw,self.codec)
+                # Keep an owned snapshot through the hash and SQLite commit.
+                crop = values[:,y:y+TILE,x:x+TILE].copy(order='C')
+                raw = memoryview(crop).cast('B')
+                codec, encoded = _encode_chunk(raw,actual,compress)
                 chunks.append((y,x,crop.shape[1],crop.shape[2],len(raw),codec,hashlib.sha256(raw).hexdigest(),encoded))
         encode_seconds = time.perf_counter()-encode_started
         encode_cpu_seconds = time.thread_time()-encode_cpu_started
         write_started = time.perf_counter()
-        with self._lock:
+        def commit_packet():
             try:
                 self._connection.execute('BEGIN IMMEDIATE')
-                if _header(self._connection)[0]['sealed']:
+                if self._is_sealed():
                     raise GrayCacheError('Cannot mutate a sealed gray cache')
+                if self.disabled_reason is not None:
+                    self._connection.rollback()
+                    return False
                 if shutil.disk_usage(self.path.parent).free < required:
                     self._connection.rollback()
                     self.disabled_reason = 'disk_space_floor'
@@ -395,8 +448,16 @@ class GrayCacheWriter:
                 self._connection.executemany('INSERT INTO frames VALUES(?,?,?)',[(frame,packet,index) for index,frame in enumerate(ids)])
                 self._connection.executemany('INSERT INTO chunks VALUES(?,?,?,?,?,?,?,?,?)',[(packet,*row) for row in chunks])
                 self._connection.commit()
-            except sqlite3.Error as error:
+                return True
+            except BaseException:
                 self._connection.rollback()
+                raise
+
+        with self._lock:
+            try:
+                if not _retry_busy(commit_packet):
+                    return False
+            except sqlite3.Error as error:
                 if _full(error):
                     self.disabled_reason = 'disk_full'
                     _metrics(disk_declines=1)
@@ -406,8 +467,7 @@ class GrayCacheWriter:
                     _metrics(busy_declines=1)
                     return False
                 raise GrayCacheError('Gray packet transaction failed') from error
-            except BaseException as error:
-                self._connection.rollback()
+            except GrayCacheUnavailable as error:
                 if _busy(error):
                     self.disabled_reason = 'lock_contention'
                     _metrics(busy_declines=1)
@@ -427,8 +487,8 @@ class GrayCacheWriter:
         return True
 
     def seal(self):
-        with self._lock:
-            try:
+        def commit_seal():
+            with self._connection:
                 metadata,_shape,centers = _header(self._connection)
                 if metadata['spec'] != self.spec:
                     raise GrayCacheError('Gray cache identity changed before sealing')
@@ -442,17 +502,17 @@ class GrayCacheWriter:
                 if metadata['spec'] != self.spec:
                     raise GrayCacheError('Gray cache identity changed before sealing')
                 if metadata['sealed']:
-                    self._connection.rollback()
                     return True
                 if {row[0] for row in self._connection.execute('SELECT frame FROM frames')} != set(centers):
-                    self._connection.rollback()
                     return False
                 digest = _content_digest(self._connection,metadata,shape,centers)
                 self._connection.execute('UPDATE header SET sealed=1,content_digest=? WHERE id=1',(digest,))
-                self._connection.commit()
                 return True
+
+        with self._lock:
+            try:
+                return _retry_busy(commit_seal)
             except BaseException as error:
-                self._connection.rollback()
                 if isinstance(error,sqlite3.Error) and _full(error):
                     self.disabled_reason = 'disk_full'
                     _metrics(seal_disk_declines=1)
@@ -572,10 +632,13 @@ class GrayCacheReader:
                     key = packet,y,x
                     values = self._cache.pop(key,None)
                     if values is None:
-                        row = self._connection.execute('SELECT h,w,raw_size,codec,sha,length(data) FROM chunks WHERE packet=? AND y=? AND x=?',key).fetchone()
-                        if row is None or not 0 < row[2] <= MAX_CHUNK_BYTES or not 0 < row[5] <= row[2]:
+                        row = self._connection.execute('''SELECT h,w,raw_size,codec,sha,
+                            CASE WHEN typeof(raw_size)='integer' AND raw_size BETWEEN 1 AND ?
+                                AND typeof(data)='blob' AND length(data) BETWEEN 1 AND raw_size THEN data END
+                            FROM chunks WHERE packet=? AND y=? AND x=?''',(MAX_CHUNK_BYTES,*key)).fetchone()
+                        if row is None or row[5] is None:
                             raise GrayCacheError('Missing or oversized gray chunk')
-                        payload = self._connection.execute('SELECT data FROM chunks WHERE packet=? AND y=? AND x=?',key).fetchone()[0]
+                        payload = row[5]
                         decode_started = time.perf_counter()
                         raw = _decode(payload,row[3],row[2],row[4])
                         decode_seconds += time.perf_counter()-decode_started
@@ -603,10 +666,14 @@ class GrayCacheReader:
             decode_host_seconds=decode_seconds,cache_hits=cache_hits,read_host_seconds=read_seconds)
         return output
 
-    def close(self):
+    def clear_cache(self):
         with self._lock:
             self._cache.clear()
             self._cached_bytes = 0
+
+    def close(self):
+        with self._lock:
+            self.clear_cache()
             self._connection.close()
 
     def __enter__(self): return self

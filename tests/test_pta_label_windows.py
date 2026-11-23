@@ -283,11 +283,11 @@ def test_publisher_label_files_and_warnings_match_full_frame_reference(tmp_path,
     expected.add('augmented_foreground_flip_dropped', 'sample/Transverse/frame=0003/tag=AbCd1234EfGh5678')
     assert result == (len(masks) - 1, {'all': 1})
     assert dict(warnings.counts) == dict(expected.counts) and dict(warnings.examples) == dict(expected.examples)
-    assert downloads[0] == (len(masks), 4)
     if save_binary:
-        assert downloads[1:] == [masks.shape]
-        assert [name for name, _ in spans] == ['pta.publish.mask_bounds']
+        assert downloads == [(len(masks),), masks.shape]
+        assert [name for name, _ in spans] == ['pta.publish.mask_occupancy']
     else:
+        assert downloads[0] == (len(masks), 4)
         nonempty = [b for b in map(bounds, masks) if b[1] >= 0]
         window_pixels = sum((w[1] - w[0]) * (w[3] - w[2])
                             for w in (yolo_label_window(b, (17, 23)) for b in nonempty))

@@ -64,7 +64,7 @@ class NativeMask:
 
     def __post_init__(self):
         top, left = operator.index(self.top), operator.index(self.left)
-        mask = np.ascontiguousarray(np.asarray(self.mask) != 0, dtype=np.bool_).copy()
+        mask = np.not_equal(np.asarray(self.mask), 0, order="C")
         if top < 0 or left < 0 or mask.ndim != 2 or not bool(mask.any()):
             raise ValueError("native masks require nonnegative coordinates and nonempty 2D foreground")
         mask.setflags(write=False)
@@ -179,17 +179,19 @@ def plan_dynamic_crops(objects: Sequence[DynamicObject], *, height: int, width: 
         top = _containing_origin(y0, y1, side=side, extent=height, snap=settings.snap)
         crop = TilePlan(left, top, side, width, height)
         values = tuple(ordered[index] for index in members)
-        for item in values:
-            item.native.to_crop(crop)
         output.append(DynamicCrop(crop, values))
     return tuple(output)
 
 
 def touches_interior_guard(native: NativeMask, crop: TilePlan, *, guard: int):
     """Physical view edges cannot trigger crop escape patches."""
+    return _bounds_touch_interior_guard(native.xyxy, crop, guard=guard)
+
+
+def _bounds_touch_interior_guard(bounds, crop: TilePlan, *, guard: int):
     if guard <= 0:
         return False
-    x0, y0, x1, y1 = native.xyxy
+    x0, y0, x1, y1 = bounds
     native_guard = max(1, int(math.ceil(guard * crop.size / DYNAMIC_MODEL_SIDE)))
     return bool((crop.left > 0 and x0 - crop.left < native_guard)
                 or (crop.top > 0 and y0 - crop.top < native_guard)
@@ -199,10 +201,10 @@ def touches_interior_guard(native: NativeMask, crop: TilePlan, *, guard: int):
 
 def split_dynamic_object(item: DynamicObject, *, settings: DynamicCropSettings):
     """Keep every component; threshold controls splitting, never mask deletion."""
-    if item.split_depth >= settings.max_split_depth:
+    if item.split_depth >= settings.max_split_depth or item.native.mask.size < 2 * settings.split_min_pixels:
         return (item,)
     import cv2
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(item.native.mask.astype(np.uint8), connectivity=8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(item.native.mask.view(np.uint8), connectivity=8)
     pieces = [index for index in range(1, count) if stats[index, cv2.CC_STAT_AREA] >= settings.split_min_pixels]
     if len(pieces) < 2:
         return (item,)
@@ -211,14 +213,19 @@ def split_dynamic_object(item: DynamicObject, *, settings: DynamicCropSettings):
     pieces.sort(key=lambda index: (-int(stats[index, cv2.CC_STAT_AREA]), int(stats[index, cv2.CC_STAT_TOP]),
                                    int(stats[index, cv2.CC_STAT_LEFT])))
     retained_pieces = pieces[:settings.max_split_children]
-    remainder = (labels != 0) & ~np.isin(labels, retained_pieces)
     omitted_piece_count = len(pieces) - len(retained_pieces)
     output = []
     for ordinal, index in enumerate(retained_pieces):
-        mask = labels == index
-        if ordinal == 0:
-            mask |= remainder
-        native = NativeMask.from_crop(mask, left=item.native.left, top=item.native.top)
+        if ordinal == 0 and len(retained_pieces) < count - 1:
+            # The largest daughter owns every island not assigned to another child.
+            belongs = np.ones(count, dtype=np.bool_)
+            belongs[0] = False
+            belongs[retained_pieces[1:]] = False
+            native = NativeMask.from_crop(belongs[labels], left=item.native.left, top=item.native.top)
+        else:
+            x, y, width, height = (int(value) for value in stats[index, :4])
+            native = NativeMask(item.native.top + y, item.native.left + x,
+                                labels[y:y + height, x:x + width] == index)
         digest = hashlib.sha256(np.packbits(native.mask).tobytes()).hexdigest()[:10]
         lineage = replace(item.seed.lineage, lineage_id=(
             f"{item.seed.lineage.lineage_id}.s{item.seed.frame_index}-{ordinal}-{digest}"))
@@ -237,10 +244,15 @@ def split_dynamic_object(item: DynamicObject, *, settings: DynamicCropSettings):
 def split_depth_budget_reached(item: DynamicObject, *, settings: DynamicCropSettings):
     if item.split_depth < settings.max_split_depth:
         return False
+    return _has_split_components(item.native.mask, settings)
+
+
+def _has_split_components(mask, settings):
+    if mask.size < 2 * settings.split_min_pixels:
+        return False
     import cv2
-    count, _, stats, _ = cv2.connectedComponentsWithStats(item.native.mask.astype(np.uint8), connectivity=8)
-    return sum(int(stats[index, cv2.CC_STAT_AREA]) >= settings.split_min_pixels
-               for index in range(1, count)) > 1
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask.view(np.uint8), connectivity=8)
+    return np.count_nonzero(stats[1:, cv2.CC_STAT_AREA] >= settings.split_min_pixels) > 1
 
 
 def resize_crop_frame(frame, *, side=DYNAMIC_MODEL_SIDE):

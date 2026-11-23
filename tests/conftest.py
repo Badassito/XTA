@@ -1,4 +1,4 @@
-"""Keep Ultralytics test settings out of the repository checkout."""
+"""Isolate process-wide test state."""
 
 from __future__ import annotations
 
@@ -82,7 +82,39 @@ def _fresh_cgroup_layout_cache():
     _reset_cgroup_layout_cache_if_loaded()
 
 
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item):
+    yield
+    restore = getattr(item.config, '_xta_restore_windows_empty_environment', None)
+    if restore is not None:
+        restore()
+
+
 def pytest_configure(config):
+    if os.name == 'nt':
+        inherited_empty = tuple(key for key, value in os.environ.items() if value == '')
+        if inherited_empty:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            read = kernel.GetEnvironmentVariableW
+            read.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+            read.restype = wintypes.DWORD
+            write = kernel.SetEnvironmentVariableW
+            write.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+            write.restype = wintypes.BOOL
+
+            def restore_empty_environment():
+                # The Windows CRT drops empty values when a test restores os.environ.
+                for key in inherited_empty:
+                    if (os.environ.get(key) == '' and read(key, None, 0) == 0
+                            and ctypes.get_last_error() == 203):  # ERROR_ENVVAR_NOT_FOUND
+                        if not write(key, ''):
+                            raise ctypes.WinError(ctypes.get_last_error())
+
+            config._xta_restore_windows_empty_environment = restore_empty_environment
+
     previous = os.environ.get('YOLO_CONFIG_DIR')
     config._xta_previous_yolo_config_dir = previous
     if previous:

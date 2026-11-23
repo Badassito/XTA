@@ -249,6 +249,7 @@ class SliceComponentTableCache:
         self._table_evictions = 0
         self._projection_sdfs: Dict[Tuple[int, int, int, int, float, int], CroppedProjectionSDF] = {}
         self._projection_sdf_order: deque[Tuple[int, int, int, int, float, int]] = deque()
+        self._pending_projection_sdfs: Dict[Tuple[int, int, int, int, float, int], Future] = {}
         sdf_budget_mib = _env_int('YOLO_TTA_INTERPOLATION_SDF_CACHE_MIB', 512)
         self._projection_sdf_budget_bytes = (
             -1 if int(sdf_budget_mib) < 0 else int(sdf_budget_mib) * (1024 ** 2)
@@ -402,6 +403,31 @@ class SliceComponentTableCache:
         if cached is not None:
             return cached
 
+        with self._sdf_lock:
+            cached = self._projection_sdfs.get(key)
+            if cached is not None:
+                return cached
+            pending = self._pending_projection_sdfs.get(key)
+            build = pending is None
+            if build:
+                pending = Future()
+                self._pending_projection_sdfs[key] = pending
+        if not build:
+            return pending.result()
+
+        try:
+            cropped = self._compute_projection_sdf(record, pad)
+            self._remember_projection_sdf(key, cropped)
+            pending.set_result(cropped)
+            return cropped
+        except BaseException as error:
+            pending.set_exception(error)
+            raise
+        finally:
+            with self._sdf_lock:
+                del self._pending_projection_sdfs[key]
+
+    def _compute_projection_sdf(self, record: SliceComponentRecord, pad: int) -> CroppedProjectionSDF:
         h, w = self.shape_yx
         y0, x0, y1, x1 = record.bbox
         crop_y0 = max(0, int(y0) - int(pad))
@@ -412,18 +438,19 @@ class SliceComponentTableCache:
         dy0 = int(y0) - int(crop_y0)
         dx0 = int(x0) - int(crop_x0)
         source_crop[dy0:dy0 + int(record.mask_crop.shape[0]), dx0:dx0 + int(record.mask_crop.shape[1])] = record.mask_crop
-        cropped = CroppedProjectionSDF(
+        return CroppedProjectionSDF(
             origin_y=int(crop_y0),
             origin_x=int(crop_x0),
             sdf=np.ascontiguousarray(_projection_cone_sdf_2d(source_crop)),
         )
+
+    def _remember_projection_sdf(
+        self, key: Tuple[int, int, int, int, float, int], cropped: CroppedProjectionSDF,
+    ) -> None:
         with self._sdf_lock:
             self._projection_sdf_computations += 1
-            existing = self._projection_sdfs.get(key)
-            if existing is not None:
-                return existing
             if int(self._projection_sdf_budget_bytes) == 0:
-                return cropped
+                return
             self._projection_sdfs[key] = cropped
             self._projection_sdf_order.append(key)
             self._projection_sdf_live_bytes += int(cropped.sdf.nbytes)
@@ -453,7 +480,6 @@ class SliceComponentTableCache:
                     - int(victim.sdf.nbytes) - 512,
                 )
                 self._projection_sdf_evictions += 1
-            return cropped
 
     def telemetry(self) -> Dict[str, int]:
         """Snapshot exact cache counts and tracked ndarray payload bytes."""
@@ -542,6 +568,32 @@ def _component_record_mirrored_u(record: SliceComponentRecord, width: int) -> Sl
         mask_crop=record.mask_crop[:, ::-1],
     )
 
+@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+def _numba_component_crop_and_anchor(labels, local_label, centroid_y, centroid_x):
+    """Build the crop and select its centroid-nearest member in row-major order."""
+    mask = np.empty(labels.shape, dtype=np.bool_)
+    first_y, first_x = -1, -1
+    best_y, best_x = -1, -1
+    best_distance = np.float32(0)
+    for y in range(labels.shape[0]):
+        dy = np.float32(y) - centroid_y
+        for x in range(labels.shape[1]):
+            member = labels[y, x] == local_label
+            mask[y, x] = member
+            if not member:
+                continue
+            dx = np.float32(x) - centroid_x
+            distance = dy * dy + dx * dx
+            if first_y < 0:
+                first_y, first_x = y, x
+                best_y, best_x = y, x
+                best_distance = distance
+            elif distance < best_distance:
+                best_y, best_x = y, x
+                best_distance = distance
+    return mask, first_y, first_x, best_y, best_x
+
+
 def _build_slice_component_table(
     labels2d: np.ndarray,
     z: int,
@@ -590,12 +642,15 @@ def _build_slice_component_table(
         height = int(stats[int(local_lbl), cv2.CC_STAT_HEIGHT])
         if width <= 0 or height <= 0:
             continue
-        comp_crop = np.ascontiguousarray(cc[y:y + height, x:x + width] == int(local_lbl))
-        ys, xs = np.nonzero(comp_crop)
-        if ys.size <= 0:
+        # Match the original float32 squared distances and first-minimum tie rule.
+        centroid_y = np.float32(float(centroids[int(local_lbl), 1]) - float(y))
+        centroid_x = np.float32(float(centroids[int(local_lbl), 0]) - float(x))
+        comp_crop, first_y, first_x, anchor_y, anchor_x = _numba_component_crop_and_anchor(
+            cc[y:y + height, x:x + width], int(local_lbl), centroid_y, centroid_x,
+        )
+        if first_y < 0:
             continue
-        # Whole component belongs to one 3D label (see docstring): read it at any member pixel.
-        label_i = int(crop_labels[y + int(ys[0]), x + int(xs[0])])
+        label_i = int(crop_labels[y + first_y, x + first_x])
         if label_i <= 0:
             continue
         if local_to_canonical is not None:
@@ -603,10 +658,6 @@ def _build_slice_component_table(
             label_i = int(local_to_canonical[label_i])
             if label_i <= 0:
                 continue
-        centroid_x = float(centroids[int(local_lbl), 0]) - float(x)
-        centroid_y = float(centroids[int(local_lbl), 1]) - float(y)
-        d2 = (ys.astype(np.float32, copy=False) - centroid_y) ** 2 + (xs.astype(np.float32, copy=False) - centroid_x) ** 2
-        anchor_idx = int(np.argmin(d2))
         record = SliceComponentRecord(
             z=int(z),
             label=int(label_i),
@@ -616,8 +667,8 @@ def _build_slice_component_table(
                 int(origin_y + by0 + y + height), int(origin_x + bx0 + x + width),
             ),
             anchor=(
-                int(origin_y + by0 + y + int(ys[anchor_idx])),
-                int(origin_x + bx0 + x + int(xs[anchor_idx])),
+                int(origin_y + by0 + y + anchor_y),
+                int(origin_x + bx0 + x + anchor_x),
             ),
             area=int(area),
             mask_crop=comp_crop,
@@ -1538,6 +1589,7 @@ class SliceBridgeRenderPlan:
     # Radius checking can retain post-component-filter sections by step index so
     # painting does not repeat SDF lerp, thresholding, and component cleanup.
     cached_sections: List[Optional[np.ndarray]] = field(default_factory=list, compare=False, repr=False)
+    endpoint_radius: Optional[float] = None
 
 @dataclass
 class SliceSeedBridgePlanResult:
@@ -1620,6 +1672,8 @@ def _build_linear_slice_bridge_plan(
     direction_sign: Optional[int] = None,
     wrap_axis: bool = False,
     component_cache: Optional[SliceComponentTableCache] = None,
+    *,
+    allow_active_crop: bool = True,
 ) -> Optional[SliceBridgeRenderPlan]:
     s0, y0, x0 = source_point
     s1, y1, x1 = target_point
@@ -1684,20 +1738,54 @@ def _build_linear_slice_bridge_plan(
 
     # Endpoint shapes share an anchor-centered odd rectangle. Translation is
     # applied when painting into the destination, so it needs no canvas space.
-    extent_y = extent_x = 0
-    for bbox, _mask, anchor in endpoints:
-        by0, bx0, by1, bx1 = map(int, bbox)
-        ay, ax = map(int, anchor)
-        extent_y = max(extent_y, abs(by0 - ay), abs(by1 - 1 - ay))
-        extent_x = max(extent_x, abs(bx0 - ax), abs(bx1 - 1 - ax))
-    half_y, half_x = extent_y + 4, extent_x + 4
-    local_masks = []
-    for bbox, mask, anchor in endpoints:
-        canvas = np.zeros((2 * half_y + 1, 2 * half_x + 1), dtype=bool)
-        oy = int(bbox[0]) - int(anchor[0]) + half_y
-        ox = int(bbox[1]) - int(anchor[1]) + half_x
-        canvas[oy:oy + mask.shape[0], ox:ox + mask.shape[1]] = mask
-        local_masks.append(canvas)
+    boxes = [tuple(int(edge) - int(anchor[i % 2]) for i, edge in enumerate(bbox))
+             for bbox, _mask, anchor in endpoints]
+    half_y = max(max(-b[0], b[2] - 1) for b in boxes) + 4
+    half_x = max(max(-b[1], b[3] - 1) for b in boxes) + 4
+    masks = [mask for _bbox, mask, _anchor in endpoints]
+    guards = [(0, 0), (0, 0)]
+    endpoint_radius = None
+    # Radius prepasses pay off for strongly mismatched endpoint areas. An
+    # intermediate foreground pixel must lie in both expanded endpoint boxes.
+    if (allow_active_crop and steps > 1
+            and max(mask.size for mask in masks) >= 4 * min(mask.size for mask in masks)):
+        radii = [_component_max_radius(np.pad(mask, 1)) for mask in masks]
+        reach = [math.ceil(0.5 + (steps - 1) * (radius - 0.5)) for radius in reversed(radii)]
+        active = (
+            max(box[0] - r for box, r in zip(boxes, reach)),
+            max(box[1] - r for box, r in zip(boxes, reach)),
+            min(box[2] + r for box, r in zip(boxes, reach)),
+            min(box[3] + r for box, r in zip(boxes, reach)),
+        )
+        cropped_y = min(half_y, max(-active[0], active[2] - 1) + 2)
+        cropped_x = min(half_x, max(-active[1], active[3] - 1) + 2)
+        for i, ((by0, bx0, by1, bx1), radius, r) in enumerate(zip(boxes, radii, reach)):
+            guard = max(math.ceil(radius), r) + 2
+            # Padding beyond the complete endpoint and one background pixel cannot affect the EDT.
+            guards[i] = (min(guard, max(0, max(-by0, by1 - 1) + 1 - cropped_y)),
+                         min(guard, max(0, max(-bx0, bx1 - 1) + 1 - cropped_x)))
+        # Skip cropping if either temporary would be larger than the original.
+        temporary_pixels = max((2 * (cropped_y + gy) + 1) * (2 * (cropped_x + gx) + 1)
+                               for gy, gx in guards)
+        if temporary_pixels < (2 * half_y + 1) * (2 * half_x + 1):
+            half_y, half_x = cropped_y, cropped_x
+            endpoint_radius = min(radii)
+        else:
+            guards = [(0, 0), (0, 0)]
+
+    fields = []
+    for (by0, bx0, by1, bx1), mask, (gy, gx) in zip(boxes, masks, guards):
+        wy, wx = half_y + gy, half_x + gx
+        canvas = np.zeros((2 * wy + 1, 2 * wx + 1), dtype=bool)
+        # Keep real component pixels throughout the guard, including pixels that
+        # cross the active crop boundary. The guard preserves EDT values used by blends.
+        sy0, sx0 = max(by0, -wy), max(bx0, -wx)
+        sy1, sx1 = min(by1, wy + 1), min(bx1, wx + 1)
+        canvas[sy0 + wy:sy1 + wy, sx0 + wx:sx1 + wx] = mask[
+            sy0 - by0:sy1 - by0, sx0 - bx0:sx1 - bx0]
+        sdf = _bridge_interface_sdf_2d(canvas)
+        fields.append(np.ascontiguousarray(sdf[gy:gy + 2 * half_y + 1, gx:gx + 2 * half_x + 1]))
+        del sdf, canvas
     # Each endpoint crop is one tight 8-connected component, and every background
     # pixel on its crop border touches the zero canvas margin, so the crop has an
     # enclosed hole exactly when its canvas does. Testing the crop is cheaper.
@@ -1715,9 +1803,10 @@ def _build_linear_slice_bridge_plan(
         steps=int(steps),
         sign=int(sign),
         num_slices=int(num_slices),
-        sdf0=np.ascontiguousarray(_bridge_interface_sdf_2d(local_masks[0])),
-        sdf1=np.ascontiguousarray(_bridge_interface_sdf_2d(local_masks[1])),
+        sdf0=fields[0],
+        sdf1=fields[1],
         fill_section_holes=bool(fill_section_holes),
+        endpoint_radius=endpoint_radius,
     )
 
 def _estimate_linear_slice_bridge_min_radius_from_plan(
@@ -1764,10 +1853,9 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
     if not np.any(source_local) or not np.any(target_local):
         return 0.0
 
-    min_radius = (
-        float(min(float(np.max(plan.sdf0)), float(np.max(plan.sdf1))))
-        + SDF_EDT_RADIUS_OFFSET
-    )
+    min_radius = plan.endpoint_radius
+    if min_radius is None:
+        min_radius = min(float(np.max(plan.sdf0)), float(np.max(plan.sdf1))) + SDF_EDT_RADIUS_OFFSET
     if threshold > 0.0 and min_radius <= threshold:
         return float(min_radius)
     section_cache = plan.cached_sections
@@ -2280,6 +2368,9 @@ def interpolate_view_volume_pass_inplace(
     gpu_render_autotune = bool(
         gpu_interpolation_render_autotune_enabled() and not bool(gpu_required)
     )
+    use_cached_painting = gpu_render_autotune and float(interpolate_min_radius) > 0.0
+    if use_cached_painting:
+        gpu_render_autotune = False
     # Selection is an execution result, not merely the configured policy.  Resolve it
     # only after CUDA admission so CPU-only fallback cannot be reported as GPU-selected.
     gpu_render_selected: Optional[bool] = None
@@ -2295,9 +2386,12 @@ def interpolate_view_volume_pass_inplace(
     scheduled_slice_flags = np.zeros((int(mask_mm.shape[0]),), dtype=bool)
 
     try:
-        gpu_renderer, gpu_renderer_status = create_cuda_interpolation_renderer(
-            process_worker=bool(interpolation_process_worker_active()),
-        )
+        if use_cached_painting:
+            gpu_renderer_status = 'CPU painting uses sections cached by the radius filter'
+        else:
+            gpu_renderer, gpu_renderer_status = create_cuda_interpolation_renderer(
+                process_worker=bool(interpolation_process_worker_active()),
+            )
         if gpu_renderer is None and bool(gpu_required):
             raise RuntimeError(
                 'YOLO_TTA_GPU_INTERPOLATION_REQUIRED=1 but CUDA interpolation is '
@@ -3643,8 +3737,6 @@ class IncrementalRawBBoxMaskStoreWriter:
  slice has been delivered exactly once, so its index, foreground count, and segment extent
     have the same semantics as:func:`write_raw_bbox_mask_store`."""
 
-    _fallback_pwrite_lock = threading.Lock()
-
     def __init__(
         self,
         *,
@@ -3675,6 +3767,7 @@ class IncrementalRawBBoxMaskStoreWriter:
         # 0=not received, 1=payload write in progress, 2=complete.
         self._slice_state = np.zeros((int(self.shape[0]),), dtype=np.uint8)
         self._lock = threading.RLock()
+        self._fallback_pwrite_lock = threading.Lock()
         self._active_callbacks = 0
         self._next_offset = 0
         self._nonempty_slices = 0
@@ -3906,20 +3999,19 @@ class IncrementalRawBBoxMaskStoreWriter:
         with self._lock:
             if self._failed_reason is not None:
                 return
-            for z_i in range(int(start), int(stop)):
-                if int(self._slice_state[z_i]) != 0:
-                    raise ValueError(f'{self.desc}: projected slice {z_i} was delivered more than once')
-            for z_i in range(int(start), int(stop)):
-                self.index[z_i]['kind'] = np.uint8(0)
-                self._slice_state[z_i] = np.uint8(2)
+            states = self._slice_state[start:stop]
+            if np.count_nonzero(states):
+                duplicate = start + int((states != 0).argmax())
+                raise ValueError(f'{self.desc}: projected slice {duplicate} was delivered more than once')
+            self.index['kind'][start:stop] = 0
+            states.fill(2)
 
-    @staticmethod
-    def _pwrite_all(fd: int, data: memoryview, offset: int) -> None:
+    def _pwrite_all(self, fd: int, data: memoryview, offset: int) -> None:
         pwrite = getattr(os, 'pwrite', None)
         if not callable(pwrite):
             # Windows has no os.pwrite. Serialize seek/write/restore on the
             # writer-owned descriptors while preserving positional semantics.
-            with IncrementalRawBBoxMaskStoreWriter._fallback_pwrite_lock:
+            with self._fallback_pwrite_lock:
                 prior = os.lseek(int(fd), 0, os.SEEK_CUR)
                 try:
                     os.lseek(int(fd), int(offset), os.SEEK_SET)
@@ -4311,8 +4403,7 @@ class RawBBoxMaskStore:
         # the process-shared read-only mmap instead of a heap-owned bytes copy.
         self._chunks_bytes: Optional[object] = chunks_bytes
         self._chunks_mmap: Optional[mmap.mmap] = None
-        # True when open holds a reference on the shared RAM cache entry for this
-        # store's chunks.bin (released via _drop_nrrd_raw_store_chunks_ram_cache).
+        # True when open holds a reference on the shared chunks.bin RAM cache entry.
         self._ram_cache_ref_held = False
         shape = self.meta.get('shape')
         if not isinstance(shape, list) or len(shape) != 3:
@@ -4381,7 +4472,7 @@ class RawBBoxMaskStore:
 
     @classmethod
     def _open_archive(cls, root: Path) -> 'RawBBoxMaskStore':
-        from .artifact_archive import member_info, open_artifact, read_artifact, split_reference
+        from .artifact_archive import _api_path, member_info, open_artifact, physical_path, read_artifact
         meta = json.loads(read_artifact(root / 'meta.json'))
         if not isinstance(meta, dict) or meta.get('format') not in MASK_STORE_FORMATS:
             raise ValueError(f'{root}: invalid raw-mask format metadata')
@@ -4418,15 +4509,20 @@ class RawBBoxMaskStore:
         with open_artifact(chunks_path) as stream:
             while stream.read(1024 * 1024):
                 pass
-        archive, _member = split_reference(chunks_path)
-        store._chunks_bytes = (np.memmap(archive, mode='r', dtype=np.uint8,
+        store._chunks_bytes = (np.memmap(_api_path(physical_path(chunks_path)), mode='r', dtype=np.uint8,
             offset=int(info['offset']), shape=(size,)) if size else b'')
         store._archive_payload = True
         return store
 
 
     def close(self) -> None:
+        chunks_bytes = self._chunks_bytes
         self._chunks_bytes = None
+        if self._ram_cache_ref_held:
+            self._ram_cache_ref_held = False
+            _release_raw_store_chunks_ram_cache(self.chunks_path)
+        if isinstance(chunks_bytes, np.memmap):
+            close_memmap_array(chunks_bytes)
         chunks_mmap = self._chunks_mmap
         if chunks_mmap is not None:
             try:
@@ -4742,9 +4838,6 @@ class RawBBoxMaskStore:
         self.close()
         if bool(getattr(self, '_archive_payload', False)):
             return  # Sealed archive members share an immutable container.
-        if bool(getattr(self, '_ram_cache_ref_held', False)):
-            self._ram_cache_ref_held = False
-            _release_raw_store_chunks_ram_cache(self.chunks_path)
         _invalidate_raw_store_chunks_ram_cache(self.chunks_path)
         release_memfd_owners_under(self.root)
         shutil.rmtree(self.root, ignore_errors=True)
@@ -4919,6 +5012,7 @@ def _write_raw_bbox_payload_store(
     desc: str,
     workers: int = 1,
     extra_meta: Optional[Dict[str, object]] = None,
+    slice_indices: Optional[Sequence[int]] = None,
 ) -> Dict[str, object]:
     """Write a slice-chunked bbox binary mask store.
 
@@ -4944,7 +5038,8 @@ def _write_raw_bbox_payload_store(
     meta_path = store_dir / 'meta.json'
 
     index = np.zeros((int(shape_i[0]),), dtype=CTILE_INDEX_DTYPE)
-    worker_count = choose_slice_parallel_workers(int(workers), int(shape_i[0]))
+    active_slices = range(shape_i[0]) if slice_indices is None else slice_indices
+    worker_count = choose_slice_parallel_workers(int(workers), len(active_slices))
     payload_bytes = 0
     nonempty_slices = 0
     foreground_voxels = 0
@@ -4953,11 +5048,11 @@ def _write_raw_bbox_payload_store(
     min_x, max_x = int(shape_i[2]), -1
 
     if worker_count <= 1:
-        iterable: Iterable[RawBBoxSlicePayload] = (encode_slice(idx) for idx in range(int(shape_i[0])))
+        iterable: Iterable[RawBBoxSlicePayload] = (encode_slice(idx) for idx in active_slices)
     else:
         iterable = parallel_map_in_order(
             encode_slice,
-            range(int(shape_i[0])),
+            active_slices,
             max_workers=worker_count,
             max_pending=max(worker_count, worker_count * 2),
         )

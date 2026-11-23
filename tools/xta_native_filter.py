@@ -234,40 +234,87 @@ class Nrrd:
             pos += n
         return data
 
+    @contextmanager
+    def payload(self):
+        with self.path.open('rb') as raw:
+            raw.seek(self.offset)
+            with context_payload(raw, self.header['encoding']) as stream:
+                yield stream
+
     def slabs(self, depth):
         plane = self.shape[1] * self.shape[2]
         stored_t, stored_y, stored_x = self.stored_shape
         dz, dy, dx = self.offset_tyx
         cropped = self.stored_shape != self.shape
-        with open(self.path, 'rb') as raw:
-            raw.seek(self.offset)
-            with context_payload(raw, self.header['encoding']) as f:
-                for z in range(0, self.shape[0], depth):
-                    count = min(depth, self.shape[0] - z)
-                    if not cropped:
-                        data = self._read_exact(f, count * plane)
-                        a = np.frombuffer(data, dtype=np.uint8).reshape(count, *self.shape[1:])
-                        if a.max(initial=0) > 1:
-                            raise ValueError(f'Nonbinary original XTA data: {self.path}')
-                        yield z, a
-                        continue
-                    a = np.zeros((count, *self.shape[1:]), np.uint8)
-                    lo, hi = max(z, dz), min(z + count, dz + stored_t)
-                    if hi > lo:
-                        data = self._read_exact(f, (hi - lo) * stored_y * stored_x)
-                        box = np.frombuffer(data, dtype=np.uint8).reshape(hi - lo, stored_y, stored_x)
-                        if box.max(initial=0) > 1:
-                            raise ValueError(f'Nonbinary original XTA data: {self.path}')
-                        a[lo - z:hi - z, dy:dy + stored_y, dx:dx + stored_x] = box
+        with self.payload() as f:
+            for z in range(0, self.shape[0], depth):
+                count = min(depth, self.shape[0] - z)
+                if not cropped:
+                    data = self._read_exact(f, count * plane)
+                    a = np.frombuffer(data, dtype=np.uint8).reshape(count, *self.shape[1:])
+                    if a.max(initial=0) > 1:
+                        raise ValueError(f'Nonbinary original XTA data: {self.path}')
                     yield z, a
-                if f.read(1):
-                    raise ValueError(f'Extra bytes after NRRD payload: {self.path}')
+                    continue
+                a = np.zeros((count, *self.shape[1:]), np.uint8)
+                lo, hi = max(z, dz), min(z + count, dz + stored_t)
+                if hi > lo:
+                    data = self._read_exact(f, (hi - lo) * stored_y * stored_x)
+                    box = np.frombuffer(data, dtype=np.uint8).reshape(hi - lo, stored_y, stored_x)
+                    if box.max(initial=0) > 1:
+                        raise ValueError(f'Nonbinary original XTA data: {self.path}')
+                    a[lo - z:hi - z, dy:dy + stored_y, dx:dx + stored_x] = box
+                yield z, a
+            if f.read(1):
+                raise ValueError(f'Extra bytes after NRRD payload: {self.path}')
 
     def array(self):
         a = np.empty(self.shape, np.uint8)
         for z, block in self.slabs(8):
             a[z:z + len(block)] = block
         return a
+
+    def source_sha256(self):
+        return digest(self.path)
+
+
+class GroupedNrrd(Nrrd):
+    """One authenticated segment from a consolidated sweep group."""
+
+    def __init__(self, source, shape):
+        self.source = source
+        self.path = source.path
+        self.header = dict(source.header)
+        color = self.header.get(f'Segment{source.layer}_Color')
+        if color is not None:
+            self.header['Segment0_Color'] = color
+        self.stored_shape = tuple(source.stored_shape_tyx)
+        self.shape, self.offset_tyx = stored_crop(self.header, self.stored_shape, shape)
+        if self.offset_tyx != tuple(reversed(source.offset_xyz)):
+            raise ValueError('Grouped mask crop offset differs from its authenticated locator.')
+        self.ijk_to_ras = validate_xta_geometry(self.header, self.offset_tyx)
+
+    @contextmanager
+    def payload(self):
+        from XTA.reconciliation_io import open_gzip_range
+        from XTA.sweep_grouped_reader import group_stamp
+
+        with self.path.open('rb') as raw:
+            if group_stamp(os.fstat(raw.fileno())) != self.source.stamp:
+                raise ValueError(f'Grouped source changed after validation: {self.path}')
+            with open_gzip_range(raw, self.source.gzip_offset, self.source.gzip_bytes) as stream:
+                yield stream
+            if group_stamp(os.fstat(raw.fileno())) != self.source.stamp:
+                raise ValueError(f'Grouped source changed while being read: {self.path}')
+
+    def source_sha256(self):
+        return self.source.sha256
+
+
+def open_original(manifest_path, filename, shape, grouped_sources=None):
+    if grouped_sources is not None:
+        return GroupedNrrd(grouped_sources[filename], shape)
+    return Nrrd(child(manifest_path.parent, filename), shape)
 
 
 @contextmanager
@@ -607,8 +654,8 @@ def load_edit(bundle_dir, entry, original):
 
 
 def manifest_entries(manifest):
-    if manifest.get('layout') != 'one_single_layer_nrrd_per_component':
-        raise ValueError('Expected an XTA per-layer NRRD manifest.')
+    if manifest.get('layout') not in {'one_single_layer_nrrd_per_component', 'grouped_sweep_segments'}:
+        raise ValueError('Expected an XTA layer manifest.')
     by_filename = {}
     for e in manifest['layers']:
         key = e['filename']
@@ -616,6 +663,40 @@ def manifest_entries(manifest):
             raise ValueError(f'Duplicate manifest filename: {key}')
         by_filename[key] = e
     return by_filename
+
+
+def grouped_catalog(path, manifest):
+    if manifest.get('layout') != 'grouped_sweep_segments':
+        return None
+    # The CLI can be launched directly from its source checkout.
+    repository = Path(__file__).resolve().parents[1]
+    if (repository / 'XTA').is_dir() and str(repository) not in sys.path:
+        sys.path.insert(0, str(repository))
+    from XTA.sweep_grouped_reader import open_grouped_catalog
+
+    return open_grouped_catalog(path)
+
+
+def grouped_edit_sources(low_path, full_path, low, full, binding, *, verify_native):
+    catalogues = (grouped_catalog(low_path, low), grouped_catalog(full_path, full))
+    if catalogues == (None, None):
+        return None
+    if binding is None or binding.get('source_storage') != 'grouped' or any(c is None for c in catalogues):
+        raise ValueError('Grouped native transfer requires the original bound preview and native catalogues.')
+    preview, native = catalogues
+    if (preview.review_path != native.review_path
+            or digest(preview.review_path) != binding['review_manifest_sha256']
+            or preview.grid_id != binding['grid_id'] or native.grid_id != 'native'
+            or any(c.cutoff_cent != binding['cutoff_cent']
+                   or c.run_manifest_sha256 != binding['run_manifest_sha256'] for c in catalogues)):
+        raise ValueError('Grouped catalogue identity differs from the sweep edit binding.')
+    identities = binding['logical_segments']
+    low_sources = {r['source_filename']: preview.segment(r['source_filename']) for r in identities}
+    full_sources = {r['source_filename']: native.segment(r['source_filename'], verify_payload=verify_native)
+                    for r in identities}
+    if any(low_sources[r['source_filename']].segment_id != r['segment_id'] for r in identities):
+        raise ValueError('Grouped preview segment identity differs from the sweep edit binding.')
+    return low_sources, full_sources
 
 
 def ensure_disjoint(output, inputs):
@@ -672,6 +753,9 @@ def run(args):
     layers = [e for e in edits if e is not global_edit]
     if not layers:
         raise ValueError('No nonglobal segments were exported.')
+    grouped = grouped_edit_sources(low_path, full_path, low, full, bundle.get('sweep_context'),
+                                   verify_native=not getattr(args, 'validate_only', False))
+    low_sources, full_sources = grouped or (None, None)
     nonadditive = []
     for e in edits:
         key = e['source_filename']
@@ -682,11 +766,10 @@ def run(args):
                 raise ValueError(f'Layer identity mismatch ({identity}): {key}')
         if e is not global_edit and le[key].get('recomposition_op') != 'union':
             nonadditive.append(e['name'])
-        source = child(low_path.parent, key)
-        if digest(source) != e['source_sha256']:
-            raise ValueError(f'Original preview changed since export: {source}')
-        Nrrd(source, low_shape)
-        Nrrd(child(full_path.parent, key), full_shape)
+        source = open_original(low_path, key, low_shape, low_sources)
+        if source.source_sha256() != e['source_sha256']:
+            raise ValueError(f'Original preview changed since export: {source.path}')
+        open_original(full_path, key, full_shape, full_sources)
     if nonadditive and not args.allow_nonadditive:
         raise ValueError('Loaded nonglobal checkpoints/diagnostic layers are not additive XTA components: '
                          + ', '.join(nonadditive) + '. Remove these from the Slicer working segmentation '
@@ -699,12 +782,18 @@ def run(args):
     if receipt:
         from xta_native_union import UnionSources
         union_sources = UnionSources(receipt, pairs, low_shape, full_shape,
-                                     low_path, full_path, edits, global_edit)
+                                     low_path, full_path, edits, global_edit,
+                                     verify_native=not getattr(args, 'validate_only', False))
     output = Path(args.output).resolve()
     ensure_disjoint(output, [bundle_dir, low_path.parent, full_path.parent])
+    if grouped is not None:
+        ensure_disjoint(output, {source.path.parent for mapping in grouped for source in mapping.values()})
     if union_sources is not None:
         ensure_disjoint(output, [p['paths'][kind].parent for p in union_sources.pairs
                                  for kind in ('low', 'full')])
+        ensure_disjoint(output, {source.path.parent for pair in union_sources.pairs
+                                 for mapping in pair['grouped_sources'].values() if mapping is not None
+                                 for source in mapping.values()})
         if union_sources.reference_dir is not None:
             ensure_disjoint(output, [union_sources.reference_dir])
     if output.exists():
@@ -756,7 +845,7 @@ def run(args):
     try:
         result = execute(args, output, scratch_root, report, global_edit, layers, le, fe,
                          low_path, full_path, bundle_dir, full_shape, low_shape, depth, support,
-                         union_sources=union_sources)
+                         union_sources=union_sources, low_sources=low_sources, full_sources=full_sources)
         return result
     except BaseException as exc:
         if report['status'] == 'in_progress':
@@ -776,10 +865,11 @@ def initialize_native_worker(context):
     initial = np.memmap(context['tmp']/'initial-global.dat', mode='r', dtype=np.uint8, shape=shape)
     context['clip'] = initial if context.pop('clip_nonempty') else None
     context['union'] = np.memmap(context['tmp']/'union.dat', mode='r+', dtype=np.uint8, shape=shape)
-    low_global_path = context.pop('low_global_path')
+    low_global_key = context.pop('low_global_key')
     sources = context.get('union_sources')
     context['low_global'] = (sources.low(sources.global_name) if sources is not None else
-                             Nrrd(low_global_path, context['low_shape']).array())
+                             open_original(context['low_path'], low_global_key, context['low_shape'],
+                                           context['low_sources']).array())
     context['support'] = Support(shape, context['low_shape'])
     _native_worker_context = context
 
@@ -814,21 +904,22 @@ def native_executor(workers, context):
 
 def process_native_layer(i, entry, *, args, output, tmp, low_path, full_path,
                          bundle_dir, full_shape, low_shape, depth, support,
-                         low_global, clip, union, edited_global_empty, union_sources=None):
+                         low_global, clip, union, edited_global_empty, union_sources=None,
+                         low_sources=None, full_sources=None):
     from xta_native_sparse import SparseLabels, sparse_label_stream
     started = time.perf_counter()
     print(f'Started [{i+1}] {entry["name"]}', flush=True)
     key = entry['source_filename']
-    low_src = Nrrd(child(low_path.parent, key), low_shape)
+    low_src = open_original(low_path, key, low_shape, low_sources)
     original_low = low_src.array() if union_sources is None else union_sources.low(entry['name'])
     after = load_edit(bundle_dir, entry, low_src)
     removed = (original_low != 0) & (after == 0)
     if union_sources is None and np.any(low_global):
         removed &= low_global != 0
-    native = (Nrrd(child(full_path.parent, key), full_shape) if union_sources is None else
+    native = (open_original(full_path, key, full_shape, full_sources) if union_sources is None else
               union_sources.native(entry['name']))
     source_check = PreviewSupportCheck(full_shape, original_low) if union_sources is None else native
-    source_hash = digest(native.path) if union_sources is None else native.descriptor()
+    source_hash = native.source_sha256() if union_sources is None else native.descriptor()
     row = {'name': entry['name'], 'source_filename': key,
            'preview_removed_voxels': int(np.count_nonzero(removed)),
            'rejected_components': 0, 'rejected_voxels': 0,
@@ -922,9 +1013,10 @@ def process_native_layer(i, entry, *, args, output, tmp, low_path, full_path,
 
 
 def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
-            low_path, full_path, bundle_dir, full_shape, low_shape, depth, support, union_sources=None):
+            low_path, full_path, bundle_dir, full_shape, low_shape, depth, support,
+            union_sources=None, low_sources=None, full_sources=None):
     key = global_edit['source_filename']
-    low_global_source = Nrrd(child(low_path.parent, key), low_shape)
+    low_global_source = open_original(low_path, key, low_shape, low_sources)
     low_global = (low_global_source.array() if union_sources is None else
                   union_sources.low(global_edit['name']))
     edited_global = load_edit(bundle_dir, global_edit, low_global_source)
@@ -934,7 +1026,7 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
     print(f'Validating {len(layers)} edited previews with {args.workers} worker(s).', flush=True)
     low_union_lock = threading.Lock()
     def validate_low_layer(e):
-        src = Nrrd(child(low_path.parent, e['source_filename']), low_shape)
+        src = open_original(low_path, e['source_filename'], low_shape, low_sources)
         before = src.array() if union_sources is None else union_sources.low(e['name'])
         if union_sources is None and low_global_nonempty:
             before &= low_global
@@ -969,10 +1061,10 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
         save_json(output/'report.json', report)
         print('Preview edits validated; no native payload processing or PTA publication requested.', flush=True)
         return 0
-    native_global_src = (Nrrd(child(full_path.parent, key), full_shape) if union_sources is None else
+    native_global_src = (open_original(full_path, key, full_shape, full_sources) if union_sources is None else
                          union_sources.native(global_edit['name']))
     if union_sources is None:
-        report['source_full_sha256'][key] = digest(native_global_src.path)
+        report['source_full_sha256'][key] = native_global_src.source_sha256()
     else:
         report['source_full_unions'][key] = native_global_src.descriptor()
     unresolved = 0
@@ -1009,8 +1101,9 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
                 context = dict(args=args, output=output, tmp=tmp,
                         low_path=low_path, full_path=full_path,
                         bundle_dir=bundle_dir, full_shape=full_shape, low_shape=low_shape,
-                        depth=depth, edited_global_empty=edited_global_empty, union_sources=union_sources)
-                worker_context = dict(context, low_global_path=low_global_source.path,
+                        depth=depth, edited_global_empty=edited_global_empty, union_sources=union_sources,
+                        low_sources=low_sources, full_sources=full_sources)
+                worker_context = dict(context, low_global_key=key,
                                       clip_nonempty=bool(global_count) and union_sources is None)
                 with native_executor(args.workers, worker_context) as executor:
                     if args.workers > 1:
@@ -1117,8 +1210,8 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--version', action='version', version=VERSION)
     p.add_argument('--edits', required=True, help='Directory exported by Export XTA Edits in Slicer.')
-    p.add_argument('--low-manifest', required=True, help='Original low_quality/<bin>/nrrd/*_nrrd_manifest.json.')
-    p.add_argument('--full-manifest', required=True, help='Matching original full-quality nrrd/*_nrrd_manifest.json.')
+    p.add_argument('--low-manifest', required=True, help='Original preview layer manifest or sweep preview source catalogue.')
+    p.add_argument('--full-manifest', required=True, help='Matching native layer manifest or sweep native source catalogue.')
     p.add_argument('--union-receipt', help='Explicit exact-name preview union manifest; requires --union-source-pairs.')
     p.add_argument('--union-source-pairs', help='Hashed original source pairs and receipt member assignments JSON.')
     p.add_argument('--validate-only', action='store_true',

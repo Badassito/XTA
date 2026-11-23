@@ -85,7 +85,7 @@ class NewVoxelDiagnostic:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('run', type=Path, help='Run or low_quality output containing an nrrd directory.')
+    parser.add_argument('run', type=Path, help='Run directory, low-quality output directory, or layer catalogue.')
     parser.add_argument('output', type=Path, help='JSON report destination outside the source repository.')
     parser.add_argument('--audit-native', action='store_true',
                         help='Also compare retained native masks/confidence and reconstruct detector restoration.')
@@ -93,8 +93,17 @@ def main():
                         help='Also write a separate diagnostic SAM union minus detector at this exact output resolution.')
     args = parser.parse_args()
     root, destination = args.run, args.output
-    manifest_path = next((root / 'nrrd').glob('*_nrrd_manifest.json'))
-    layers = json.loads(manifest_path.read_text())['layers']
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, locate_run_layer_catalog, open_grouped_catalog
+    from tools.nrrd_reference_grid import open_manifest_layers
+
+    manifest_path = root.resolve() if root.is_file() else locate_run_layer_catalog(root / 'manifest.json')
+    manifest = json.loads(manifest_path.read_bytes())
+    if manifest.get('layout') == GROUPED_CATALOG_LAYOUT:
+        root = open_grouped_catalog(manifest_path).run_manifest.parent
+    elif args.run.is_file():
+        root = manifest_path.parent.parent
+    layers = manifest['layers']
     bridge_layers = [layer for layer in layers if layer.get('interpolation_backend') == 'sam']
     if not bridge_layers:
         raise ValueError('This output contains no selected SAM bridge layers')
@@ -114,18 +123,23 @@ def main():
         transform = bridge_layers[0]['native_transform']
         if transform['view_family'] != 'orthogonal' or transform['view_name'] != 'transverse':
             raise ValueError('Native-to-source restoration audit currently requires verified Transverse geometry')
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from XTA.confidence_evidence import ConfidenceEvidenceRef
         from XTA.interpolation import RawBBoxMaskStore
         from XTA.outputs import _restore_source_indices_for_output_z, _resize_binary_mask_frame_to_output_shape
         confidence_manifest = json.loads((root/'reconciliation_evidence'/'manifest.json').read_text())
-        confidence_entry = next(layer for layer in confidence_manifest['layers']
-                                if layer['layer_key'] == detector['layer_key'])
+        confidence_entries = [layer for layer in confidence_manifest['layers']
+                              if layer['layer_key'] == detector['layer_key']]
+        model_name = detector.get('model_name')
+        if model_name:
+            confidence_entries = [layer for layer in confidence_entries if layer.get('model_name') == model_name]
+        if len(confidence_entries) != 1:
+            raise ValueError('Expected one retained confidence layer for this detector')
+        confidence_entry = confidence_entries[0]
         confidence_ref = ConfidenceEvidenceRef.open(root/'reconciliation_evidence'/confidence_entry['directory'])
         native_reader = confidence_ref.native_reader()
         native_shape = native_reader.shape
         for layer in bridge_layers:
-            bundle = (root/'nrrd'/layer['proposal_evidence_path']).resolve()
+            bundle = (manifest_path.parent/layer['proposal_evidence_path']).resolve()
             path = bundle.parent / f"sam_bridge_pass{int(layer['pass_index']):02d}_{layer['interpolation_direction']}.cvol"
             native_owners.append(RawBBoxMaskStore.open(path, mmap_payload=True))
         assert all(owner.shape == native_shape for owner in native_owners)
@@ -149,11 +163,10 @@ def main():
                         cache.popitem(last=False)
                 output |= _resize_binary_mask_frame_to_output_shape(cache[index], *shape[1:])
             return output != 0
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from tools.nrrd_reference_grid import open_manifest_layers
     # Offset-aware reader: cropped and full-raster layers yield identical reference planes.
     collection = open_manifest_layers(manifest_path, filenames=names)
     owners = list(collection)
+    input_files = [owner.path or manifest_path.parent / owner.layer_id for owner in owners]
     shape = tuple(collection.shape_tyx)
     diagnostic = NewVoxelDiagnostic(args.new_voxels_output, shape) if args.new_voxels_output else None
     count = shape[1] * shape[2]
@@ -198,7 +211,7 @@ def main():
         result['native_audit'] = native_audit
     if diagnostic is not None:
         result['new_voxels_diagnostic'] = diagnostic.finalize(
-            files=[root/'nrrd'/name for name in names],
+            files=input_files,
             policy_ids=sorted({layer['interpolation_policy_identity'] for layer in bridge_layers}))
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(result, indent=2))

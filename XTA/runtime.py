@@ -29,6 +29,7 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -498,10 +499,7 @@ def plan_gpu_feeder_core_reservations(
         print(f'Warning: [affinity] {unavailable}; dedicated GPU feeder reservations are disabled.')
         return [[] for _ in range(n)]
 
-    try:
-        allowed = {int(cpu) for cpu in os.sched_getaffinity(0)}
-    except Exception:
-        allowed = set(range(max(1, int(_cpu_count()))))
+    allowed = _current_process_cpu_affinity() or set(range(_cpu_count()))
     allowed.difference_update(int(cpu) for cpu in (excluded_cpus or ()))
     if not allowed:
         print('Warning: [affinity] no allocated CPUs remain for dedicated GPU feeder cores.')
@@ -625,10 +623,9 @@ def plan_gpu_worker_affinity(
     all_reserved = {int(cpu) for values in reserved for cpu in values}
     excluded = {int(cpu) for cpu in (excluded_cpus or ())} | all_reserved
 
-    try:
-        allowed_all = {int(cpu) for cpu in os.sched_getaffinity(0)}
-    except Exception:
-        allowed_all = set(range(max(1, int(_cpu_count()))))
+    if cpu_affinity_unavailable_reason() is not None:
+        return plan
+    allowed_all = _current_process_cpu_affinity() or set(range(_cpu_count()))
     shared_allowed = sorted(int(cpu) for cpu in (allowed_all - excluded))
 
     topo = numa_topology() if (numa_enabled() and numa_worker_pin_enabled()) else None
@@ -754,14 +751,7 @@ def plan_openvino_cpu_instances(
     and may consume that reserve.
     """
     excluded = {int(cpu) for cpu in (excluded_cpus or ())}
-    try:
-        allowed_cpus = sorted(
-            int(cpu) for cpu in os.sched_getaffinity(0) if int(cpu) not in excluded
-        )
-    except Exception:
-        allowed_cpus = [
-            int(cpu) for cpu in range(max(1, int(_cpu_count()))) if int(cpu) not in excluded
-        ]
+    allowed_cpus = sorted((_current_process_cpu_affinity() or set(range(_cpu_count()))) - excluded)
     if not allowed_cpus:
         raise RuntimeError('No CPUs remain for OpenVINO after dedicated GPU feeder reservations')
     topo = numa_topology()
@@ -882,6 +872,34 @@ class _WindowsAffinityApi:
             raise self.ctypes.WinError(self.ctypes.get_last_error())
         return int(process.value), int(system.value)
 
+    def physical_core_groups(self, cpus: Sequence[int]) -> Optional[List[List[int]]]:
+        from ctypes import wintypes
+
+        if self.kernel.GetActiveProcessorGroupCount() != 1:
+            return None
+        ctypes = self.ctypes
+
+        class ProcessorInfo(ctypes.Structure):
+            _fields_ = [('mask', ctypes.c_size_t), ('relationship', wintypes.DWORD),
+                        ('details', ctypes.c_ulonglong * 2)]
+
+        read = self.kernel.GetLogicalProcessorInformation
+        read.argtypes = (ctypes.POINTER(ProcessorInfo), ctypes.POINTER(wintypes.DWORD))
+        read.restype = wintypes.BOOL
+        size = wintypes.DWORD()
+        read(None, ctypes.byref(size))
+        record_size = ctypes.sizeof(ProcessorInfo)
+        if not size.value or size.value % record_size:
+            return None
+        records = (ProcessorInfo * (size.value // record_size))()
+        if not read(records, ctypes.byref(size)) or size.value % record_size:
+            return None
+        allowed = sorted(set(cpus))
+        groups = [[cpu for cpu in allowed if item.mask & (1 << cpu)]
+                  for item in records[:size.value // record_size] if item.relationship == 0]
+        groups = sorted(group for group in groups if group)
+        return groups if sorted(cpu for group in groups for cpu in group) == allowed else None
+
     def thread_mask(self, tid: int) -> Tuple[int, int]:
         handle = self.kernel.OpenThread(0x0800, False, int(tid))  # QUERY_LIMITED_INFORMATION
         if not handle:
@@ -922,6 +940,17 @@ def cpu_affinity_unavailable_reason() -> Optional[str]:
     if groups != 1:
         return f'Windows reports {groups} active processor groups; XTA CPU masks are single-group'
     return None
+
+def _current_process_cpu_affinity() -> Optional[set[int]]:
+    try:
+        if os.name == 'nt':
+            if cpu_affinity_unavailable_reason() is None:
+                mask, _system_mask = _WindowsAffinityApi().process_masks()
+                return {cpu for cpu in range(mask.bit_length()) if mask & (1 << cpu)}
+            return None
+        return set(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return None
 
 
 def _windows_setaffinity_all_threads(cpus: Sequence[int], *, _process=None, _api=None) -> bool:
@@ -1136,19 +1165,22 @@ def default_worker_budget() -> int:
     """
     return max(1, int(_cpu_count()) * 2)
 
-def gpu_worker_cpu_share(gpu_device_count: int) -> int:
+def gpu_worker_cpu_share(gpu_device_count: int, *, cpu_count: Optional[int] = None) -> int:
     """Logical CPU share reserved for each CUDA inference worker process."""
-    cpu = max(1, int(_cpu_count()))
+    cpu = max(1, _cpu_count() if cpu_count is None else int(cpu_count))
     n = max(1, int(gpu_device_count))
     return max(1, cpu // n)
 
-def main_process_worker_budget(gpu_device_count: int, gpu_worker_process_active: bool) -> int:
+def main_process_worker_budget(
+    gpu_device_count: int, gpu_worker_process_active: bool, *, cpu_count: Optional[int] = None,
+) -> int:
     """Main-process CPU budget while one-or-more CUDA worker processes are active."""
-    total = int(default_worker_budget())
+    cpu = max(1, _cpu_count() if cpu_count is None else int(cpu_count))
+    total = 2 * cpu
     if not bool(gpu_worker_process_active):
         return max(1, total)
     n = max(1, int(gpu_device_count))
-    reserved = int(gpu_worker_cpu_share(n)) * n
+    reserved = gpu_worker_cpu_share(n, cpu_count=cpu) * n
     return max(1, total - reserved)
 
 def tail_worker_budget_expansion_enabled() -> bool:
@@ -1413,17 +1445,21 @@ def resolve_parent_memory_limits(available_bytes: int, *, sam_enabled: bool,
         max(128*GIB, min(256*GIB, int(headroom*.40))))
     transient_default = max(64*GIB, int(headroom*.25) if sam_enabled else
                             min(192*GIB, int(headroom*.25)))
-    inference = int(max(1., _env_float('YOLO_TTA_DIRECT_UNION_INFERENCE_GIB',
-                                     inference_default/GIB))*GIB)
-    dense = int(max(inference/GIB, _env_float('YOLO_TTA_DIRECT_UNION_TOTAL_GIB',
-                                            dense_default/GIB))*GIB)
+    def configured_bytes(name, default):
+        value = _env_float(name, float('nan'))
+        if not math.isfinite(value):
+            return default
+        return max(1, round(value * GIB)) if value > 0 else GIB
+
+    inference = configured_bytes('YOLO_TTA_DIRECT_UNION_INFERENCE_GIB', inference_default)
+    dense = configured_bytes('YOLO_TTA_DIRECT_UNION_TOTAL_GIB', max(inference, dense_default))
+    inference = min(inference, dense)
     if sam_enabled and dense_default <= int(headroom*.40):
         # Increase only the default, without spending an explicit dense
         # allowance twice or changing the legacy small-host floors.
         transient_default = max(transient_default,
             min(int(headroom*.40), int(headroom*.80)-dense))
-    transient = int(max(1., _env_float('YOLO_TTA_PARENT_TRANSIENT_GIB',
-                                     transient_default/GIB))*GIB)
+    transient = configured_bytes('YOLO_TTA_PARENT_TRANSIENT_GIB', transient_default)
     return inference, dense, transient
 
 
@@ -2070,6 +2106,15 @@ def _detach_transferred_fd(handle: object) -> int:
     if fd < 0:
         raise OSError(f'Invalid transferred file descriptor: {fd}')
     return fd
+
+def _attach_interpolation_memfd_transfer(kwargs: Dict[str, object]) -> _MemfdTransferBatch:
+    # Call only after pickling preflight, once this dispatch has been admitted.
+    with _MEMFD_OWNER_LOCK:
+        handle = _duplicate_memfd_path_for_child(kwargs.get('mask_path'))
+    if handle is None:
+        return _MemfdTransferBatch([])
+    kwargs['mask_fd'] = handle
+    return _MemfdTransferBatch([handle])
 
 def _materialize_worker_task_memfd_paths(
     task: Dict[str, object],
@@ -2906,12 +2951,6 @@ _RUN_SCRATCH_CLEANUP_PATH: Optional[Path] = None
 
 _RUN_SCRATCH_CLEANUP_REGISTERED = False
 
-_RUN_TERMINATION_REQUESTED = threading.Event()
-
-_RUN_TERMINATION_WATCHDOG_STARTED = False
-
-_RUN_TERMINATION_SIGNAL = int(getattr(signal, 'SIGTERM', 15))
-
 def _cleanup_registered_unique_run_scratch() -> None:
     """Remove this process's unique scratch tree on normal/handled termination.
 
@@ -2937,21 +2976,18 @@ def _cleanup_registered_unique_run_scratch() -> None:
     except Exception:
         pass
 
-def _force_termination_watchdog() -> None:
+def _force_termination_watchdog(signum: int, finished: threading.Event) -> None:
     """Bound graceful teardown so SLURM KillWait cannot strand PID scratch.
 
     Executor shutdown normally waits for active interpolation.  A pass can run for hours, so
     SIGTERM needs a finite grace period before terminating children, removing this run's
     conservatively-owned scratch tree, and exiting without Python's thread-join atexit phase.
     """
-    _RUN_TERMINATION_REQUESTED.wait()
-    signum = int(_RUN_TERMINATION_SIGNAL)
     grace_seconds = max(
         1.0, _env_float('YOLO_TTA_TERMINATION_GRACE_SECONDS', 20.0),
     )
-    deadline = time.monotonic() + float(grace_seconds)
-    while time.monotonic() < deadline:
-        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    if finished.wait(grace_seconds):
+        return
     try:
         children = list(mp.active_children())
     except Exception:
@@ -2971,39 +3007,54 @@ def _force_termination_watchdog() -> None:
     _cleanup_registered_unique_run_scratch()
     os._exit(128 + int(signum))
 
-def _run_scratch_sigterm_handler(signum: int, _frame: object) -> None:
-    global _RUN_TERMINATION_SIGNAL
-    _RUN_TERMINATION_SIGNAL = int(signum)
-    _RUN_TERMINATION_REQUESTED.set()
-    raise KeyboardInterrupt(f'received signal {int(signum)}')
+@contextlib.contextmanager
+def run_termination_watchdog():
+    """Bound TTA teardown on signals and restore the embedding process's handlers."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    wake = threading.Event()
+    finished = threading.Event()
+    received_signal = None
+    previous_handlers = {}
+
+    def handle(signum: int, _frame: object) -> None:
+        nonlocal received_signal
+        if received_signal is not None:
+            return
+        received_signal = signum
+        wake.set()
+        raise KeyboardInterrupt(f'received signal {signum}')
+
+    def watch() -> None:
+        wake.wait()
+        if received_signal is not None and not finished.is_set():
+            _force_termination_watchdog(received_signal, finished)
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            try:
+                if signal.getsignal(signum) not in (None, signal.SIG_IGN):
+                    previous_handlers[signum] = signal.signal(signum, handle)
+            except (ValueError, OSError):
+                pass
+        if previous_handlers:
+            threading.Thread(target=watch, name='termination-watchdog', daemon=True).start()
+        yield
+    finally:
+        finished.set()
+        wake.set()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 def register_unique_run_scratch_cleanup(path: Path) -> None:
-    """Register conservative atexit/SIGTERM cleanup for one PID-owned scratch tree."""
+    """Register conservative atexit cleanup for one PID-owned scratch tree."""
     global _RUN_SCRATCH_CLEANUP_PATH, _RUN_SCRATCH_CLEANUP_REGISTERED
-    global _RUN_TERMINATION_WATCHDOG_STARTED
-    path_obj = Path(path)
     with _RUN_SCRATCH_CLEANUP_LOCK:
-        _RUN_SCRATCH_CLEANUP_PATH = path_obj
+        _RUN_SCRATCH_CLEANUP_PATH = Path(path)
         if not _RUN_SCRATCH_CLEANUP_REGISTERED:
             atexit.register(_cleanup_registered_unique_run_scratch)
             _RUN_SCRATCH_CLEANUP_REGISTERED = True
-
-    # SLURM normally sends SIGTERM before a forced SIGKILL. Convert that catchable signal
-    # into Python unwinding so executor/sink finalizers and the atexit scratch cleanup run.
-    if str(path_obj.name).endswith(f'_{int(os.getpid())}_temp'):
-        try:
-            if not _RUN_TERMINATION_WATCHDOG_STARTED:
-                watchdog = threading.Thread(
-                    target=_force_termination_watchdog,
-                    name='termination-watchdog',
-                    daemon=True,
-                )
-                watchdog.start()
-                _RUN_TERMINATION_WATCHDOG_STARTED = True
-            signal.signal(signal.SIGTERM, _run_scratch_sigterm_handler)
-            signal.signal(signal.SIGINT, _run_scratch_sigterm_handler)
-        except (ValueError, OSError, AttributeError):
-            pass
 
 def _mount_fstype_for_path(path: Path) -> Optional[str]:
     """Resolve the effective Linux mount, including bind mounts over existing mounts.
@@ -3266,13 +3317,19 @@ def defer_retired_memmap_directory_cleanup(path: Path) -> None:
         _start_memmap_unlink_worker_locked()
 
 
+def _retirement_match_path(path: Path) -> Path:
+    # Match aliases without changing the pathname or inode the worker may unlink.
+    return Path(os.path.normcase(os.path.realpath(path)))
+
+
 def wait_for_retired_memmap_directory_cleanup(path: Path, *, timeout_s: float = 5.0) -> None:
     """Wait for deferred deletion of one scratch directory."""
-    target = Path(path).absolute()
+    target = _retirement_match_path(path)
     deadline = time.monotonic() + max(0.0, float(timeout_s))
     while True:
         with _MEMMAP_UNLINK_LOCK:
-            pending = any(entry[0] == target for entry in _MEMMAP_PENDING_DIRECTORIES)
+            directories = tuple(_MEMMAP_PENDING_DIRECTORIES)
+        pending = any(_retirement_match_path(entry[0]) == target for entry in directories)
         if not pending:
             return
         if time.monotonic() >= deadline:
@@ -3298,18 +3355,31 @@ def _finish_memmap_retirement(mapping_id: int, state: dict[str, object]) -> None
         _MEMMAP_RETIREMENTS.pop(mapping_id, None)
 
 
-def wait_for_retired_memmap_unlinks(*, path: Optional[Path] = None, timeout_s: float = 5.0) -> None:
+def wait_for_retired_memmap_unlinks(
+    *, path: Optional[Path] = None, under: Optional[Path] = None, timeout_s: float = 5.0,
+) -> None:
     """Wait for scheduled scratch deletion, raising if another handle still blocks it."""
-    target = Path(path).absolute() if path is not None else None
+    target = _retirement_match_path(path) if path is not None else None
+    root = _retirement_match_path(under) if under is not None else None
+
+    def selected(candidate: Path) -> bool:
+        resolved = _retirement_match_path(candidate)
+        if target is not None and resolved != target:
+            return False
+        # A leaf symlink is itself the unlink target, even if its referent is elsewhere.
+        return (root is None or resolved.is_relative_to(root)
+                or _retirement_match_path(candidate.parent).is_relative_to(root))
+
     deadline = time.monotonic() + max(0.0, float(timeout_s))
     while True:
         with _MEMMAP_RETIREMENT_LOCK:
             active = tuple(entry[0] for _reference, _finalizer, state in _MEMMAP_RETIREMENTS.values()
-                           for entry in state['unlink_paths']
-                           if target is None or entry[0] == target)
+                           for entry in state['unlink_paths'])
             with _MEMMAP_UNLINK_LOCK:
-                pending = active + tuple(entry[0] for entry in _MEMMAP_PENDING_UNLINKS
-                                         if target is None or entry[0] == target)
+                pending = active + tuple(entry[0] for entries in
+                    (_MEMMAP_PENDING_UNLINKS, _MEMMAP_PENDING_DIRECTORIES) for entry in entries)
+        if target is not None or root is not None:
+            pending = tuple(candidate for candidate in pending if selected(candidate))
         if not pending:
             return
         if time.monotonic() >= deadline:
@@ -3644,6 +3714,10 @@ class _GpuWorkerAuxInterpolationPool:
             if not entry.get('error'):
                 entry['error'] = str(reason)
             entry['event'].set()  # type: ignore[union-attr]
+        for entry in entries:
+            transfer = entry.pop('memfd_transfer', None)
+            if transfer is not None:
+                transfer.rollback()  # type: ignore[union-attr]
 
     def try_submit(self, aux_kwargs: Dict[str, object]) -> Optional[Dict[str, object]]:
         with self._lock:
@@ -3670,6 +3744,7 @@ class _GpuWorkerAuxInterpolationPool:
             self._busy_workers.add(int(worker_id))
             allow_full_cpu_affinity = bool(self._leased.get(int(worker_id), False))
             task_queue = self._task_queues[int(worker_id)]
+        batch = _MemfdTransferBatch([])
         try:
             envelope = {
                 'task_id': int(task_id),
@@ -3678,11 +3753,21 @@ class _GpuWorkerAuxInterpolationPool:
                 'allow_full_cpu_affinity': bool(allow_full_cpu_affinity),
             }
             preflight_multiprocessing_payload(envelope)
-            task_queue.put(envelope)
-        except Exception:
+            with self._lock:
+                # A failed pool permanently withdraws the reservation above.
+                if self._pending.get(task_id) is not handle:
+                    return None
+                batch = _attach_interpolation_memfd_transfer(envelope['aux_kwargs'])
+                task_queue.put(envelope)
+                if batch.handles:
+                    handle['memfd_transfer'] = batch
+        except BaseException as exc:
+            batch.rollback()
             with self._lock:
                 self._pending.pop(task_id, None)
                 self._busy_workers.discard(int(worker_id))
+            if not isinstance(exc, Exception):
+                raise
             return None
         return handle
 
@@ -3699,6 +3784,7 @@ class _GpuWorkerAuxInterpolationPool:
             self._busy_workers.discard(int(worker_id))
         if handle is None:
             return
+        handle.pop('memfd_transfer', None)
         if bool(ok):
             handle['stats'] = dict(stats or {})
         else:
@@ -3766,7 +3852,6 @@ def reset_runtime_state_for_new_run() -> None:
     with _RUN_SCRATCH_CLEANUP_LOCK:
         _RUN_SCRATCH_CLEANUP_PATH = None
     _SCRATCH_DIR_IS_MEMORY_BACKED = False
-    _RUN_TERMINATION_REQUESTED.clear()
     shutdown_parallel_pool_cache()
     # The optional native DSA binding owns process-local work-queue state. Importing
     # its Python control plane here does not load the native module, and close_manager
@@ -3779,14 +3864,7 @@ def reset_runtime_state_for_new_run() -> None:
         runtime_telemetry().fallback('workspace.copy.dsa.close', exc)
 
 def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
-    if arr is None:
-        return None
     try:
-        arr_np = np.asarray(arr)
-        memfd_path = _memfd_backing_path_from_array(arr)
-        if memfd_path is not None and bool(arr_np.flags['C_CONTIGUOUS']):
-            if memfd_path.stat().st_size >= int(arr_np.nbytes):
-                return memfd_path
         if (
             isinstance(arr, np.memmap)
             # A sliced np.memmap is still an np.memmap and inherits the parent's
@@ -3795,16 +3873,20 @@ def _interpolation_array_backing_path(arr: object) -> Optional[Path]:
             # root mapping has the raw mmap.mmap buffer as its `base`; views chain
             # to the parent ndarray instead.
             and isinstance(getattr(arr, 'base', None), mmap.mmap)
-            and bool(arr_np.flags['C_CONTIGUOUS'])
+            and arr.flags.c_contiguous
+            and arr.mode != 'c'
             and int(getattr(arr, 'offset', 0) or 0) == 0
         ):
+            memfd_path = _memfd_backing_path_from_array(arr)
+            if memfd_path is not None:
+                return memfd_path if memfd_path.stat().st_size == arr.nbytes else None
             filename = getattr(arr, 'filename', None)
             if not filename:
                 return None
             path = Path(filename)
             # The child reopens by (path, shape): the file must actually hold the
             # full array starting at byte 0.
-            if path.stat().st_size < int(arr_np.nbytes):
+            if path.stat().st_size < arr.nbytes:
                 return None
             return path
     except Exception:
@@ -3864,10 +3946,8 @@ def _interpolation_process_entry(
     bridge_component_dir: Optional[str] = None,
     known_slice_any: Optional[np.ndarray] = None,
     known_slice_bboxes: Optional[np.ndarray] = None,
+    mask_fd: Optional[object] = None,
 ) -> Dict[str, object]:
-    # Local import keeps the package dependency graph acyclic.
-    from .interpolation import interpolate_view_volume_pass_inplace
-
     global _INTERPOLATION_PROCESS_WORKER
     _INTERPOLATION_PROCESS_WORKER = True
     try:
@@ -3875,13 +3955,16 @@ def _interpolation_process_entry(
     except Exception:
         pass
 
-    mask_mm = np.memmap(
-        Path(mask_path),
-        dtype=np.dtype(mask_dtype),
-        mode='r+',
-        shape=tuple(int(x) for x in mask_shape),
-    )
+    shape = tuple(int(x) for x in mask_shape)
+    if mask_fd is None:
+        mask_mm = np.memmap(Path(mask_path), dtype=np.dtype(mask_dtype), mode='r+', shape=shape)
+    else:
+        with os.fdopen(_detach_transferred_fd(mask_fd), 'r+b') as file:
+            mask_mm = np.memmap(file, dtype=np.dtype(mask_dtype), mode='r+', shape=shape)
     try:
+        # Local import keeps the package dependency graph acyclic.
+        from .interpolation import interpolate_view_volume_pass_inplace
+
         stats = interpolate_view_volume_pass_inplace(
             mask_mm=mask_mm,
             work_dir=Path(work_dir),
@@ -3977,220 +4060,252 @@ def interpolate_view_volume_pass_maybe_process(
         pass_tag=str(pass_tag),
         workers=max(1, min(int(workers), int(mask_mm.shape[0]) if getattr(mask_mm, 'ndim', 0) else int(workers))),
     )
-    fallback_enabled = bool(interpolation_process_fallback_enabled())
-    worker_mm = process_mm
-    worker_path = Path(process_path)
-    staged_bridge_path: Optional[Path] = None
-    staged_component_dir: Optional[Path] = None
+    try:
+        fallback_enabled = bool(interpolation_process_fallback_enabled())
+        worker_mm = process_mm
+        worker_path = Path(process_path)
+        staged_bridge_path: Optional[Path] = None
+        staged_component_dir: Optional[Path] = None
 
-    # A failed interpolation pass is allowed to have modified any byte before it raises.
-    # When recovery is enabled, isolate that speculative write set in a private pathname
-    # transaction.  The clean input is retained for the in-process retry, and an auxiliary
-    # worker whose transport failed can continue touching only the abandoned transaction.
-    if fallback_enabled:
-        transaction_token = (
-            f'{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}'
-        )
-        worker_path = Path(work_dir) / (
-            f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.fallback-stage.u8.dat'
-        )
-        worker_mm = copy_workspace_array(
-            np.asarray(process_mm),
-            worker_path,
-            desc=f'Interpolation fallback transaction {pass_tag}',
-            prefer_memory=False,
-            workers=max(
-                1,
-                min(
-                    int(workers),
-                    int(mask_mm.shape[0]) if getattr(mask_mm, 'ndim', 0) else int(workers),
+        # A failed interpolation pass is allowed to have modified any byte before it raises.
+        # When recovery is enabled, isolate that speculative write set in a private pathname
+        # transaction.  The clean input is retained for the in-process retry, and an auxiliary
+        # worker whose transport failed can continue touching only the abandoned transaction.
+        if fallback_enabled:
+            transaction_token = (
+                f'{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}'
+            )
+            worker_path = Path(work_dir) / (
+                f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.fallback-stage.u8.dat'
+            )
+            worker_mm = copy_workspace_array(
+                np.asarray(process_mm),
+                worker_path,
+                desc=f'Interpolation fallback transaction {pass_tag}',
+                prefer_memory=False,
+                workers=max(
+                    1,
+                    min(
+                        int(workers),
+                        int(mask_mm.shape[0]) if getattr(mask_mm, 'ndim', 0) else int(workers),
+                    ),
                 ),
-            ),
-        )
-        if bridge_delta_path is not None:
-            staged_bridge_path = Path(work_dir) / (
-                f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.bridge-stage.u8.dat'
             )
-        if bridge_component_dir is not None:
-            staged_component_dir = Path(work_dir) / (
-                f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.component-stage'
+            if bridge_delta_path is not None:
+                staged_bridge_path = Path(work_dir) / (
+                    f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.bridge-stage.u8.dat'
+                )
+            if bridge_component_dir is not None:
+                staged_component_dir = Path(work_dir) / (
+                    f'{_sanitize_filesystem_token(pass_tag)}.{transaction_token}.component-stage'
+                )
+
+        shape = tuple(int(x) for x in np.asarray(worker_mm).shape)
+        dtype_str = str(np.asarray(worker_mm).dtype)
+
+        def _discard_speculative_worker_storage() -> None:
+            if worker_mm is process_mm:
+                return
+            worker_backing = Path(worker_path)
+            retire_path = (
+                worker_backing if worker_backing.exists()
+                and _root_memmap_for_array(worker_mm) is not None
+                and _memfd_owner_key_from_array(worker_mm) is None
+                else None
             )
-
-    shape = tuple(int(x) for x in np.asarray(worker_mm).shape)
-    dtype_str = str(np.asarray(worker_mm).dtype)
-
-    def _discard_speculative_worker_storage() -> None:
-        if worker_mm is process_mm:
-            return
-        worker_backing = Path(worker_path)
-        retire_path = (
-            worker_backing if worker_backing.exists()
-            and _root_memmap_for_array(worker_mm) is not None
-            and _memfd_owner_key_from_array(worker_mm) is None
-            else None
-        )
-        close_memmap_array(worker_mm, unlink_path=retire_path)
-        try:
-            Path(worker_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-        if staged_bridge_path is not None:
+            close_memmap_array(worker_mm, unlink_path=retire_path)
             try:
-                Path(staged_bridge_path).unlink(missing_ok=True)
+                Path(worker_path).unlink(missing_ok=True)
             except Exception:
                 pass
-        if staged_component_dir is not None:
-            shutil.rmtree(staged_component_dir, ignore_errors=True)
+            if staged_bridge_path is not None:
+                try:
+                    Path(staged_bridge_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if staged_component_dir is not None:
+                shutil.rmtree(staged_component_dir, ignore_errors=True)
 
-    def _commit_speculative_worker_storage(stats: Dict[str, object]) -> np.ndarray:
-        try:
-            if worker_mm is not process_mm:
-                total_slices = int(np.asarray(process_mm).shape[0])
+        def _commit_speculative_worker_storage(stats: Dict[str, object]) -> np.ndarray:
+            try:
+                if worker_mm is not process_mm:
+                    total_slices = int(np.asarray(process_mm).shape[0])
 
-                def _commit_slice(idx: int) -> None:
-                    np.copyto(process_mm[int(idx)], worker_mm[int(idx)])
+                    def _commit_slice(idx: int) -> None:
+                        np.copyto(process_mm[int(idx)], worker_mm[int(idx)])
 
-                parallel_for_indices(
-                    total_slices,
-                    _commit_slice,
-                    max_workers=max(1, min(int(workers), total_slices)),
-                    desc=f'Committing interpolation transaction {pass_tag}',
-                    show_progress=False,
-                )
-            if staged_bridge_path is not None and bridge_delta_path is not None:
-                if Path(staged_bridge_path).exists():
-                    Path(bridge_delta_path).parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(Path(staged_bridge_path), Path(bridge_delta_path))
-                    stats['bridge_delta_path'] = str(bridge_delta_path)
-            if staged_component_dir is not None and bridge_component_dir is not None:
-                target_root = Path(bridge_component_dir)
-                target_root.mkdir(parents=True, exist_ok=True)
-                rewritten: List[Dict[str, object]] = []
-                for raw_entry in stats.get('bridge_component_deltas', []):
-                    entry = dict(raw_entry)
-                    source_path = Path(str(entry.get('path', '')))
-                    target_path = target_root / source_path.name
-                    if target_path.exists():
-                        shutil.rmtree(target_path, ignore_errors=True)
-                    if source_path.exists():
-                        os.replace(source_path, target_path)
-                    entry['path'] = str(target_path)
-                    rewritten.append(entry)
-                stats['bridge_component_deltas'] = rewritten
-        finally:
+                    parallel_for_indices(
+                        total_slices,
+                        _commit_slice,
+                        max_workers=max(1, min(int(workers), total_slices)),
+                        desc=f'Committing interpolation transaction {pass_tag}',
+                        show_progress=False,
+                    )
+                if staged_bridge_path is not None and bridge_delta_path is not None:
+                    if Path(staged_bridge_path).exists():
+                        Path(bridge_delta_path).parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(Path(staged_bridge_path), Path(bridge_delta_path))
+                        stats['bridge_delta_path'] = str(bridge_delta_path)
+                if staged_component_dir is not None and bridge_component_dir is not None:
+                    target_root = Path(bridge_component_dir)
+                    target_root.mkdir(parents=True, exist_ok=True)
+                    rewritten: List[Dict[str, object]] = []
+                    for raw_entry in stats.get('bridge_component_deltas', []):
+                        entry = dict(raw_entry)
+                        source_path = Path(str(entry.get('path', '')))
+                        target_path = target_root / source_path.name
+                        if target_path.exists():
+                            shutil.rmtree(target_path, ignore_errors=True)
+                        if source_path.exists():
+                            os.replace(source_path, target_path)
+                        entry['path'] = str(target_path)
+                        rewritten.append(entry)
+                    stats['bridge_component_deltas'] = rewritten
+            finally:
+                _discard_speculative_worker_storage()
+            return process_mm
+
+        def _fallback_in_process(backend_name: str) -> Dict[str, object]:
+            # Close/unlink only the parent's speculative mapping. A transport-failed auxiliary
+            # process may still hold its own mapping, but it cannot race this clean base volume.
+            # Local import keeps the package dependency graph acyclic.
+            from .interpolation import interpolate_view_volume_pass_inplace
+
             _discard_speculative_worker_storage()
-        return process_mm
+            fallback_stats = interpolate_view_volume_pass_inplace(
+                mask_mm=process_mm,
+                work_dir=work_dir,
+                pass_tag=pass_tag,
+                max_slice_distance=int(max_slice_distance),
+                search_angle_deg=float(search_angle_deg),
+                interpolation_walk_back=int(interpolation_walk_back),
+                interpolation_candidates=int(interpolation_candidates),
+                interpolate_min_radius=float(interpolate_min_radius),
+                prefer_memory=bool(prefer_memory),
+                reserve_bytes=int(reserve_bytes),
+                workers=int(workers),
+                wrap_axis=bool(wrap_axis),
+                bridge_delta_path=bridge_delta_path,
+                bridge_component_dir=bridge_component_dir,
+                known_slice_any=known_slice_any,
+                known_slice_bboxes=known_slice_bboxes,
+            )
+            result = dict(fallback_stats)
+            result['process_backend'] = str(backend_name)
+            return result
 
-    def _fallback_in_process(backend_name: str) -> Dict[str, object]:
-        # Close/unlink only the parent's speculative mapping. A transport-failed auxiliary
-        # process may still hold its own mapping, but it cannot race this clean base volume.
-        # Local import keeps the package dependency graph acyclic.
-        from .interpolation import interpolate_view_volume_pass_inplace
-
-        _discard_speculative_worker_storage()
-        fallback_stats = interpolate_view_volume_pass_inplace(
-            mask_mm=process_mm,
-            work_dir=work_dir,
-            pass_tag=pass_tag,
+        pass_entry_kwargs: Dict[str, object] = dict(
+            mask_path=str(worker_path),
+            mask_shape=shape,
+            mask_dtype=dtype_str,
+            work_dir=str(work_dir),
+            pass_tag=str(pass_tag),
             max_slice_distance=int(max_slice_distance),
             search_angle_deg=float(search_angle_deg),
             interpolation_walk_back=int(interpolation_walk_back),
             interpolation_candidates=int(interpolation_candidates),
             interpolate_min_radius=float(interpolate_min_radius),
-            prefer_memory=bool(prefer_memory),
             reserve_bytes=int(reserve_bytes),
             workers=int(workers),
             wrap_axis=bool(wrap_axis),
-            bridge_delta_path=bridge_delta_path,
-            bridge_component_dir=bridge_component_dir,
+            bridge_delta_path=(
+                str(staged_bridge_path)
+                if staged_bridge_path is not None else
+                (str(bridge_delta_path) if bridge_delta_path is not None else None)
+            ),
+            bridge_component_dir=(
+                str(staged_component_dir)
+                if staged_component_dir is not None else
+                (str(bridge_component_dir) if bridge_component_dir is not None else None)
+            ),
+            # small per-slice metadata arrays pickle across the process boundary.
             known_slice_any=known_slice_any,
             known_slice_bboxes=known_slice_bboxes,
         )
-        result = dict(fallback_stats)
-        result['process_backend'] = str(backend_name)
-        return result
 
-    pass_entry_kwargs: Dict[str, object] = dict(
-        mask_path=str(worker_path),
-        mask_shape=shape,
-        mask_dtype=dtype_str,
-        work_dir=str(work_dir),
-        pass_tag=str(pass_tag),
-        max_slice_distance=int(max_slice_distance),
-        search_angle_deg=float(search_angle_deg),
-        interpolation_walk_back=int(interpolation_walk_back),
-        interpolation_candidates=int(interpolation_candidates),
-        interpolate_min_radius=float(interpolate_min_radius),
-        reserve_bytes=int(reserve_bytes),
-        workers=int(workers),
-        wrap_axis=bool(wrap_axis),
-        bridge_delta_path=(
-            str(staged_bridge_path)
-            if staged_bridge_path is not None else
-            (str(bridge_delta_path) if bridge_delta_path is not None else None)
-        ),
-        bridge_component_dir=(
-            str(staged_component_dir)
-            if staged_component_dir is not None else
-            (str(bridge_component_dir) if bridge_component_dir is not None else None)
-        ),
-        # small per-slice metadata arrays pickle across the process boundary.
-        known_slice_any=known_slice_any,
-        known_slice_bboxes=known_slice_bboxes,
-    )
+        # once inference has drained, the warm GPU worker processes serve
+        # interpolation passes too — try them first (non-blocking), then the dedicated pool.
+        aux_pool = gpu_worker_aux_interpolation_pool()
+        if aux_pool is not None:
+            aux_handle = aux_pool.try_submit(pass_entry_kwargs)
+            if aux_handle is not None:
+                try:
+                    stats = dict(aux_pool.wait(aux_handle))
+                except Exception as exc:
+                    if not fallback_enabled:
+                        raise RuntimeError(
+                            f'GPU-worker aux interpolation failed for {pass_tag} at {process_path}. '
+                            'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun failed passes in-process for recovery.'
+                        ) from exc
+                    print(
+                        f'Warning: GPU-worker aux interpolation failed for {pass_tag} ({exc}); '
+                        'falling back to in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
+                    )
+                    stats = _fallback_in_process('fallback_in_process_after_aux_failure')
+                    result_mm = process_mm
+                else:
+                    result_mm = _commit_speculative_worker_storage(stats)
+                    # _interpolation_process_entry is shared with the ordinary process pool
+                    # and stamps that transport by default. This branch knows the actual
+                    # successful host; numerical CUDA use is reported independently by
+                    # interpolation_render_backend/gpu_interpolation_active.
+                    stats['process_backend'] = 'gpu_worker_aux_process'
+                stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
+                stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
+                return result_mm, stats
 
-    # once inference has drained, the warm GPU worker processes serve
-    # interpolation passes too — try them first (non-blocking), then the dedicated pool.
-    aux_pool = gpu_worker_aux_interpolation_pool()
-    if aux_pool is not None:
-        aux_handle = aux_pool.try_submit(pass_entry_kwargs)
-        if aux_handle is not None:
+        try:
+            # Submission itself may fail when the pool is broken or shutting down. Keep it in
+            # the same recovery transaction as Future.result() rather than leaking a raw error.
+            if _memfd_owner_fd_for_path(worker_path) is not None:
+                preflight_multiprocessing_payload(pass_entry_kwargs)
+            batch = _attach_interpolation_memfd_transfer(pass_entry_kwargs)
             try:
-                stats = dict(aux_pool.wait(aux_handle))
-            except Exception as exc:
-                if not fallback_enabled:
-                    raise RuntimeError(
-                        f'GPU-worker aux interpolation failed for {pass_tag} at {process_path}. '
-                        'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun failed passes in-process for recovery.'
-                    ) from exc
-                print(
-                    f'Warning: GPU-worker aux interpolation failed for {pass_tag} ({exc}); '
-                    'falling back to in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
-                )
-                stats = _fallback_in_process('fallback_in_process_after_aux_failure')
-                result_mm = process_mm
-            else:
-                result_mm = _commit_speculative_worker_storage(stats)
-                # _interpolation_process_entry is shared with the ordinary process pool
-                # and stamps that transport by default. This branch knows the actual
-                # successful host; numerical CUDA use is reported independently by
-                # interpolation_render_backend/gpu_interpolation_active.
-                stats['process_backend'] = 'gpu_worker_aux_process'
-            stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
-            stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
-            return result_mm, stats
+                fut = executor.submit(_interpolation_process_entry, **pass_entry_kwargs)
+            except BaseException:
+                batch.rollback()
+                raise
+            try:
+                stats = dict(fut.result())
+            except BrokenProcessPool:
+                # A failed pool cannot complete this dispatch, even if another
+                # process already consumed the one-use descriptor.
+                batch.rollback()
+                raise
+            finally:
+                if batch.handles and fut.cancelled():
+                    batch.rollback()
+        except Exception as exc:
+            if not fallback_enabled:
+                raise RuntimeError(
+                    f'Interpolation process worker failed for {pass_tag} at {process_path}. '
+                    'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun this pass in-process for recovery.'
+                ) from exc
+            print(
+                f'Warning: interpolation process worker failed for {pass_tag} ({exc}); '
+                'falling back to legacy in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
+            )
+            stats = _fallback_in_process('fallback_in_process_after_worker_failure')
+            result_mm = process_mm
+        else:
+            result_mm = _commit_speculative_worker_storage(stats)
 
-    try:
-        # Submission itself may fail when the pool is broken or shutting down. Keep it in
-        # the same recovery transaction as Future.result() rather than leaking a raw error.
-        fut = executor.submit(_interpolation_process_entry, **pass_entry_kwargs)
-        stats = dict(fut.result())
-    except Exception as exc:
-        if not fallback_enabled:
-            raise RuntimeError(
-                f'Interpolation process worker failed for {pass_tag} at {process_path}. '
-                'Set YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1 to rerun this pass in-process for recovery.'
-            ) from exc
-        print(
-            f'Warning: interpolation process worker failed for {pass_tag} ({exc}); '
-            'falling back to legacy in-process interpolation because YOLO_TTA_INTERPOLATION_PROCESS_FALLBACK=1.'
-        )
-        stats = _fallback_in_process('fallback_in_process_after_worker_failure')
-        result_mm = process_mm
-    else:
-        result_mm = _commit_speculative_worker_storage(stats)
+        stats.setdefault('process_backend', 'process_pool_memmap')
+        stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
+        stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
+        return result_mm, stats
+    except BaseException as error:
+        if copied_to_memmap:
+            import traceback
 
-    stats.setdefault('process_backend', 'process_pool_memmap')
-    stats['process_memmap_copied_from_anonymous_array'] = bool(copied_to_memmap)
-    stats['process_pool_workers'] = int(_INTERPOLATION_PROCESS_MAX_WORKERS)
-    return result_mm, stats
+            try:
+                close_memmap_array_without_flush(process_mm, unlink_path=process_path)
+            except BaseException as cleanup_error:
+                note = getattr(error, 'add_note', None)
+                if callable(note):
+                    note(f'Interpolation process input cleanup failed: {cleanup_error}')
+            finally:
+                # A Future can retain the failing pass traceback after it returns.
+                worker_mm = result_mm = process_mm = None
+                traceback.clear_frames(error.__traceback__)
+        raise

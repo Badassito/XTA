@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from contextlib import nullcontext, ExitStack
 from dataclasses import dataclass, field, replace
+from functools import partial
 import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import time
 import tempfile
 import threading
@@ -24,7 +26,7 @@ from .sam_interpolation import (SamPreparedInterpolationPass,_scope_metadata,_bu
     _retry_cpu_wave_within_peak,_tracker_scope_admission,_promote_retry_execution)
 from .sam_resources import sam_worker_count
 from .sam_evidence import SamEvidenceWriter
-from .artifact_archive import split_reference, member_exists, artifact_directory, read_artifact
+from .artifact_archive import artifact_directory, artifact_stage_parent, member_exists, read_artifact, split_reference
 from .json_publication import write_json_atomic
 
 
@@ -1182,7 +1184,8 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
     assemblies={}
     if mode=='tiled' and split_reference(destination) is not None and runtime_work_dir is not None:
         Path(runtime_work_dir).mkdir(parents=True,exist_ok=True)
-    assembly_root=(Path(tempfile.mkdtemp(prefix='sam-tail-tiles-',dir=runtime_work_dir))
+    assembly_root=(Path(tempfile.mkdtemp(prefix='sam-tail-tiles-',
+        dir=runtime_work_dir if runtime_work_dir is not None else artifact_stage_parent(destination)))
         if mode=='tiled' and split_reference(destination) is not None else destination/'assembly')
     completed=set()
     stream=None
@@ -1306,23 +1309,13 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
                     write_empty_tiles(index)
             bundle=writer.commit()
     finally:
-        try:
-            if stream is not None and hasattr(stream,'close'):
-                stream.close()
-        finally:
-            try:
-                close=getattr(lease,'close',None)
-                if callable(close):
-                    close()
-            finally:
-                try:
-                    if prefetched is not None:
-                        prefetched.close()
-                finally:
-                    for assembly in assemblies.values():
-                        assembly.close()
-                    if mode=='tiled' and split_reference(destination) is not None:
-                        assembly_root.rmdir()
+        from .sam_crop_tiling import _remove_scratch_directory, _settle_scratch_cleanup
+        cleanup = [close for value in (stream, lease, prefetched)
+                   if callable(close := getattr(value, 'close', None))]
+        cleanup.extend(assembly.close for assembly in assemblies.values())
+        if mode=='tiled' and split_reference(destination) is not None:
+            cleanup.append(partial(_remove_scratch_directory, assembly_root))
+        _settle_scratch_cleanup(cleanup, sys.exc_info()[1])
     with _trace_sam_phase('selection',metadata.get('scope_id',''),operation='extrapolation'):
         receipt=select_sam_extrapolation(bundle)
     stats['initial_generated_runs']=len(bundle.runs)
@@ -1336,15 +1329,14 @@ def extrapolate_sam_view_volume_pass(observations,*,work_dir,image_provider=None
                 resource_profile=resource_profile,cancel_event=cancel_event,
                 exact_crop_family_dispatch=exact_crop_family_dispatch,retry_group_context=_retry_group_context)
         stats['sam_crop_retry']=ledger
-    # Match the JSON writer's ASCII output without trusting a replaceable file's size.
-    receipt_bytes=(len(json.dumps(receipt,indent=2,ensure_ascii=True,allow_nan=False)) if _evidence_only else None)
-    write_json_atomic(destination/'selection.json', receipt)
     if _evidence_only:
+        receipt_bytes = write_json_atomic(destination/'selection.json', receipt, return_byte_count=True)
         stats.update(generated_runs=len(bundle.runs),selected_runs=len(receipt['selected_run_ids']),
             sam_evidence_path=str(bundle.directory),sam_selection_receipt_path=str(destination/'selection.json'),
             publication_performed=False,policy_hash=receipt['policy_hash'],selection_identity=receipt['selection_identity'],
             selection_receipt_bytes=receipt_bytes)
         return observations,stats,[]
+    write_json_atomic(destination/'selection.json', receipt)
     if prepared.observation_snapshot_sha256 and observation_snapshot_sha256(np.asarray(observations))!=prepared.observation_snapshot_sha256:
         raise ValueError('Frozen post-interpolation baseline changed before final tail publication')
     with _trace_sam_phase('publication',metadata.get('scope_id',''),operation='extrapolation'):

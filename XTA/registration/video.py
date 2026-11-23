@@ -63,6 +63,16 @@ def _stat_identity(path):
     )
 
 
+def _source_stat_matches(path, expected, current, digest=None):
+    if expected == current:
+        return True
+    if expected is not None and any(
+        expected.get(key) != value for key, value in current.items() if key != "ctime_ns"
+    ):
+        return False
+    return bool(digest and sha256_file(path) == digest and _stat_identity(path) == current)
+
+
 def _frame_rate(stream):
     for key in ("avg_frame_rate", "r_frame_rate"):
         try:
@@ -90,6 +100,12 @@ def probe_video(path, *, header_path=None, spacing_xyz=None, include_hash=True):
     """
     path = Path(path)
     initial = _stat_identity(path)
+    digest = sha256_file(path) if include_hash else None
+    if include_hash:
+        before_probe = _stat_identity(path)
+        if not _source_stat_matches(path, initial, before_probe, digest):
+            raise ValueError("Source movie changed while its metadata was being read")
+        initial = before_probe
     stream = _probe_stream(path)
     if stream.get("pix_fmt") != "gray":
         raise ValueError("Registration movies must contain native eight-bit grayscale pixels")
@@ -149,10 +165,11 @@ def probe_video(path, *, header_path=None, spacing_xyz=None, include_hash=True):
             header_sha256=sha256_file(header_path),
         )
     if include_hash:
-        result["sha256"] = sha256_file(path)
-    if initial != _stat_identity(path):
+        result["sha256"] = digest
+    current = _stat_identity(path)
+    if not _source_stat_matches(path, initial, current, digest):
         raise ValueError("Source movie changed while its metadata was being read")
-    result["_source_stat"] = initial
+    result["_source_stat"] = current
     return result
 
 
@@ -169,11 +186,12 @@ def decoded_volume(path, work_dir, *, info=None, threads=4):
     info = probe_video(path, include_hash=False) if info is None else info
     before = _stat_identity(path)
     expected_stat = info.get("_source_stat")
+    digest = info.get("sha256")
     if expected_stat is not None:
-        if expected_stat != before:
+        if not _source_stat_matches(path, expected_stat, before, digest):
             raise ValueError("Source movie changed since it was probed")
-    elif info.get("sha256"):
-        if sha256_file(path) != info["sha256"] or _stat_identity(path) != before:
+    elif digest:
+        if not _source_stat_matches(path, None, before, digest):
             raise ValueError("Source movie identity disagrees with its decoded input metadata")
     else:
         raise ValueError(
@@ -218,7 +236,7 @@ def decoded_volume(path, work_dir, *, info=None, threads=4):
         )
         if raw.stat().st_size != expected:
             raise ValueError("Decoded frame count or geometry disagrees with the probed movie")
-        if before != _stat_identity(path):
+        if not _source_stat_matches(path, before, _stat_identity(path), digest):
             raise ValueError("Source movie changed during decoding")
         volume = np.memmap(raw, np.uint8, "r", shape=shape)
         try:

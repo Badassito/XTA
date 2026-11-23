@@ -230,28 +230,36 @@ class WorkerCutoffPlanes:
                     mask = scores = None
                 self._last_crops[cutoff == self.floor_cent] = (index, cutoff, mask, scores, bbox, count, frames)
 
-    def consume_same_result(self, index, cutoff, source_cutoff):
-        """Reuse the preceding owned CPU crop only with exact same-frame detector identity."""
+    def consume_same_result(self, index, cutoff, source_cutoff, *, published_crop=False):
+        """Reuse an exact same-frame product, optionally using its published nonempty crop."""
         with self._lock:
             if self.reason is not None:
                 return False
             if self.scalar_owned_floor and (source_cutoff == self.floor_cent or cutoff == self.floor_cent):
                 return False
-            previous = self._last_crops.get(source_cutoff == self.floor_cent)
-            if previous is None or previous[:2] != (index, source_cutoff):
-                return False
+            put_alias = getattr(self.writer, "put_alias", None)
+            if published_crop:
+                if not callable(put_alias):
+                    return False
+                # The original crop's journal entry already owns its metadata.
+                bbox = count = frames = None
+            else:
+                previous = self._last_crops.get(source_cutoff == self.floor_cent)
+                if previous is None or previous[:2] != (index, source_cutoff):
+                    return False
+                bbox, count, frames = previous[4:]
             try:
-                if hasattr(self.writer, "put_alias"):
-                    bbox, count, frames = previous[4:]
+                if callable(put_alias):
                     if bbox == (0,0,0,0) and hasattr(self.writer, "put_empty_range"):
                         self._record_empty(cutoff,index,count,frames)
                     else:
                         self._flush_empty(cutoff)
-                        self.writer.put_alias(cutoff,self.offset+index,source_cutoff=source_cutoff,
-                                              prediction_count=count,frames_with_predictions=frames)
+                        put_alias(cutoff,self.offset+index,source_cutoff=source_cutoff,
+                                  prediction_count=count,frames_with_predictions=frames)
                         self.frames_written += 1
                         self.counters["native_packet_aliases"] = self.counters.get("native_packet_aliases",0)+1
-                    self._last_crops[cutoff == self.floor_cent] = (index, cutoff, *previous[2:])
+                    if not published_crop:
+                        self._last_crops[cutoff == self.floor_cent] = (index, cutoff, *previous[2:])
                 else:
                     self._write(cutoff, index, *previous[2:], allow_alias=True, reused=True)
                 self.counters["identical_native_crops_reused"] = self.counters.get("identical_native_crops_reused",0)+1

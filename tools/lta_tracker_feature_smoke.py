@@ -184,7 +184,7 @@ def main():
     parser.add_argument("--cache-shape", type=int, nargs=3, required=True)
     parser.add_argument("--seed", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile", choices=("auto", "egpu", "h100"), default="auto")
+    parser.add_argument("--profile", choices=("auto", "egpu", "h100", "a100"), default="auto")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--compare-propagation", action="store_true")
     parser.add_argument("--reference-module", type=Path,

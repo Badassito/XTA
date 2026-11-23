@@ -111,6 +111,49 @@ def test_cpu_tile_task_renders_only_accepted_tile(tmp_path):
     assert write.call_args.kwargs['cand'] is candidate
 
 
+@pytest.mark.parametrize('legacy_tile', (False, True))
+@pytest.mark.parametrize('augmentation_index', (0, 1))
+def test_cpu_task_renders_intensity_only_when_used(tmp_path, legacy_tile, augmentation_index):
+    plan = make_plan(tmp_path, 'C3S1')
+    tile = plan.tile_layout[0]
+    if legacy_tile:
+        tile = replace(tile, shared_job=None)
+    plan = replace(plan, tile_layout=(tile,))
+    keys = ('full', tile.tile_tag)
+    items = tuple((key, (pta.OutputCandidate(
+        order=order, volume_name='sample', parent_view_tag=plan.tag, output_tag=key,
+        item_key=key, frame_idx=2, is_tile=key != 'full', label_enabled=True,
+        augmentation_index=augmentation_index if key != 'full' else 0,
+    ),)) for order, key in enumerate(keys))
+    task = pta_workers.FrameRenderTask(0, 2, items)
+    volume = np.arange(5*6*7, dtype=np.uint8).reshape(5, 6, 7)
+    mask = (volume % 7 < 3).astype(np.uint8)
+    reference = pta_rendering.render_plan_frame_source(volume=volume, mask=mask, plan=plan, idx=2)
+    with (
+        mock.patch.dict(pta_workers._WORKER_STATIC, {
+            'augmentation': None, 'out_dir': tmp_path, 'split_active': False,
+            'image_format': 'png', 'png_compression': 1, 'jpeg_quality': 95,
+            'save_images': False,
+        }, clear=True),
+        mock.patch.object(pta_rendering, 'render_channel_formatted_images',
+                          wraps=pta_rendering.render_channel_formatted_images) as full_images,
+        mock.patch.object(pta_rendering, 'render_shared_tile_images',
+                          wraps=pta_rendering.render_shared_tile_images) as tile_images,
+        mock.patch.object(pta_workers, 'write_selected_candidate_version', return_value='written') as write,
+    ):
+        result = pta_workers.execute_render_task(volume, mask, (plan,), task)
+    assert result[0] == 2
+    if not augmentation_index:
+        assert full_images.call_count == tile_images.call_count == 0
+    for key, call in zip(keys, write.call_args_list, strict=True):
+        image, expected_mask = pta_workers._derive_item_arrays(reference, plan, key)
+        np.testing.assert_array_equal(call.kwargs['mask'], expected_mask)
+        if augmentation_index and key != 'full':
+            np.testing.assert_array_equal(call.kwargs['image'], image)
+        elif not augmentation_index:
+            assert call.kwargs['image'] is None
+
+
 def test_nonbatched_gpu_task_skips_rejected_rasters_before_gpu_boundary(tmp_path):
     plan = make_plan(tmp_path, 'gray')
     tile = plan.tile_layout[1]

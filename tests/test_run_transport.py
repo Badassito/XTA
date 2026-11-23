@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -148,6 +149,39 @@ class RunTransportTests(unittest.TestCase):
         self.assertIn("other/temp/checkpoint.dat", {row["path"] for row in result["files"]})
         self.assertIn("interesting.tmp", {row["path"] for row in result["files"]})
         self.assertEqual(result["omitted"][0]["path"], "temp")
+
+    def test_pack_omits_low_quality_atomic_result_staging(self):
+        self.write(".low_quality.atomic-result-Qz_kdV7b/.projection.42.assembling.nrrd", b"temporary")
+        self.write(".low_quality.atomic-result-Qz_kdV7c", b"ordinary file")
+        result = transport.pack_run(self.run, self.root / "staged.zip", scope="all")
+        self.assertIn(".low_quality.atomic-result-Qz_kdV7c", {row["path"] for row in result["files"]})
+        self.assertIn(".low_quality.atomic-result-Qz_kdV7b", {row["path"] for row in result["omitted"]})
+
+    def test_macos_publication_uses_an_exclusive_rename(self):
+        stage, target = self.root / "stage", self.root / "target"
+        rename = mock.Mock(return_value=0)
+        posix = SimpleNamespace(name="posix", fsencode=os.fsencode)
+        with (mock.patch.object(transport, "os", posix),
+              mock.patch.object(transport, "sys", SimpleNamespace(platform="darwin")),
+              mock.patch("ctypes.CDLL", return_value=SimpleNamespace(renamex_np=rename))):
+            transport._publish_fresh(stage, target, directory=True)
+        rename.assert_called_once_with(os.fsencode(stage), os.fsencode(target), 4)
+
+    def test_unsupported_exclusive_linux_rename_fails_closed(self):
+        stage, target = self.root / "stage", self.root / "target"
+        rename = mock.Mock(return_value=-1)
+        plain_rename = mock.Mock()
+        posix = SimpleNamespace(name="posix", fsencode=os.fsencode, strerror=os.strerror,
+                                rename=plain_rename)
+        with (mock.patch.object(transport, "os", posix),
+              mock.patch.object(transport, "sys", SimpleNamespace(platform="linux")),
+              mock.patch("ctypes.CDLL", return_value=SimpleNamespace(renameat2=rename))):
+            for code in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+                with self.subTest(code=code), mock.patch("ctypes.get_errno", return_value=code):
+                    with self.assertRaisesRegex(transport.TransportError, "unsupported"):
+                        transport._publish_fresh(stage, target, directory=True)
+        rename.assert_called_with(-100, os.fsencode(stage), -100, os.fsencode(target), 1)
+        plain_rename.assert_not_called()
 
     def test_fresh_outside_destinations_and_overwrites_refused(self):
         with self.assertRaises(transport.TransportError):

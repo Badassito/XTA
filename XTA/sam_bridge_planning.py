@@ -537,10 +537,16 @@ def _cone_candidates(source: SamObservation, targets: Sequence[int],
     if (crop[2] - crop[0]) * (crop[3] - crop[1]) > limits.max_crop_pixels:
         return [], "projection_search_crop_limit"
     mask = source.mask_in_crop(crop)
-    # One-cell padding treats pixels on the canvas edge as bounded foreground.
-    padded = np.pad(mask, 1)
-    sdf = (ndi.distance_transform_edt(padded, sampling=(sy, sx))
-           - ndi.distance_transform_edt(~padded, sampling=(sy, sx)))[1:-1, 1:-1]
+    if not np.any(mask):
+        return [], None
+    if slope > 0:
+        field = ndi.distance_transform_edt(~mask, sampling=(sy, sx))
+        np.negative(field, out=field)
+    elif slope < 0:
+        # Padding bounds foreground that meets the canvas edge.
+        field = ndi.distance_transform_edt(np.pad(mask, 1), sampling=(sy, sx))[1:-1, 1:-1]
+    else:
+        field = mask
     found: list[tuple[int, float, str, int]] = []
     anchor = source.anchor_yx
     for index in targets:
@@ -552,10 +558,11 @@ def _cone_candidates(source: SamObservation, targets: Sequence[int],
         cy0, cx0 = max(ty0, crop[0]), max(tx0, crop[1])
         cy1, cx1 = min(ty1, crop[2]), min(tx1, crop[3])
         support = target.mask_crop[cy0 - ty0:cy1 - ty0, cx0 - tx0:cx1 - tx0]
-        allowed = sdf[cy0 - crop[0]:cy1 - crop[0], cx0 - crop[1]:cx1 - crop[1]] >= -slope * steps * sz
-        if not np.any(support & allowed):
-            continue
+        section = field[cy0 - crop[0]:cy1 - crop[0], cx0 - crop[1]:cx1 - crop[1]]
+        allowed = section if slope == 0 else section >= -slope * steps * sz
         ys, xs = np.nonzero(support & allowed)
+        if not ys.size:
+            continue
         nearest = float(np.min(((ys + cy0 - anchor[0]) * sy) ** 2
                                + ((xs + cx0 - anchor[1]) * sx) ** 2))
         found.append((steps, nearest, target.observation_id, index))

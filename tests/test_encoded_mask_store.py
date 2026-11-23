@@ -5,6 +5,7 @@ import io
 import os
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -123,20 +124,42 @@ class EncodedMaskStoreTests(unittest.TestCase):
         self.assertFalse(writer.store_dir.exists())
 
     def test_positional_write_fallback_preserves_cursor_and_concurrent_offsets(self):
-        path = self.root / 'positional.bin'
-        fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o600)
-        try:
-            os.write(fd, bytes(80))
-            os.lseek(fd, 7, os.SEEK_SET)
-            with mock.patch.object(ip.os, 'pwrite', None, create=True), ThreadPoolExecutor(max_workers=4) as pool:
-                futures = [pool.submit(ip.IncrementalRawBBoxMaskStoreWriter._pwrite_all,
-                    fd, memoryview(bytes([i+1])*20), i*20) for i in range(4)]
-                for future in futures:
-                    future.result()
-            self.assertEqual(os.lseek(fd, 0, os.SEEK_CUR), 7)
-        finally:
-            os.close(fd)
-        self.assertEqual(path.read_bytes(), b''.join(bytes([i+1])*20 for i in range(4)))
+        writer = self.writer()
+        fd = writer._fd
+        os.write(fd, bytes(80))
+        os.lseek(fd, 7, os.SEEK_SET)
+        with mock.patch.object(ip.os, 'pwrite', None, create=True), ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(writer._pwrite_all,
+                fd, memoryview(bytes([i+1])*20), i*20) for i in range(4)]
+            for future in futures:
+                future.result()
+        self.assertEqual(os.lseek(fd, 0, os.SEEK_CUR), 7)
+        self.assertEqual(writer.chunks_path.read_bytes(), b''.join(bytes([i+1])*20 for i in range(4)))
+
+    def test_independent_stores_can_write_concurrently_without_pwrite(self):
+        writers = [self.writer(), self.writer(packed=True)]
+        both_writing = threading.Barrier(2)
+        write = os.write
+        def overlapping_write(fd, data):
+            both_writing.wait(timeout=5)
+            return write(fd, data)
+        with (mock.patch.object(ip.os, 'pwrite', None, create=True),
+              mock.patch.object(ip.os, 'write', new=overlapping_write),
+              ThreadPoolExecutor(max_workers=2) as pool):
+            futures = [pool.submit(writer._pwrite_all, writer._fd, memoryview(b'x'), 0)
+                       for writer in writers]
+            for future in futures:
+                future.result()
+        self.assertEqual([writer.chunks_path.read_bytes() for writer in writers], [b'x', b'x'])
+
+    def test_bulk_empty_range_rejects_overlap_before_marking_other_slices(self):
+        writer = self.writer()
+        writer.consume_empty_range(2, 1)
+        with self.assertRaisesRegex(ValueError, 'slice 2 was delivered more than once'):
+            writer.consume_empty_range(1, 3)
+        writer.consume_empty_range(0, 2)
+        writer.consume_empty_range(3, 2)
+        self.assertEqual(writer.finalize()['foreground_voxels'], 0)
 
 
 if __name__ == '__main__':

@@ -29,7 +29,8 @@ try:
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("tqdm is required: pip install tqdm") from exc
 
-from .runtime import runtime_telemetry, runtime_telemetry_phase
+from . import media
+from .runtime import close_memmap_array, runtime_telemetry, runtime_telemetry_phase
 from .pta_workers import ArrayAllocator, SharedBlock, WarningLog, bind_current_thread_to_cpus
 
 
@@ -246,33 +247,30 @@ def decode_video_gray8_to_memory(video_path: Path, *, warnings: WarningLog, allo
         block = None
     frame_bytes = int(w) * int(h)
     chunk_frames = max(1, min(128, (256 * 1024 * 1024) // max(1, frame_bytes)))
-    raw = memoryview(arr).cast("B")
     cmd = ["ffmpeg", "-v", "error", "-i", str(video_path), "-f", "rawvideo", "-pix_fmt", "gray", "-vsync", "0", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.stdout is not None
     try:
-        with tqdm(total=t, desc="Decoding video to in-memory gray8 volume") as pbar:
-            for start in range(0, t, chunk_frames):
-                nframes = min(chunk_frames, t - start)
-                need = nframes * frame_bytes
-                offset = start * frame_bytes
-                view = raw[offset:offset + need]
-                filled = 0
-                while filled < need:
-                    nread = proc.stdout.readinto(view[filled:])
-                    if nread is None or nread <= 0:
-                        raise RuntimeError(f"Unexpected EOF while decoding {video_path} near frame {start + 1}")
-                    filled += int(nread)
-                pbar.update(nframes)
-    finally:
-        if proc.stdout is not None:
-            proc.stdout.close()
-            # The frame reader owns stdout. communicate() only needs to drain stderr.
-            proc.stdout = None
-        _, err = proc.communicate()
-    if proc.returncode not in (0, None):
-        msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
-        raise RuntimeError(f"ffmpeg decode failed: {msg}")
+        with memoryview(arr).cast("B") as raw:
+            proc = media._spawn_decode_process(cmd)
+            with media._synchronous_decode_stdout(proc) as stdout:
+                with tqdm(total=t, desc="Decoding video to in-memory gray8 volume") as pbar:
+                    for start in range(0, t, chunk_frames):
+                        nframes = min(chunk_frames, t - start)
+                        need = nframes * frame_bytes
+                        offset = start * frame_bytes
+                        with raw[offset:offset + need] as view:
+                            filled = 0
+                            while filled < need:
+                                with view[filled:] as pending:
+                                    nread = stdout.readinto(pending)
+                                if nread is None or nread <= 0:
+                                    raise RuntimeError(f"Unexpected EOF while decoding {video_path} near frame {start + 1}")
+                                filled += nread
+                        pbar.update(nframes)
+    except BaseException:
+        if block is None:
+            close_memmap_array(arr)
+        arr = None  # Drop the allocation before the owning decorator releases shared memory.
+        raise
     warnings.add("input_volume_loaded_in_memory", f"{arr.shape}, {arr.nbytes / GIB:.2f} GiB")
     return arr, fps, block
 
@@ -863,10 +861,10 @@ def _read_cropped_nrrd_planes(
             window[:] = stored_plane
         elif source_z == box_t + stored_t:
             window[:] = 0
-        for target_z in target_planes_by_source.get(source_z, ()):
+        targets = target_planes_by_source.get(source_z)
+        if targets:
             with telemetry.span('pta.mask.nrrd_resample'):
-                _write_nrrd_mask_plane(plane, mask[target_z], xy_indices)
-                _record_plane_foreground(mask[target_z:target_z + 1], summary, target_z)
+                _write_nrrd_mask_targets(plane, mask, xy_indices, summary, targets)
 
 
 
@@ -875,7 +873,10 @@ def _read_canonical_uint8_nrrd(
     source_contiguous=True, source_plane_indices=None,
 ):
     """Bound gzip output in place instead of building and copying an entire bytearray."""
-    import gzip
+    try:
+        from isal.igzip import IGzipFile as gzip_reader
+    except (ImportError, OSError):
+        from gzip import GzipFile as gzip_reader
     with Path(nrrd_path).open('rb') as source:
         header = nrrd.read_header(source)
         if (header.get('type') not in {'uint8', 'uint8_t', 'uchar', 'unsigned char'}
@@ -911,7 +912,7 @@ def _read_canonical_uint8_nrrd(
         for target_z, source_z in enumerate(source_planes):
             if source_z < 0 or source_z >= source_shape[0]:
                 mask[target_z] = 0
-        stream = gzip.GzipFile(fileobj=source, mode='rb') if header['encoding'] in {'gzip', 'gz'} else source
+        stream = gzip_reader(fileobj=source, mode='rb') if header['encoding'] in {'gzip', 'gz'} else source
         direct_read = source_shape == tuple(expected_shape_tyx) and source_plane_indices is None
         telemetry = runtime_telemetry()
         try:
@@ -938,10 +939,10 @@ def _read_canonical_uint8_nrrd(
                     plane = np.empty(source_shape[1:], dtype=np.uint8)
                     for source_z in range(source_shape[0]):
                         _read_nrrd_bytes_into(stream, memoryview(plane).cast('B'), nrrd_path)
-                        for target_z in target_planes_by_source.get(source_z, ()):
+                        targets = target_planes_by_source.get(source_z)
+                        if targets:
                             with telemetry.span('pta.mask.nrrd_resample'):
-                                _write_nrrd_mask_plane(plane, mask[target_z], xy_indices)
-                                _record_plane_foreground(mask[target_z:target_z + 1], summary, target_z)
+                                _write_nrrd_mask_targets(plane, mask, xy_indices, summary, targets)
                 if stream.read(1):
                     raise ValueError(f'NRRD segmentation payload exceeds declared dimensions: {nrrd_path}')
         finally:
@@ -1015,6 +1016,17 @@ def _write_nrrd_mask_plane(source, destination, xy_indices):
 
 
 
+def _write_nrrd_mask_targets(source, mask, xy_indices, summary, targets):
+    """Normalize and summarize each shared source plane once."""
+    first = targets[0]
+    _write_nrrd_mask_plane(source, mask[first], xy_indices)
+    _record_plane_foreground(mask[first:first + 1], summary, first)
+    for target in targets[1:]:
+        mask[target] = mask[first]
+        summary.has_foreground[target] = summary.has_foreground[first]
+        summary.first_foreground[target] = summary.first_foreground[first]
+
+
 def load_nrrd_mask_for_volume(
     nrrd_path: Path, expected_shape_tyx: Tuple[int, int, int], *, warnings: WarningLog,
     force: bool = False, source_contiguous: bool = True,
@@ -1075,29 +1087,37 @@ def _load_nrrd_mask_for_volume(
         arr = np.asarray(data)
         crop = _nrrd_reference_crop(header, arr.shape, expected_shape_tyx, nrrd_path,
                                     indexed=source_plane_indices is not None)
-        if crop is not None:
-            reference_shape, offset = crop
-            placed = np.zeros(reference_shape, dtype=arr.dtype)
-            placed[tuple(slice(start, start + size) for start, size in zip(offset, arr.shape))] = arr
-            arr = placed
+        reference_shape, offset = (arr.shape, (0, 0, 0)) if crop is None else crop
         orientation, permutation = _nrrd_mask_orientation(
-            header, arr.shape, expected_shape_tyx, nrrd_path, force=force,
+            header, reference_shape, expected_shape_tyx, nrrd_path, force=force,
             source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
         )
         internal = arr if permutation == (0, 1, 2) else np.transpose(arr, permutation)
-        source_shape = tuple(int(value) for value in internal.shape)
+        source_shape = tuple(int(reference_shape[axis]) for axis in permutation)
+        box_offset = tuple(int(offset[axis]) for axis in permutation)
+        box = tuple(slice(start, start + size) for start, size in zip(box_offset, internal.shape))
         source_planes = _nrrd_mask_source_planes(
             source_shape, expected_shape_tyx, nrrd_path, force=force,
             source_contiguous=source_contiguous, source_plane_indices=source_plane_indices,
         )
+        mask = np.empty(expected_shape_tyx, dtype=np.uint8)
         if source_shape == expected_shape_tyx and source_plane_indices is None:
-            mask = np.ascontiguousarray((np.asarray(internal) > 0).astype(np.uint8))
+            if crop is not None:
+                mask.fill(0)
+            np.greater(internal, 0, out=mask[box].view(np.bool_))
         else:
             xy_indices = _nrrd_mask_xy_indices(source_shape, expected_shape_tyx)
-            mask = np.empty(expected_shape_tyx, dtype=np.uint8)
+            if crop is not None:
+                reference_plane = np.zeros(source_shape[1:], dtype=internal.dtype)
+                window = reference_plane[box[1:]]
             for target_z, source_z in enumerate(source_planes):
-                if 0 <= source_z < source_shape[0]:
-                    _write_nrrd_mask_plane(internal[int(source_z)], mask[target_z], xy_indices)
+                stored_z = int(source_z) - box_offset[0]
+                if 0 <= stored_z < len(internal):
+                    plane = internal[stored_z]
+                    if crop is not None:
+                        window[:] = plane
+                        plane = reference_plane
+                    _write_nrrd_mask_plane(plane, mask[target_z], xy_indices)
                 else:
                     mask[target_z] = 0
     matched_positions = tuple(

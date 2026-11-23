@@ -146,7 +146,7 @@ def test_failed_sequential_mask_load_releases_decoded_shared_volume():
 
 def test_failed_video_process_start_releases_its_own_allocation():
     block=SimpleNamespace(release=mock.Mock())
-    with mock.patch.object(pta_inputs,'_require_bin'), mock.patch.object(pta_inputs.subprocess,'Popen',side_effect=OSError('spawn failed')):
+    with mock.patch.object(pta_inputs,'_require_bin'), mock.patch.object(pta_inputs.media,'_spawn_decode_process',side_effect=OSError('spawn failed')):
         with pytest.raises(OSError,match='spawn failed'):
             pta.decode_video_gray8_to_memory(Path('sample.mkv'),warnings=pta.WarningLog(),
                 allocator=lambda shape:(np.zeros(shape,np.uint8),block),probe_info=video_spec().video_info_hint)

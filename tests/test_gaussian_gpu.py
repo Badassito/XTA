@@ -138,27 +138,58 @@ def face_touching_mask():
 @pytest.mark.parametrize("core_slices", [1, 3, 7])
 @pytest.mark.parametrize("sigma", [0.6, 1.0, 1.5])
 def test_tta_z_chunked_smoothing_matches_whole_volume_at_faces(monkeypatch, tmp_path, sigma, core_slices):
+    from contextlib import contextmanager
     from XTA import assembly
 
     chunk_depths = []
+    upload_dtypes = []
+    events = []
+
+    @contextmanager
+    def device(index):
+        assert index == 2
+        events.append('device entered')
+        yield
+        events.append('device exited')
 
     def recording_filter(input, **kwargs):
         chunk_depths.append(int(input.shape[0]))
         return ndi.gaussian_filter(input, **kwargs)
 
+    def upload(array, dtype=None):
+        if dtype is None:
+            upload_dtypes.append(array.dtype)
+        return np.asarray(array, dtype=dtype)
+
+    def memory_info():
+        assert events[-1] == 'device entered'
+        events.append('memory checked')
+        return 512 << 20, 1024 << 20
+
     cp = SimpleNamespace(
-        asarray=np.asarray, asnumpy=np.asarray, float32=np.float32, uint8=np.uint8,
-        get_default_memory_pool=lambda: SimpleNamespace(free_all_blocks=lambda: None),
+        asarray=upload, asnumpy=np.asarray, float32=np.float32, uint8=np.uint8,
+        cuda=SimpleNamespace(Device=device, runtime=SimpleNamespace(memGetInfo=memory_info)),
+        get_default_memory_pool=lambda: SimpleNamespace(free_all_blocks=lambda: events.append('pool freed')),
     )
     monkeypatch.setitem(sys.modules, "cupy", cp)
     monkeypatch.setitem(sys.modules, "cupyx.scipy", SimpleNamespace(ndimage=SimpleNamespace(gaussian_filter=recording_filter)))
     monkeypatch.setenv("YOLO_TTA_GAUSSIAN_SMOOTHING_GPU", "1")
+    class Lease:
+        device_index = 2
+
+        def __enter__(self):
+            events.append('acquired')
+
+        def __exit__(self, *exc):
+            events.append('released')
+
+    monkeypatch.setattr(assembly, '_try_acquire_main_process_gpu_stage', lambda *_args: Lease())
     # Force small z chunks; the halo stays the production value.
     production_core_depth = assembly._gaussian_gpu_core_depth
     monkeypatch.setattr(
         assembly, "_gaussian_gpu_core_depth",
-        lambda shape, chunk_sigma, truncate=4.0: (
-            core_slices, production_core_depth(shape, chunk_sigma, truncate)[1]),
+        lambda shape, chunk_sigma, **kwargs: (
+            core_slices, production_core_depth(shape, chunk_sigma, **kwargs)[1]),
     )
     source = face_touching_mask()
     expected = [source]
@@ -166,20 +197,45 @@ def test_tta_z_chunked_smoothing_matches_whole_volume_at_faces(monkeypatch, tmp_
         expected.append(binary_gaussian_pass(expected[-1], sigma=sigma, gaussian_filter=ndi.gaussian_filter))
     assert expected[-1][0].any() and expected[-1][-1].any() and expected[-1][:, :, -1].any()
 
+    def publish(result, *, pass_index, **_kwargs):
+        events.append(f'published {pass_index}')
+        np.testing.assert_array_equal(result, expected[pass_index])
+        return f'pass {pass_index}'
+
+    monkeypatch.setattr(assembly, 'materialize_nrrd_global_layer', publish)
     actual = source.copy()
-    stats = assembly.apply_gaussian_smoothing_inplace(actual, sigma, 2, tmp_path, workers=1, reserve_bytes=0)
+    layers = []
+    stats = assembly.apply_gaussian_smoothing_inplace(
+        actual, sigma, 2, tmp_path, workers=1, reserve_bytes=0, nrrd_layers=layers,
+    )
 
     assert stats["backend"] == "cupy_chunked_gpu"
     assert stats["chunk_core_slices"] == core_slices
     assert stats["halo_slices"] == math.ceil(4.0 * sigma)
     assert stats["passes_completed"] == 2
+    assert events == ['acquired', 'device entered', 'memory checked', 'published 1',
+                      'pool freed', 'device exited', 'released', 'published 2']
+    assert layers == ['pass 1', 'pass 2']
+    assert not list(tmp_path.iterdir())
     assert len(chunk_depths) == 2 * math.ceil(source.shape[0] / core_slices)
+    assert upload_dtypes == [np.dtype(np.uint8)] * len(chunk_depths)
     assert max(chunk_depths) <= core_slices + 2 * stats["halo_slices"] < source.shape[0]
     np.testing.assert_array_equal(actual, expected[-1])
     for index in (1, 2):
         old, new = expected[index - 1].astype(bool), expected[index].astype(bool)
         assert stats[f"pass{index}_added_voxels"] == np.count_nonzero(new & ~old)
         assert stats[f"pass{index}_removed_voxels"] == np.count_nonzero(old & ~new)
+
+
+def test_tta_gpu_chunk_budget_resizes_against_free_vram_and_disallows_unfittable_halo(monkeypatch):
+    from XTA import assembly
+
+    monkeypatch.setenv('YOLO_TTA_GAUSSIAN_GPU_CHUNK_MIB', '1024')
+    shape = (41, 1000, 1000)
+    assert assembly._gaussian_gpu_core_depth(shape, 1.0) == (41, 4)
+    assert assembly._gaussian_gpu_core_depth(shape, 1.0, free_bytes=500 << 20) == (1, 4)
+    assert assembly._gaussian_gpu_core_depth(shape, 1.0, free_bytes=400 << 20) == (0, 4)
+    assert assembly._gaussian_gpu_core_depth((2, *shape[1:]), 1.0, free_bytes=400 << 20) == (2, 4)
 
 
 def test_native_f3_plane_fits_budget_by_tiling_in_plane():

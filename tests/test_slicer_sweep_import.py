@@ -17,7 +17,8 @@ def load_functions():
         "_segment_ids", "_find_mask_id", "_xta_commit_binary_updates", "_xta_load_review", "_xta_child",
         "_xta_display_payload", "_xta_review_group_selection", "_xta_requested_review_cutoffs",
         "_xta_cutoff_label", "_xta_sweep_review_location", "_xta_sweep_grid_folder",
-        "_xta_sweep_review_relative", "_xta_sweep_header_grid_ids",
+        "_xta_sweep_review_relative", "_xta_sweep_header_grid_ids", "_xta_check_review_family",
+        "_xta_sweep_child", "_xta_sweep_digest",
     }
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     module = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names],
@@ -123,6 +124,55 @@ def test_incomplete_or_wrong_parent_rejected_before_scene_access(tmp_path, statu
         {"schema":"xta.confidence_sweep/1","sweep_id":"example","status":status,"review_manifest":review}))
     with pytest.raises(RuntimeError, match="parent sweep"):
         load_functions()["_xta_load_review"](path,None,None,[])
+
+
+def test_partial_grouped_review_import_binds_hash_and_completed_cutoffs(tmp_path):
+    from hashlib import sha256
+
+    path = tmp_path / "review" / "manifest.json"
+    path.parent.mkdir()
+    run_path = tmp_path / "confidence_cutoffs" / "conf_050" / "manifest.json"
+    run_path.parent.mkdir(parents=True)
+    run_path.write_text('{"status":"complete"}', encoding="utf-8")
+    run_sha = sha256(run_path.read_bytes()).hexdigest()
+    branch = dict(cutoff_cent=50, run_manifest="../" + run_path.relative_to(tmp_path).as_posix(),
+                  run_manifest_sha256=run_sha)
+    grid = dict(grid_id="low_quality/half", payload="grouped", branches=[branch], groups=[])
+    review = dict(schema="xta.sweep_review/1", sweep_id="example", status="complete",
+                  source_storage="grouped", sweep_status="failed", cutoffs_cent=[50], grids=[grid])
+    family_path = tmp_path / "manifest.json"
+    family = dict(schema="xta.confidence_sweep/1", sweep_id="example", status="failed",
+                  review_manifest="review/manifest.json", branches=[
+                      dict(status="complete", cutoff_hundredths=50, manifest_sha256=run_sha),
+                      dict(status="failed", cutoff_hundredths=80),
+                  ])
+
+    def write_pair():
+        path.write_text(json.dumps(review), encoding="utf-8")
+        family["review_manifest_sha256"] = sha256(path.read_bytes()).hexdigest()
+        family_path.write_text(json.dumps(family), encoding="utf-8")
+
+    write_pair()
+    api = load_functions()
+    def loaded(_path, manifest, *_args, **_kwargs):
+        return "store", manifest["cutoffs_cent"]
+    api["_xta_import_store_review"] = loaded
+    def open_preview():
+        return api["_xta_load_review"](path, "low_quality/half", None, [])
+    assert open_preview() == [50]
+
+    path.write_text(json.dumps(review) + " ", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="parent sweep"):
+        open_preview()
+    review["cutoffs_cent"] = [50, 80]
+    write_pair()
+    with pytest.raises(RuntimeError, match="parent sweep"):
+        open_preview()
+    review["cutoffs_cent"] = [50]
+    write_pair()
+    run_path.write_text('{"status":"failed"}', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="parent sweep"):
+        open_preview()
 
 
 

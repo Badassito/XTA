@@ -1,5 +1,5 @@
 """Prepared banks add real credit and keep expired-parent grants until settlement."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import copy
 import json
 import threading
@@ -92,6 +92,34 @@ def test_unsettled_scope_retains_credit_after_owner_permission_expires():
     assert account.in_use == 0
     admission.release_scope()
     admission.close()
+    assert account.in_use == 0
+
+
+def test_packing_failure_refunds_only_after_every_submission_settles():
+    account = pool()
+    with resources.admit_sam_parent_resources(account, 4*GIB, 'scope', worker_count=4,
+            base_allowance_bytes=4*GIB, headroom_probe=lambda:16*GIB) as profile:
+        admission = mint(profile)
+        admission.acquire_scope()
+        failed = Future()
+        failed.set_exception(ValueError('packing failed after completion'))
+        packing = admission.admit_mask_packing()
+        packing.track(failed)
+        pending = admission.admit_mask_packing()
+        pending._submission_unproven = True
+        charged = account.in_use
+        with pytest.raises((ValueError, RuntimeError)):
+            admission.release_scope()
+        assert packing._closed and not pending._closed
+        assert account.in_use == charged
+        pending._submission_unproven = False
+        failure = Future()
+        failure.set_exception(ValueError('settled retry failed'))
+        pending.track(failure)
+        admission.close()
+    assert account.in_use == charged
+    with pytest.raises(ValueError, match='settled retry failed'):
+        admission.release_scope()
     assert account.in_use == 0
 
 

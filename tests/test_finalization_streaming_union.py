@@ -12,6 +12,30 @@ import numpy as np
 from XTA import finalization, interpolation
 
 
+def test_fallback_centerline_finds_the_center_of_a_tight_solid_crop():
+    mask = np.zeros((4, 10, 12), dtype=np.uint8)
+    mask[1:3, 3:8, 5:10] = 1
+    samples = finalization._fallback_centerline_samples(mask, extent_xyt=(0, 11, 0, 9, 1, 2))
+    np.testing.assert_array_equal(samples.points_tyx, [[1, 5, 7], [2, 5, 7]])
+    np.testing.assert_array_equal(samples.radii, [3., 3.])
+
+
+def test_watershed_solid_component_has_a_finite_interior_ridge(monkeypatch):
+    seen = []
+
+    def capture_watershed(topography, markers, *, structure):
+        seen.append(topography.copy())
+        return markers
+
+    monkeypatch.setattr(finalization.ndi, 'watershed_ift', capture_watershed)
+    component = np.ones((7, 7), dtype=np.uint8)
+    basin = finalization._watershed_candidate_basin(component, [(3, 3, 1.)], [(0, 0)])
+    assert basin[0, 0] and not basin[3, 3]
+    assert len(seen) == 1
+    assert seen[0][3, 3] == 1
+    assert seen[0][0, 0] > seen[0][1, 1] > seen[0][3, 3]
+
+
 def _bbox(plane: np.ndarray) -> tuple[int, int, int, int]:
     ys, xs = np.nonzero(np.asarray(plane))
     if int(ys.size) == 0:

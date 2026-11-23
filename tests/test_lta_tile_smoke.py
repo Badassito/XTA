@@ -77,6 +77,40 @@ class LtaTileSmokeTests(unittest.TestCase):
                 source_height=3064,
             )
 
+    def test_fractional_bbox_must_fit_at_an_integer_tile_origin(self) -> None:
+        width = 2048
+        polygon = self.polygon(((0.4 / width, 0.1), (1008.3 / width, 0.2), (0.1, 0.3)))
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            self.tool.plan_object_tile(polygon, source_width=width, source_height=2048)
+
+    def test_exact_vertex_at_right_and_bottom_boundary_is_a_retained_pixel(self) -> None:
+        from XTA.lta_tiles import rasterize_polygon_on_tile
+
+        side = 2048
+        length = 1008
+
+        def rect(start):
+            a, b = start / side, length / side
+            return self.polygon(((a, a), (b, a), (b, b), (a, b)))
+
+        tile = self.tool.plan_object_tile(rect(1), source_width=side, source_height=side)
+        self.assertEqual(tile.xyxy, (1, 1, 1009, 1009))
+        self.assertTrue(rasterize_polygon_on_tile(rect(1), tile).all())
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            self.tool.plan_object_tile(rect(0), source_width=side, source_height=side)
+
+    def test_crossing_polygon_tile_matches_source_raster_on_edge_rounding_tie(self) -> None:
+        import numpy as np
+
+        from XTA.lta_tiles import TilePlan, masks_for_tile, rasterize_polygons_to_shape
+
+        tile = TilePlan(50, 47, 100, 256, 225)
+        points = ((136, 154), (43, 60), (156, 158), (210, 128))
+        polygon = self.polygon(tuple(((x + 0.25) / 256, (y + 0.25) / 225) for x, y in points))
+        source_mask = rasterize_polygons_to_shape((polygon,), height=225, width=256)
+        mask, = masks_for_tile((polygon,), tile)
+        np.testing.assert_array_equal(mask, source_mask[47:147, 50:150])
+
     def test_tile_requires_positive_adequate_source_dimensions(self) -> None:
         polygon = self.polygon(((0.1, 0.1), (0.2, 0.1), (0.2, 0.2), (0.1, 0.2)))
         for source_width, source_height, size in (

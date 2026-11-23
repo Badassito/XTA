@@ -200,7 +200,6 @@ class TtaSchedulerOperations:
     memfd_workspace_enabled: Callable[[], bool]
     preflight_multiprocessing_payload: Callable[[object], object]
     azimuthal_batch_padding_count: Callable[..., int]
-    azimuthal_batch_padding_mirror_groups: Callable[..., Sequence[object]]
     runtime_telemetry: Callable[[], object]
     tile_dense_worker_result_warn_seconds: Callable[[], float]
     view_processing_volume_shape: Callable[..., Sequence[int]]
@@ -645,18 +644,10 @@ class TtaScheduler:
         padding_count = int(self.tile_task_azimuthal_padding_count(task))
         if padding_count <= 0:
             return int(main_bytes) * int(policy_factor)
-        view_obj = task.get('view')
-        assert isinstance(view_obj, ViewInfo)
-        group_count = len(self.operations.azimuthal_batch_padding_mirror_groups(
-            view_obj,
-            int(task.get('slice_count', view_obj.num_slices)),
-            max(1, int(task.get('prediction_batch', self.inputs.batch))),
-            slice_offset=int(task.get('slice_start', 0)),
-        ))
         plane_bytes = int(shape[1]) * int(shape[2]) * int(np.dtype(np.uint8).itemsize)
         compact_padding_bytes = int(padding_count) * int(plane_bytes) * int(planes)
-        grouped_result_bytes = int(group_count) * int(main_bytes)
-        return int(main_bytes + compact_padding_bytes + grouped_result_bytes) * int(policy_factor)
+        # Keep credit for both the worker's seam slots and one compact parity group.
+        return (main_bytes + 2 * compact_padding_bytes) * policy_factor
 
     def tile_dense_result_task_admissible(self, task: Dict[str, object]) -> bool:
         if str(task.get('kind', '')) != 'tile':
@@ -752,9 +743,9 @@ class TtaScheduler:
         )
         mask_mm: Optional[np.ndarray] = None
         conf_mm: Optional[np.ndarray] = None
-        total_need = int(self.tile_dense_result_task_bytes(task))
+        main_bytes = int(self.operations.array_nbytes(shape, np.uint8)) * (2 if original_conf_path else 1)
         anon_cap = int(self.operations.workspace_anon_cap_bytes())
-        projected_memfd = int(self.state.gpu_worker_tile_dense_result_memfd_bytes_reserved) + int(total_need)
+        projected_memfd = int(self.state.gpu_worker_tile_dense_result_memfd_bytes_reserved) + main_bytes
         prefer_shared_memfd = bool(
             self.operations.memfd_workspace_enabled()
             and int(self.operations.available_anon_work_bytes()) >= int(projected_memfd) + 16 * self.inputs.gib
@@ -811,7 +802,7 @@ class TtaScheduler:
                     'tile.dense_worker_result_memfd_bytes_reserved',
                     int(self.state.gpu_worker_tile_dense_result_memfd_bytes_reserved),
                 )
-            path_bytes = max(0, int(total_need) - int(actual_memfd_bytes))
+            path_bytes = max(0, main_bytes - int(actual_memfd_bytes))
             if int(path_bytes) > 0:
                 self._telemetry_add(
                     'tile.dense_worker_result_path_fallback_bytes', int(path_bytes),

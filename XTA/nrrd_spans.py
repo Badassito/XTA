@@ -52,6 +52,7 @@ def _stream_native_crop_spans_fused(view, payload_writer, first, stop, member_by
     limit = int(batch_bytes) if batch_bytes is not None else int(nrrd_producer_batch_bytes())
     limit = max(1, limit)
     write_batch = getattr(payload_writer, 'write_owned_member_batch', None)
+    write_crop_batch = getattr(payload_writer, 'try_write_crop_span_batch', None)
     first, stop = int(first), int(stop)
     kinds = view.kinds[first:stop].tolist()
     y0s = view.y0[first:stop].tolist()
@@ -95,6 +96,12 @@ def _stream_native_crop_spans_fused(view, payload_writer, first, stop, member_by
             row += y1 - y0
         if sparse_consumer is not None:
             tee_or_observe(sparse_consumer, buf, np.asarray(records, dtype=np.int64).reshape(-1, 6))
+        if callable(write_crop_batch):
+            cropped_bytes = write_crop_batch(buf, segments, records)
+            if cropped_bytes is not None:
+                encoded_bytes += cropped_bytes
+                z = z_end
+                continue
         if callable(write_batch):
             write_batch(buf, segments)
         else:

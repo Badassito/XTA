@@ -287,7 +287,7 @@ def test_categorical_tile_resize_matches_cpu_publisher_on_cpu(tmp_path, imgsz, t
     resized = 0
     for item in plan.tile_layout:
         expected = resize_centered(extract_padded_tile(canvas, item.x, item.y, tile),
-                                   item.out_w, item.out_h, cv2.INTER_NEAREST)
+                                   item.out_w, item.out_h, cv2.INTER_NEAREST_EXACT)
         actual = masks._cpr_item_from_native(torch.from_numpy(native), plan, item.tile_tag,
                                              torch=torch, categorical=True)
         np.testing.assert_array_equal(actual.numpy(), expected)
@@ -296,6 +296,41 @@ def test_categorical_tile_resize_matches_cpu_publisher_on_cpu(tmp_path, imgsz, t
     xs, ys = masks._cpr_tile_resize_indices(torch, tile, imgsz, imgsz, torch.device("cpu"))
     assert xs.dtype == torch.int64 and ys.dtype == torch.int64
     assert masks._cpr_tile_resize_indices(torch, tile, imgsz, imgsz, torch.device("cpu"))[0] is xs
+
+
+@pytest.mark.parametrize("side", [8, 1024])
+def test_resized_canvas_tile_keeps_mask_and_coverage_on_the_cpu_output_grid(monkeypatch, side):
+    out = 3 * side // 4
+    tile = SimpleNamespace(tile_tag="crop", x=0, y=0, cfg=SimpleNamespace(tile_size=side),
+                           out_h=out, out_w=out, shared_job=None)
+    plan = SimpleNamespace(tag="cpr", tile_layout=(tile,))
+    ramp = np.arange(side, dtype=np.float32)[None, :]
+    index = int(cv2.resize(ramp, (out, 1), interpolation=cv2.INTER_NEAREST_EXACT)[0, 4])
+    image = (np.arange(side * side).reshape(side, side) % 251).astype(np.uint8)
+    mask = np.zeros((side, side), dtype=np.uint8)
+    coverage = np.zeros_like(mask)
+    mask[index, index] = coverage[index, index] = 1
+    coverage[0, 0] = 1
+    candidate = SimpleNamespace(channel_kind="gray", label_enabled=True, foreground_deferred="semantic")
+    source = workers.RenderFrameSource(None, None, image, mask)
+    expected_image, expected_mask = workers._derive_item_arrays(source, plan, tile.tile_tag)
+
+    monkeypatch.setattr(workers, "render_channel_formatted_images", lambda **kwargs: (None, image))
+    monkeypatch.setattr(workers, "render_plan_frame_mask_source", lambda **kwargs: (None, kwargs["mask"]))
+    work, = workers._render_gpu_item_group(image[None], mask, plan, 0,
+                                           ((tile.tile_tag, (candidate,)),), semantic_coverage=coverage)
+    single_image, single_mask, single_size = workers._derive_gpu_item_source(source, plan, tile.tile_tag)
+    expected_coverage = cv2.resize(coverage, (out, out), interpolation=cv2.INTER_NEAREST_EXACT)
+
+    assert single_size == work.output_size == (out, out)
+    for actual in (work.image, single_image):
+        np.testing.assert_array_equal(actual, expected_image)
+    for actual in (work.mask, single_mask):
+        np.testing.assert_array_equal(actual, expected_mask)
+    np.testing.assert_array_equal(work.semantic_coverage, expected_coverage)
+    assert work.mask[4, 4] == work.semantic_coverage[4, 4] == 1
+    workers._resolve_gpu_source_foregrounds({"torch": None}, [work])
+    assert candidate.foreground
 
 
 def test_joined_generation_change_releases_strong_geometry_keys(tmp_path):

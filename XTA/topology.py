@@ -31,6 +31,7 @@ from .config import (
 from .runtime import (
     array_nbytes,
     choose_slice_parallel_workers,
+    close_memmap_array_without_flush,
     estimate_voidfill_workspace_bytes,
     interpolation_process_worker_active,
     numa_interleave_memory,
@@ -605,21 +606,20 @@ def fill_3d_voids_inplace_streaming(
         bg_gid_path = work_prefix.with_suffix('.bg_gid.u32.dat')
         bg_gid_path.parent.mkdir(parents=True, exist_ok=True)
         bg_gid_store = np.memmap(bg_gid_path, dtype=np.uint32, mode='w+', shape=(z_dim, h, w))
-    numa_interleave_memory(bg_gid_store, desc='3D void fill gid store')  #
+    try:
+        numa_interleave_memory(bg_gid_store, desc='3D void fill gid store')
+        if gpu_device_ids:
+            from .topology_gpu_voidfill import prepare_gpu_void_fill
 
-    if gpu_device_ids:
-        from .topology_gpu_voidfill import prepare_gpu_void_fill
-
-        try:
-            slabs, lookups, gpu_stats = prepare_gpu_void_fill(
-                mask_mm, bg_gid_store, connectivity=connectivity, device_ids=gpu_device_ids,
-            )
-        except Exception as exc:
-            stats['fallback_reason'] = f'{type(exc).__name__}: {exc}'
-            print(f"GPU 3D void fill unavailable; using CPU: {stats['fallback_reason']}")
-        else:
-            # GPU preparation never edits mask; apply starts only after the complete join.
             try:
+                slabs, lookups, gpu_stats = prepare_gpu_void_fill(
+                    mask_mm, bg_gid_store, connectivity=connectivity, device_ids=gpu_device_ids,
+                )
+            except Exception as exc:
+                stats['fallback_reason'] = f'{type(exc).__name__}: {exc}'
+                print(f"GPU 3D void fill unavailable; using CPU: {stats['fallback_reason']}")
+            else:
+                # GPU preparation never edits mask; apply starts only after the complete join.
                 with runtime_telemetry().span('topology.void_fill.apply'):
                     _apply_void_fill_slab(mask_mm[:0], bg_gid_store[:0], lookups[0])
 
@@ -631,53 +631,48 @@ def fill_3d_voids_inplace_streaming(
                         for future in [executor.submit(apply_slab, i) for i in range(len(slabs))]:
                             future.result()
                 return gpu_stats
-            finally:
-                del bg_gid_store
-                if bg_gid_path is not None:
-                    bg_gid_path.unlink(missing_ok=True)
 
-    uf = _UnionFind()
-    prev_gid_slice: Optional[np.ndarray] = None
+        uf = _UnionFind()
+        prev_gid_slice: Optional[np.ndarray] = None
 
-    for z in tqdm(range(z_dim), desc='3D void fill: slice labeling'):
-        bg = (np.asarray(mask_mm[z]) == 0).astype(np.uint8, copy=False)
-        num_labels, labels2d = cv2.connectedComponents(bg, connectivity=slice_connectivity, ltype=cv2.CV_32S)
-        if int(num_labels) <= 1:
-            bg_gid_store[z, :, :] = 0
-            prev_gid_slice = None
-            continue
+        for z in tqdm(range(z_dim), desc='3D void fill: slice labeling'):
+            bg = (np.asarray(mask_mm[z]) == 0).astype(np.uint8, copy=False)
+            num_labels, labels2d = cv2.connectedComponents(bg, connectivity=slice_connectivity, ltype=cv2.CV_32S)
+            if int(num_labels) <= 1:
+                bg_gid_store[z, :, :] = 0
+                prev_gid_slice = None
+                continue
 
-        local_to_gid = np.zeros((int(num_labels),), dtype=np.uint32)
-        local_to_gid[1:] = uf.new_ids(int(num_labels) - 1)
-        gid_slice = local_to_gid[labels2d]
-        bg_gid_store[z, :, :] = gid_slice
+            local_to_gid = np.zeros((int(num_labels),), dtype=np.uint32)
+            local_to_gid[1:] = uf.new_ids(int(num_labels) - 1)
+            gid_slice = local_to_gid[labels2d]
+            bg_gid_store[z, :, :] = gid_slice
 
-        _mark_boundary_components_from_local_labels(uf, local_to_gid, labels2d, z=z, z_max=z_dim - 1)
+            _mark_boundary_components_from_local_labels(uf, local_to_gid, labels2d, z=z, z_max=z_dim - 1)
 
-        if prev_gid_slice is not None and np.any(prev_gid_slice) and np.any(gid_slice):
-            uf.union_pair_codes(_adjacent_gid_pair_codes(prev_gid_slice, gid_slice, adjacent_offsets))
+            if prev_gid_slice is not None and np.any(prev_gid_slice) and np.any(gid_slice):
+                uf.union_pair_codes(_adjacent_gid_pair_codes(prev_gid_slice, gid_slice, adjacent_offsets))
 
-        prev_gid_slice = np.asarray(gid_slice)
+            prev_gid_slice = np.asarray(gid_slice)
 
-    root_map = uf.root_map()
-    touches_by_gid = np.zeros(root_map.shape, dtype=bool)
-    for gid in range(1, root_map.shape[0]):
-        touches_by_gid[gid] = bool(uf.touches_boundary[int(root_map[gid])])
+        root_map = uf.root_map()
+        touches_by_gid = np.zeros(root_map.shape, dtype=bool)
+        for gid in range(1, root_map.shape[0]):
+            touches_by_gid[gid] = bool(uf.touches_boundary[int(root_map[gid])])
 
-    for z in tqdm(range(z_dim), desc='3D void fill: apply enclosed components'):
-        gid_slice = np.asarray(bg_gid_store[z])
-        enclosed = (gid_slice > 0) & (~touches_by_gid[gid_slice])
-        if np.any(enclosed):
-            mask_mm[z, enclosed] = np.uint8(1)
-
-    del bg_gid_store
-    if bg_gid_path is not None:
-        try:
-            bg_gid_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-    stats['chunks'] = int(z_dim)
-    return stats
+        for z in tqdm(range(z_dim), desc='3D void fill: apply enclosed components'):
+            gid_slice = np.asarray(bg_gid_store[z])
+            enclosed = (gid_slice > 0) & (~touches_by_gid[gid_slice])
+            if np.any(enclosed):
+                mask_mm[z, enclosed] = np.uint8(1)
+        stats['chunks'] = int(z_dim)
+        return stats
+    finally:
+        if bg_gid_path is not None:
+            close_memmap_array_without_flush(bg_gid_store, unlink_path=bg_gid_path)
+        # A propagated traceback can keep this frame and its locals alive.
+        gid_slice = None
+        del bg_gid_store
 
 @_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
 def _numba_compact_relabel_kernel(labels, lut_flat, lut_offsets, bboxes, counts):  # pragma: no cover - jit

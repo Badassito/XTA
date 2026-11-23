@@ -293,9 +293,12 @@ def _refine_source_centerline(mask: np.ndarray, points_tyx: np.ndarray, radii: n
                 found[index] = True
             # A small coarse lift can land outside a thin tube. Select the
             # nearest connected cross-section rather than the largest neighbor.
-            yy, xx = np.nonzero(labels)
-            nearest = int(np.argmin((yy - half) ** 2 + (xx - half) ** 2))
-            cy, cx = _filled_center(labels, int(labels[yy[nearest], xx[nearest]]))
+            label = 1 if count == 1 else int(labels[half, half])
+            if label == 0:
+                yy, xx = np.nonzero(labels)
+                nearest = int(np.argmin((yy - half) ** 2 + (xx - half) ** 2))
+                label = int(labels[yy[nearest], xx[nearest]])
+            cy, cx = _filled_center(labels, label)
             points[index] += normal * ((cx - half) * step) + binormal * ((cy - half) * step)
     return points
 
@@ -305,26 +308,36 @@ def _trim_and_prune_centerline(points_tyx: np.ndarray, found: np.ndarray) -> np.
 
     Ends are trimmed to the first and last seeds whose plane met foreground;
     unrefined end seeds stay at off-axis block centers. Seeds closer than one
-    voxel to the previous kept seed are merged, keeping the true last seed.
+    voxel to the previous kept seed are merged without hiding an end reversal.
     A vertex turning by more than 90 degrees is resolved by dropping a slid-back
     end seed (the shorter end segment), or, when two consecutive vertices both
     reverse, the one whose removal shortens the path most (the outlier), or
-    otherwise the reversing vertex itself. If less than one voxel of path
-    remains, as with a single found seed, the refined seeds are returned
-    unchanged.
+    otherwise the reversing vertex itself. A single hit keeps its immediate
+    neighbors to define the sampling tangent.
     """
-    refined = points = np.asarray(points_tyx, dtype=np.float64)
+    refined = np.asarray(points_tyx, dtype=np.float64)
     hits = np.flatnonzero(found)
-    if len(hits):
-        points = points[hits[0]:hits[-1] + 1]
+    if not len(hits):
+        raise ValueError("CPR centerline met no foreground voxels")
+    if len(hits) == 1:
+        hit = int(hits[0])
+        return refined[max(0, hit - 1):hit + 2]
+    points = refined[hits[0]:hits[-1] + 1]
     kept = [0]
     for index in range(1, len(points)):
         if np.linalg.norm(points[index] - points[kept[-1]]) >= 1.0:
             kept.append(index)
-    if kept[-1] != len(points) - 1:
-        if len(kept) > 1:
+    if len(kept) == 1:
+        distances = np.linalg.norm(points - points[0], axis=1)
+        farthest = int(np.argmax(distances))
+        if distances[farthest] <= 1e-7:
+            return refined[max(0, int(hits[0]) - 1):int(hits[-1]) + 2]
+        kept.append(len(points) - 1 if distances[-1] > 1e-7 else farthest)
+    elif kept[-1] != len(points) - 1:
+        tail = points[-1] - points[kept[-1]]
+        if np.dot(tail, points[kept[-1]] - points[kept[-2]]) > 0:
             kept[-1] = len(points) - 1
-        else:
+        elif tail.any():
             kept.append(len(points) - 1)
     points = points[kept]
     while len(points) >= 3:
@@ -336,9 +349,9 @@ def _trim_and_prune_centerline(points_tyx: np.ndarray, found: np.ndarray) -> np.
             break
         vertex = int(np.argmax(reversing)) + 1
         last = len(points) - 1
-        if vertex == last - 1 and seg[-1] < seg[-2]:
+        if vertex == last - 1 and seg[-1] <= seg[-2]:
             vertex = last
-        elif vertex == 1 and seg[0] < seg[1]:
+        elif vertex == 1 and seg[0] <= seg[1]:
             vertex = 0
         elif vertex + 1 < last and reversing[vertex]:
             # Path shortening from dropping each of the two reversing vertices.
@@ -348,8 +361,6 @@ def _trim_and_prune_centerline(points_tyx: np.ndarray, found: np.ndarray) -> np.
             if gains[1] > gains[0]:
                 vertex += 1
         points = np.delete(points, vertex, axis=0)
-    if np.linalg.norm(np.diff(points, axis=0), axis=1).sum() < 1.0:
-        return refined
     return points
 
 
@@ -393,6 +404,7 @@ def extract_cpr_geometries(
             if np.count_nonzero(component) < 3:
                 continue
             origin = tuple((int(axis.start) - 2) * factor + (factor - 1) * 0.5 for axis in box)
+            first_branch = len(results)
             try:
                 arrays, _ = _embedded_centerline_arrays(
                     component, spacing_tyx=(float(factor),) * 3,
@@ -414,7 +426,8 @@ def extract_cpr_geometries(
                     ))
             except (RuntimeError, ValueError) as exc:
                 if warn is not None:
-                    warn(f"CPR component {component_id}: {exc}; no usable centerline")
+                    outcome = "no usable centerline" if len(results) == first_branch else "keeping earlier branches"
+                    warn(f"CPR component {component_id}: {exc}; {outcome}")
     return results
 
 

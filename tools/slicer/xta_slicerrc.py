@@ -2193,6 +2193,55 @@ def _xta_undo_intensity_alignment(volume, parent, previous):
         parent.SetMatrixTransformToParent(previous)
 
 
+def _xta_check_review_family(manifest_path, manifest, data):
+    """Bind the review to its finalized family and exact validated cutoff receipts."""
+    import hashlib
+
+    family_path = manifest_path.parent.parent / "manifest.json"
+    if not family_path.is_file():
+        return
+    family = json.loads(family_path.read_text(encoding="utf-8"))
+    if family.get("schema") != "xta.confidence_sweep/1":
+        return
+    status = family.get("status")
+    problem = "The parent sweep has no matching published cutoff review."
+    if (family.get("sweep_id") != manifest["sweep_id"]
+            or _xta_sweep_child(family_path.parent, family.get("review_manifest", "")) != manifest_path):
+        raise RuntimeError(problem)
+    if manifest.get("source_storage") != "grouped":
+        if status != "complete":
+            raise RuntimeError(problem)
+        return
+    if (status not in {"complete", "incomplete", "failed", "cancelled"}
+            or manifest.get("status") != "complete" or manifest.get("sweep_status") != status
+            or family.get("review_manifest_sha256") != hashlib.sha256(data).hexdigest()):
+        raise RuntimeError(problem)
+    validated = [row for row in family.get("branches", []) if row.get("status") in {"complete", "incomplete"}]
+    expected = {row["cutoff_hundredths"]: row["manifest_sha256"] for row in validated}
+    declared = manifest.get("cutoffs_cent", [])
+    if len(expected) != len(validated) or declared != sorted(expected):
+        raise RuntimeError(problem)
+    checked_runs = set()
+    for grid in manifest["grids"]:
+        branches = grid["branches"]
+        actual = {row["cutoff_cent"]: row["run_manifest_sha256"] for row in branches}
+        if len(actual) != len(branches) or actual != expected:
+            raise RuntimeError(problem)
+        if any(group.get("cutoff_cent") not in expected
+               or any(row.get("cutoff_cent") != group["cutoff_cent"] for row in group.get("segments", []))
+               for group in grid.get("groups", [])):
+            raise RuntimeError(problem)
+        for branch in branches:
+            declared_path = _xta_sweep_child(manifest_path.parent, branch["run_manifest"],
+                                             boundary=family_path.parent)
+            cutoff = branch["cutoff_cent"]
+            run_path = family_path.parent / "confidence_cutoffs" / f"conf_{cutoff:03d}" / "manifest.json"
+            if declared_path != run_path or (cutoff not in checked_runs
+                    and hashlib.sha256(run_path.read_bytes()).hexdigest() != expected[cutoff]):
+                raise RuntimeError(problem)
+            checked_runs.add(cutoff)
+
+
 def _xta_load_review(manifest_path, grid_id, intensity, existing, max_working_mib=None, cutoff_cents=None,
                      review_mode=None, edit_log=None):
     """Importer for a cutoff review: store-backed (default) or per-cutoff segments (legacy).
@@ -2209,18 +2258,14 @@ def _xta_load_review(manifest_path, grid_id, intensity, existing, max_working_mi
         manifest_path, folder_grid, detached = _xta_sweep_review_location(manifest_path)
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data = manifest_path.read_bytes()
+    manifest = json.loads(data)
     if manifest.get("schema") != "xta.sweep_review/1" or not manifest.get("sweep_id"):
         raise RuntimeError("Choose the manifest.json of a completed XTA cutoff review "
                            "(review/ or its low-quality grid folder).")
     sweep = manifest["sweep_id"]
-    family_path = manifest_path.parent.parent / "manifest.json"
-    if not detached and family_path.is_file():
-        family = json.loads(family_path.read_text(encoding="utf-8"))
-        if family.get("schema") == "xta.confidence_sweep/1" and (
-                family.get("status") != "complete" or family.get("sweep_id") != sweep or
-                _xta_child(family_path.parent, family.get("review_manifest", "")) != manifest_path):
-            raise RuntimeError("The parent sweep is incomplete or refers to a different review.")
+    if not detached:
+        _xta_check_review_family(manifest_path, manifest, data)
     grids = {g["grid_id"]: g for g in manifest["grids"]}
     # Reference-only grids hold edit-transfer identities, never loadable masks.
     grouped = [name for name, grid in grids.items() if _xta_display_payload(grid) == "grouped"]
@@ -6912,12 +6957,12 @@ def _xta_store_export_cut_bundle(store, rx, k, cut_dir, *, created_utc=None):
         segments=[],
     )
     digest = _xta_sweep_digest
+    group_digests = {}
     for index, (logical, row) in enumerate(sorted(group.items())):
         mask, extent, matrix = _xta_store_mask_and_extent(store.layers[logical], k, rx)
         filename = f"{index:05d}.npz"
         np.savez_compressed(child / filename, mask=mask, extent_xyz=extent, ijk_to_ras=matrix)
         original = row["original"]
-        source = _xta_sweep_child(branch["path"].parent, original["filename"])
         bundle["segments"].append(
             dict(
                 name=original["segment_name"],
@@ -6925,7 +6970,7 @@ def _xta_store_export_cut_bundle(store, rx, k, cut_dir, *, created_utc=None):
                 sha256=digest(child / filename),
                 foreground_voxels=int(np.count_nonzero(mask)),
                 source_filename=original["filename"],
-                source_sha256=digest(source),
+                source_sha256=_xta_sweep_source_digest(row, branch, group_digests),
                 recomposition_op=original.get("recomposition_op"),
                 node_name=rx.node_names[row["segment_id"]],
                 segment_id=row["segment_id"],
@@ -12947,7 +12992,7 @@ def _xta_sweep_review_source(path):
     if detached:
         raise RuntimeError(
             f'This review grid folder ({grid_id}) was opened on its own. Display and editing work, but '
-            'edit export binds each cutoff to its scalar branch manifests, which live in the complete sweep '
+            'edit export binds each cutoff to the source catalogues and run receipts in the complete sweep '
             'output. Put the folder back in its review, or open <sweep>/review/manifest.json, and export again.')
     return review
 
@@ -12978,11 +13023,13 @@ def _xta_sweep_run(path, expected_hash, cent, sweep_id, source_mode):
     return run
 
 
-def _xta_sweep_scalar(path, expected_hash, grid):
+def _xta_sweep_scalar(path, expected_hash, grid, *, source_storage='scalar'):
     if _xta_sweep_digest(path) != expected_hash:
         raise ValueError('Sweep scalar source-manifest checksum mismatch.')
     value = _xta_sweep_json(path)
-    if (value.get('layout') != 'one_single_layer_nrrd_per_component'
+    layout = ('grouped_sweep_segments' if source_storage == 'grouped'
+              else 'one_single_layer_nrrd_per_component')
+    if (value.get('layout') != layout
             or _xta_sweep_shape(value.get('output_shape_tyx')) != _xta_sweep_shape(grid['shape_tyx'])):
         raise ValueError('Sweep scalar source-manifest layout/grid mismatch.')
     low = grid['grid_id'].startswith('low_quality/')
@@ -13021,6 +13068,8 @@ def _xta_sweep_review(path):
     manifest = _xta_sweep_json(path)
     if manifest.get('schema') != 'xta.sweep_review/1':
         raise ValueError('Select a cutoff sweep review manifest.')
+    if manifest.get('source_storage') == 'grouped':
+        _xta_check_review_family(path, manifest, path.read_bytes())
     sweep_id = _xta_sweep_text(manifest.get('sweep_id'), 'sweep_id')
     source_mode = manifest.get('source_mode','confidence_sweep')
     if source_mode not in {'confidence_sweep','independent_scalar'}:
@@ -13041,24 +13090,31 @@ def _xta_sweep_review(path):
             branch_dir = _xta_sweep_child(path.parent, branch['branch_dir'], boundary=root)
             run_path = _xta_sweep_child(path.parent, branch['run_manifest'], boundary=root)
             standard_branch = branch_dir.name == f'conf_{cent:03d}' and branch_dir.parent.name == 'confidence_cutoffs'
+            storage = branch.get('source_storage', 'scalar')
+            if storage not in {'scalar', 'grouped'}:
+                raise ValueError('Unsupported sweep source storage.')
+            source_directory = path.parent if storage == 'grouped' else branch_dir
             if (branch.get('source_mode',source_mode) != source_mode
                     or (source_mode == 'confidence_sweep' and not standard_branch) or branch_dir == root
-                    or not source.is_relative_to(branch_dir) or run_path.parent != branch_dir
+                    or not source.is_relative_to(source_directory) or run_path.parent != branch_dir
                     or run_path.name != 'manifest.json'):
                 raise ValueError('Sweep scalar sources are outside their declared cutoff branch.')
             run_hash = branch['run_manifest_sha256']
             run_key = (run_path,run_hash,cent,source_mode,sweep_id)
             if run_key not in run_cache:
                 run_cache[run_key] = _xta_sweep_run(run_path,run_hash,cent,sweep_id,source_mode)
-            scalar = _xta_sweep_scalar(source, branch['source_manifest_sha256'], grid)
+            scalar = _xta_sweep_scalar(source, branch['source_manifest_sha256'], grid, source_storage=storage)
             branches[cent] = dict(path=source, manifest=scalar,
                 rows={row['filename']:row for row in scalar['layers']},
                 sha256=branch['source_manifest_sha256'],branch_dir=branch_dir,
-                run_path=run_path,run_sha256=run_hash)
+                run_path=run_path,run_sha256=run_hash,source_storage=storage)
         by_cut = {}
         payload, rows = _xta_sweep_grid_rows(grid)
+        locations = {}
         for group in grid.get('groups', []):
-            _xta_sweep_child(path.parent, group['path'], boundary=root)
+            group_path = _xta_sweep_child(path.parent, group['path'], boundary=root)
+            for segment in group.get('segments', []):
+                locations[segment['segment_id']] = (group_path, group.get('sha256'))
         for row in rows:
             cent = _xta_sweep_cent(row.get('cutoff_cent'))
             sid = _xta_sweep_text(row.get('segment_id'), 'segment_id')
@@ -13075,6 +13131,13 @@ def _xta_sweep_review(path):
                 if row.get(key) != original.get(key):
                     raise ValueError(f'Review/scalar layer identity mismatch: {key}')
             record = dict(row, grid_id=grid_id, original=original)
+            if branches[cent]['source_storage'] == 'grouped':
+                if sid not in locations:
+                    raise ValueError('Grouped source segment has no review group.')
+                group_path, sha256 = locations[sid]
+                if not isinstance(sha256, str) or len(sha256) != 64 or not group_path.is_relative_to(path.parent):
+                    raise ValueError('Invalid grouped source identity.')
+                record['group_source'] = group_path, sha256
             by_cut[cent][logical] = record
             records[sid] = record
         grids[grid_id] = dict(grid=grid, payload=payload, branches=branches, by_cut=by_cut)
@@ -13114,7 +13177,7 @@ def _xta_sweep_binding(review, grid_id, cent, logical_ids):
             source_filename=original['filename'], segment_name=original['segment_name'],
             model_name=original.get('model_name'), layer_key=original.get('layer_key'),
             suffix=original.get('suffix'), recomposition_op=original.get('recomposition_op')))
-    return dict(schema='xta.sweep_edit_binding/1', sweep_id=review['sweep_id'],source_mode=review['source_mode'],
+    binding = dict(schema='xta.sweep_edit_binding/1', sweep_id=review['sweep_id'],source_mode=review['source_mode'],
         cutoff_cent=cent, grid_id=grid_id, review_manifest_sha256=review['sha256'],
         preview_manifest_sha256=source_low['sha256'], native_manifest_sha256=source_full['sha256'],
         branch_dir_relative=source_low['branch_dir'].relative_to(review['root']).as_posix(),
@@ -13123,6 +13186,23 @@ def _xta_sweep_binding(review, grid_id, cent, logical_ids):
         run_manifest_relative=source_low['run_path'].relative_to(review['root']).as_posix(),
         run_manifest_sha256=source_low['run_sha256'],run_manifest_file='source_run_manifest.json',
         native_manifest_file='source_native_manifest.json', logical_segments=identities)
+    if source_low.get('source_storage') == 'grouped' or source_full.get('source_storage') == 'grouped':
+        if not all(source.get('source_storage') == 'grouped' for source in (source_low, source_full)):
+            raise ValueError('Preview and native source storage differ.')
+        binding.update(source_storage='grouped',
+                       review_manifest_relative=review['path'].relative_to(review['root']).as_posix())
+    return binding
+
+
+def _xta_sweep_source_digest(row, branch, group_digests):
+    if 'group_source' not in row:
+        return _xta_sweep_digest(_xta_sweep_child(branch['path'].parent, row['original']['filename']))
+    path, expected = row['group_source']
+    if path not in group_digests:
+        group_digests[path] = _xta_sweep_digest(path)
+    if group_digests[path] != expected:
+        raise ValueError(f'Grouped sweep source checksum mismatch: {path}')
+    return expected
 
 
 def _xta_sweep_tag(segment, key):
@@ -13256,6 +13336,7 @@ def ExportXTASweepEdits(source_manifest=None, output_dir=None, *, cutoff_cents=N
         notes=['Each cutoff is an independent legacy edit bundle. Hidden segments are included.',
                'Nonadditive diagnostics are excluded. No cutoff masks are unioned with another cutoff.'])
     try:
+        group_digests = {}
         for (source_grid,cent),group in sorted(selected.items()):
             binding = _xta_sweep_binding(review,source_grid,cent,group)
             grid = review['grids'][source_grid]
@@ -13281,10 +13362,9 @@ def ExportXTASweepEdits(source_manifest=None, output_dir=None, *, cutoff_cents=N
                 filename = f'{index:05d}.npz'
                 np.savez_compressed(child/filename,mask=mask,extent_xyz=extent,ijk_to_ras=matrix)
                 original = row['original']
-                source = _xta_sweep_child(branch['path'].parent,original['filename'])
                 bundle['segments'].append(dict(name=original['segment_name'],file=filename,
                     sha256=_xta_sweep_digest(child/filename),foreground_voxels=int(np.count_nonzero(mask)),
-                    source_filename=original['filename'],source_sha256=_xta_sweep_digest(source),
+                    source_filename=original['filename'],source_sha256=_xta_sweep_source_digest(row, branch, group_digests),
                     recomposition_op=original.get('recomposition_op'),node_name=node.GetName(),segment_id=sid,
                     sweep_segment_id=row['segment_id'],logical_id=logical,cutoff_cent=cent))
                 del mask

@@ -271,7 +271,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tile-top", type=int, default=0)
     parser.add_argument("--tile-index", type=int, default=0)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--profile", choices=("auto", "h100", "egpu"), default="auto")
+    parser.add_argument("--profile", choices=("auto", "h100", "egpu", "a100"), default="auto")
     parser.add_argument("--conf", type=float, default=0.15)
     parser.add_argument("--startup-timeout", type=float, default=600.0)
     parser.add_argument("--task-timeout", type=float, default=900.0)

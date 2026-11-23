@@ -36,7 +36,8 @@ def _bilinear_displacement(field: Any, xy: Any) -> tuple[Any, Any, Any]:
     import torch
     _, h, w = field.shape
     x, y = xy[..., 0].clamp(0, w - 1), xy[..., 1].clamp(0, h - 1)
-    x0, y0 = x.floor().long(), y.floor().long()
+    x0 = x.floor().long().clamp(max=max(0, w - 2))
+    y0 = y.floor().long().clamp(max=max(0, h - 2))
     x1, y1 = (x0 + 1).clamp(max=w - 1), (y0 + 1).clamp(max=h - 1)
     flat = field.reshape(2, -1)
     def at(xx: Any, yy: Any) -> Any:
@@ -105,7 +106,10 @@ def inverse_policy_grid(forward: Any, displacement: Any | None, height: int, wid
                                     (-c * residual[..., 0] + a * residual[..., 1]) / denominator), dim=-1)
                 current = current - step.clamp(-32., 32.)
                 current = torch.nan_to_num(current, nan=-1e6, posinf=1e6, neginf=-1e6)
-            delta, dx, dy = _bilinear_displacement(displacement, current)
+            # The accepted roundoff halo is sampled at the raster edge.
+            edge_sample = torch.stack((current[..., 0].clamp(0, w - 1),
+                                       current[..., 1].clamp(0, h - 1)), dim=-1)
+            delta, dx, dy = _bilinear_displacement(displacement, edge_sample)
             residual = current @ linear.T + offset + delta - goal
             det = ((linear[0, 0] + dx[..., 0]) * (linear[1, 1] + dy[..., 1])
                    - (linear[0, 1] + dy[..., 0]) * (linear[1, 0] + dx[..., 1]))

@@ -295,7 +295,8 @@ def execute(args, prepared, *, runtime_factory=None, monitor_factory=None):
                     except BaseException as error:
                         if result_error is None:
                             raise
-                        result_error.add_note("Transfer cleanup also failed: " + str(error))
+                        if callable(getattr(result_error, "add_note", None)):
+                            result_error.add_note("Transfer cleanup also failed: " + str(error))
             if {str(path.resolve()): file_sha(path) for path in source_files} != source_hashes:
                 raise RuntimeError("Qualification source changed during execution")
             report["status"] = "passed"

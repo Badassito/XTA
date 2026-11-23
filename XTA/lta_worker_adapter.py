@@ -134,7 +134,8 @@ def build_worker_predictor(config: Mapping[str, object]) -> LtaSamWorkerContext:
         try:
             close_worker_predictor(context)
         except Exception as cleanup_error:
-            exc.add_note(f"SAM worker initialization cleanup also failed: {cleanup_error}")
+            if callable(getattr(exc, "add_note", None)):
+                exc.add_note(f"SAM worker initialization cleanup also failed: {cleanup_error}")
         raise
 
 
@@ -218,7 +219,7 @@ def _relay_observation(
 ) -> None:
     import numpy as np
 
-    from .lta_tile_tracking import rebase_tile_mask
+    from .lta_tile_tracking import rebase_tile_mask_port
 
     lineage = prediction.lineage
     seed = seed_by_lineage[lineage]
@@ -231,29 +232,14 @@ def _relay_observation(
     if probability < float(min_probability):
         return
     for destination_index, destination_tile in neighbors:
-        source_x0, source_y0, source_x1, source_y1 = source_tile.xyxy
-        destination_x0, destination_y0, destination_x1, destination_y1 = (
-            destination_tile.xyxy
-        )
-        overlap_x0 = max(source_x0, destination_x0)
-        overlap_y0 = max(source_y0, destination_y0)
-        overlap_x1 = min(source_x1, destination_x1)
-        overlap_y1 = min(source_y1, destination_y1)
-        if overlap_x1 > overlap_x0 and overlap_y1 > overlap_y0:
-            source_mask = np.asarray(frame.binary_mask, dtype=np.bool_)
-            overlap_pixels = int(
-                np.count_nonzero(
-                    source_mask[
-                        overlap_y0 - source_y0 : overlap_y1 - source_y0,
-                        overlap_x0 - source_x0 : overlap_x1 - source_x0,
-                    ]
-                )
-            )
-            if overlap_pixels < int(min_pixels):
-                continue
-        rebased = rebase_tile_mask(frame.binary_mask, source_tile, destination_tile)
-        if int(np.count_nonzero(rebased)) < int(min_pixels):
+        port = rebase_tile_mask_port(frame.binary_mask, source_tile, destination_tile)
+        if port is None:
             continue
+        destination_slice, source_crop = port
+        if int(np.count_nonzero(source_crop)) < int(min_pixels):
+            continue
+        rebased = np.zeros((destination_tile.height, destination_tile.width), dtype=np.bool_)
+        rebased[destination_slice] = source_crop
         key = lineage.token, int(destination_index)
         record = observations.setdefault(
             key,
@@ -688,10 +674,8 @@ def _execute_worker_task_impl(
             seed_by_lineage.update({seed.lineage: seed for seed in seeds})
             reduced_prediction_keys: set[tuple[str, int, int]] = set()
             owned_start, owned_stop = owned_frame_range(window)
-            window_union = np.zeros(
-                (owned_stop - owned_start, source_tile.size, source_tile.size),
-                dtype=np.uint8,
-            )
+            window_union: list[np.ndarray | None] = [None] * (owned_stop - owned_start)
+            window_bounds: list[tuple[int, int, int, int] | None] = [None] * (owned_stop - owned_start)
 
             def reduce_prediction(item: Any) -> None:
                 prediction = item.prediction
@@ -716,14 +700,24 @@ def _execute_worker_task_impl(
                 reduced_prediction_keys.add(key)
                 if crop_model_side is not None:
                     crop_observation_scores[f"{item.lineage.token}|{prediction.frame_index}"] = prediction.frame_tracker_score
-                coverage.add_prediction(item.lineage, key[1], prediction.binary_mask)
-                if bool(np.asarray(prediction.binary_mask, dtype=np.bool_).any()):
+                crop = coverage.add_prediction(item.lineage, key[1], prediction.binary_mask)
+                if crop is not None:
                     active_frames_by_lineage.setdefault(key[0], set()).add(key[1])
-                if owned_start <= prediction.frame_index < owned_stop:
-                    window_union[prediction.frame_index - owned_start] |= np.asarray(
-                        prediction.binary_mask,
-                        dtype=np.uint8,
-                    )
+                    if owned_start <= key[1] < owned_stop:
+                        top, left, mask = crop
+                        ordinal = key[1] - owned_start
+                        bottom, right = top + mask.shape[0], left + mask.shape[1]
+                        plane = window_union[ordinal]
+                        if plane is None:
+                            plane = np.zeros((source_tile.size, source_tile.size), dtype=np.bool_)
+                            window_union[ordinal] = plane
+                        plane[top:bottom, left:right] |= mask
+                        # OR preserves the extremal pixels of every tight prediction crop.
+                        prior = window_bounds[ordinal]
+                        window_bounds[ordinal] = (top, left, bottom, right) if prior is None else (
+                            min(top, prior[0]), min(left, prior[1]),
+                            max(bottom, prior[2]), max(right, prior[3]),
+                        )
                 _relay_observation(
                     observations,
                     prediction=item,
@@ -861,7 +855,15 @@ def _execute_worker_task_impl(
                     }
                 )
             with trace.phase("union_chunk_pack", work_id=str(payload["work_id"]), window_index=window_index):
-                union_writer.append_chunk(owned_start, window_union)
+                frame_crops = []
+                for ordinal, bounds in enumerate(window_bounds):
+                    if bounds is None:
+                        frame_crops.append(None)
+                        continue
+                    top, left, bottom, right = bounds
+                    frame_crops.append((top, left, window_union[ordinal][top:bottom, left:right]))
+                union_writer.append_cropped_chunk(owned_start, frame_crops)
+                del frame_crops
             window_union = None
             resource = None
             gc.collect()

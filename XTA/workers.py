@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (
     Callable,
@@ -57,6 +57,7 @@ from .config import (
 from .runtime import (
     HYBRID_DEFERRED_RESULT_MODE,
     _close_fd_list,
+    _current_process_cpu_affinity,
     _interpolation_process_entry,
     _materialize_worker_task_memfd_paths,
     _sched_setaffinity_all_threads,
@@ -123,6 +124,7 @@ from .inference import (
 from .semantic_inference import (
     accumulate_semantic_probability_frame,
     semantic_foreground_probability_numpy,
+    semantic_native_cutoff_planes,
 )
 from .cuda_d1 import (
     D1GroupReductionFallbackRequired,
@@ -686,14 +688,32 @@ class _OpenVinoCpuSegmenter:
                 f'OpenVINO CPU model input must be rank 4; got {original_shape}'
             )
         layout = 'NCHW'
-        if len(original_shape) == 4:
+        get_layout = getattr(getattr(ov, 'layout_helpers', None), 'get_layout', None)
+        model_layout = get_layout(model_input) if callable(get_layout) else None
+        candidates = ('NCHW', 'NHWC')
+        if model_layout is not None:
+            # OpenVINO can represent trailing axes as negative indices.
+            candidates = tuple(candidate for candidate in candidates if all(
+                not model_layout.has_name(axis)
+                or model_layout.get_index_by_name(axis) in (index, index - 4)
+                for index, axis in enumerate(candidate)
+            ))
+        if not candidates:
+            raise RuntimeError(f'OpenVINO CPU image layout must be NCHW or NHWC; got {model_layout}')
+        if len(candidates) == 1:
+            layout = candidates[0]
+        elif len(original_shape) == 4:
             second = original_shape[1]
             last = original_shape[3]
             if second == self.input_channels:
                 layout = 'NCHW'
             elif last == self.input_channels:
                 layout = 'NHWC'
-            elif second is not None and last is not None:
+            elif second is None and last in (None, self.imgsz):
+                layout = 'NCHW'
+            elif last is None and second == self.imgsz:
+                layout = 'NHWC'
+            else:
                 raise ModelInputChannelMismatchError(
                     f'OpenVINO CPU model input shape {original_shape} does not match '
                     f'--channel_format C={self.input_channels}'
@@ -705,14 +725,22 @@ class _OpenVinoCpuSegmenter:
             else (self.batch, self.imgsz, self.imgsz, self.input_channels)
         )
         reshape_needed = not original_shape or any(value is None for value in original_shape)
-        if original_shape and not reshape_needed:
-            for actual, expected in zip(original_shape, target_shape):
-                if int(actual) != int(expected):
-                    raise RuntimeError(
-                        f'OpenVINO CPU model has static input shape {original_shape}, but the run requested '
-                        f'batch={self.batch}, C={self.input_channels}, imgsz={self.imgsz} ({target_shape}).'
-                    )
-        elif reshape_needed:
+        if original_shape:
+            channel_axis = layout.index('C')
+            if original_shape[channel_axis] not in (None, self.input_channels):
+                raise ModelInputChannelMismatchError(
+                    f'OpenVINO CPU model input shape {original_shape} does not match '
+                    f'--channel_format C={self.input_channels}'
+                )
+            if ((not reshape_needed and original_shape[0] != self.batch)
+                    or any(actual not in (None, expected)
+                           for actual, expected in zip(original_shape[1:], target_shape[1:]))):
+                raise RuntimeError(
+                    f'OpenVINO CPU model has static dimensions in input shape {original_shape}, '
+                    f'but the run requested batch={self.batch}, C={self.input_channels}, '
+                    f'imgsz={self.imgsz} ({target_shape}).'
+                )
+        if reshape_needed:
             try:
                 model.reshape({model_input: list(target_shape)})
             except Exception as exc:
@@ -859,54 +887,88 @@ class _OpenVinoCpuSegmenter:
             _OpenVinoCpuSegmenter._disable_native_fanout(writer, exc)
 
     def _emit_native_fanout_batch(
-        self, outputs, frame_specs, submitted_batch, writer, *, source, out_size,
-        M_out_to_native, native_h, native_w, has_scores, probabilities=None,
+        self, frame_specs, writer, *, source, out_size, M_out_to_native,
+        native_h, native_w, has_scores, floor_payloads, probabilities,
     ):
-        """Decode siblings through scalar CPU operations, one native plane at a time."""
+        """Decode sibling cutoffs, keeping one native mask and score plane at a time."""
         restore = getattr(source, 'restore_prediction_planes', None)
-        for cent in writer.cutoffs:
-            threshold = int(cent) / 100.
-            payloads = None
-            if getattr(self, 'task', 'segment') != 'semantic':
-                payloads = _openvino_cpu_payloads_from_outputs(
-                    outputs, batch_size=int(submitted_batch), conf_threshold=threshold,
-                    out_size=int(out_size), expected_class_count=self.expected_class_count,
-                )
-            for local_index, spec in enumerate(frame_specs):
-                if spec is None:
-                    continue  # Discard the ordinary fixed-batch synthetic extension.
-                if not isinstance(spec, BatchResultFrameSpec) or spec.is_azimuthal_padding:
-                    raise ValueError('CPU native fanout requires ordinary frame destinations')
-                mask = np.zeros((1, int(native_h), int(native_w)), dtype=np.uint8)
-                scores = np.zeros_like(mask) if has_scores else None
-                restore_planes = ((lambda planes, active_spec=spec: restore(active_spec, planes))
-                                  if callable(restore) else None)
-                if (getattr(self, 'task', 'segment') == 'semantic'
-                        or int(payloads[int(local_index)].confs.size) > 0):
+        cutoffs = sorted(writer.cutoffs)
+        if not cutoffs:
+            return
+        consume_empty = getattr(writer, 'consume_empty', None)
+        same_result = getattr(writer, 'consume_same_result', None)
+        for local_index, spec in enumerate(frame_specs):
+            if spec is None:
+                continue  # Discard the ordinary fixed-batch synthetic extension.
+            if not isinstance(spec, BatchResultFrameSpec) or spec.is_azimuthal_padding:
+                raise ValueError('CPU native fanout requires ordinary frame destinations')
+            index = int(spec.task_index)
+            floor = None if floor_payloads is None else floor_payloads[local_index]
+            # Bound the shared FP32 plane and each cutoff scan to the model raster area.
+            if (floor is None and not callable(restore) and len(cutoffs) > 1
+                    and int(native_h) * int(native_w) <= probabilities[local_index].size):
+                for cent, mask, scores, count in semantic_native_cutoff_planes(
+                    probabilities[local_index], cutoffs, M_out_to_native=M_out_to_native,
+                    native_h=native_h, native_w=native_w, has_scores=has_scores,
+                ):
                     self._record_native_fanout_work(writer, mask_decodes=1)
-                if getattr(self, 'task', 'segment') == 'semantic':
-                    instance_count, frame_count = accumulate_semantic_probability_frame(
-                        probabilities[int(local_index)], frame_index=0, conf_threshold=threshold,
-                        view_union_mm=mask, view_confmap_mm=scores,
-                        M_out_to_native=M_out_to_native, native_h=int(native_h),
-                        native_w=int(native_w), restore_planes=restore_planes,
+                    writer.put(
+                        cent, index, mask, scores, prediction_count=count,
+                        frames_with_predictions=count, proto_treated=False,
                     )
+                continue
+            restore_planes = ((lambda planes, active_spec=spec: restore(active_spec, planes))
+                              if callable(restore) else None)
+            previous_count = -1
+            previous_cutoff = None
+            for cent in cutoffs:
+                threshold = int(cent) / 100.
+                if floor is not None:
+                    keep = floor.confs >= threshold
+                    count = int(keep.sum())
+                    if count == 0 and callable(consume_empty):
+                        consume_empty(index, int(cent), 0, frames=0)
+                        continue
+                    if (count == previous_count and previous_cutoff is not None and callable(same_result)
+                            and same_result(index, int(cent), previous_cutoff, published_crop=True)):
+                        continue
+                # The selected instance set can only shrink as cutoffs increase.
+                if floor is None or count != previous_count:
+                    mask = np.zeros((1, int(native_h), int(native_w)), dtype=np.uint8)
+                    scores = np.zeros_like(mask) if has_scores else None
+                    if floor is None:
+                        self._record_native_fanout_work(writer, mask_decodes=1)
+                        instance_count, frame_count = accumulate_semantic_probability_frame(
+                            probabilities[local_index], frame_index=0, conf_threshold=threshold,
+                            view_union_mm=mask, view_confmap_mm=scores, M_out_to_native=M_out_to_native,
+                            native_h=int(native_h), native_w=int(native_w), restore_planes=restore_planes,
+                        )
+                    else:
+                        if count > 0:
+                            self._record_native_fanout_work(writer, mask_decodes=1)
+                        selected = floor if count == floor.confs.size else replace(
+                            floor, coeffs=floor.coeffs[keep], boxes_xyxy=floor.boxes_xyxy[keep],
+                            confs=floor.confs[keep],
+                        )
+                        instance_count, frame_count = _process_cpu_retina_prediction_frame(
+                            0, selected, int(out_size), mask, scores, M_out_to_native,
+                            int(native_h), int(native_w), restore_planes=restore_planes,
+                        )
+                        previous_count = count
+                    has_foreground = _cleanup_prediction_slice_inplace(
+                        mask, scores, 0, min_conf=0., min_radius=0.,
+                    )
+                frames = int(bool(frame_count) and bool(has_foreground))
+                if floor is not None and not has_foreground and callable(consume_empty):
+                    consume_empty(index, int(cent), int(instance_count), frames=frames)
+                    previous_cutoff = None
                 else:
-                    instance_count, frame_count = _process_cpu_retina_prediction_frame(
-                        0, payloads[int(local_index)], int(out_size), mask, scores,
-                        M_out_to_native, int(native_h), int(native_w),
-                        slice_lock=None, restore_planes=restore_planes,
+                    writer.put(
+                        int(cent), index, mask[0], None if scores is None else scores[0],
+                        prediction_count=int(instance_count), frames_with_predictions=frames,
+                        proto_treated=False,
                     )
-                has_foreground = _cleanup_prediction_slice_inplace(
-                    mask, scores, 0, min_conf=0., min_radius=0.,
-                )
-                writer.put(
-                    int(cent), int(spec.task_index), mask[0],
-                    None if scores is None else scores[0],
-                    prediction_count=int(instance_count),
-                    frames_with_predictions=int(bool(frame_count) and bool(has_foreground)),
-                    proto_treated=False,
-                )
+                    previous_cutoff = int(cent) if has_foreground else None
 
     def infer_source_to_union(
         self,
@@ -933,6 +995,11 @@ class _OpenVinoCpuSegmenter:
             or azimuthal_padding_union_mm is not None or azimuthal_padding_confmap_mm is not None
         ):
             self._disable_native_fanout(native_fanout, ValueError('Unsupported CPU native fanout cleanup'))
+            native_fanout = None
+        if native_fanout is not None and getattr(self, 'task', 'segment') != 'semantic' and any(
+            not (float(conf_threshold) <= int(cent) / 100.) for cent in native_fanout.cutoffs
+        ):
+            self._disable_native_fanout(native_fanout, ValueError('CPU inference cutoff exceeds a native sibling cutoff'))
             native_fanout = None
         output_queue: 'queue.Queue[object]' = queue.Queue(
             maxsize=max(2, int(self.request_count)),
@@ -1002,6 +1069,7 @@ class _OpenVinoCpuSegmenter:
                     # their lifetime. Persist before any threshold-dependent adapter.
                     if forward_replay is not None and replay_key is not None:
                         forward_replay.store(replay_key, tuple(payload))
+                    probabilities = payloads = None
                     if getattr(self, 'task', 'segment') == 'semantic':
                         probabilities = semantic_foreground_probability_numpy(
                             payload, batch_size=int(submitted_batch), output_size=int(out_size),
@@ -1110,12 +1178,11 @@ class _OpenVinoCpuSegmenter:
                     if native_fanout is not None:
                         try:
                             self._emit_native_fanout_batch(
-                                payload, frame_specs, submitted_batch, native_fanout,
+                                frame_specs, native_fanout,
                                 source=source, out_size=out_size, M_out_to_native=M_out_to_native,
                                 native_h=native_h, native_w=native_w,
                                 has_scores=view_confmap_mm is not None,
-                                probabilities=(probabilities if getattr(self, 'task', 'segment')
-                                               == 'semantic' else None),
+                                floor_payloads=payloads, probabilities=probabilities,
                             )
                         except Exception as exc:
                             self._disable_native_fanout(native_fanout, exc)
@@ -2480,9 +2547,10 @@ def _gpu_inference_worker_main(
         # CUDA/model work, so allocator arenas, pinned staging and TRT host scratch land
         # node-local. The parent computed the plan (None = stay unpinned).
         _numa_pin_cpus = init_dict.get('numa_affinity_cpus', None)
-        if _numa_pin_cpus and hasattr(os, 'sched_getaffinity'):
+        if _numa_pin_cpus:
             try:
-                _GPU_WORKER_NUMA_FULL = {int(c) for c in os.sched_getaffinity(0)}
+                allocated_cpus = init_dict.get('allocated_cpus') or _current_process_cpu_affinity()
+                _GPU_WORKER_NUMA_FULL = set(allocated_cpus) if allocated_cpus else None
                 if _sched_setaffinity_all_threads([int(c) for c in _numa_pin_cpus]):  # type: ignore[union-attr]
                     _GPU_WORKER_NUMA_PIN = {int(c) for c in _numa_pin_cpus}  # type: ignore[union-attr]
                     print(f'[numa] gpu-worker {int(gpu_index)}: pinned to {len(_GPU_WORKER_NUMA_PIN)} cpu(s)')

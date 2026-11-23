@@ -170,6 +170,8 @@ class BridgeGeometryTests(unittest.TestCase):
                         direction_sign=sign, wrap_axis=wrap, component_cache=cache,
                     )
                     self.assertIsNotNone(plan)
+                    self.assertEqual(plan.source_point, (z0, cy, cx))
+                    self.assertEqual(plan.target_point, (z1, cy + 2, target_x))
                     exact, sections = self._exact_radius_and_sections(plan)
                     for threshold in (0., 1., 3., 3.000001, 10.):
                         with self.subTest(z0=z0, z1=z1, cache=use_cache, shape=shape, threshold=threshold):
@@ -218,6 +220,68 @@ class BridgeGeometryTests(unittest.TestCase):
         for plan in plans[1:]:
             np.testing.assert_allclose(plan.sdf0, plans[0].sdf0, atol=1e-6)
             np.testing.assert_allclose(plan.sdf1, plans[0].sdf1, atol=1e-6)
+
+    def test_bounded_distance_fields_reproduce_full_canvas_for_mismatched_endpoints(self):
+        from dataclasses import replace
+
+        labels = np.zeros((8, 311, 401), np.uint16)
+        labels[0, 5:306, 6:396] = 1
+        labels[0, 10:301, 11:391] = 0
+        _ellipse(labels, 7, 152, 21, 5, 6, 2)
+        plan = interpolation._build_linear_slice_bridge_plan(
+            labels, 1, 2, (0, 150, 8), (7, 152, 21),
+        )
+        self.assertIsNotNone(plan.endpoint_radius)
+
+        # Independently reconstruct the previous full, anchor-aligned fields.
+        half_y, half_x = labels.shape[1:]
+        full_fields = []
+        for z, anchor, label in ((0, (150, 8), 1), (7, (152, 21), 2)):
+            full = np.zeros((2 * half_y + 1, 2 * half_x + 1), bool)
+            y0, x0 = half_y - anchor[0], half_x - anchor[1]
+            full[y0:y0 + labels.shape[1], x0:x0 + labels.shape[2]] = labels[z] == label
+            full_fields.append(interpolation._bridge_interface_sdf_2d(full))
+        reference = replace(plan, sdf0=full_fields[0], sdf1=full_fields[1], endpoint_radius=None)
+
+        self.assertLess(plan.sdf0.size, reference.sdf0.size // 20)
+        for step in range(1, plan.steps):
+            actual = np.zeros_like(labels[0], dtype=np.uint8)
+            expected = np.zeros_like(actual)
+            interpolation._paint_linear_slice_bridge_plan_onto_slice(actual, plan, step)
+            interpolation._paint_linear_slice_bridge_plan_onto_slice(expected, reference, step)
+            np.testing.assert_array_equal(actual, expected)
+        self.assertEqual(interpolation._estimate_linear_slice_bridge_min_radius_from_plan(plan),
+                         interpolation._estimate_linear_slice_bridge_min_radius_from_plan(reference))
+
+    def test_clamped_endpoint_guards_avoid_bailout_and_area_mode_keeps_full_endpoint(self):
+        from tools.qualify_sdf_alignment import aligned_builder
+
+        labels = np.zeros((7, 100, 245), dtype=np.uint16)
+        labels[0, 48:53, 8:160] = 1
+        _ellipse(labels, 0, 50, 160, 18, 18, 1)
+        _ellipse(labels, 6, 50, 22, 5, 5, 2)
+        build = interpolation._build_linear_slice_bridge_plan
+        args = (labels, 1, 2, (0, 50, 14), (6, 50, 22))
+        with mock.patch.object(interpolation, '_bridge_interface_sdf_2d',
+                               wraps=interpolation._bridge_interface_sdf_2d) as edt:
+            cropped = build(*args)
+        full = build(*args, allow_active_crop=False)
+        self.assertIsNotNone(cropped.endpoint_radius)
+        self.assertLess(float(cropped.sdf0.max()) + 0.5, cropped.endpoint_radius)
+        self.assertLess(cropped.sdf0.size, full.sdf0.size)
+        self.assertEqual(edt.call_args_list[1].args[0].shape, cropped.sdf1.shape)
+        for step in range(1, cropped.steps):
+            actual = np.zeros_like(labels[0], dtype=np.uint8)
+            expected = np.zeros_like(actual)
+            interpolation._paint_linear_slice_bridge_plan_onto_slice(actual, cropped, step)
+            interpolation._paint_linear_slice_bridge_plan_onto_slice(expected, full, step)
+            np.testing.assert_array_equal(actual, expected)
+
+        area = aligned_builder(build, 'area')(*args)
+        self.assertIsNone(area.endpoint_radius)
+        self.assertEqual(int(np.count_nonzero(area.sdf0 >= 0)), int(np.count_nonzero(labels[0])))
+        self.assertEqual(int(np.count_nonzero(area.sdf1 >= 0)), int(np.count_nonzero(labels[6])))
+        self.assertIsNotNone(area.cached_sections[1])
 
     def test_radius_certificate_avoids_edt_but_defers_near_float_boundary(self):
         labels = np.zeros((6, 25, 25), np.uint16)

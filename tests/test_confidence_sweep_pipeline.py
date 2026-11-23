@@ -6,6 +6,7 @@ they do not claim detector/SAM or hardware equivalence.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -53,13 +54,20 @@ record = {'arguments':arguments, 'cwd':str(Path.cwd()), 'pid':os.getpid(),
               'XTA_YOLO_SWEEP_WORK_DIR','XTA_YOLO_SWEEP_ID',
               'XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS','XTA_YOLO_SWEEP_FLOOR_HUNDREDTHS',
               'XTA_YOLO_SWEEP_CUTOFFS_HUNDREDTHS','XTA_YOLO_SWEEP_NATIVE_ROLE',
-              'XTA_YOLO_SWEEP_OUTPUT_ROOT',
+              'XTA_YOLO_SWEEP_OUTPUT_ROOT','XTA_YOLO_SWEEP_QUOTA_DATABASE',
+              'XTA_YOLO_SWEEP_SAM_ARCHIVE_ROOT',
               'PYTHONPATH','PYTHONSAFEPATH')}}
 (out / 'child_observed.json').write_text(json.dumps(record))
 print('scalar-live-' + str(cent), flush=True)
 print('scalar-stderr-' + str(cent), file=sys.stderr, flush=True)
 mode = os.environ.get('SWEEP_TEST_MODE', '') if cent == 75 else ''
 if mode == 'exit':
+    raise SystemExit(7)
+if mode == 'abandoned_sam_archive':
+    from XTA.artifact_archive import StagedArtifactArchive, append_members
+    public = out / 'sam-artifacts.tar'
+    pending = StagedArtifactArchive.reserve(public, os.environ['XTA_YOLO_SWEEP_SAM_ARCHIVE_ROOT'])
+    append_members(public, {'evidence/receipt.json': b'recoverable'})
     raise SystemExit(7)
 if mode == 'missing':
     raise SystemExit(0)
@@ -181,6 +189,24 @@ if mode == 'in_progress':
     receipt['status'] = 'in_progress'
 if mode == 'conf':
     receipt['resolved_configuration']['conf'] = .123
+if summary_section := os.environ.get('XTA_YOLO_SWEEP_SUMMARY_SECTION'):
+    summary_destination = out.parent.parent / 'summary.txt'
+    receipt['outputs']['paths']['summary'] = str(summary_destination)
+    if mode != 'missing_summary':
+        summary_section = Path(summary_section)
+        summary_section.parent.mkdir(parents=True, exist_ok=True)
+        summary_section.write_text(
+            f'View statistics:\n  Total prediction count: {cent}\n'
+            f'Final outputs:\nrun_manifest: {out / "manifest.json"}\n',
+            encoding='utf-8',
+        )
+    if mode == 'late_summary_conflict':
+        summary_destination.write_text('foreign summary', encoding='utf-8')
+if media_root := os.environ.get('XTA_YOLO_SWEEP_MEDIA_ROOT'):
+    stage = Path(media_root) / f'conf_{cent:03d}' / 'native.packbits'
+    stage.parent.mkdir(parents=True, exist_ok=True)
+    stage.write_bytes(bytes((1, 0, 1, 0)))
+    identity['heatmap_inputs'] = {'grids': {'native': [2, 3, 4]}, 'streaming_decode': False}
 (out / 'manifest.json').write_text(json.dumps(receipt))
 if mode == 'strict_omission':
     raise SystemExit(1)
@@ -203,6 +229,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.delenv('SWEEP_TEST_MODE', raising=False)
     monkeypatch.delenv('SWEEP_TEST_FANOUT', raising=False)
     monkeypatch.delenv('XTA_YOLO_SWEEP_VIEW_MAJOR', raising=False)
+    monkeypatch.delenv('XTA_YOLO_SWEEP_QUOTA_DIR', raising=False)
     monkeypatch.delenv('XTA_YOLO_SWEEP_CACHE_GIB', raising=False)
     system_temp = tmp_path/'system-temp'
     system_temp.mkdir()
@@ -245,6 +272,231 @@ def _read(path):
     return json.loads(Path(path).read_text(encoding='utf-8'))
 
 
+def test_output_mount_check_fails_before_first_cutoff(harness, monkeypatch):
+    from XTA import json_publication
+    output = harness.root / 'unsupported-output'
+
+    def unsupported(stage, destination):
+        assert stage.is_relative_to(output) and destination.is_relative_to(output)
+        assert (stage / 'file').is_file()
+        raise OSError('fixture directory rename unsupported')
+
+    monkeypatch.setattr(json_publication, '_publish_sweep_directory', unsupported)
+    with pytest.raises(RuntimeError, match='publication check failed'):
+        sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50, 75), output_root=output,
+                                   save_options=('nrrd',))
+    receipt = _read(output / 'manifest.json')
+    assert not harness.children and receipt['branches'] == []
+    assert receipt['status'] == 'failed' and receipt['work_cleanup_complete']
+    assert not list(output.glob('.xta-publication-check-*'))
+    assert not (output / '.confidence_sweep.lock').exists()
+
+
+def test_publication_timing_identifies_completed_output_stage(tmp_path):
+    from XTA.json_publication import SweepDirectoryPublicationError
+    destination = tmp_path / 'review'
+    staged = tmp_path / 'private' / 'review'
+    manifest = {}
+    with pytest.raises(SweepDirectoryPublicationError):
+        with sweep._time_sweep_publication(manifest, 'review'):
+            raise SweepDirectoryPublicationError(destination, staged, OSError('commit failed'))
+    assert manifest['completed_publication_stages'] == {'review': 'private/review'}
+    assert manifest['publication_seconds']['review'] >= 0
+
+
+def test_heatmap_failure_retains_accepted_media_only_cutoffs(harness, monkeypatch):
+    from XTA import sweep_heatmaps
+
+    output = harness.root / 'media-only'
+
+    def fail_publication(root, work, inputs, grids, cutoffs, incomplete, **options):
+        assert root == output
+        assert cutoffs == (50, 75)
+        assert grids == {'native': [2, 3, 4]}
+        assert not incomplete
+        for cent in cutoffs:
+            assert (work / 'heatmap-input' / f'conf_{cent:03d}' / 'native.packbits').is_file()
+        raise OSError('fixture encoder failed')
+
+    monkeypatch.setattr(sweep_heatmaps, 'publish_sweep_heatmaps', fail_publication)
+    with pytest.raises(OSError, match='fixture encoder failed'):
+        sweep.run_confidence_sweep(
+            harness.arguments, cutoffs_hundredths=(50, 75), output_root=output,
+            save_options=('high_quality',),
+        )
+    receipt = _read(output / 'manifest.json')
+    assert receipt['status'] == 'failed'
+    assert receipt['publication_seconds']['heatmaps'] >= 0
+    assert receipt['heatmap_recovery']['validated_cutoffs_hundredths'] == [50, 75]
+    assert Path(receipt['heatmap_recovery']['path']).is_dir()
+    assert receipt['work_cleanup_complete'] is False
+    assert not (output / 'heatmaps').exists()
+
+
+def test_heatmaps_namespace_is_reserved_when_requested(harness):
+    output = harness.root / 'media-namespace'
+    directory = output / 'heatmaps'
+    directory.mkdir(parents=True)
+    marker = directory / 'untouched'
+    marker.write_text('external', encoding='utf-8')
+    with pytest.raises(FileExistsError, match='heatmaps'):
+        sweep.run_confidence_sweep(
+            harness.arguments, cutoffs_hundredths=(50, 75), output_root=output,
+            save_options=('high_quality',),
+        )
+    assert not harness.children
+    sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50, 75), output_root=output)
+    assert marker.read_text(encoding='utf-8') == 'external'
+
+
+@pytest.mark.parametrize('mode', ('complete', 'incomplete', 'exit', 'missing_summary', 'late_summary_conflict'))
+def test_sweep_summary_uses_one_public_file_and_keeps_validated_sections(harness, monkeypatch, mode):
+    monkeypatch.setenv('SWEEP_TEST_MODE', mode)
+    output = harness.root / 'summary-family'
+
+    def run():
+        return sweep.run_confidence_sweep([*harness.arguments, '--save', 'summary'],
+            cutoffs_hundredths=(50, 100, 75), output_root=output)
+
+    if mode == 'exit':
+        with pytest.raises(subprocess.CalledProcessError):
+            run()
+    elif mode == 'missing_summary':
+        with pytest.raises(ValueError, match='did not finish its sweep summary section'):
+            run()
+    elif mode == 'late_summary_conflict':
+        with pytest.raises((FileExistsError, ValueError), match='appeared|exists'):
+            run()
+    else:
+        run()
+
+    summary = output / 'summary.txt'
+    manifest = _read(output / 'manifest.json')
+    if mode == 'late_summary_conflict':
+        assert summary.read_text(encoding='utf-8') == 'foreign summary'
+        assert 'summary' not in manifest
+        assert not manifest['work_cleanup_complete']
+        assert (Path(manifest['work_directory']) / 'summary' / 'conf_050.txt').is_file()
+        return
+
+    assert manifest['summary'] == 'summary.txt'
+    cutoffs = (50, 100, 75) if mode in ('complete', 'incomplete') else (50, 100)
+    sections = []
+    for cent in cutoffs:
+        branch_manifest = output / 'confidence_cutoffs' / f'conf_{cent:03d}' / 'manifest.json'
+        assert Path(_read(branch_manifest)['outputs']['paths']['summary']) == summary
+        sections.append(
+            f'=== Confidence cutoff {cent / 100:.2f} ===\n'
+            f'View statistics:\n  Total prediction count: {cent}\n'
+            f'Final outputs:\nrun_manifest: {branch_manifest}\n'
+        )
+    assert summary.read_text(encoding='utf-8') == '\n'.join(sections)
+    assert list(output.rglob('*.txt')) == [summary]
+    assert manifest['work_cleanup_complete']
+
+
+@pytest.mark.parametrize('child_fails', [False, True])
+def test_separate_quota_storage_is_shared_and_retired(harness, monkeypatch, child_fails):
+    quota_parent = harness.root / 'fast-metadata'
+    quota_parent.mkdir()
+    keep = quota_parent / 'unrelated'
+    keep.write_text('preserve')
+    monkeypatch.setenv('XTA_YOLO_SWEEP_QUOTA_DIR', str(quota_parent))
+    monkeypatch.setenv('XTA_YOLO_SWEEP_QUOTA_DATABASE', str(keep))
+    output = harness.root / 'family'
+    if child_fails:
+        monkeypatch.setenv('SWEEP_TEST_MODE', 'exit')
+        with pytest.raises(subprocess.CalledProcessError) as failure:
+            sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50, 75), output_root=output)
+        assert failure.value.returncode == 7
+    else:
+        sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50, 75), output_root=output)
+    manifest = _read(output / 'manifest.json')
+    placement = manifest['work_storage']['native_quota']
+    for cent in (50, 75):
+        record = _read(output / f'confidence_cutoffs/conf_{cent:03d}/child_observed.json')
+        assert Path(record['environment']['XTA_YOLO_SWEEP_QUOTA_DATABASE']) == Path(placement['directory']) / 'quota.sqlite'
+    assert Path(placement['directory']).parent == quota_parent
+    assert manifest['work_cleanup_complete']
+    assert list(quota_parent.iterdir()) == [keep]
+
+
+@pytest.mark.parametrize('failure', [None, 'branch', 'publication'])
+def test_staged_nrrds_follow_group_publication_and_recovery(harness, monkeypatch, failure):
+    import importlib
+
+    import numpy as np
+
+    # Let native dependencies use platform probes during their first import.
+    with monkeypatch.context() as platform_imports:
+        platform_imports.setattr(subprocess, 'Popen', _POPEN)
+        importlib.import_module('XTA.runtime')
+        from XTA.reconciliation_io import write_seg_nrrd
+
+    monkeypatch.delitem(sys.modules, 'XTA.sweep_publication')
+    publication = importlib.import_module('XTA.sweep_publication')
+    if failure == 'branch':
+        monkeypatch.setenv('SWEEP_TEST_MODE', 'exit')
+    if failure == 'publication':
+        def failed_group(*args, **kwargs):
+            raise OSError('grouped output write failed')
+        monkeypatch.setattr(publication, 'write_grouped_seg_nrrd', failed_group)
+    run_child = sweep._run_child
+
+    def with_staged_layer(command, env, *, started):
+        returncode = run_child(command, env, started=started)
+        if returncode == 0:
+            cutoff = int(env['XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS'])
+            branch = Path(command[command.index('--output') + 1])
+            run_path = branch / 'manifest.json'
+            receipt = _read(run_path)
+            receipt['confidence_sweep']['nrrd_storage'] = 'grouped'
+            run_path.write_text(json.dumps(receipt), encoding='utf-8')
+            stage = Path(env['XTA_YOLO_SWEEP_NRRD_STAGE_ROOT']) / f'conf_{cutoff:03d}' / 'nrrd'
+            stage.mkdir(parents=True)
+            shape = tuple(receipt['inputs']['source_shape_t_y_x'])
+            mask = np.ones(shape, dtype=np.uint8)
+            write_seg_nrrd(stage / 'volume.seg.nrrd', shape_tyx=shape,
+                           read_slab=lambda z0, z1: mask[z0:z1])
+            catalog = {
+                'layout': 'one_single_layer_nrrd_per_component', 'output_shape_tyx': list(shape),
+                'exported_axes': '(X, Y, t)',
+                'layers': [{'filename': 'volume.seg.nrrd', 'segment_name': 'fixture',
+                            'layer_key': 'fixture', 'model_name': 'fixture', 'source': 'global',
+                            'stage': 'final_output_after_all_postprocessing'}],
+            }
+            if 'run_id' in receipt:
+                catalog['run_id'] = receipt['run_id']
+            (stage / 'volume_nrrd_manifest.json').write_text(json.dumps(catalog), encoding='utf-8')
+        return returncode
+
+    monkeypatch.setattr(sweep, '_run_child', with_staged_layer)
+    output = harness.root / 'grouped'
+    args = dict(cutoffs_hundredths=(50, 75), output_root=output)
+    if failure == 'branch':
+        with pytest.raises(subprocess.CalledProcessError):
+            sweep.run_confidence_sweep(harness.arguments, **args)
+    elif failure == 'publication':
+        with pytest.raises(OSError, match='grouped output write failed'):
+            sweep.run_confidence_sweep(harness.arguments, **args)
+    else:
+        sweep.run_confidence_sweep(harness.arguments, **args)
+    family = _read(output / 'manifest.json')
+    assert not list((output / 'confidence_cutoffs').rglob('*.seg.nrrd'))
+    if failure == 'publication':
+        assert family['review_manifest'] is None and not family['work_cleanup_complete']
+        assert family['nrrd_recovery']['validated_cutoffs_hundredths'] == [50, 75]
+        assert Path(family['nrrd_recovery']['path']).is_dir()
+    else:
+        assert family['work_cleanup_complete'] and 'nrrd_recovery' not in family
+        path = output / family['review_manifest']
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == family['review_manifest_sha256']
+        review = _read(path)
+        assert review['cutoffs_cent'] == ([50] if failure == 'branch' else [50, 75])
+        assert review['sweep_status'] == ('failed' if failure == 'branch' else 'complete')
+        assert all(grid['payload'] == 'grouped' for grid in review['grids'])
+
+
 def test_scalar_processes_are_independent_and_live_output_is_inherited(harness, tmp_path, monkeypatch, capfd):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv('XTA_YOLO_SWEEP_CACHE_GIB', '0')
@@ -278,6 +530,7 @@ def test_scalar_processes_are_independent_and_live_output_is_inherited(harness, 
         assert args[args.index('--capture_component_replay')+1].endswith(f'conf_{cent:03d}')
         env = item['environment']
         assert env['XTA_YOLO_SWEEP_ID'] == receipt['sweep_id']
+        assert Path(env['XTA_YOLO_SWEEP_SAM_ARCHIVE_ROOT']) == tmp_path/'work-root'
         assert env['XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS'] == str(cent)
         assert env['XTA_YOLO_SWEEP_FLOOR_HUNDREDTHS'] == '50'
         assert env['XTA_YOLO_SWEEP_CACHE_GIB'] == '0'
@@ -289,6 +542,20 @@ def test_scalar_processes_are_independent_and_live_output_is_inherited(harness, 
     streams = capfd.readouterr()
     assert 'scalar-live-100' in streams.out
     assert 'scalar-stderr-100' in streams.err
+
+
+def test_failed_branch_archive_stage_survives_family_cleanup(harness, monkeypatch):
+    from XTA.artifact_archive import read_member, reference
+
+    monkeypatch.setenv('SWEEP_TEST_MODE', 'abandoned_sam_archive')
+    output = harness.root/'failed'
+    temp_root = harness.root/'local-scratch'
+    with pytest.raises(subprocess.CalledProcessError):
+        sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50, 75),
+                                   output_root=output, temp_root=temp_root)
+    assert _read(output/'manifest.json')['work_cleanup_complete'] is True
+    (stage,) = temp_root.iterdir()
+    assert read_member(reference(stage/'sam-artifacts.tar', 'evidence/receipt.json')) == b'recoverable'
 
 
 @pytest.mark.parametrize('mode', (
@@ -396,8 +663,15 @@ def test_live_unrelated_log_is_preserved(harness):
     out.mkdir()
     log = out/'slurm-preflight.out'
     log.write_text('existing live scheduler output\n')
+    summary = out / 'summary.txt'
+    summary.write_text('existing unrelated report', encoding='utf-8')
+    with pytest.raises(FileExistsError, match='summary.txt'):
+        sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50,), output_root=out,
+                                   save_options=('summary',))
+    assert not harness.children
     sweep.run_confidence_sweep(harness.arguments,cutoffs_hundredths=(50,),output_root=out)
     assert log.read_text() == 'existing live scheduler output\n'
+    assert summary.read_text(encoding='utf-8') == 'existing unrelated report'
 
 
 @pytest.mark.parametrize('reserved',('review','confidence_cutoffs','manifest.json','fanout_progress.json','fanout_storage.json'))
@@ -425,6 +699,7 @@ def test_one_cut_range_disables_shared_caches_and_preserves_system_temp(harness,
     monkeypatch.setenv('XTA_YOLO_SWEEP_CUTOFFS_HUNDREDTHS', 'bad inherited cutoffs')
     monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_ROLE', 'consume')
     monkeypatch.setenv('XTA_YOLO_SWEEP_OUTPUT_ROOT', str(inherited))
+    monkeypatch.setenv('XTA_YOLO_SWEEP_SAM_ARCHIVE_ROOT', str(inherited))
     if populated:
         import hashlib
 
@@ -441,6 +716,7 @@ def test_one_cut_range_disables_shared_caches_and_preserves_system_temp(harness,
     assert observed['environment']['XTA_YOLO_SWEEP_CUTOFFS_HUNDREDTHS'] is None
     assert observed['environment']['XTA_YOLO_SWEEP_NATIVE_ROLE'] is None
     assert observed['environment']['XTA_YOLO_SWEEP_OUTPUT_ROOT'] is None
+    assert observed['environment']['XTA_YOLO_SWEEP_SAM_ARCHIVE_ROOT'] is None
     assert receipt['upstream_fanout'] == {'status':'disabled_singleton'}
     if populated:
         assert list(foreign_record.parent.iterdir()) == [foreign_record]

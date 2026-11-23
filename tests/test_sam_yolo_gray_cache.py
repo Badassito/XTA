@@ -171,6 +171,24 @@ def test_temporarily_unavailable_cache_records_reason_and_uses_source(tmp_path, 
         context.close()
 
 
+def test_sealed_reader_reuses_index_proof_between_cohorts(tmp_path, monkeypatch):
+    view = CACHED_VIEWS[0]
+    context = context_for(tmp_path, np.zeros(SOURCE_SHAPE, np.uint8))
+    shape = (view.num_slices, 8, 8)
+    install_cache(context, view, shape)
+    proof = mock.Mock(wraps=gray_cache._content_digest)
+    monkeypatch.setattr(gray_cache, '_content_digest', proof)
+    try:
+        context.image_provider(view, shape, demand(shape, {0: (2, 2, 6, 6)}))
+        context.image_provider(view, shape, demand(shape, {1: (1, 1, 7, 7)}))
+        assert proof.call_count == 1
+        reader, = context._idle_gray_readers.values()
+        assert reader._cached_bytes == 0
+    finally:
+        context.close()
+    assert not context._idle_gray_readers
+
+
 def test_active_decode_failure_discards_entire_private_cohort_and_closes_reader(tmp_path):
     view = CACHED_VIEWS[0]
     context = context_for(tmp_path, np.zeros(SOURCE_SHAPE, np.uint8))

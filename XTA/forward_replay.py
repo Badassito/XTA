@@ -119,8 +119,15 @@ def bind_worker_replay_source(source, task, render_path):
 
 def _db(root):
     conn = sqlite3.connect(root / "packets.sqlite", timeout=5, isolation_level=None)
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    try:
+        # Replay may live on shared scratch, where SQLite WAL shared memory is unsupported.
+        if conn.execute("PRAGMA journal_mode=DELETE").fetchone() != ("delete",):
+            raise sqlite3.OperationalError("Forward replay cache requires rollback journaling")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 @lru_cache(maxsize=16)
@@ -128,7 +135,6 @@ def _initialize(root, pid):
     root.mkdir(parents=True, exist_ok=True)
     conn = _db(root)
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS packets (
                 key TEXT PRIMARY KEY, backend TEXT NOT NULL, bytes INTEGER NOT NULL, ready INTEGER NOT NULL
@@ -432,9 +438,12 @@ class ForwardReplay:
                 except OSError:
                     pass
             if lease:
-                try:
-                    if published is not None:
+                if published is not None:
+                    try:
                         published.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                try:
                     self._settle(key, reserved)
                 except _CACHE_ERRORS:
                     pass
@@ -465,15 +474,16 @@ class ForwardReplay:
         try:
             try:
                 stream = self._packet_path(key).open("rb")
+                inline_packet = None
             except FileNotFoundError:
                 row = self._connection().execute("SELECT packet FROM inline_packets WHERE key=?", (key,)).fetchone()
                 if row is None:
                     self.note("miss")
                     return None
-                stream = io.BytesIO(row[0])
+                inline_packet = row[0]
+                stream = io.BytesIO(inline_packet)
             with stream as f:
-                inline = isinstance(f, io.BytesIO)
-                size = len(f.getbuffer()) if inline else os.fstat(f.fileno()).st_size
+                size = len(inline_packet) if inline_packet is not None else os.fstat(f.fileno()).st_size
                 if size > min(self.limit, _MAX_PACKET) or f.read(8) != _MAGIC:
                     raise ValueError("Invalid replay packet")
                 head_size, = struct.unpack("<I", f.read(4))
@@ -492,8 +502,10 @@ class ForwardReplay:
                     n = math.prod(shape)
                     if n*dtype.itemsize > size-f.tell():
                         raise ValueError("Truncated replay array")
-                    if inline:
-                        value = np.frombuffer(f.read(n*dtype.itemsize), dtype=dtype).copy().reshape(shape)
+                    if inline_packet is not None:
+                        offset = f.tell()
+                        value = np.frombuffer(inline_packet, dtype=dtype, count=n, offset=offset).copy().reshape(shape)
+                        f.seek(offset + n*dtype.itemsize)
                     else:
                         value = np.fromfile(f, dtype=dtype, count=n).reshape(shape)
                     if (self.verify and checksum is not None

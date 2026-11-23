@@ -193,6 +193,21 @@ def test_measured_parent_counts_replace_placeholders_and_deduplicate_c1_frames()
         pta._finalize_deferred_classification(prep,3,backgrounds,augmentations,measured,fraction=.2)
 
 
+@pytest.mark.parametrize("covered", [False, True])
+def test_deferred_semantic_cpu_fallback_resizes_mask_and_coverage_together(covered):
+    mask = np.zeros((4, 4), np.uint8)
+    mask[1, 1] = 1
+    coverage = np.zeros_like(mask)
+    coverage[1, 1] = covered
+    cand = candidate(foreground_deferred="semantic")
+    item = SimpleNamespace(candidates=(cand,), mask=mask, semantic_coverage=coverage,
+                           output_size=(2, 2), ready_event=None, categorical_ready_event=None)
+
+    workers._resolve_gpu_source_foregrounds({"torch": None}, [item])
+
+    assert cand.foreground is covered
+
+
 def test_count_derived_source_support_reuses_scalar_truth_without_conflating_polygon_class():
     mask=np.zeros((8,8),np.uint8)
     mask[2,2]=1

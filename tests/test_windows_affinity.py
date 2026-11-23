@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from XTA import runtime
+from XTA import runtime, workspace
 
 
 class FakeProcess:
@@ -163,6 +163,27 @@ class CpuAffinityAvailabilityTests(unittest.TestCase):
                 mock.patch.object(runtime, 'gpu_feeder_reserved_physical_cores', return_value=4):
             self.assertEqual(runtime.plan_gpu_feeder_core_reservations(['0', '1']), [[], []])
 
+    def test_windows_current_affinity_keeps_noncontiguous_cpu_ids(self):
+        with mock.patch.object(runtime, 'os', SimpleNamespace(name='nt')), \
+                mock.patch.object(runtime, 'cpu_affinity_unavailable_reason', return_value=None), \
+                mock.patch.object(runtime, '_WindowsAffinityApi') as api:
+            api.return_value.process_masks.return_value = (0b1010, 0b1111)
+            self.assertEqual(runtime._current_process_cpu_affinity(), {1, 3})
+
+    def test_windows_workspace_budget_respects_bound_process_mask(self):
+        fake_os = SimpleNamespace(name='nt', cpu_count=lambda: 16)
+        with mock.patch.object(workspace, 'os', fake_os), \
+                mock.patch.object(workspace, '_slurm_allocated_cpu_count', return_value=8), \
+                mock.patch.object(runtime, '_current_process_cpu_affinity', return_value={1, 3}) as affinity:
+            self.assertEqual(workspace._cpu_count(), 2)
+            affinity.return_value = None
+            self.assertEqual(workspace._cpu_count(), 8)
+
+    def test_worker_budget_uses_full_allocation_after_parent_affinity_narrows(self):
+        with mock.patch.object(runtime, '_cpu_count', return_value=1):
+            self.assertEqual(runtime.main_process_worker_budget(4, True, cpu_count=32), 32)
+            self.assertEqual(runtime.gpu_worker_cpu_share(4, cpu_count=32), 8)
+
 
 @unittest.skipUnless(os.name == 'nt', 'Native Windows affinity smoke')
 class WindowsAffinityNativeTests(unittest.TestCase):
@@ -170,6 +191,7 @@ class WindowsAffinityNativeTests(unittest.TestCase):
         code = r'''
 import json, threading, psutil
 from XTA.runtime import _WindowsAffinityApi, _sched_setaffinity_all_threads
+from XTA.workspace import _cpu_count
 p = psutil.Process()
 api = _WindowsAffinityApi()
 original = p.cpu_affinity()
@@ -197,10 +219,12 @@ try:
     api.restore_thread_mask(threads[0].native_id, 1 << original[0])
     target = original[-min(2, len(original)):]
     assert _sched_setaffinity_all_threads(target)
+    assert _cpu_count() == len(target)
     checked = verify(target)
     start(ready[3])
     assert api.thread_mask(threads[3].native_id) == (sum(1 << c for c in target), 0)
     assert _sched_setaffinity_all_threads(original)
+    assert _cpu_count() == len(original)
     checked_after = verify(original)
 finally:
     assert _sched_setaffinity_all_threads(original)

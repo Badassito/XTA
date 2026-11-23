@@ -41,6 +41,16 @@ class AugmentationBackendSelectionTests(unittest.TestCase):
         self.assertEqual(settings.for_backend('gpu').content_sha256, settings.gpu_sha256)
         settings.assert_unchanged()
 
+    def test_supplied_inactive_policy_does_not_change_single_backend_seed_identity(self):
+        entries = [f'gpu:{GPU}', f'cpu:{CPU}']
+        for active, selected in (('gpu', entries[0]), ('cpu', entries[1])):
+            options = {active: True}
+            with self.subTest(active=active):
+                single = self.resolve([selected], **options)
+                both = self.resolve(entries, **options)
+                self.assertEqual(both.content_sha256, single.content_sha256)
+                self.assertEqual(set(both.record()['policies']), {'cpu', 'gpu'})
+
     def test_missing_active_entry_and_duplicate_tags_fail(self):
         with self.assertRaisesRegex(ValueError, 'requires a cpu:'):
             self.resolve([f'gpu:{GPU}'], cpu=True)

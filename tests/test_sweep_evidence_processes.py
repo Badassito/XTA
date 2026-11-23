@@ -85,7 +85,8 @@ def _owner(root):
         low_quality_root=branch / "low_quality", run_id=branch_run_id("family-one", 50))
     owner = ViewMajorPublication(family_root=family, workspace=work, sweep_id="family-one",
         cutoffs_hundredths=CUTS, current_cutoff=50, scalar_sink=sink, source_shape_tyx=SHAPE,
-        model_name="detector", task="segment", min_conf=0., confidence_floor_by_backend={"gpu": .5})
+        model_name="detector", task="segment", min_conf=0., confidence_floor_by_backend={"gpu": .5},
+        retain_confidence=True)
     return owner, sink
 
 
@@ -108,7 +109,7 @@ def _publish(owner, view, decision, identity="identity-one", *, declare_journal=
 
 
 def _receipts(root):
-    return sorted((root / "work/view_publication/published").rglob("*.json"))
+    return sorted((root / "work/view_publication/published/by_view").glob("*.zip"))
 
 
 def _wait_for_workers(pool, count):
@@ -196,8 +197,8 @@ def test_worker_evidence_is_byte_identical_to_producer_threads(tmp_path, monkeyp
             for view, decision in zip(views, decisions):
                 refs = _publish(owner, view, decision)
                 assert refs[70] is not None and refs[100] is None
-            receipts = sorted((root / "work/view_publication/published").rglob("*.json"))
-            assert len(receipts) == 4
+            receipts = sorted((root / "work/view_publication/published/by_view").glob("*.zip"))
+            assert len(receipts) == 2
             # Worker mode never starts a producer evidence thread.
             assert bool(owner._confidence_pool._threads) == (processes == "0")
         finally:
@@ -227,11 +228,11 @@ def test_worker_error_propagates_without_poisoning_the_nrrd_barrier(tmp_path, mo
         # The worker's traceback travels with the original exception type.
         assert "write_blocks" in str(caught.value.__cause__)
         assert not owner._confidence[70]._pending and not owner._confidence[100]._pending
-        assert not list((tmp_path / "work/view_publication/published").rglob("*.json"))
+        assert not list((tmp_path / "work/view_publication/published/by_view").glob("*.zip"))
         # The shared NRRD owner and the worker pool keep serving other views.
         refs = _publish(owner, good, decisions[good.name])
         assert refs[70] is not None
-        assert len(list((tmp_path / "work/view_publication/published").rglob("*.json"))) == 2
+        assert len(list((tmp_path / "work/view_publication/published/by_view").glob("*.zip"))) == 1
     finally:
         owner.close()
         floor.shutdown()
@@ -311,7 +312,7 @@ def test_undeclared_crops_are_read_on_producer_threads(tmp_path, monkeypatch):
         pool.submit = lambda *args: jobs.append(args) or real_submit(*args)
         refs = _publish(owner, view, decision, declare_journal=False)
         assert refs[70] is not None
-        assert len(_receipts(tmp_path)) == 2
+        assert len(_receipts(tmp_path)) == 1
         assert owner._confidence_pool._threads and not jobs
     finally:
         owner.close()
@@ -346,7 +347,7 @@ def test_idle_worker_death_degrades_to_producer_threads(tmp_path, monkeypatch, c
         assert _publish(owner, views[1], decisions[1])[70] is not None
         assert len(fallbacks) == 2
         assert all(not writer._pending for writer in owner._confidence.values())
-        assert len(_receipts(root)) == 4
+        assert len(_receipts(root)) == 2
     finally:
         owner.close()
         floor.shutdown()
@@ -418,7 +419,7 @@ def test_worker_death_mid_view_rewrites_layers_on_threads_after_join(tmp_path, m
         assert ("joined", None) in events[:first_write]
         assert sorted(e[1] for e in events if e[0] == "thread-write") == [70, 70, 100, 100]
         assert all(not writer._pending for writer in owner._confidence.values())
-        assert len(_receipts(root)) == 4
+        assert len(_receipts(root)) == 2
     finally:
         owner.close()
         floor.shutdown()
@@ -487,20 +488,18 @@ def test_receipts_follow_durable_worker_evidence(tmp_path, monkeypatch):
     monkeypatch.setenv(PROCESSES_ENV, "2")
     view = _view()
     decision = _seal(view)
-    real_write = publication_module.write_json_atomic
+    real_write = publication_module._write_view_receipts
     checked = []
 
-    def receipt_after_evidence(path, payload, *args, **kwargs):
-        path = Path(path)
-        if path.parent.parent.name == "published":
-            cent = int(path.parent.name.split("_")[1])
+    def receipts_after_evidence(path, receipts):
+        for cent in receipts:
             tree = _evidence_tree(tmp_path, cent)
             (row,) = json.loads((tree / "manifest.json").read_text(encoding="utf-8"))["layers"]
             assert (tree / row["directory"] / "metadata.json").is_file()
-            checked.append(cent)
-        return real_write(path, payload, *args, **kwargs)
+        checked.append(list(receipts))
+        real_write(path, receipts)
 
-    monkeypatch.setattr(publication_module, "write_json_atomic", receipt_after_evidence)
+    monkeypatch.setattr(publication_module, "_write_view_receipts", receipts_after_evidence)
     owner, floor = _owner(tmp_path)
     jobs = []
     try:
@@ -511,7 +510,7 @@ def test_receipts_follow_durable_worker_evidence(tmp_path, monkeypatch):
     finally:
         owner.close()
         floor.shutdown()
-    assert sorted(jobs) == [70, 100] and sorted(checked) == [70, 100]
+    assert sorted(jobs) == [70, 100] and checked == [[70, 100]]
 
 
 def test_affinity_widening_reaches_live_workers_and_their_new_threads(monkeypatch):

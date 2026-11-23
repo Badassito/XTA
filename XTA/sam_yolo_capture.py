@@ -220,6 +220,8 @@ class GrayCaptureSession:
             allow_nan=False).encode()).hexdigest()
         self.cancelled = threading.Event()
         self._publish,self._seal = publish_frames,seal
+        self._writer = None
+        self._writer_lock = threading.Lock()
         self._state = threading.Condition(threading.RLock())
         self._producer = threading.Lock()
         self._copies = set()
@@ -244,38 +246,43 @@ class GrayCaptureSession:
         if not self.group_depth:
             pool.disable_view(self.view_key,'gray frame exceeds cache packet bound')
 
+    def _open_writer(self):
+        from .gray_cache import GrayCacheWriter,gray_cache_path,GrayCacheUnavailable,_retry_busy
+        with self._writer_lock:
+            if self.view_key in self.pool.disabled_views:
+                return None
+            if self._writer is None:
+                path = gray_cache_path(self.payload['store_root'],self.spec)
+                try:
+                    self._writer = _retry_busy(lambda: GrayCacheWriter(path,self.spec))
+                except GrayCacheUnavailable as error:
+                    self.pool.disable_view(self.view_key,error)
+            return self._writer
+
+    def _close_writer(self):
+        with self._writer_lock:
+            if self._writer is not None:
+                self._writer.close()
+                self._writer = None
+
     def _write(self,ids,gray):
         if self._publish is not None:
             return self._publish(ids,gray)
-        from .gray_cache import GrayCacheWriter,gray_cache_path,GrayCacheUnavailable
-        try:
-            writer = GrayCacheWriter(gray_cache_path(self.payload['store_root'],self.spec),self.spec)
-        except GrayCacheUnavailable as error:
-            self.pool.disable_view(self.view_key,error)
+        writer = self._open_writer()
+        if writer is None:
             return False
-        try:
-            accepted = writer.write_frames(ids,gray)
-            if not accepted:
-                self.pool.disable_view(self.view_key,getattr(writer,'disabled_reason',None) or 'cache disk admission declined')
-            return accepted
-        finally:
-            writer.close()
+        accepted = writer.write_frames(ids,gray)
+        if not accepted:
+            self.pool.disable_view(self.view_key,writer.disabled_reason or 'cache disk admission declined')
+        return accepted
 
     def _seal_store(self):
         if self.view_key in self.pool.disabled_views:
             return False
         if self._seal is not None:
             return bool(self._seal())
-        from .gray_cache import GrayCacheWriter,gray_cache_path,GrayCacheUnavailable
-        try:
-            writer = GrayCacheWriter(gray_cache_path(self.payload['store_root'],self.spec),self.spec)
-        except GrayCacheUnavailable as error:
-            self.pool.disable_view(self.view_key,error)
-            return False
-        try:
-            return bool(writer.seal())
-        finally:
-            writer.close()
+        writer = self._open_writer()
+        return writer is not None and writer.seal()
 
     def capture_gpu(self,tensor,frame_ids,ready_event,*,ring_slot=None):
         """Read input once; ring reuse waits only quantization's last source read."""
@@ -473,13 +480,19 @@ class GrayCaptureSession:
             try:
                 self.pool.executor.submit(self._finalize)
             except BaseException as error:
-                self.future.set_exception(error)
+                try:
+                    self._close_writer()
+                finally:
+                    self.future.set_exception(error)
 
     def _finalize(self):
         try:
-            if self._failure is not None:
-                raise self._failure
-            sealed = self._seal_store()
+            try:
+                if self._failure is not None:
+                    raise self._failure
+                sealed = self._seal_store()
+            finally:
+                self._close_writer()
             self.future.set_result(dict(gray_capture_frames=self.captured_frames,
                 gray_capture_committed_frames=self.committed_frames,
                 gray_capture_packets=self.packets,gray_capture_sealed=sealed,

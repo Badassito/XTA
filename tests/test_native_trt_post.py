@@ -298,6 +298,58 @@ class NativeRingCudaPostTests(unittest.TestCase):
         ex._set_slot_unit_descriptor(slot, ex.default_descriptor)
         return ex, slot
 
+    def test_scalar_and_tiled_proto_union_reject_nan_boxes(self):
+        torch = self.torch
+        with mock.patch.object(inference, 'direct_device_compaction_enabled', return_value=True), \
+                mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=True):
+            for dtype, tiled, expected_kernel in (
+                (torch.float32, False, 'scalar'),
+                (torch.float32, True, 'tiled_f32'),
+                (torch.float16, True, 'tiled_f16'),
+            ):
+                with self.subTest(kernel=expected_kernel):
+                    head = torch.zeros((37, 2), dtype=dtype, device='cuda')
+                    head[:4, 0] = torch.tensor([32, 32, 64, 64], dtype=dtype, device='cuda')
+                    head[0, 0] = float('nan')
+                    head[:4, 1] = torch.tensor([32, 32, 16, 16], dtype=dtype, device='cuda')
+                    head[4:6, :] = 1
+                    proto = torch.ones((32, 16, 16), dtype=dtype, device='cuda')
+                    im = torch.empty((1, 1, 64, 64), dtype=dtype, device='cuda')
+                    reduced = inference._reduce_direct_prototypes(head, proto, im, .5, allow_tiled=tiled)
+                    self.assertIsNotNone(reduced)
+                    logits, scores, retained, kernel, _refs = reduced
+                    expected = torch.zeros_like(scores)
+                    expected[6:10, 6:10] = 1
+                    self.assertEqual(kernel, expected_kernel)
+                    self.assertEqual(retained.item(), 2)
+                    self.assertTrue(torch.equal(logits > 0, expected.bool()))
+                    self.assertTrue(torch.equal(scores, expected))
+
+    def test_affine_proto_confidence_rounds_network_pixels_before_nearest_upsample(self):
+        import torch.nn.functional as F
+
+        torch = self.torch
+        ph, pw, img_size = 15, 18, 65
+        native_h, native_w = 49, 57
+        matrix = np.asarray(((0.95, -0.1, 4.31), (0.1, 0.95, -0.83)), np.float32)
+        head = torch.zeros((37, 1), device='cuda')
+        proto = torch.zeros((32, ph, pw), device='cuda')
+        _ex, slot = self._executor(head, proto, matrix, img_size, (native_h, native_w))
+        logits = torch.ones((ph, pw), device='cuda')
+        scores = (torch.arange(ph * pw, device='cuda') % 251 + 1).reshape(ph, pw).float() / 255
+        cp = self.kernels.cp
+        self.kernels.upsample_quantize_affine(
+            ((native_w + 31) // 32, (native_h + 7) // 8), (32, 8),
+            (cp.asarray(logits), cp.asarray(scores), np.uintp(0), np.int32(ph), np.int32(pw),
+             np.int32(img_size), np.int32(img_size), np.int32(native_h), np.int32(native_w),
+             *slot.native_to_out, cp.asarray(slot.native_union), cp.asarray(slot.native_conf), np.uintp(0)),
+            stream=inference._cupy_external_stream(cp, torch.cuda.current_stream()),
+        )
+        upsampled = F.interpolate(scores[None, None], size=(img_size, img_size), mode='nearest')[0, 0]
+        expected = inference._torch_warp_planes_to_native(
+            [upsampled], matrix, img_size, native_h, native_w)[0]
+        self.assertTrue(torch.equal(slot.native_conf, (expected * 255).round().to(torch.uint8)))
+
     def test_native_post_matches_direct_tensors_counts_confidence_and_bboxes(self):
         torch = self.torch
         generator = torch.Generator(device='cuda').manual_seed(20260909)

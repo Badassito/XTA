@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import io
 import json
 import math
@@ -544,6 +545,61 @@ def ffprobe_info(video_path: Path) -> Dict[str, object]:
     num_frames = int(nf)
     return {"width": width, "height": height, "fps": fps, "num_frames": num_frames}
 
+def _start_decode_stderr_reader(
+    proc: subprocess.Popen, stderr_tail: bytearray, stderr_errors: list[BaseException],
+) -> threading.Thread:
+    # Drain diagnostics while stdout is read so both pipes can reach EOF.
+    stderr_pipe = proc.stderr
+    assert stderr_pipe is not None
+
+    def drain() -> None:
+        try:
+            with stderr_pipe:
+                while chunk := stderr_pipe.read(65536):
+                    stderr_tail.extend(chunk)
+                    del stderr_tail[:-256 * 1024]
+        except BaseException as exc:
+            stderr_errors.append(exc)
+
+    reader = threading.Thread(target=drain, name='gray8-decode-stderr', daemon=True)
+    reader.start()
+    proc.stderr = None  # communicate must not race the dedicated reader.
+    return reader
+
+
+@contextmanager
+def _synchronous_decode_stdout(proc: subprocess.Popen):
+    stderr_tail, stderr_errors = bytearray(), []
+    stderr_reader = None
+    try:
+        assert proc.stdout is not None
+        stderr_reader = _start_decode_stderr_reader(proc, stderr_tail, stderr_errors)
+        yield proc.stdout
+    except BaseException:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+                proc.stdout = None
+            if proc.stderr is not None:
+                proc.stderr.close()
+        finally:
+            proc.wait()
+            if stderr_reader is not None:
+                stderr_reader.join()
+    if proc.returncode != 0:
+        msg = stderr_tail.decode('utf-8', errors='replace')
+        raise RuntimeError(f'ffmpeg decode failed: {msg}')
+    if stderr_errors:
+        raise RuntimeError('Could not read ffmpeg decode diagnostics') from stderr_errors[0]
+
+
 @runtime_telemetry_phase('startup.decode')
 def decode_video_to_memmap_gray8(
     input_video: Path,
@@ -598,92 +654,40 @@ def decode_video_to_memmap_gray8(
     ]
     print(f'FFmpeg gray8 decode threads: {ffmpeg_decode_threads()}')
     runtime_trace_event('startup_decode_start', streaming=False, frames=int(num_frames))
+    process_verified = False
     try:
         proc = _spawn_subprocess_with_retry(
             lambda: _spawn_decode_process(cmd),
             'ffmpeg gray8 decode',
         )
-    except BaseException:
-        runtime_trace_event('startup_decode_done', streaming=False, failed=True, frames=int(num_frames))
-        raise
-    assert proc.stdout is not None
-
-    stderr_tail = bytearray()
-    stderr_errors = []
-    stderr_reader = None
-    if strict_frame_count:
-        # EOF verification waits for ffmpeg to exit. Drain diagnostics concurrently
-        # so a full stderr pipe cannot prevent stdout from reaching EOF.
-        stderr_pipe = proc.stderr
-        assert stderr_pipe is not None
-
-        def _drain_stderr() -> None:
-            try:
-                with stderr_pipe:
-                    while chunk := stderr_pipe.read(65536):
-                        stderr_tail.extend(chunk)
-                        del stderr_tail[:-256 * 1024]
-            except BaseException as exc:
-                stderr_errors.append(exc)
-
-        stderr_reader = threading.Thread(target=_drain_stderr, name='gray8-decode-stderr', daemon=True)
-        stderr_reader.start()
-        proc.stderr = None  # communicate must not race the dedicated reader.
-
-    decode_error = None
-    view = None
-    try:
-        with tqdm(total=num_frames, desc='Decoding input volume (gray8)') as pbar:
-            for start in range(0, num_frames, chunk_frames):
-                nframes = min(chunk_frames, num_frames - start)
-                need = int(nframes) * int(frame_bytes)
-                offset = int(start) * int(frame_bytes)
-                view = raw_bytes[offset:offset + need]
-                filled = 0
-                while filled < need:
-                    nread = proc.stdout.readinto(view[filled:])
-                    if nread is None or nread <= 0:
-                        raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}; the input '
-                                               'has fewer frames than probed (YOLO_TTA_FRAME_COUNT_FULL_SCAN=1 counts every packet)')
-                    filled += int(nread)
-                pbar.update(int(nframes))
-        if strict_frame_count and proc.stdout.read(1):
-            raise RuntimeError(
-                f'Frame count mismatch: decoded more than the declared {num_frames} frames from {input_video}'
-            )
-    except BaseException as exc:
-        decode_error = exc
-        if strict_frame_count and proc.poll() is None:
-            proc.kill()
-        raise
+        with _synchronous_decode_stdout(proc) as stdout:
+            with tqdm(total=num_frames, desc='Decoding input volume (gray8)') as pbar:
+                for start in range(0, num_frames, chunk_frames):
+                    nframes = min(chunk_frames, num_frames - start)
+                    need = nframes * frame_bytes
+                    offset = start * frame_bytes
+                    with raw_bytes[offset:offset + need] as view:
+                        filled = 0
+                        while filled < need:
+                            with view[filled:] as pending:
+                                nread = stdout.readinto(pending)
+                            if nread is None or nread <= 0:
+                                raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}; the input '
+                                                   'has fewer frames than probed (YOLO_TTA_FRAME_COUNT_FULL_SCAN=1 counts every packet)')
+                            filled += nread
+                    pbar.update(nframes)
+            if strict_frame_count and stdout.read(1):
+                raise RuntimeError(
+                    f'Frame count mismatch: decoded more than the declared {num_frames} frames from {input_video}'
+                )
+        process_verified = True
     finally:
-        process_verified = False
-        try:
-            if proc.stdout:
-                proc.stdout.close()
-                # Windows communicate() otherwise starts a reader for this closed pipe.
-                proc.stdout = None
-            _, err = proc.communicate()
-            if stderr_reader is not None:
-                stderr_reader.join()
-                err = bytes(stderr_tail)
-                if stderr_errors and decode_error is None:
-                    raise RuntimeError('Could not read ffmpeg decode diagnostics') from stderr_errors[0]
-            if proc.returncode not in (0, None) and decode_error is None:
-                msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
-                raise RuntimeError(f"ffmpeg decode failed: {msg}")
-            process_verified = True
-        finally:
-            if strict_frame_count and (decode_error is not None or not process_verified):
-                # Tracebacks retain these views, which otherwise lock failed
-                # scratch mappings on Windows until the exception is discarded.
-                if view is not None:
-                    view.release()
-                raw_bytes.release()
-                close_memmap_array(arr)
-            runtime_trace_event('startup_decode_done', streaming=False,
-                                failed=decode_error is not None or not process_verified,
-                                frames=int(num_frames))
+        raw_bytes.release()
+        if not process_verified:
+            close_memmap_array(arr)
+            arr = None  # The traceback can outlive the failed scratch mapping.
+        runtime_trace_event('startup_decode_done', streaming=False, failed=not process_verified,
+                            frames=int(num_frames))
     return arr
 
 def decode_video_to_memmap_gray8_streaming(
@@ -735,7 +739,7 @@ def decode_video_to_memmap_gray8_streaming(
     def _decode_worker() -> None:
         cmd = [
             "ffmpeg", "-v", "error", "-threads", str(ffmpeg_decode_threads()),
-            "-i", str(input_video), "-f", "rawvideo", "-pix_fmt", "gray", "-vsync", "0", "-",
+            "-i", str(input_video), "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "gray", "-vsync", "0", "-",
         ]
         print(f'FFmpeg gray8 streaming decode threads: {ffmpeg_decode_threads()}')
         runtime_trace_event('startup_decode_start', streaming=True, frames=int(num_frames))
@@ -743,6 +747,10 @@ def decode_video_to_memmap_gray8_streaming(
         # this thread used to leave the VolumeReadiness unmarked, so every consumer of the
         # decoded volume blocked forever on wait_for_slice while the pipeline "continued".
         proc: Optional[subprocess.Popen] = None
+        stderr_tail, stderr_errors = bytearray(), []
+        stderr_reader = None
+        process_verified = False
+        view = None
         try:
             proc = _spawn_subprocess_with_retry(
                 lambda: _spawn_decode_process(cmd),
@@ -750,6 +758,7 @@ def decode_video_to_memmap_gray8_streaming(
             )
             _register_streaming_subprocess(proc)
             assert proc.stdout is not None
+            stderr_reader = _start_decode_stderr_reader(proc, stderr_tail, stderr_errors)
             decode_started = time.monotonic()
             read_seconds = 0.0
             with tqdm(total=num_frames, desc='Streaming decode input volume (gray8)') as pbar:
@@ -769,10 +778,10 @@ def decode_video_to_memmap_gray8_streaming(
                             raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}; the input '
                                                'has fewer frames than probed (YOLO_TTA_FRAME_COUNT_FULL_SCAN=1 counts every packet)')
                         filled += int(nread)
-                    for frame_idx in range(int(start), int(start) + int(nframes)):
+                    # The final slice also completes the volume readiness gate.
+                    for frame_idx in range(start, min(start + nframes, num_frames - 1)):
                         readiness.mark_slice_ready(int(frame_idx))
                     pbar.update(int(nframes))
-            readiness.mark_all_ready()
             # ffmpeg CPU is a child process, so the process CPU gauge never sees it.
             # cores = ffmpeg_cpu / wall shows whether decode was CPU-bound; read
             # time close to wall with few cores means the pipe or input was the limit.
@@ -789,13 +798,29 @@ def decode_video_to_memmap_gray8_streaming(
                   f'(reader blocked {read_seconds:.1f}s; ffmpeg CPU '
                   f'{(ffmpeg_cpu / decode_wall) if ffmpeg_cpu >= 0 and decode_wall > 0 else float("nan"):.1f} cores; '
                   f'pipe {int(getattr(proc, "_xta_pipe_bytes", 0)) // 1024} KiB).', flush=True)
+            if proc.stdout.read(1):
+                raise RuntimeError(
+                    f'Frame count mismatch: decoded more than the declared {num_frames} frames from {input_video}'
+                )
+            proc.wait()
+            stderr_reader.join()
+            if proc.returncode != 0:
+                msg = stderr_tail.decode("utf-8", errors="replace")
+                raise RuntimeError(f"ffmpeg decode failed: {msg}")
+            if stderr_errors:
+                raise RuntimeError('Could not read ffmpeg decode diagnostics') from stderr_errors[0]
+            if streaming_producers_aborted():
+                raise RuntimeError('streaming gray8 decode aborted by pipeline shutdown')
+            if on_verified is not None:
+                on_verified()
+            readiness.mark_all_ready()
+            process_verified = True
         except BaseException as exc:
             # Loud failure: waking every waiter with the root cause is what turns a silent
             # consumer hang into an immediate pipeline abort.
             readiness.mark_failed(exc)
             print(f'ERROR: streaming gray8 decode failed; failing all volume consumers: {exc}')
-            # Unblock the finally's communicate: a decode we are abandoning must not be
-            # waited on while it still streams the remainder of the input.
+            # Stop the decoder before waiting for it to settle.
             try:
                 if proc is not None and proc.poll() is None:
                     proc.kill()
@@ -803,30 +828,26 @@ def decode_video_to_memmap_gray8_streaming(
                 pass
             raise
         finally:
-            process_verified = False
             try:
                 if proc is not None:
                     try:
-                        if proc.stdout:
+                        if proc.stdout is not None:
                             proc.stdout.close()
-                            # Keep stderr attached, but do not reread the consumed stdout.
                             proc.stdout = None
-                        _out, err = proc.communicate()
-                        if proc.returncode not in (0, None):
-                            msg = err.decode("utf-8", errors="replace") if isinstance(err, (bytes, bytearray)) else str(err)
-                            readiness.mark_failed(RuntimeError(f"ffmpeg decode failed: {msg}"))
-                        process_verified = readiness._exception is None
+                        if proc.stderr is not None:
+                            proc.stderr.close()
+                        if proc.returncode is None:
+                            proc.wait()
+                        if stderr_reader is not None and stderr_reader.is_alive():
+                            stderr_reader.join()
                     finally:
                         _unregister_streaming_subprocess(proc)
             finally:
+                if view is not None:
+                    view.release()
+                raw_bytes.release()
                 runtime_trace_event('startup_decode_done', streaming=True,
                                     failed=not process_verified, frames=int(num_frames))
-        if process_verified and on_verified is not None:
-            try:
-                on_verified()
-            except BaseException as exc:
-                readiness.mark_failed(exc)
-                raise
 
     # daemon=True: if main dies without reaching abort_streaming_producers,
     # interpreter shutdown must not join a producer that may have hours of decode left.
@@ -1074,6 +1095,27 @@ def resize_volume_t_axis_only_gray8_slab(
 
     return out_mm
 
+def _processing_cube_xy_resizer(volume: np.ndarray, out_shape: Tuple[int, int, int]):
+    out_t, out_h, out_w = out_shape
+
+    def resize(z: int) -> np.ndarray:
+        return _resize_gray_slice_nearest_or_linear(volume[z], out_w, out_h, cv2.INTER_LINEAR)
+
+    if volume.shape[0] == out_t or volume.shape[0] >= 2 * out_t or volume.shape[1:] == (out_h, out_w):
+        return resize
+
+    # Consecutive outputs share T taps; keep at most two resized planes per worker.
+    worker = threading.local()
+
+    def resize_on_worker(z: int) -> np.ndarray:
+        cached = getattr(worker, 'resize', None)
+        if cached is None:
+            cached = worker.resize = lru_cache(maxsize=2)(resize)
+        return cached(z)
+
+    return resize_on_worker
+
+
 def resize_volume_to_processing_cube_gray8(
     volume_gray: np.ndarray,
     out_shape: Tuple[int, int, int],
@@ -1118,17 +1160,19 @@ def resize_volume_to_processing_cube_gray8(
     worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
     chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
+    resize_xy = _processing_cube_xy_resizer(volume_gray, (out_t, out_h, out_w))
+
     def _render_target_slice(out_z: int) -> None:
         src_z = _center_aligned_source_position(int(out_z), int(out_t), int(in_t))
         z0 = int(math.floor(src_z))
         z1 = min(in_t - 1, z0 + 1)
         alpha = float(src_z - float(z0))
 
-        f0 = _resize_gray_slice_nearest_or_linear(volume_gray[z0], out_w, out_h, cv2.INTER_LINEAR)
+        f0 = resize_xy(z0)
         if z1 == z0 or alpha <= 1e-7:
             out_mm[int(out_z), :, :] = f0
             return
-        f1 = _resize_gray_slice_nearest_or_linear(volume_gray[z1], out_w, out_h, cv2.INTER_LINEAR)
+        f1 = resize_xy(z1)
         blended = cv2.addWeighted(
             np.ascontiguousarray(f0),
             float(1.0 - alpha),
@@ -1281,6 +1325,8 @@ def resize_volume_to_processing_cube_gray8_streaming(
     worker_count = choose_slice_parallel_workers(int(workers), int(out_t))
     chunk_size = choose_parallel_chunk_size(out_t, worker_count, target_chunks_per_worker=2, min_chunk_size=1)
 
+    resize_xy = _processing_cube_xy_resizer(volume_gray, (out_t, out_h, out_w))
+
     def _render_target_slice(out_z: int) -> None:
         if streaming_producers_aborted():
             raise RuntimeError('streaming cubic resize aborted by pipeline shutdown')
@@ -1289,13 +1335,13 @@ def resize_volume_to_processing_cube_gray8_streaming(
         z1 = min(in_t - 1, z0 + 1)
         alpha = float(src_z - float(z0))
         wait_for_volume_slice_ready(volume_gray, int(z0))
-        f0 = _resize_gray_slice_nearest_or_linear(volume_gray[z0], out_w, out_h, cv2.INTER_LINEAR)
+        f0 = resize_xy(z0)
         if z1 == z0 or alpha <= 1e-7:
             out_mm[int(out_z), :, :] = f0
             readiness.mark_slice_ready(int(out_z))
             return
         wait_for_volume_slice_ready(volume_gray, int(z1))
-        f1 = _resize_gray_slice_nearest_or_linear(volume_gray[z1], out_w, out_h, cv2.INTER_LINEAR)
+        f1 = resize_xy(z1)
         out_mm[int(out_z), :, :] = cv2.addWeighted(np.ascontiguousarray(f0), float(1.0 - alpha), np.ascontiguousarray(f1), float(alpha), 0.0)
         readiness.mark_slice_ready(int(out_z))
 

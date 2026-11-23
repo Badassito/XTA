@@ -399,11 +399,25 @@ class RenderFrameSource:
     # Canonical direct-to-output tile rasters.  These prevent PTA from
     # reintroducing a canvas-crop-resize interpolation layer after TTA's
     # collapsed tile transform.
-    tile_arrays: Dict[str, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    tile_arrays: Dict[str, Tuple[Optional[np.ndarray], np.ndarray]] = field(default_factory=dict)
 
 
 def edge_clamped_view_index(view: ViewInfo, index: int) -> int:
     return max(0, min(int(view.num_slices) - 1, int(index)))
+
+
+class EncodedSliceIndices(tuple):
+    """Immutable sorted integer lattice shared by partial-sequence channel lookups."""
+
+    __slots__ = ()
+
+    def __new__(cls, indices, *, description="Encoded image indices"):
+        if type(indices) is cls:
+            return indices
+        encoded = super().__new__(cls, map(int, indices))
+        if any(encoded[i] >= encoded[i + 1] for i in range(len(encoded) - 1)):
+            raise ValueError(f"{description} must be strictly increasing, got {encoded[:24]}")
+        return encoded
 
 
 def encoded_channel_source_positions(
@@ -418,23 +432,22 @@ def encoded_channel_source_positions(
     index *inside* those bounds must exist exactly; otherwise the center crosses
     a discontinuity and is ineligible.
     """
-    encoded = tuple(int(x) for x in encoded_indices)
+    encoded = EncodedSliceIndices(encoded_indices)
     if not encoded:
         raise ValueError("encoded_channel_source_positions requires at least one encoded index")
-    if any(encoded[i] >= encoded[i + 1] for i in range(len(encoded) - 1)):
-        raise ValueError(f"Encoded image indices must be strictly increasing, got {encoded[:24]}")
     center_pos = int(center_position)
     if center_pos < 0 or center_pos >= len(encoded):
         raise IndexError(f"Center position {center_pos} is outside encoded index mapping of length {len(encoded)}")
     lower = int(encoded[0])
     upper = int(encoded[-1])
     center_encoded = int(encoded[center_pos])
+    contiguous = upper - lower + 1 == len(encoded)
     positions: List[int] = []
     missing: List[int] = []
     for offset in offsets:
         requested = center_encoded + int(offset)
         resolved = lower if requested < lower else (upper if requested > upper else requested)
-        position = bisect_left(encoded, int(resolved))
+        position = resolved - lower if contiguous else bisect_left(encoded, resolved)
         if position >= len(encoded) or int(encoded[position]) != int(resolved):
             missing.append(int(resolved))
         else:
@@ -635,7 +648,10 @@ def render_shared_tile_images(
     )
 
 
-def render_plan_frame_source(*, volume: np.ndarray, mask: np.ndarray, plan: RenderPlan, idx: int, need_canvas: Optional[bool] = None, need_full: bool = True) -> RenderFrameSource:
+def render_plan_frame_source(
+    *, volume: np.ndarray, mask: np.ndarray, plan: RenderPlan, idx: int,
+    need_canvas: Optional[bool] = None, need_full: bool = True, need_image: bool = True,
+) -> RenderFrameSource:
     """Render one center slice and its requested channel context.
 
     Tasks that only feed the full-frame item pass
@@ -653,27 +669,27 @@ def render_plan_frame_source(*, volume: np.ndarray, mask: np.ndarray, plan: Rend
     canvas_required = bool(need_canvas) and len(shared_tiles) != len(plan.tile_layout)
     img_full = img_canvas = mask_full = mask_canvas = None
     if need_full or canvas_required:
-        img_full, img_canvas = render_channel_formatted_images(
-            volume=volume,
-            plan=plan,
-            idx=int(idx),
-            need_canvas=bool(canvas_required),
-        )
+        if need_image:
+            img_full, img_canvas = render_channel_formatted_images(
+                volume=volume,
+                plan=plan,
+                idx=int(idx),
+                need_canvas=bool(canvas_required),
+            )
         mask_full, mask_canvas = render_plan_frame_mask_source(
             mask=mask,
             plan=plan,
             idx=int(idx),
             need_canvas=bool(canvas_required),
         )
-    tile_arrays: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    tile_arrays: Dict[str, Tuple[Optional[np.ndarray], np.ndarray]] = {}
     for tile in shared_tiles:
         assert plan.view.shared_view is not None and tile.shared_job is not None
-        tile_image = render_shared_tile_images(
-            volume=volume,
-            plan=plan,
-            tile=tile,
-            idx=int(idx),
-        )
+        tile_image = None
+        if need_image:
+            tile_image = render_shared_tile_images(volume=volume, plan=plan, tile=tile, idx=int(idx))
+        else:
+            _require_pta_canonical_plan(plan, "categorical_ground_truth", tile=tile)
         tile_mask = shared_geometry.render_categorical_dense_tile_for_job(
             mask,
             plan.view.shared_view,
@@ -681,7 +697,7 @@ def render_plan_frame_source(*, volume: np.ndarray, mask: np.ndarray, plan: Rend
             int(idx),
         )
         tile_arrays[str(tile.tile_tag)] = (
-            np.ascontiguousarray(tile_image, dtype=np.uint8),
+            tile_image,
             np.ascontiguousarray((np.asarray(tile_mask) > 0).astype(np.uint8)),
         )
     return RenderFrameSource(

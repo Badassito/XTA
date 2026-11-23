@@ -55,6 +55,8 @@ def test_archived_crops_match_plain_and_remain_valid_after_append(tmp_path, pack
         actual = np.concatenate([member.reshape(-1) if member is not None else np.zeros(size, np.uint8)
             for size, member in stored.iter_native_sparse_members(0, len(source), member_bytes=91)])
         np.testing.assert_array_equal(actual, source.reshape(-1))
+        stored.close()
+        np.testing.assert_array_equal(first[4], source[3])
         stored.unlink()
         assert path.is_file()
     with contextlib.closing(ip.RawBBoxMaskStore.open(reference)) as reopened:

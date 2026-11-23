@@ -111,9 +111,10 @@ def classify_task(runtime, mask, plans, task, *, identity, coverage=None):
                     rendered, known, ready = result
                     with torch.cuda.stream(owner.stream):
                         owner.stream.wait_event(ready)
-                        decision = rendered if known is None else ((rendered > 0) & (known > 0))
+                        decision = rendered if known is None else rendered.logical_and(known)
                         count = torch.count_nonzero(decision)
-                    pending.append((job, (plan.tag, frame_idx, key, 0), rendered, count))
+                    polygon_mask = None if task.semantic else rendered
+                    pending.append((job, (plan.tag, frame_idx, key, 0), polygon_mask, count))
                     projected_bytes += byte_count
                     stats['gpu_queries'] += 1
             flush()

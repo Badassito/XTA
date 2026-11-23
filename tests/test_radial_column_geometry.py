@@ -1,4 +1,5 @@
 """Exact Radial column-hoisting dispatch, fallback and optional CUDA parity."""
+from contextlib import nullcontext
 from dataclasses import replace
 import os
 from types import SimpleNamespace
@@ -11,12 +12,15 @@ from XTA import cuda_backend as cb
 from tests.test_cylindrical_cuda import resident_engine, shell_views
 
 
+_FAKE_CUPY = SimpleNamespace(asarray=lambda value: value, cuda=SimpleNamespace(Device=nullcontext))
+
+
 class RadialColumnDispatchTests(unittest.TestCase):
     def test_output_stream_is_recorded_before_scalar_or_column_launches(self):
         import torch
         for enabled in (False, True):
             engine = resident_engine(np.zeros((11, 13, 15), np.uint8))
-            engine._stream = object()
+            engine._stream = nullcontext()
             order = []
             output = SimpleNamespace(is_cuda=True,
                 record_stream=lambda stream: order.append(('output_stream', stream)))
@@ -33,7 +37,7 @@ class RadialColumnDispatchTests(unittest.TestCase):
             def sample(grid, block, args, **kwargs):
                 self.assertIs(args[2], output)
                 order.append(('sample', kwargs['stream']))
-            kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda value: value),
+            kernels = SimpleNamespace(cp=_FAKE_CUPY,
                 radial_native_f32=scalar, radial_columns_f64=columns, radial_native_columns_f32=sample)
             with self.subTest(columns=enabled), \
                     mock.patch.object(cb, '_radial_native_kernels', return_value=kernels), \
@@ -65,10 +69,10 @@ class RadialColumnDispatchTests(unittest.TestCase):
             scalar = mock.Mock(side_effect=lambda grid, block, args, **kw: (order.append('scalar'), args[1].zero_()))
             columns = mock.Mock(side_effect=lambda *args, **kw: order.append('columns'))
             sample = mock.Mock(side_effect=lambda grid, block, args, **kw: (order.append('sample'), args[2].zero_()))
-            kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda value: value),
+            kernels = SimpleNamespace(cp=_FAKE_CUPY,
                 radial_native_f32=scalar, radial_columns_f64=columns, radial_native_columns_f32=sample)
             with mock.patch.object(cb, '_radial_native_kernels', return_value=kernels), \
-                    mock.patch.object(cb, '_cupy_external_stream', return_value='render'), \
+                    mock.patch.object(cb, '_cupy_external_stream', return_value=nullcontext()), \
                     mock.patch.object(cb, 'radial_column_geometry_for_shape', return_value=enabled), \
                     mock.patch('builtins.print'):
                 result = engine._render_radial_native_resident_cuda(shell_views()[0], 0)
@@ -86,7 +90,7 @@ class RadialColumnDispatchTests(unittest.TestCase):
         engine = resident_engine(np.zeros((11, 13, 15), np.uint8))
         engine._stream = object()
         scalar = mock.Mock(side_effect=lambda grid, block, args, **kw: args[1].zero_())
-        kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda value: value), radial_native_f32=scalar)
+        kernels = SimpleNamespace(cp=_FAKE_CUPY, radial_native_f32=scalar)
         empty = torch.empty
         attempts = []
         def allocate(shape, **kwargs):
@@ -95,7 +99,7 @@ class RadialColumnDispatchTests(unittest.TestCase):
                 raise torch.OutOfMemoryError('optional column table')
             return empty(shape, **kwargs)
         with mock.patch.object(cb, '_radial_native_kernels', return_value=kernels), \
-                mock.patch.object(cb, '_cupy_external_stream', return_value='render'), \
+                mock.patch.object(cb, '_cupy_external_stream', return_value=nullcontext()), \
                 mock.patch.object(cb, 'radial_column_geometry_for_shape', return_value=True), \
                 mock.patch.object(torch, 'empty', side_effect=allocate), mock.patch('builtins.print'):
             for index in (0, 1):

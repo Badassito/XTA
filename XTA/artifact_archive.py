@@ -18,7 +18,8 @@ import time
 import uuid
 
 from .env_flags import env_flag
-from .run_transport import _api_path, _canonical_path, _plain_ancestors, _safe_relative, _stamp
+from .file_hashing import sha256_file
+from .run_transport import _api_path, _canonical_path, _plain_ancestors, _publish_fresh, _safe_relative, _stamp
 
 SCHEMA = "xta.artifact-archive/1"
 _BLOCK = 512
@@ -26,9 +27,12 @@ _CHUNK = 1024 * 1024
 _MAX_COMMIT = 64 * 1024**2
 # A reader may index without the companion lock when it cannot open it for these.
 _UNWRITABLE_LOCK_ERRNOS = frozenset({errno.EROFS, errno.EACCES, errno.EPERM})
+_UNSUPPORTED_DIRECTORY_SYNC_ERRNOS = frozenset({errno.EINVAL, errno.EBADF, errno.ENOTSUP, errno.EOPNOTSUPP})
 _LOCKS = {}
 _ARCHIVE_INDEX_CACHE = {}
 _APPEND_SNAPSHOTS = {}
+_STAGED_ARCHIVES = {}
+_STAGED_RESERVATION_HANDLES = set()
 _GUARD = threading.Lock()
 _READERS_CHANGED = threading.Condition(_GUARD)
 # Reader handles: one shared read-only descriptor per (thread, archive), positional
@@ -46,8 +50,16 @@ class ArchiveError(ValueError):
 
 def _after_fork():
     global _LOCKS, _ARCHIVE_INDEX_CACHE, _APPEND_SNAPSHOTS, _GUARD, _READERS_CHANGED
-    global _THREAD_HANDLES, _STATS_GUARD
+    global _THREAD_HANDLES, _STATS_GUARD, _STAGED_ARCHIVES, _STAGED_RESERVATION_HANDLES
+    for handle in _STAGED_RESERVATION_HANDLES:
+        # Closing the child's copy leaves the parent's flock in place.
+        try:
+            handle.close()
+        except OSError:
+            pass
+    _STAGED_RESERVATION_HANDLES = set()
     _LOCKS, _ARCHIVE_INDEX_CACHE, _APPEND_SNAPSHOTS, _GUARD = {}, {}, {}, threading.Lock()
+    _STAGED_ARCHIVES = {}
     _READERS_CHANGED = threading.Condition(_GUARD)
     # Inherited descriptors belong to the parent's threads; never reuse them.
     _THREAD_HANDLES, _STATS_GUARD = threading.local(), threading.Lock()
@@ -74,6 +86,30 @@ def archive_read_stats():
 
 def _lock_free_reads_enabled():
     return env_flag('YOLO_TTA_ARCHIVE_LOCK_FREE_READS', True)
+
+
+def _path_key(path):
+    return str(path).casefold() if os.name == "nt" else str(path)
+
+
+def _archive_backing(path):
+    direct = _STAGED_ARCHIVES.get(str(path))
+    if direct is not None:
+        return direct
+    if os.name == "nt" and _STAGED_ARCHIVES:
+        with _GUARD:
+            candidates = tuple(_STAGED_ARCHIVES.items())
+        for destination, backing in candidates:
+            if _path_key(destination) != _path_key(path):
+                continue
+            # A case-sensitive Windows directory can have two distinct files.
+            # The public lock exists even while the public archive is staged.
+            try:
+                if os.path.samefile(_api_path(Path(destination + ".lock")), _api_path(Path(str(path) + ".lock"))):
+                    return backing
+            except FileNotFoundError:
+                pass
+    return path
 
 
 class _SharedDescriptor:
@@ -138,7 +174,7 @@ def _fast_stream(path, cached_stamp):
         handles = getattr(_THREAD_HANDLES, 'handles', None)
         if handles is None:
             handles = _THREAD_HANDLES.handles = {}
-        key = str(path)
+        key = _path_key(path)
         shared = handles.get(key)
         if shared is None:
             try:
@@ -187,7 +223,7 @@ def _fast_index(path):
     """
     if not _lock_free_reads_enabled():
         return None
-    cached = _ARCHIVE_INDEX_CACHE.get(str(path))
+    cached = _ARCHIVE_INDEX_CACHE.get(_path_key(path))
     if cached is None:
         return None
     stream = _fast_stream(path, cached[0])
@@ -231,21 +267,29 @@ def _json(value):
 
 def _lock_for(path):
     with _GUARD:
-        return _LOCKS.setdefault(str(path).casefold() if os.name == "nt" else str(path), threading.RLock())
+        return _LOCKS.setdefault(_path_key(path), threading.RLock())
 
 
 @contextmanager
-def _writer_lock(path, *, reader=False):
+def _writer_lock(path, *, reader=False, record_stats=True):
     lock_path = Path(str(path) + ".lock")
     _plain_ancestors(lock_path)
     if os.path.exists(_api_path(lock_path)) and not stat.S_ISREG(os.stat(_api_path(lock_path)).st_mode):
         raise ArchiveError("Artifact lock must be a regular file")
     requested = time.perf_counter()
+    owner_pid = os.getpid()
     acquired_at = None
+    shared_reader = reader and os.name != "nt"
     try:
         with _lock_for(path):
             try:
-                handle = open(_api_path(lock_path), "a+b")
+                if shared_reader:
+                    try:
+                        handle = open(_api_path(lock_path), "rb")
+                    except FileNotFoundError:
+                        handle = open(_api_path(lock_path), "a+b")
+                else:
+                    handle = open(_api_path(lock_path), "a+b")
             except OSError as error:
                 # A reader that cannot open the companion lock (read-only media,
                 # another owner's permissions) indexes committed members without
@@ -263,11 +307,11 @@ def _writer_lock(path, *, reader=False):
                 yield
                 return
             with handle:
-                if os.fstat(handle.fileno()).st_size == 0:
-                    handle.write(b"\0")
-                    handle.flush()
                 if os.name == "nt":
                     import msvcrt
+                    if os.fstat(handle.fileno()).st_size == 0:
+                        handle.write(b"\0")
+                        handle.flush()
                     while True:
                         handle.seek(0)
                         try:
@@ -279,18 +323,19 @@ def _writer_lock(path, *, reader=False):
                             time.sleep(.02)
                 else:
                     import fcntl
-                    fcntl.flock(handle, fcntl.LOCK_EX)
+                    fcntl.flock(handle, fcntl.LOCK_SH if shared_reader else fcntl.LOCK_EX)
                 acquired_at = time.perf_counter()
                 try:
-                    yield
+                    yield handle
                 finally:
-                    if os.name == "nt":
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        fcntl.flock(handle, fcntl.LOCK_UN)
+                    if os.getpid() == owner_pid:
+                        if os.name == "nt":
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            fcntl.flock(handle, fcntl.LOCK_UN)
     finally:
-        if acquired_at is not None:
+        if acquired_at is not None and record_stats and os.getpid() == owner_pid:
             _count(writer_lock_acquisitions=1, writer_lock_wait_seconds=acquired_at-requested,
                    writer_lock_hold_seconds=time.perf_counter()-acquired_at)
         with _READERS_CHANGED:
@@ -303,17 +348,20 @@ def _reader_lock(path, snapshot_result):
     lock, result, acquired = _lock_for(path), None, False
     waited = time.perf_counter()
     try:
-        with _READERS_CHANGED:
-            while True:
-                snapshot = _APPEND_SNAPSHOTS.get(str(path))
-                if snapshot is not None:
-                    result = snapshot_result(snapshot)
-                    if result is not None:
+        key, snapshot = _path_key(path), None
+        while True:
+            with _READERS_CHANGED:
+                current = _APPEND_SNAPSHOTS.get(key)
+                if current is None or current is snapshot:
+                    acquired = lock.acquire(blocking=False)
+                    if acquired:
                         break
-                acquired = lock.acquire(blocking=False)
-                if acquired:
-                    break
-                _READERS_CHANGED.wait()
+                    _READERS_CHANGED.wait()
+                    continue
+                snapshot = current
+            result = snapshot_result(snapshot)
+            if result is not None:
+                break
         if result is not None:
             _count(snapshot_reads=1, reader_lock_wait_seconds=time.perf_counter()-waited)
             yield result
@@ -374,6 +422,8 @@ def _scan(stream):
                 raise ArchiveError("Corrupt artifact TAR metadata") from error
             if item is None:
                 break
+            # The scan uses offsets directly and needs no historical TarInfo objects.
+            archive.members.clear()
             if item.offset_data + item.size > size:
                 break
             if not item.isfile() or item.size < 0:
@@ -433,11 +483,12 @@ def _index(path, stream=None):
         stream = open(_api_path(path), "rb")
     try:
         signature = _stamp(os.fstat(stream.fileno()))
-        cached = _ARCHIVE_INDEX_CACHE.get(str(path))
+        key = _path_key(path)
+        cached = _ARCHIVE_INDEX_CACHE.get(key)
         if cached is not None and cached[0] == signature:
             return cached[1], cached[2]
         entries, end = _scan(stream)
-        _ARCHIVE_INDEX_CACHE[str(path)] = signature, entries, end
+        _ARCHIVE_INDEX_CACHE[key] = signature, entries, end
         return entries, end
     finally:
         if owned:
@@ -480,8 +531,10 @@ def _write_member(stream, name, source):
 
 def append_members(archive, members, *, replace=False, fresh_prefix=None):
     """Durably publish bytes/source files as one transaction, preserving originals."""
-    path = _canonical_path(archive)
-    reference(path)
+    destination = _canonical_path(archive)
+    path = _archive_backing(destination)
+    key = _path_key(path)
+    reference(destination)
     if type(replace) is not bool or not members:
         raise ArchiveError("Artifact append requires members and a boolean replace flag")
     normalized = {}
@@ -489,7 +542,8 @@ def append_members(archive, members, *, replace=False, fresh_prefix=None):
         logical = _name(name)
         if logical in normalized:
             raise ArchiveError("Duplicate artifact logical name")
-        if not isinstance(source, bytes) and _canonical_path(source) in (path, Path(str(path) + ".lock")):
+        if not isinstance(source, bytes) and _canonical_path(source) in (
+                destination, Path(str(destination) + ".lock"), path, Path(str(path) + ".lock")):
             raise ArchiveError("Artifact archive cannot append itself or its lock")
         normalized[logical] = source
     _plain_ancestors(path)
@@ -501,18 +555,22 @@ def append_members(archive, members, *, replace=False, fresh_prefix=None):
         mode = "x+b" if created else "r+b"
         with open(_api_path(path), mode) as stream:
             entries, end = _index(path, stream)
-            if fresh_prefix is not None:
-                prefix = _name(fresh_prefix)
-                if any(name == prefix or name.startswith(prefix + "/") for name in entries):
-                    raise FileExistsError(reference(path, prefix))
-            if not replace and set(normalized).intersection(entries):
+            prefix = _name(fresh_prefix) if fresh_prefix is not None else None
+            subtree = prefix + "/" if prefix is not None else None
+            if prefix is not None and _member_prefix_exists(entries, prefix):
+                raise FileExistsError(reference(destination, prefix))
+            if not replace and any(name in entries for name in normalized):
                 raise ArchiveError("Refusing to replace a committed artifact")
-            all_names = set(entries).union(normalized)
             for name in normalized:
                 parts = name.split("/")
-                if any("/".join(parts[:stop]) in all_names for stop in range(1, len(parts))):
-                    raise ArchiveError("Artifact file/directory names conflict")
-                if any(other.startswith(name + "/") for other in all_names):
+                for stop in range(1, len(parts)):
+                    parent = "/".join(parts[:stop])
+                    if parent in entries or parent in normalized:
+                        raise ArchiveError("Artifact file/directory names conflict")
+                if subtree is not None and (name == prefix or name.startswith(subtree)):
+                    continue
+                child_prefix = name + "/"
+                if any(other.startswith(child_prefix) for other in entries):
                     raise ArchiveError("Artifact file/directory names conflict")
             transaction = uuid.uuid4().hex
             stream.seek(end)
@@ -525,8 +583,9 @@ def append_members(archive, members, *, replace=False, fresh_prefix=None):
             stream.seek(end)
             try:
                 # Only this exclusive writer may lend its verified immutable prefix.
+                snapshot = (_stamp(os.fstat(stream.fileno()))[:2], entries, end, str(path))
                 with _READERS_CHANGED:
-                    _APPEND_SNAPSHOTS[str(path)] = (_stamp(os.fstat(stream.fileno()))[:2], entries, end)
+                    _APPEND_SNAPSHOTS[key] = snapshot
                     _READERS_CHANGED.notify_all()
                 published = {}
                 for name, source in normalized.items():
@@ -550,6 +609,9 @@ def append_members(archive, members, *, replace=False, fresh_prefix=None):
                     directory_fd = os.open(_api_path(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
                     try:
                         os.fsync(directory_fd)
+                    except OSError as error:
+                        if error.errno not in _UNSUPPORTED_DIRECTORY_SYNC_ERRNOS:
+                            raise
                     finally:
                         os.close(directory_fd)
             except BaseException:
@@ -557,40 +619,45 @@ def append_members(archive, members, *, replace=False, fresh_prefix=None):
                 stream.write(b"\0" * (2 * _BLOCK))
                 stream.flush()
                 os.fsync(stream.fileno())
-                _ARCHIVE_INDEX_CACHE.pop(str(path), None)
+                _ARCHIVE_INDEX_CACHE.pop(key, None)
                 raise
             finally:
                 with _GUARD:
-                    _APPEND_SNAPSHOTS.pop(str(path), None)
+                    _APPEND_SNAPSHOTS.pop(key, None)
             updated = {**entries, **published}
-            _ARCHIVE_INDEX_CACHE[str(path)] = _stamp(os.fstat(stream.fileno())), updated, committed_end
+            _ARCHIVE_INDEX_CACHE[key] = _stamp(os.fstat(stream.fileno())), updated, committed_end
     return transaction
 
 
 def _open_append_prefix(path, snapshot):
-    """Called under _GUARD; lend a descriptor only for this writer's old prefix."""
-    identity, _entries, end = snapshot
-    stream = None
+    """Lend a descriptor only for the file with this verified prefix."""
+    identity, _entries, end, writer_path = snapshot
+    _plain_ancestors(path)
+    stream = open(_api_path(path), "rb")
     try:
-        _plain_ancestors(path)
-        stream = open(_api_path(path), "rb")
         info = os.fstat(stream.fileno())
-        if (not stat.S_ISREG(info.st_mode) or _stamp(info)[:2] != identity
-                or info.st_size < end):
-            raise ArchiveError("Artifact committed prefix changed during append")
-        return stream
-    except BaseException:
-        _APPEND_SNAPSHOTS.pop(str(path), None)
+        if stat.S_ISREG(info.st_mode) and _stamp(info)[:2] == identity and info.st_size >= end:
+            result, stream = stream, None
+            return result
+        # A shared Windows key can also describe two distinct files.
+        if writer_path == str(path):
+            key = _path_key(path)
+            with _GUARD:
+                if _APPEND_SNAPSHOTS.get(key) is snapshot:
+                    _APPEND_SNAPSHOTS.pop(key)
+                    raise ArchiveError("Artifact committed prefix changed during append")
+        return None
+    finally:
         if stream is not None:
             stream.close()
-        raise
 
 
 def _entry(value, *, open_payload=False):
     parsed = split_reference(value)
     if parsed is None or not parsed[1]:
         raise ArchiveError("Expected an artifact archive member reference")
-    path, name = parsed
+    destination, name = parsed
+    path = _archive_backing(destination)
     fast = _fast_index(path)
     if fast is not None:
         (_stamp_value, entries, _end), stream = fast
@@ -604,6 +671,8 @@ def _entry(value, *, open_payload=False):
     def lookup(snapshot):
         if name in snapshot[1]:
             stream = _open_append_prefix(path, snapshot)
+            if stream is None:
+                return None
             try:
                 entry = dict(snapshot[1][name])
                 if open_payload:
@@ -635,30 +704,48 @@ def member_exists(value):
         return False
 
 
-def list_members(archive, prefix=""):
-    path = _canonical_path(archive)
+def _lookup_inventory(archive, prefix, select):
+    path = _archive_backing(_canonical_path(archive))
     prefix = _name(prefix.rstrip("/\\")) if prefix else ""
-    # Like the append snapshot: only an existing, non-empty prefix may answer
-    # without waiting; full inventories and missing prefixes still wait.
+    # Only a present prefix can use the unlocked or append-snapshot paths.
     fast = _fast_index(path) if prefix else None
     if fast is not None:
         (_stamp_value, entries, _end), stream = fast
         stream.close()
-        names = sorted(name for name in entries if name == prefix or name.startswith(prefix + "/"))
-        if names:
+        result = select(entries, prefix)
+        if result:
             _count(fast_reads=1)
-            return names
+            return result
+
     def lookup(snapshot):
         if prefix:
-            names = sorted(name for name in snapshot[1] if name == prefix or name.startswith(prefix + "/"))
-            if names:
-                with _open_append_prefix(path, snapshot):
-                    return names
+            result = select(snapshot[1], prefix)
+            if result:
+                stream = _open_append_prefix(path, snapshot)
+                if stream is not None:
+                    stream.close()
+                    return result
+
     with _reader_lock(path, lookup) as result:
         if result is not None:
             return result
         entries, _ = _index(path)
-        return sorted(name for name in entries if not prefix or name == prefix or name.startswith(prefix + "/"))
+        return select(entries, prefix)
+
+
+def _member_prefix_exists(entries, prefix):
+    if not prefix:
+        return bool(entries)
+    subtree = prefix + "/"
+    return prefix in entries or any(name.startswith(subtree) for name in entries)
+
+
+def list_members(archive, prefix=""):
+    def names(entries, logical):
+        subtree = logical + "/"
+        return sorted(name for name in entries if not logical or name == logical or name.startswith(subtree))
+
+    return _lookup_inventory(archive, prefix, names)
 
 
 class _MemberReader(io.RawIOBase):
@@ -731,6 +818,16 @@ def open_artifact(value):
     return open_member(value) if split_reference(value) is not None else Path(value).open("rb")
 
 
+def artifact_sha256(value):
+    """Hash a local file or verify and return an archived member's SHA-256."""
+    if split_reference(value) is None:
+        return sha256_file(value)
+    with open_member(value) as stream:
+        while stream.read(_CHUNK):
+            pass
+        return stream._entry["sha256"]
+
+
 def read_artifact(value, *, max_bytes=None):
     with open_artifact(value) as stream:
         if max_bytes is not None:
@@ -749,7 +846,7 @@ def artifact_exists(value):
     if parsed is None:
         return Path(value).exists()
     try:
-        return bool(list_members(parsed[0], parsed[1]))
+        return _lookup_inventory(*parsed, _member_prefix_exists)
     except FileNotFoundError:
         return False
 
@@ -783,7 +880,159 @@ def write_artifact(value, data, *, replace=True):
 
 def physical_path(value):
     parsed = split_reference(value)
-    return parsed[0] if parsed is not None else Path(value)
+    return _archive_backing(parsed[0]) if parsed is not None else Path(value)
+
+
+def artifact_stage_parent(value):
+    """Use the active archive's scratch disk for private member builders."""
+    archive, _ = split_reference(value)
+    backing = _archive_backing(archive)
+    return _api_path(backing.parent) if backing != archive else None
+
+
+class StagedArtifactArchive:
+    """Build a fresh public archive on scratch until its producers have settled."""
+
+    @classmethod
+    def reserve(cls, destination, scratch_root):
+        destination = _canonical_path(destination)
+        reference(destination)
+        _plain_ancestors(destination)
+        if os.path.lexists(_api_path(destination)):
+            return None  # Existing archives keep their live append behavior.
+        scratch_root = _canonical_path(scratch_root)
+        _plain_ancestors(scratch_root)
+        with _GUARD:
+            if any(_path_key(path) == _path_key(destination) for path in _STAGED_ARCHIVES):
+                raise ArchiveError(f"Artifact archive already staged: {destination}")
+        reservation = _writer_lock(destination, record_stats=False)
+        handle = reservation.__enter__()
+        try:
+            if not os.path.lexists(_api_path(destination)):
+                return cls(destination, scratch_root, reservation, handle)
+        except BaseException:
+            reservation.__exit__(None, None, None)
+            raise
+        reservation.__exit__(None, None, None)
+        return None
+
+    def __init__(self, destination, scratch_root, reservation, handle):
+        self.destination = destination
+        self._reservation = reservation
+        self._handle = handle
+        self._owner_pid = os.getpid()
+        self._publication_started = False
+        self._key = str(destination)
+        directory = tempfile.mkdtemp(prefix=".xta-sam-archive-", dir=_api_path(scratch_root))
+        self.path = _canonical_path(Path(directory) / destination.name)
+        with _GUARD:
+            _STAGED_ARCHIVES[self._key] = self.path
+            _STAGED_RESERVATION_HANDLES.add(handle)
+
+    def publish(self):
+        """Commit only the settled prefix. The final name is reserved by this owner."""
+        if self._reservation is None:
+            return
+        if self._owner_pid != os.getpid():
+            raise ArchiveError("Only the owning process can publish its staged archive")
+        self._publication_started = True
+        with _writer_lock(self.path, record_stats=False):
+            if os.path.lexists(_api_path(self.path)):
+                _publish_staged_archive(self.path, self.destination)
+        self._release()
+
+    def _release(self):
+        backing_key = _path_key(self.path)
+        handles = getattr(_THREAD_HANDLES, 'handles', None)
+        if handles is not None:
+            handles.pop(backing_key, None)
+        with _GUARD:
+            _STAGED_ARCHIVES.pop(self._key, None)
+            _ARCHIVE_INDEX_CACHE.pop(backing_key, None)
+            _STAGED_RESERVATION_HANDLES.discard(self._handle)
+        reservation, self._reservation = self._reservation, None
+        reservation.__exit__(None, None, None)
+        lock_path = Path(str(self.path) + ".lock")
+        try:
+            os.unlink(_api_path(lock_path))
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(_api_path(self.path.parent))
+        except OSError as error:
+            if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                raise
+
+    def close(self):
+        if self._reservation is None or self._owner_pid != os.getpid():
+            return
+        try:
+            if not self._publication_started:
+                self.publish()
+        finally:
+            if self._reservation is not None:
+                self._release()
+                print(f"SAM archive transfer failed. Recovery archive preserved at {self.path}.", flush=True)
+
+
+def _publish_staged_archive(source, destination):
+    from .json_publication import _fsync_parent_directory
+
+    _plain_ancestors(source)
+    _plain_ancestors(destination)
+    if os.path.lexists(_api_path(destination)):
+        raise FileExistsError(destination)
+    entries, end = _index(source)
+    if not entries:
+        return
+    with open(_api_path(source), "rb") as stream:
+        initial = os.fstat(stream.fileno())
+        captured = _stamp(initial)
+        stream.seek(end)
+        footer = b"\0" * (2 * _BLOCK)
+        clean = stream.read(len(footer)) == footer and captured[2] == end + len(footer)
+    if clean:
+        try:
+            if os.name == "nt":
+                _publish_fresh(source, destination)
+            else:
+                os.link(_api_path(source), _api_path(destination))
+        except OSError as error:
+            if error.errno != errno.EXDEV and getattr(error, "winerror", None) != 17:
+                raise
+        else:
+            _fsync_parent_directory(destination.parent)
+            if os.name != "nt":
+                os.unlink(_api_path(source))
+            return
+
+    descriptor, temporary = tempfile.mkstemp(
+        prefix="." + destination.name + ".", suffix=".assembling", dir=_api_path(destination.parent),
+    )
+    stage = _canonical_path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as output, open(_api_path(source), "rb") as stream:
+            if _stamp(os.fstat(stream.fileno())) != captured:
+                raise ArchiveError("Staged artifact archive changed before publication")
+            remaining = end
+            while remaining:
+                chunk = stream.read(min(remaining, 16 * _CHUNK))
+                if not chunk:
+                    raise ArchiveError("Staged artifact archive shortened during publication")
+                output.write(chunk)
+                remaining -= len(chunk)
+            output.write(footer)
+            if (_stamp(os.fstat(stream.fileno())) != captured
+                    or _stamp(os.stat(_api_path(source))) != captured):
+                raise ArchiveError("Staged artifact archive changed during publication")
+            os.chmod(_api_path(stage), stat.S_IMODE(initial.st_mode))
+            output.flush()
+            os.fsync(output.fileno())
+        _publish_fresh(stage, destination)
+        _fsync_parent_directory(destination.parent)
+        os.unlink(_api_path(source))
+    finally:
+        stage.unlink(missing_ok=True)
 
 
 def publish_directory(staging, destination):
@@ -816,7 +1065,8 @@ def artifact_directory(destination, *, temp_root=None):
         return
     if artifact_exists(destination):
         raise FileExistsError(str(destination))
-    parent = _canonical_path(temp_root if temp_root is not None else tempfile.gettempdir())
+    parent = _canonical_path(temp_root if temp_root is not None else
+                             artifact_stage_parent(destination) or tempfile.gettempdir())
     _plain_ancestors(parent)
     os.makedirs(_api_path(parent), exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".artifact-stage-", dir=_api_path(parent)))

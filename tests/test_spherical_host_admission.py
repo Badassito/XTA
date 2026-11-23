@@ -210,6 +210,7 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
             nrrd_layers_needed=False, component_layers_needed=False,
             baseline_union_by_model_view={},
             baseline_confmap_by_model_view={}, baseline_slice_locks_by_model_view={},
+            view_slice_meta={},
             baseline_union_paths=self.state.baseline_union_paths,
             baseline_confmap_paths=self.state.baseline_confmap_paths,
             direct_union_backing_leases=self.state.direct_union_backing_leases,

@@ -4,8 +4,9 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
+import pytest
 
-from XTA.workers import _OpenVinoCpuSegmenter
+from XTA.workers import ModelInputChannelMismatchError, _OpenVinoCpuSegmenter
 
 
 def _runner(batch: int, channels: int, layout: str, element_type: str):
@@ -74,6 +75,77 @@ class OpenVinoInputPreparationTests(unittest.TestCase):
             ])
         with self.assertRaisesRegex(ValueError, 'need at least one array to stack'):
             _runner(0, 1, 'NCHW', 'f32')._prepare_input([])
+
+
+@pytest.mark.parametrize(('layout', 'shape'), [('NCHW', [-1, 3, -1, -1]), ('NHWC', [-1, -1, -1, 3])])
+def test_dynamic_spatial_input_preserves_known_channel_axis(tmp_path, layout, shape):
+    ov = pytest.importorskip('openvino')
+    from openvino import opset13 as ops
+
+    image = ops.parameter(shape, np.float32, name='images')
+    path = tmp_path / 'model.xml'
+    ov.save_model(ov.Model([ops.relu(image)], [image]), path)
+
+    def load(channels):
+        return _OpenVinoCpuSegmenter(
+            str(path), imgsz=8, batch=1, input_channels=channels, requested_precision='fp32',
+            inference_threads=1, physical_cores=1, streams=1, infer_requests=1,
+        )
+
+    with pytest.raises(ModelInputChannelMismatchError, match='--channel_format C=1'):
+        load(1)
+    assert load(3).input_layout == layout
+
+
+@pytest.mark.parametrize(('declared', 'shape', 'layout'), [
+    ('NHWC', [1, -1, -1, -1], 'NHWC'),
+    ('[N,...,C]', [1, 3, -1, -1], 'NHWC'),
+    ('[N,H,W,?]', [1, 3, -1, -1], 'NHWC'),
+    (None, [1, -1, -1, -1], 'NCHW'),
+    (None, [-1, -1, -1, -1], 'NCHW'),
+])
+def test_input_layout_precedes_shape_hints_when_declared(tmp_path, declared, shape, layout):
+    ov = pytest.importorskip('openvino')
+    from openvino import opset13 as ops
+
+    image = ops.parameter(shape, np.float32, name='images')
+    if declared is not None:
+        image.set_layout(ov.Layout(declared))
+    path = tmp_path / 'model.xml'
+    ov.save_model(ov.Model([ops.relu(image)], [image]), path)
+
+    runner = _OpenVinoCpuSegmenter(
+        str(path), imgsz=3, batch=1, input_channels=3, requested_precision='fp32',
+        inference_threads=1, physical_cores=1, streams=1, infer_requests=1,
+    )
+    assert runner.input_layout == layout
+    rgb = np.arange(27, dtype=np.uint8).reshape(3, 3, 3)
+    expected = rgb.astype(np.float32) / 255
+    if layout == 'NCHW':
+        expected = expected.transpose(2, 0, 1)
+    np.testing.assert_array_equal(runner._prepare_input([rgb])[0], expected)
+
+
+@pytest.mark.parametrize(('layout', 'shape', 'error'), [
+    (None, [1, 3, 16, -1], RuntimeError),
+    ('NCHW', [1, 3, 16, -1], RuntimeError),
+    ('NHWC', [1, -1, 16, 3], RuntimeError),
+    ('NHWC', [1, 3, -1, 16], ModelInputChannelMismatchError),
+])
+def test_partial_shape_cannot_overwrite_static_image_dimensions(tmp_path, layout, shape, error):
+    ov = pytest.importorskip('openvino')
+    from openvino import opset13 as ops
+
+    image = ops.parameter(shape, np.float32, name='images')
+    if layout is not None:
+        image.set_layout(ov.Layout(layout))
+    path = tmp_path / 'model.xml'
+    ov.save_model(ov.Model([ops.relu(image)], [image]), path)
+    with pytest.raises(error, match='static dimensions|--channel_format'):
+        _OpenVinoCpuSegmenter(
+            str(path), imgsz=8, batch=1, input_channels=3, requested_precision='fp32',
+            inference_threads=1, physical_cores=1, streams=1, infer_requests=1,
+        )
 
 
 if __name__ == '__main__':

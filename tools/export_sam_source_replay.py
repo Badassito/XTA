@@ -28,6 +28,9 @@ from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter, INTERNAL_PACKED
 from XTA.sam_evidence import SamEvidenceBundle, iter_selected_native_crops, native_output_shape_tyx
 from XTA.artifact_archive import read_artifact
 from XTA.file_hashing import source_sha256
+from XTA.reconciliation_io import write_seg_nrrd
+from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, locate_run_layer_catalog, run_layer_catalogs
+from tools.nrrd_reference_grid import open_manifest_layers
 
 
 def file_sha256(path):
@@ -122,7 +125,7 @@ def write_native_direction(crops, destination, shape, *, memory_bytes):
 
 def reference_scope(reference_run, bundle):
     reference_run = Path(reference_run)
-    manifest_path = next((reference_run/'nrrd').glob('*_nrrd_manifest.json'))
+    manifest_path = locate_run_layer_catalog(reference_run/'manifest.json')
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     matches = [layer for layer in manifest['layers'] if layer.get('interpolation_backend') == 'sam'
         and layer['view_name'] == bundle.scope['view_name'] and layer['source'] == 'fullframe']
@@ -149,16 +152,34 @@ def reference_scope(reference_run, bundle):
     return manifest_path, manifest, layer, detector, view, source_shape
 
 
-def append_reference_detector(manifest_path, source_dir, detector):
+def append_reference_detector(manifest_path, source_catalog, detector, *, memory_mib):
     manifest_path = Path(manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-    source = Path(source_dir)/detector['filename']
+    row = dict(detector, replay_reference=True)
+    source = source_catalog.parent/detector['filename']
     destination = manifest_path.parent/detector['filename']
-    shutil.copy2(source, destination)
-    manifest['layers'].insert(0, dict(detector, replay_reference=True))
+    if json.loads(source_catalog.read_bytes()).get('layout') == GROUPED_CATALOG_LAYOUT:
+        with open_manifest_layers(source_catalog, filenames=[detector['filename']],
+                                  memory_mib=memory_mib, workspace=destination.parent) as collection:
+            layer = collection[0]
+            segment = collection.grouped_catalog.segment(detector['filename'])
+            stored = write_seg_nrrd(
+                destination, shape_tyx=collection.shape_tyx, geometry=collection.geometry,
+                read_slab=layer.read_slab, memory_mib=memory_mib,
+                segment_name=detector.get('segment_name') or layer.header['Segment0_Name'],
+                color_rgb=tuple(float(v) for v in layer.header['Segment0_Color'].split()),
+            )
+            source = segment.path
+        row.update(stored_shape_tyx=stored['stored_shape_tyx'], stored_offset_tyx=[0, 0, 0],
+                   stored_layout='full_reference', empty_segment=stored['empty_segment'])
+        provenance = {'source_segment_id': segment.segment_id, 'source_group_sha256': segment.sha256}
+    else:
+        shutil.copy2(source, destination)
+        provenance = {}
+    manifest['layers'].insert(0, row)
     manifest['layer_count'] = len(manifest['layers'])
     manifest_path.write_text(json.dumps(manifest, indent=2)+'\n', encoding='utf-8')
-    return {'source':str(source.resolve()), 'sha256':file_sha256(destination)}
+    return {'source':str(source.resolve()), 'sha256':file_sha256(destination), **provenance}
 
 
 def annotate_replay_manifest(path, provenance, selection_copy):
@@ -257,10 +278,11 @@ def export_source_replay(evidence, selection_path, reference_run, output, *, dow
             exported_manifest = sink.write_manifest()
             sink.shutdown()
             sink = None
-        detector_receipts = [append_reference_detector(exported_manifest, manifest_path.parent, detector)]
+        detector_receipts = [append_reference_detector(exported_manifest, manifest_path, detector, memory_mib=memory_mib)]
         annotate_replay_manifest(exported_manifest, provenance, staging/'selection.json')
+        reference_catalogs = run_layer_catalogs(Path(reference_run)/'manifest.json')
         for spec in specs:
-            candidates = list((Path(reference_run)/'low_quality').glob('*/nrrd/*_nrrd_manifest.json'))
+            candidates = [path for grid, path in reference_catalogs.items() if grid.startswith('low_quality/')]
             match = next((path for path in candidates if tuple(json.loads(path.read_text(encoding='utf-8'))['output_shape_tyx']) == tuple(spec.output_shape_t_y_x)), None)
             if match is None:
                 raise ValueError('Reference run lacks the requested low-quality detector geometry')
@@ -269,7 +291,7 @@ def export_source_replay(evidence, selection_path, reference_run, output, *, dow
             low_detector = dict(low_detector, downbin_value=str(spec.raw_value), downbin_token=str(spec.token),
                 downbin_scale=float(spec.scale))
             target = staging/'low_quality'/spec.token/'nrrd'/exported_manifest.name
-            detector_receipts.append(append_reference_detector(target, match.parent, low_detector))
+            detector_receipts.append(append_reference_detector(target, match, low_detector, memory_mib=memory_mib))
             annotate_replay_manifest(target, provenance, staging/'selection.json')
         result = dict(schema='xta.sam_source_replay/1', complete=True, coordinate_space='source_grid',
             evidence_directory=str(bundle.directory.resolve()), evidence_fingerprint=bundle.evidence_fingerprint,

@@ -137,7 +137,8 @@ class LtaWorkerAdapterTests(unittest.TestCase):
             spy.mark_observed.side_effect = observe
             def propagate(_measured, _raw, *, request, prediction_callback, **kwargs):
                 for frame in (1, 2):
-                    mask = seed.mask if frame == 1 else np.zeros((4, 4), dtype=bool)
+                    mask = (np.asfortranarray(seed.mask, dtype=np.uint8) if frame == 1
+                            else np.zeros((4, 4), dtype=bool))
                     prediction_callback(LtaObjectPrediction(seed.lineage, SamFramePrediction(
                         request.session.sequence_id, request.session.session_index, frame, 0, 1.0, mask, 0.9,
                     ), 0, LtaSeedProvenance.AUTHORITATIVE))
@@ -162,6 +163,11 @@ class LtaWorkerAdapterTests(unittest.TestCase):
             self.assertEqual(coverage["tile_shape_hw"], [4, 4])
             self.assertEqual(coverage["lineage_count"], 1)
             self.assertEqual(coverage["mask_count"], 1)
+            self.assertEqual(manifest["lineage_active_frame_ranges"], {seed.lineage.token: [[1, 2]]})
+            expected = np.zeros((3, 4, 4), dtype=np.uint8)
+            expected[0] = seed.mask
+            np.testing.assert_array_equal(read_union_array(manifest["union"]), expected)
+            self.assertEqual(Path(manifest["union"]["path"]).read_bytes(), b"\x01")
             with LtaCoverageLedger(root / "coverage.sqlite", frame_count=4) as ledger:
                 ledger.ingest(coverage, expected_work_id="coverage-task", tile_index=0,
                               tile_config_id="s4_st4", frame_start=1, frame_stop=3,

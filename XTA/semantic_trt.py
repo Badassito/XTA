@@ -111,12 +111,7 @@ class SemanticTrtRingExecutor:
             for _ in range(2)
         ]
         self.direct = slots is not None
-        if len(self.slots) != 2 or any(
-            tuple(int(x) for x in slot.input.shape) != plan.input_shape
-            or slot.input.dtype != self.input_dtype
-            for slot in self.slots
-        ):
-            raise ValueError('Semantic TensorRT slots do not match the fixed input binding')
+        self._validate_slots(self.slots)
         contexts = [engine.create_execution_context() for _ in range(2)]
         if any(context is None for context in contexts) or contexts[0] is contexts[1]:
             raise ValueError('TensorRT could not create two independent semantic contexts')
@@ -140,6 +135,35 @@ class SemanticTrtRingExecutor:
                     f'Semantic TensorRT admission could not drain its private contexts: {close_exc}'
                 ) from exc
             raise
+
+    def _validate_slots(self, slots: Sequence[object]) -> None:
+        if len(slots) != 2 or any(
+            tuple(int(x) for x in slot.input.shape) != self.plan.input_shape
+            or slot.input.dtype != self.input_dtype
+            for slot in slots
+        ):
+            raise ValueError('Semantic TensorRT slots do not match the fixed input binding')
+        if slots[0] is slots[1] or slots[0].input.data_ptr() == slots[1].input.data_ptr():
+            raise ValueError('Semantic TensorRT requires two independent input slots')
+
+    def bind_direct_slots(self, slots: Sequence[object], *, capture_graphs: bool) -> None:
+        self._validate_slots(slots)
+        self.resume()
+        # Bind each context's existing output even if the input slots swap places.
+        outputs = [slot.output for slot in self.slots]
+        for previous in self.slots:
+            previous.infer_graph = None
+            if all(previous is not current for current in slots):
+                previous.context = None
+                previous.output = None
+                previous.addresses = None
+        for slot, output in zip(slots, outputs):
+            slot.output = output
+        self.slots = list(slots)
+        self.direct = True
+        self.preflight_key = None
+        self._bind_all()
+        self._warmup_and_capture(capture_graphs)
 
     def _set_shape(self, context: object) -> None:
         if callable(getattr(context, 'set_input_shape', None)):
@@ -205,6 +229,7 @@ class SemanticTrtRingExecutor:
 
     def _warmup_and_capture(self, capture_graphs: bool) -> None:
         for slot in self.slots:
+            slot.infer_graph = None
             with self.torch.cuda.stream(slot.infer_stream):
                 slot.input.zero_()
                 self._execute(slot)
@@ -429,7 +454,6 @@ def try_semantic_trt_ring(
             if cached is not None and (
                 cached.backend is not backend or cached.engine is not engine
                 or cached.plan != plan or cached.closed
-                or cached.direct != direct
             ):
                 _CACHE.pop(id(backend), None)
                 cached.close()
@@ -437,19 +461,20 @@ def try_semantic_trt_ring(
         if direct:
             from .backprojection import _torch_dtype_for_trt_binding
             dtype = _torch_dtype_for_trt_binding(backend, engine, plan.input_name, torch)
-            if cached is not None:
+            if cached is not None and cached.direct:
                 source._direct_ring = cached.slots
             direct_slots = source.prepare_direct_ring(input_dtype=dtype)
-            if cached is not None and any(
-                actual is not expected for actual, expected in zip(direct_slots, cached.slots)
-            ):
-                with _CACHE_LOCK:
-                    _CACHE.pop(id(backend), None)
-                cached.close()
-                cached = None
         if cached is not None:
-            cached.resume()
             executor = cached
+            if direct_slots is not None and (
+                not cached.direct or len(direct_slots) != len(cached.slots)
+                or any(actual is not expected for actual, expected in zip(direct_slots, cached.slots))
+            ):
+                cached.bind_direct_slots(
+                    direct_slots, capture_graphs=env_flag('YOLO_TTA_SEMANTIC_TRT_GRAPHS', True),
+                )
+            else:
+                cached.resume()
             cache_hit = True
         if executor is None:
             executor = SemanticTrtRingExecutor(

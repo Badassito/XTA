@@ -136,8 +136,7 @@ def test_encoded_worker_budget_clamps_and_live_receipt_is_complete(tmp_path):
         result = sparse_projection.project_azimuthal_sparse_store(
             path, view, tmp_path / 'projected.cvol', out_shape_tyx=_TARGET, workers=8)
     np.testing.assert_array_equal(_decode(result['path']), _oracle(data, view))
-    expected_bytes = _TARGET[1] * _TARGET[2] + _TARGET[1] * ((_TARGET[2] + 7) // 8)
-    expected_bytes += 9 * (_TARGET[1] + _TARGET[2]) + 1024**2
+    expected_bytes = _TARGET[1] * _TARGET[2] + 1024**2
     assert result['projection_worker_workspace_bytes'] == expected_bytes
     assert result['projection_workers'] == 1
     assert {key for key, _ in events} == {
@@ -146,6 +145,7 @@ def test_encoded_worker_budget_clamps_and_live_receipt_is_complete(tmp_path):
     assert events[-1][1]['state'] == 'complete'
     assert events[-1][1]['completed_planes'] == events[-1][1]['total_planes'] == _TARGET[0]
     assert all(value['consumer_plane_bytes'] == 0 and value['workers'] == 1 for _, value in events)
+    assert all(value['consumer_writer_bytes'] == 3 * _TARGET[1] * _TARGET[2] for _, value in events)
     assert [value['completed_planes'] for _, value in events] == sorted(value['completed_planes'] for _, value in events)
 
 
@@ -249,17 +249,13 @@ def test_encoded_worker_failure_joins_other_readers_and_cleans_unpublished_store
     assert not list(tmp_path.glob('.failed.cvol.projection-*'))
 
 
-@pytest.mark.parametrize('tilted', [False, True])
 @pytest.mark.parametrize('late_validation_failure', [False, True])
-def test_sparse_owned_directory_cleanup_waits_for_actual_delayed_unlink(tmp_path, tilted, late_validation_failure):
+def test_sparse_owned_directory_cleanup_waits_for_actual_delayed_unlink(tmp_path, late_validation_failure):
     """Directory removal must never race the runtime's deletion of source.bits."""
-    if tilted:
-        view = _VIEWS[0]
-    else:
-        view = geometry.get_view_infos(
-            11, 13, 15, cartesian_views=[], azimuthal_views=['transverse'],
-            azimuthal_azimuth_angles=[45.])[0]
-        view = replace(view, num_slices=4, azimuths_deg=(1., 37., 88., 179.))
+    view = geometry.get_view_infos(
+        11, 13, 15, cartesian_views=[], azimuthal_views=['transverse'],
+        azimuthal_azimuth_angles=[45.])[0]
+    view = replace(view, num_slices=4, azimuths_deg=(1., 37., 88., 179.))
     data = _data()
     expected = _oracle(data, view)
     source_path = tmp_path / 'source.cvol'
@@ -346,8 +342,42 @@ def test_sparse_owned_directory_cleanup_waits_for_actual_delayed_unlink(tmp_path
     assert not list(tmp_path.glob('.delayed.cvol.projection-*'))
 
 
+@pytest.mark.parametrize('backend', ['compiled', 'numpy'])
+@pytest.mark.parametrize('bad_count', [False, True])
+def test_tilted_sparse_publishes_without_decode_or_packed_scratch(tmp_path, monkeypatch, backend, bad_count):
+    view, data = _VIEWS[0], _data()
+    source, target = tmp_path / 'input.cvol', tmp_path / 'output.cvol'
+    write_raw_bbox_mask_store(data, source, format_name=INTERNAL_PACKED_CVOL_FORMAT, desc='encoded input')
+    finalize = sparse_projection.IncrementalRawBBoxMaskStoreWriter.finalize
+
+    def verify(writer):
+        assert not (writer.store_dir.parent / 'source.bits').exists()
+        stats = finalize(writer)
+        np.testing.assert_array_equal(_decode(writer.store_dir), _oracle(data, view))
+        if bad_count:
+            stats['foreground_voxels'] += 1
+        return stats
+
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_BACKEND', backend)
+    monkeypatch.setattr(sparse_projection.IncrementalRawBBoxMaskStoreWriter, 'finalize', verify)
+    with mock.patch.object(sparse_projection, '_input_slabs', side_effect=AssertionError('native decode')):
+        if bad_count:
+            with pytest.raises(RuntimeError, match='foreground count differs'):
+                sparse_projection.project_azimuthal_sparse_store(source, view, target, out_shape_tyx=_TARGET)
+            assert not target.exists()
+        else:
+            stats = sparse_projection.project_azimuthal_sparse_store(source, view, target, out_shape_tyx=_TARGET)
+            assert stats['max_decoded_input_slab_bytes'] == 0
+            assert stats['input_foreground_samples'] == int(np.count_nonzero(data))
+    assert not list(tmp_path.glob('.output.cvol.projection-*'))
+
+
 def test_sparse_encoder_traceback_preserves_error_and_retires_partial_staging(tmp_path):
     """An encoder error retains packed while completed earlier slices are staged."""
+    view = geometry.get_view_infos(
+        11, 13, 15, cartesian_views=[], azimuthal_views=['transverse'], azimuthal_azimuth_angles=[45.],
+    )[0]
+    view = replace(view, num_slices=4, azimuths_deg=(1., 37., 88., 179.))
     data = np.ones((4, 7, 7), np.uint8)
     source_path = tmp_path / 'source.cvol'
     write_raw_bbox_mask_store(data, source_path, format_name=INTERNAL_PACKED_CVOL_FORMAT,
@@ -365,7 +395,7 @@ def test_sparse_encoder_traceback_preserves_error_and_retires_partial_staging(tm
         with mock.patch.object(sparse_projection, '_packed_output_slice', new=encode):
             with pytest.raises(RuntimeError, match='synthetic partial encoder failure'):
                 sparse_projection.project_azimuthal_sparse_store(
-                    source, _VIEWS[0], tmp_path / 'encoder-failed.cvol',
+                    source, view, tmp_path / 'encoder-failed.cvol',
                     out_shape_tyx=_TARGET, workers=3)
         assert not (tmp_path / 'encoder-failed.cvol').exists()
         np.testing.assert_array_equal(np.stack([source.decode_slice(z) for z in range(4)]), data)

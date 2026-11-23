@@ -69,11 +69,14 @@ def test_insufficient_cuda_quota_uses_exact_cpu_clip(monkeypatch):
     monkeypatch.setenv("YOLO_TTA_SAM_GPU_IMAGES", "1")
     frames = Frames([Image.new("RGB", (7, 11), (21, 44, 177))])
     owner = model()
-    cuda = SimpleNamespace(mem_get_info=lambda _: (100*1024**3, 100*1024**3),
-        memory_allocated=lambda _: 0, memory_reserved=lambda _: 0)
+    cuda = SimpleNamespace(current_device=lambda: 3,
+        mem_get_info=mock.Mock(return_value=(100*1024**3, 100*1024**3)),
+        memory_allocated=mock.Mock(return_value=0), memory_reserved=mock.Mock(return_value=0))
     receipt = prepare_sam_video_frames(SimpleNamespace(model=owner), frames,
         torch_module=SimpleNamespace(cuda=cuda), cuda_quota_bytes=1)
     assert receipt["backend"] == "cpu"
+    for probe in (cuda.mem_get_info, cuda.memory_allocated, cuda.memory_reserved):
+        probe.assert_called_once_with(3)
     assert torch.equal(frames._xta_prepared_video_frames.images, oracle(frames, owner))
 
 

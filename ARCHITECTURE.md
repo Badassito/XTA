@@ -27,8 +27,10 @@ instead of `pipeline.main`. The coordinator launches one child TTA run per
 cutoff through the same CLI. By default, with more than one cutoff, the
 lowest-cutoff child evaluates the model once on eligible routes and fans out
 native prediction products to the other children, which keep independent
-cleanup, interpolation, SAM and publication. The coordinator publishes one
-family `manifest.json`; see [confidence sweeps](docs/confidence_sweeps.md).
+cleanup, interpolation and SAM. The coordinator publishes the family
+`manifest.json`, the requested native and preview segmentation groups, cutoff
+support heatmaps and combined summary. Cutoff-specific binary outputs and run
+receipts belong to their scalar branches. See [confidence sweeps](docs/confidence_sweeps.md).
 
 | Shared boundary | Owner |
 | --- | --- |
@@ -558,12 +560,8 @@ Each covered final Z plane is validated once per invocation, including empty
 interior planes. Eligibility uses the already-projected backing grid, rather
 than the original proposal transform metadata. Other shapes/backings retain the
 dense restoration reader; connection-topology checks keep their existing scope.
-For unchanged plain-union outputs, final survival receipts may reuse the source
-audit after writers settle. Identity, mutation, workspace-budget and exact
-content checks protect reuse; source-integrity assertions and existing
-`not_assessed` topology scopes remain intact. Receipts retain separate stages
-and record their origin. Telemetry measures the content checks as well as the
-audit, since hashing the mask and evidence can offset the saved audit work.
+The final survival audit measures the settled output after NRRD writers finish.
+Telemetry records the source and final audits separately.
 
 `sam_integration` plans before image rendering, model construction, and GPU
 admission. Empty/exhausted passes create no image cache or predictor. Compatible
@@ -1353,9 +1351,20 @@ a requested unavailable accelerator fails or uses the documented supported
 fallback before an output starts. Partial artifacts and worker failures never
 produce a complete run manifest.
 
-TTA writes retained SAM interpolation and extrapolation artifacts into
-`OUTPUT/sam-artifacts.tar` while the run executes. `artifact_archive` serializes
-writers through `sam-artifacts.tar.lock` and commits sealed evidence bundles,
+TTA retains SAM interpolation and extrapolation artifacts in
+`OUTPUT/sam-artifacts.tar`. With an explicit disk-backed `--temp` and a fresh
+archive, the run reserves its public name and writes and reads the working archive
+on the scratch disk. Member references use the final output path throughout the
+run. After the SAM producers and output readers settle, publication exposes the
+archive by an exclusive rename or link on the same filesystem. Across filesystems
+it streams the committed prefix once into an output sibling and syncs it before
+publication. On handled failures the run attempts to publish any committed prefix.
+If that transfer fails or the run is forcibly stopped, the archive can be
+recovered from the printed staging path under the `--temp` root. Live publication
+is used when `--temp` is omitted or memory-backed, when the output archive
+already exists, or when `YOLO_TTA_SAM_ARCHIVE_LIVE_OUTPUT=1`.
+
+`artifact_archive` serializes writers on the active archive's lock and commits sealed evidence bundles,
 CVOL stores, and JSON receipts as independent TAR/PAX transactions. During an
 append by this process, readers can open an authenticated previously committed
 member without waiting for the writer's payload copy or flush. New members and

@@ -1,4 +1,5 @@
 """Optional image overlap spends real parent rights without minting physical RAM."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import FrozenInstanceError
 import threading
@@ -115,6 +116,29 @@ def test_registration_failure_rolls_back_both_ledgers(monkeypatch):
         assert list(registry) == [owner._lease.lease_id]
         assert account.in_use == resources.sam_parent_promised_bytes(account) == 64
         assert resources.sam_image_staging_snapshot(account)['image_parent_funded_bytes'] == 0
+
+
+def test_optional_prefetch_accepts_a_decrease_in_promises_during_probe():
+    account = pool()
+    probing, proceed = threading.Event(), threading.Event()
+
+    def probe():
+        probing.set()
+        assert proceed.wait(5)
+        return 256
+
+    def prepare(owner):
+        with _try_image_profile(account, 100, 'next', probe, parent_profile=owner) as images:
+            assert images is not None
+            assert images.other_promised_bytes == 64
+
+    with parent(account) as owner, ThreadPoolExecutor(max_workers=1) as executor:
+        with _try_image_profile(account, 50, 'current', lambda:4096) as current:
+            assert current is not None
+            pending = executor.submit(prepare, owner)
+            assert probing.wait(5)
+        proceed.set()
+        pending.result(timeout=5)
 
 
 def test_nested_image_profile_cannot_mint_another_staging_pool():

@@ -116,12 +116,16 @@ def _infer(runner, source, *, cent=15, writer=None, scores=True, min_conf=0.):
 @pytest.mark.parametrize('scores', [False, True])
 def test_one_source_forward_emits_every_scalar_native_plane(semantic, scores):
     source, runner, writer = _Source(), _runner(semantic=semantic), _Planes()
-    floor_stats, floor_mask, floor_scores = _infer(runner, source, writer=writer, scores=scores)
+    writer.cutoffs = (90, 40, 100, 70)
+    with mock.patch.object(workers, '_openvino_cpu_payloads_from_outputs',
+                           wraps=workers._openvino_cpu_payloads_from_outputs) as decode:
+        floor_stats, floor_mask, floor_scores = _infer(runner, source, writer=writer, scores=scores)
+    assert decode.call_count == (0 if semantic else 2)
     assert source.rendered == 2 and runner.infer_queue.calls == 2
     assert writer.work['rendered_frames'] == 3
     assert writer.work['render_batches'] == 2
     assert writer.work['forward_calls'] == 2
-    assert writer.work['mask_decodes'] == (15 if semantic else 12)
+    assert writer.work['mask_decodes'] == (15 if semantic else 9)
     assert len(writer.records) == 3 * (len(writer.cutoffs) + 1)
     for cent in (writer.floor_cent, *writer.cutoffs):
         scalar_stats, expected, expected_scores = _infer(
@@ -158,6 +162,14 @@ def test_nonzero_cleanup_disables_optional_native_decoding():
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(actual_scores, expected_scores)
     assert not writer.records and writer.reason
+
+
+def test_sibling_below_inference_cutoff_declines_optimized_fanout():
+    writer = _Planes()
+    _, actual, _ = _infer(_runner(), _Source(), cent=50, writer=writer)
+    _, expected, _ = _infer(_runner(), _Source(), cent=50)
+    np.testing.assert_array_equal(actual, expected)
+    assert not writer.records and 'exceeds a native sibling cutoff' in writer.reason
 
 
 def _worker_task(tmp_path, mode):
@@ -286,7 +298,7 @@ def test_actual_native_bridge_crops_and_commits_every_cutoff_plane():
     assert receipt['status'] == 'complete'
     assert receipt['produced_cutoff_frames'] == 15
     assert receipt['counters']['forward_calls'] == 2
-    assert receipt['counters']['mask_decodes'] == 12
+    assert receipt['counters']['mask_decodes'] == 9
     for cent in journal.cutoffs:
         _stats, expected, scores = _infer(_runner(), _Source(), cent=cent)
         for frame in range(3):
@@ -298,6 +310,48 @@ def test_actual_native_bridge_crops_and_commits_every_cutoff_plane():
             actual_scores[y0:y1, x0:x1] = values
             np.testing.assert_array_equal(actual, expected[frame])
             np.testing.assert_array_equal(actual_scores, scores[frame])
+
+
+@pytest.mark.parametrize('background', [False, True])
+def test_concurrent_openvino_aliases_use_the_correct_durable_frame(tmp_path, background):
+    from XTA.native_fanout import WorkerCutoffPlanes
+    from XTA.sweep_views import NativeTaskFanoutWriter, hydrate, seal_view_family
+
+    shape = (3, 7, 9)
+    cuts = (15, 40, 70, 80, 90, 100)
+    journal = NativeTaskFanoutWriter(tmp_path, 'model', 'view', shape, cuts,
+                                    frame_start=0, expected_frames=3, backend='openvino',
+                                    scalar_owned_cutoff=15)
+    if background:
+        journal.start_background_encoding()
+    barrier = threading.Barrier(2, timeout=10)
+
+    class InterleavedPlanes(WorkerCutoffPlanes):
+        def put(self, cutoff, index, *args, **kwargs):
+            super().put(cutoff, index, *args, **kwargs)
+            if cutoff == 70 and index in (0, 2):
+                barrier.wait()
+
+    source = _Source()
+    source.images[2] = source.images[1][::-1].copy()
+    writer = InterleavedPlanes(journal, floor_cent=15, offset=0, shape=shape[1:],
+                               has_scores=True, expected_frames=shape[0])
+    _infer(_runner(), source, writer=writer)
+    assert not writer._last_crops
+    receipt = writer.finish()
+    assert receipt['status'] == 'complete'
+    assert receipt['counters']['native_packet_aliases'] == 6
+    assert receipt['counters']['bulk_empty_frames'] == 3
+    decision = seal_view_family('model', 'view', shape, cuts, receipts=[receipt], root=tmp_path)
+    for cent in cuts[1:]:
+        expected_stats, expected, expected_scores = _infer(_runner(), source, cent=cent)
+        actual = np.zeros(shape, dtype=np.uint8)
+        scores = np.zeros_like(actual)
+        hydrate('model', 'view', cent, actual, scores, root=tmp_path)
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(scores, expected_scores)
+        assert decision['prediction_counts'][cent] == expected_stats['prediction_count']
+        assert decision['frames_with_predictions'][cent] == expected_stats['frames_with_predictions']
 
 
 def test_real_openvino_cpu_fanout_uses_one_forward_per_rendered_batch(tmp_path, monkeypatch):
@@ -352,7 +406,7 @@ def test_native_fanout_bypasses_seeded_raw_cache_and_scalar_fallback_still_reuse
     assert stats['openvino_forward_replay_hits'] == 0
     assert stats['openvino_forward_replay_misses'] == 0
     assert second.infer_queue.calls == writer.work['forward_calls'] == 2
-    assert writer.work['mask_decodes'] == 12
+    assert writer.work['mask_decodes'] == 9
     assert writer.work['rendered_frames'] == 3
     assert writer.work['render_batches'] == 2
 

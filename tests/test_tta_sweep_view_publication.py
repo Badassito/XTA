@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 from unittest.mock import Mock
+from zipfile import ZipFile
 
 import numpy as np
 import pytest
@@ -26,21 +27,23 @@ def view():
                     full_t=3, full_h=8, full_w=8, tta_aug_id="a0")
 
 
-def make_owner(root, cent, progress=None):
+def make_owner(root, cent, progress=None, *, retain_confidence=True, staged=False):
     family, work = root/"family", root/"work"
-    branch = family/"confidence_cutoffs"/f"conf_{cent:03d}"
+    nrrd_stage_root = work / "nrrd_sources" if staged else None
+    branch = (nrrd_stage_root if staged else family / "confidence_cutoffs") / f"conf_{cent:03d}"
     sink = outputs.NrrdLayerSink(nrrd_dir=branch/"nrrd", stem="case",
         output_shape_tyx=SHAPE, max_workers=2,
         low_quality_specs=[outputs.LowQualityDownbinSpec("0.5","half",.5,(2,4,4))],
-        low_quality_root=branch/"low_quality", run_id=branch_run_id("family-one",cent))
+        low_quality_root=branch/"low_quality", run_id=branch_run_id("family-one",cent),
+        relative_artifact_paths=not staged)
     owner = ViewMajorPublication(family_root=family, workspace=work, sweep_id="family-one",
         cutoffs_hundredths=CUTS,current_cutoff=cent,scalar_sink=sink,source_shape_tyx=SHAPE,
         model_name="detector",task="segment",min_conf=0.,confidence_floor_by_backend={"gpu":.5},
-        progress=progress)
+        progress=progress, retain_confidence=retain_confidence, nrrd_stage_root=nrrd_stage_root)
     return owner,sink
 
 
-def publish(owner,view, *, d1=False):
+def publish(owner,view, *, d1=False, score_lanes=True):
     mask=np.zeros(SHAPE,np.uint8)
     mask[:,2:6,2:6]=1
     masks={70:mask,100:np.zeros_like(mask)}
@@ -48,12 +51,13 @@ def publish(owner,view, *, d1=False):
         if cent==70:
             yield (2,6,2,6,masks[cent][z,2:6,2:6],np.full((4,4),214,np.uint8))
     def sparse_mask(cent,z):
-        for y0,y1,x0,x1,plane,_ in sparse(cent,z):
-            yield y0,y1,x0,x1,plane
+        if cent==70:
+            yield 2,6,2,6,masks[cent][z,2:6,2:6]
     def no_dense(*_):
         raise AssertionError("Sparse readers must avoid constructing full native input planes")
     return owner.publish_view_family(view,native_shape=SHAPE,read_mask_plane=no_dense,
-        read_score_plane=no_dense,read_mask_crops=sparse_mask,read_native_crops=sparse,
+        read_score_plane=no_dense,read_mask_crops=sparse_mask,
+        read_native_crops=sparse if score_lanes else no_dense,
         counts_by_cutoff={50:9,70:6,100:0}, retain_empty_orthogonal=d1)
 
 
@@ -64,6 +68,39 @@ def cpu_only(monkeypatch):
     monkeypatch.setenv("YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN","0")
     from XTA import nrrd_compression
     monkeypatch.setattr(nrrd_compression,"_require_nrrd_member_codec",lambda **_:("zlib",1,gzip.compress))
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_default_publication_projects_masks_without_opening_score_layers(tmp_path, view, monkeypatch, staged):
+    from XTA import sweep_confidence, sweep_evidence_processes
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("An unrequested evidence writer was opened")
+
+    monkeypatch.setenv("XTA_YOLO_SWEEP_NATIVE_ROLE", "produce")
+    monkeypatch.setenv("XTA_YOLO_SWEEP_NRRD_PROCESSES", "0")
+    monkeypatch.setenv("XTA_YOLO_SWEEP_EVIDENCE_PROCESSES", "1")
+    monkeypatch.setattr(sweep_confidence, "SweepObservedConfidenceWriter", unexpected)
+    monkeypatch.setattr(sweep_evidence_processes, "SweepEvidenceProcessPool", unexpected)
+    owner, sink = make_owner(tmp_path, 50, retain_confidence=False, staged=staged)
+    try:
+        refs = publish(owner, view, score_lanes=False)
+        assert refs[70] is not None and refs[100] is None
+        assert owner._confidence_pool is None
+        assert not list(owner.family_root.rglob("reconciliation_evidence"))
+        if staged:
+            assert len(list((owner.nrrd_stage_root / "conf_070").rglob("*.seg.nrrd"))) == 2
+            assert not list(owner.family_root.rglob("*.seg.nrrd"))
+    finally:
+        owner.close()
+        sink.shutdown()
+
+    consumer, sink = make_owner(tmp_path, 70, retain_confidence=False, staged=staged)
+    try:
+        assert consumer.adopt_view(view) == (refs[70], 6)
+    finally:
+        consumer.close()
+        sink.shutdown()
 
 
 def test_real_sibling_outputs_visible_during_first_view_and_adopted_by_later_scalar(tmp_path,view,monkeypatch):
@@ -139,6 +176,45 @@ def test_real_sibling_outputs_visible_during_first_view_and_adopted_by_later_sca
     assert storage["live_bytes"]==0 and storage["retired_bytes"]==storage["published_bytes"]
 
 
+@pytest.mark.parametrize("partial_bundle", [False, True])
+def test_legacy_receipt_adoption_and_partial_bundle_rejection(tmp_path, view, partial_bundle):
+    producer, floor = make_owner(tmp_path, 50)
+    try:
+        ref = publish(producer, view)[70]
+        (bundle_path,) = (producer.work / "published" / "by_view").glob("*.zip")
+        with ZipFile(bundle_path) as bundle:
+            assert bundle.namelist() == ["conf_070.json", "conf_100.json"]
+            row = bundle.read("conf_070.json")
+        with pytest.raises(RuntimeError, match="already exist"):
+            publish(producer, view)
+    finally:
+        producer.close()
+        floor.shutdown()
+
+    legacy_path = producer.work / "published" / "conf_070" / f"{bundle_path.stem}.json"
+    legacy_path.parent.mkdir()
+    legacy_path.write_bytes(row)
+    if partial_bundle:
+        # A well-formed ZIP with the requested row cannot authorize a partial view.
+        with ZipFile(bundle_path, "w") as bundle:
+            bundle.writestr("conf_070.json", row)
+    else:
+        bundle_path.unlink()
+
+    consumer, sink = make_owner(tmp_path, 70)
+    try:
+        assert consumer.has_published_view(view)
+        if partial_bundle:
+            with pytest.raises(ValueError, match="cutoff inventory"):
+                consumer.adopt_view(view)
+            assert sink.layer_count() == 0
+        else:
+            assert consumer.adopt_view(view) == (ref, 6)
+    finally:
+        sink.shutdown()
+        consumer.close()
+
+
 def test_changed_view_geometry_rejected_before_sink_adoption(tmp_path,view):
     from dataclasses import replace
     producer,floor=make_owner(tmp_path,50)
@@ -166,7 +242,7 @@ def test_unsupported_view_leaves_no_sibling_files(tmp_path,view,monkeypatch):
         assert publish(producer,view) is None
         assert sum(producer.geometry_fallbacks.values())==1
         assert not list((tmp_path/"family/confidence_cutoffs/conf_070").rglob("*.seg.nrrd"))
-        assert not list((tmp_path/"work/view_publication").rglob("*.json"))
+        assert not list((tmp_path/"work/view_publication/published/by_view").glob("*.zip"))
     finally:
         producer.close();sink.shutdown()
 

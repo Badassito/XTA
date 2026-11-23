@@ -78,7 +78,10 @@ def test_union_reuses_exact_array_without_opening_components_scores_or_new_map(t
     assert report['layers']['model/bridge']['role'] == 'bridge'
     assert report['layers']['model/prediction']['metadata']['confidence_coordinate_space'] == 'native_view_processing'
     assert not (tmp_path / 'work').exists()
-    assert (tmp_path / 'published/policy.py').read_bytes() == Path(cfg.path).read_bytes()
+    assert not (tmp_path / 'published/policy.py').exists()
+    assert report['policy_path'] == cfg.path
+    assert report['policy_sha256'] == cfg.sha256
+    assert report['policy']['proposal_policy_sha256'] == cfg.sha256
     assert json.loads((tmp_path / 'published/manifest.json').read_text()) == report
     deferred.reader.assert_not_called()
     # The ordinary postprocessing tail can still modify the same live buffer.
@@ -145,10 +148,17 @@ def test_policy_change_and_manifest_failure_never_close_borrowed_mmap(tmp_path):
         with pytest.raises(OSError, match='publication failure'):
             run([], array, cfg, tmp_path)
     assert not array._mmap.closed
-    Path(cfg.path).write_text(Path(cfg.path).read_text() + '# changed\n')
-    with pytest.raises(RuntimeError, match='policy changed'):
-        run([], array, cfg, tmp_path, policy=dict(mode='union'))
+
+    def change_policy(*_args):
+        source = Path(cfg.path)
+        source.write_text(source.read_text() + '# changed\n')
+
+    with mock.patch.object(runtime, '_record_source_bridge_survival', side_effect=change_policy):
+        with pytest.raises(RuntimeError, match='policy changed'):
+            run([], array, cfg, tmp_path, policy=dict(mode='union'))
     assert not array._mmap.closed
+    assert not (tmp_path / 'published/manifest.json').exists()
+    assert not (tmp_path / 'published/manifest.json.partial').exists()
     array._mmap.close()
 
 
@@ -210,15 +220,12 @@ def _pipeline_reconciliation_block():
 
 
 @pytest.mark.parametrize('reuse', [False, True])
-@pytest.mark.parametrize('sam_active', [False, True])
-def test_pipeline_tail_updates_all_known_union_owners_and_preserves_reused_buffer(tmp_path, reuse, sam_active):
+def test_pipeline_tail_updates_all_known_union_owners_and_preserves_reused_buffer(tmp_path, reuse):
     original = np.zeros((2, 3, 4), np.uint8)
     weak_original = weakref.ref(original)
     replacement = original if reuse else np.ones_like(original)
     closed = []
     namespace = dict(__name__='XTA.pipeline', __package__='XTA', reconciliation_settings=SimpleNamespace(enabled=True),
-        sam_context=object() if sam_active else None, source_survival_reuse=None,
-        _source_bridge_survival_reuse_enabled=lambda *_a: pytest.fail('No final sink needs no reuse capture'),
         runtime_telemetry=lambda: SimpleNamespace(span=lambda *args: nullcontext()),
         nrrd_layer_sink=lambda: None, final_union_mm=original, streamed_final_union_mm=original,
         streaming_final_union_holder={'model': original}, model_name='model',

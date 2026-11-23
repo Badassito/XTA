@@ -63,8 +63,8 @@ from XTA.lta_sam import (  # noqa: E402
     audit_sam_fa3_routing,
     build_local_sam_predictor,
     preflight_sam_fa3,
-    resolve_sam_attention_backend,
     resolve_local_sam_bundle,
+    resolve_sam_device_profile,
 )
 
 
@@ -1681,44 +1681,13 @@ def run_tile(
 
 
 def _resolve_profile(torch_module: Any, device: int, requested: str) -> dict[str, Any]:
-    capability = tuple(int(value) for value in torch_module.cuda.get_device_capability(int(device)))
-    attention = resolve_sam_attention_backend(capability)
-    profile = str(requested)
-    if profile == "auto":
-        profile = "h100" if capability[0] >= 9 else "egpu"
-    if profile == "h100":
-        if capability[0] < 9:
-            raise ValueError(
-                "--profile h100 requires CUDA capability 9.x or newer; "
-                f"device {device} reports {capability[0]}.{capability[1]}"
-            )
-        return {
-            "name": profile,
-            "weight_storage": "float32",
-            "use_fa3": attention == "fa3_fp8",
-            # Real-valued RoPE is needed only for torch.compile compatibility;
-            # this diagnostic harness deliberately runs compile=False.
-            "use_rope_real": False,
-            "constrained_batches": False,
-            "sdpa_fallback": True,
-            "attention_backend": ("meta_fa3_fp8_e4m3fn" if attention == "fa3_fp8"
-                                  else "torch_sdpa_flash_efficient_math"),
-            "attention_qkv_dtype": "float8_e4m3fn" if attention == "fa3_fp8" else "bfloat16",
-            "runtime_autocast_dtype": "bfloat16",
-        }
-    if profile == "egpu":
-        if attention != "sdpa":
-            raise ValueError("the eGPU SAM profile requires sdpa attention")
-        return {
-            "name": profile,
-            "weight_storage": "bfloat16_egpu",
-            "use_fa3": False,
-            "use_rope_real": False,
-            "constrained_batches": True,
-            "sdpa_fallback": True,
-            "attention_backend": "torch_sdpa_flash_efficient_math",
-        }
-    raise ValueError(f"unknown execution profile: {requested}")
+    profile = resolve_sam_device_profile(torch_module, device, requested=requested)
+    # The projected profile is hashed into completed tile receipts used by --resume.
+    keys = ("name", "weight_storage", "use_fa3", "use_rope_real", "constrained_batches",
+            "sdpa_fallback", "attention_backend")
+    if profile["name"] != "egpu":
+        keys += ("attention_qkv_dtype", "runtime_autocast_dtype")
+    return {key: profile[key] for key in keys}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1732,7 +1701,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", required=True, help="New output directory, or existing with --resume")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--profile", choices=("auto", "h100", "egpu"), default="auto")
+    parser.add_argument("--profile", choices=("auto", "h100", "egpu", "a100"), default="auto")
     parser.add_argument("--frame-start", type=int, default=0)
     parser.add_argument("--frame-stop", type=int, default=None)
     parser.add_argument("--exemplar-index-origin", type=int, default=1)

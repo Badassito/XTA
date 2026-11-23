@@ -11,7 +11,7 @@ def fill_sam_mask_logits_inplace(logits):
 
     Work on each object's final two spatial dimensions independently.  Only new
     foreground receives a positive logit; scores and existing foreground retain
-    their original values.  The host implementation matches detector hole fill.
+    their original values. Both paths use the detector's connectivity rule.
     """
     import numpy as np
     import torch
@@ -19,14 +19,48 @@ def fill_sam_mask_logits_inplace(logits):
 
     if logits is None or logits.ndim < 2 or logits.numel() == 0:
         return logits
-    binary = (logits.detach() > 0).to(device='cpu').numpy()
+    if logits.is_cuda:
+        try:
+            import cupy as cp
+            from cupyx.scipy import ndimage as cpx_ndi
+        except ImportError:
+            pass
+        else:
+            from ._prediction_cleanup import _device_enclosed_background
+            from .geometry import _cupy_external_stream
+
+            device = logits.device
+
+            def allocate(size):
+                buffer = torch.empty(max(1, int(size)), dtype=torch.uint8, device=device)
+                memory = cp.cuda.UnownedMemory(buffer.data_ptr(), buffer.numel(), buffer, device.index)
+                return cp.cuda.MemoryPointer(memory, 0)
+
+            try:
+                stream = torch.cuda.current_stream(device)
+                with cp.cuda.Device(device.index), _cupy_external_stream(cp, stream), cp.cuda.using_allocator(allocate):
+                    background = ~(logits.detach() > 0).reshape(-1, *logits.shape[-2:])
+                    holes = _device_enclosed_background(cp, cpx_ndi, cp.from_dlpack(background))
+                    device_holes = torch.from_dlpack(holes).reshape(logits.shape)
+            except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError,
+                    cp.cuda.compiler.CompileException, torch.cuda.OutOfMemoryError) as exc:
+                # Preserve potential device faults before attempting a host copy.
+                if isinstance(exc, cp.cuda.runtime.CUDARuntimeError) and exc.status != 2:  # cudaErrorMemoryAllocation
+                    raise
+                background = holes = device_holes = None
+            else:
+                logits.masked_fill_(device_holes, 10.0)
+                return logits
+    host_logits = logits.to(device='cpu')
+    binary = (host_logits.detach() > 0).numpy()
     added = np.zeros_like(binary, dtype=bool)
     height, width = binary.shape[-2:]
     for source, target in zip(binary.reshape(-1, height, width), added.reshape(-1, height, width)):
         target[:] = fill_binary_mask_holes_2d(source) & ~source
     if bool(added.any()):
-        holes = torch.from_numpy(added).to(device=logits.device)
-        logits.masked_fill_(holes, 10.0)
+        host_logits.masked_fill_(torch.from_numpy(added), 10.0)
+        if host_logits is not logits:
+            logits.copy_(host_logits)
     return logits
 
 

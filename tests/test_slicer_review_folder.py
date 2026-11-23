@@ -34,7 +34,8 @@ def load(names, **extra):
 
 
 LOCATION = ("_xta_sweep_review_location", "_xta_sweep_grid_folder", "_xta_sweep_review_relative",
-            "_xta_sweep_review_source", "_xta_child", "_xta_sweep_header_grid_ids")
+            "_xta_sweep_review_source", "_xta_child", "_xta_sweep_header_grid_ids", "_xta_check_review_family",
+            "_xta_sweep_child", "_xta_sweep_digest")
 
 
 def publish(tmp_path, grids=("native", LOW), family_status="complete"):

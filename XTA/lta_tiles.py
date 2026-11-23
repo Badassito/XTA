@@ -8,6 +8,7 @@ It has no accelerator imports.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -177,21 +178,26 @@ def plan_object_tile(
         x1 * source_width,
         y1 * source_height,
     )
-    if pixel_box[2] - pixel_box[0] > size or pixel_box[3] - pixel_box[1] > size:
-        raise ValueError(f"selected polygon bbox does not fit a {size}x{size} source tile")
-    center_x = (pixel_box[0] + pixel_box[2]) * 0.5
-    center_y = (pixel_box[1] + pixel_box[3]) * 0.5
-    left = min(max(0, int(round(center_x - size * 0.5))), source_width - size)
-    top = min(max(0, int(round(center_y - size * 0.5))), source_height - size)
-    plan = TilePlan(left, top, size, source_width, source_height)
-    if (
-        plan.left > pixel_box[0]
-        or plan.top > pixel_box[1]
-        or plan.left + plan.size < pixel_box[2]
-        or plan.top + plan.size < pixel_box[3]
+    px0, py0, px1, py1 = pixel_box
+    if not (
+        all(math.isfinite(value) for value in pixel_box)
+        and 0 <= px1 and px0 < source_width and px0 <= px1
+        and 0 <= py1 and py0 < source_height and py0 <= py1
     ):
-        raise RuntimeError("object-centered tile does not contain the complete polygon bbox")
-    return plan
+        raise ValueError("selected polygon bbox has no finite source support")
+    ix0, iy0 = max(0, int(px0)), max(0, int(py0))
+    ix1, iy1 = min(source_width - 1, int(px1)), min(source_height - 1, int(py1))
+    min_left = max(0, ix1 + 1 - size)
+    max_left = min(source_width - size, ix0)
+    min_top = max(0, iy1 + 1 - size)
+    max_top = min(source_height - size, iy0)
+    if min_left > max_left or min_top > max_top:
+        raise ValueError(f"selected polygon bbox does not fit a {size}x{size} source tile")
+    center_x = (ix0 + ix1 + 1) * 0.5
+    center_y = (iy0 + iy1 + 1) * 0.5
+    left = min(max(min_left, round(center_x - size * 0.5)), max_left)
+    top = min(max(min_top, round(center_y - size * 0.5)), max_top)
+    return TilePlan(left, top, size, source_width, source_height)
 
 
 def transform_polygon_to_tile(polygon: Any, plan: TilePlan) -> Any:
@@ -276,11 +282,56 @@ def polygon_intersects_tile(polygon: Any, tile: TilePlan) -> bool:
     source_y1 = y1 * tile.source_height
     left, top, right, bottom = tile.xyxy
     return bool(
-        source_x1 > left
+        source_x1 >= left
         and source_x0 < right
-        and source_y1 > top
+        and source_y1 >= top
         and source_y0 < bottom
     )
+
+
+def _rasterize_source_polygon(polygon: Any, *, height: int, width: int):
+    """Return the source origin and bitmap of a polygon's clipped bounding box."""
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    points = [(int(float(x) * width), int(float(y) * height))
+              for x, y in polygon.points]
+    xs, ys = zip(*points)
+    bx0, by0 = max(0, min(xs)), max(0, min(ys))
+    bx1, by1 = min(width, max(xs) + 1), min(height, max(ys) + 1)
+    if bx0 >= bx1 or by0 >= by1:
+        return bx0, by0, np.empty((0, 0), dtype=bool)
+    # Pillow rounds intersections in absolute x. Its scanline differences use relative y.
+    image = Image.new("1", (bx1, by1 - by0), 0)
+    ImageDraw.Draw(image).polygon([(x, y - by0) for x, y in points], fill=1)
+    return bx0, by0, np.asarray(image.crop((bx0, 0, bx1, by1 - by0)), dtype=bool)
+
+
+def _polygon_tile_region(raster, tile: TilePlan):
+    bx0, by0, pixels = raster
+    left, top, right, bottom = tile.xyxy
+    x0, y0 = max(left, bx0), max(top, by0)
+    x1, y1 = min(right, bx0 + pixels.shape[1]), min(bottom, by0 + pixels.shape[0])
+    if x0 >= x1 or y0 >= y1:
+        return None
+    return x0 - left, y0 - top, pixels[y0 - by0:y1 - by0, x0 - bx0:x1 - bx0]
+
+
+def _embed_polygon_region(region, tile: TilePlan):
+    import numpy as np
+
+    mask = np.zeros((tile.size, tile.size), dtype=bool)
+    if region is not None:
+        x, y, pixels = region
+        height, width = pixels.shape
+        mask[y:y + height, x:x + width] = pixels
+    return mask
+
+
+def rasterize_polygon_on_tile(polygon: Any, tile: TilePlan):
+    """Rasterize in source pixels before extracting the visible tile portion."""
+    raster = _rasterize_source_polygon(polygon, height=tile.source_height, width=tile.source_width)
+    return _embed_polygon_region(_polygon_tile_region(raster, tile), tile)
 
 
 def masks_for_tile(polygons: Iterable[Any], tile: TilePlan) -> tuple[Any, ...]:
@@ -290,8 +341,7 @@ def masks_for_tile(polygons: Iterable[Any], tile: TilePlan) -> tuple[Any, ...]:
     for polygon in polygons:
         if not polygon_intersects_tile(polygon, tile):
             continue
-        local = transform_polygon_to_tile(polygon, tile)
-        mask = rasterize_polygons((local,), size=tile.size)
+        mask = rasterize_polygon_on_tile(polygon, tile)
         if bool(mask.any()):
             masks.append(mask)
     return tuple(masks)
@@ -370,6 +420,7 @@ __all__ = (
     "plan_object_tile",
     "plan_tile_grid",
     "polygon_intersects_tile",
+    "rasterize_polygon_on_tile",
     "rasterize_polygons",
     "rasterize_polygons_to_shape",
     "select_polygon_row",

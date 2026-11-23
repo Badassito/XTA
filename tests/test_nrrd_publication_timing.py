@@ -1,5 +1,6 @@
 """Durability telemetry separates NRRD publication without weakening atomicity."""
 from contextlib import contextmanager
+import errno
 from unittest import mock
 
 import pytest
@@ -46,3 +47,16 @@ def test_other_outputs_do_not_initialize_nrrd_telemetry(tmp_path):
     with mock.patch.object(outputs,'runtime_telemetry',side_effect=AssertionError('NRRD telemetry')):
         outputs._publish_staged_file_atomically(stage,target)
     assert target.read_bytes()==b'complete payload'
+
+
+def test_directory_sync_error_surfaces_after_rename(tmp_path):
+    stage, target = tmp_path / 'stage', tmp_path / 'target.seg.nrrd'
+    stage.write_bytes(b'new output')
+    failure = OSError(errno.EIO, 'directory sync failed')
+    with mock.patch.object(outputs, '_fsync_parent_directory', side_effect=failure) as sync:
+        with pytest.raises(OSError) as caught:
+            outputs._publish_staged_file_atomically(stage, target)
+    sync.assert_called_once_with(target.parent)
+    assert caught.value is failure
+    assert target.read_bytes() == b'new output'
+    assert not stage.exists()

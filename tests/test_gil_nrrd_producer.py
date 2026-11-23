@@ -80,7 +80,7 @@ def _sha(data):
 @pytest.fixture(scope='module', autouse=True)
 def _warm():
     info = nk.warm_nrrd_producer_kernels()
-    assert info['crop_row_signatures'] >= 2 and info['tee_signatures'] >= 2
+    assert info['crop_row_signatures'] == 1 and info['tee_signatures'] == 1
 
 
 # ----------------------------------------------------------------------------- crop rows
@@ -298,7 +298,8 @@ def _write_layer(tmp_path, tag, store_path, fmt, store_shape, out_shape, mirrors
     tee = mock.patch.object(nk.FusedSparseMirrorTee, 'tee_records', autospec=True,
                             side_effect=nk.FusedSparseMirrorTee.tee_records)
     with ctx, tee as tee_calls, contextlib.redirect_stdout(io.StringIO()):
-        outputs.write_layer_nrrd_with_low_quality_mirrors(ref, out_shape, out, mirror_specs, z_shards=z_shards)
+        outputs.write_layer_nrrd_with_low_quality_mirrors(
+            ref, out_shape, out, mirror_specs, z_shards=z_shards, layout='full')
     assert bool(tee_calls.call_count) == bool(fused)
     return [_sha(out.read_bytes())] + [_sha(p.read_bytes()) for _s, p in mirror_specs]
 
@@ -504,4 +505,4 @@ def test_warm_compiles_every_kernel_signature():
     assert info['seconds'] < 5.0
     for key in ('crop_row_signatures', 'native_signatures', 'restored_signatures',
                 'tee_signatures', 'tee_or_signatures'):
-        assert info[key] >= 2
+        assert info[key] == 1

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import errno
 import hashlib
 import mmap
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tarfile
@@ -26,6 +28,120 @@ class ArtifactArchiveTests(unittest.TestCase):
 
     def ref(self, name):
         return artifacts.reference(self.archive, name)
+
+    def test_staged_archive_keeps_public_references_and_moves_settled_bytes(self):
+        pending = artifacts.StagedArtifactArchive.reserve(self.archive, self.root)
+        self.addCleanup(pending.close)
+        self.assertEqual(artifacts.physical_path(self.ref("left/a")), pending.path)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(artifacts.append_members, self.archive, {name: name.encode()})
+                       for name in ("left/a", "right/b")]
+            for future in futures:
+                future.result(timeout=5)
+        self.assertFalse(self.archive.exists())
+        self.assertEqual(artifacts.list_members(self.archive), ["left/a", "right/b"])
+        self.assertEqual(list(artifacts.iter_artifacts(self.ref("left"))), [Path(self.ref("left/a"))])
+        self.assertEqual(artifacts.read_member(self.ref("right/b")), b"right/b")
+        self.assertEqual(artifacts.split_reference(self.ref("right/b")), (self.archive, "right/b"))
+        expected = pending.path.read_bytes()
+        pending.publish()
+        self.assertEqual(artifacts.physical_path(self.ref("left/a")), self.archive)
+        self.assertEqual(self.archive.read_bytes(), expected)
+        self.assertFalse(pending.path.parent.exists())
+        self.assertIsNone(artifacts.StagedArtifactArchive.reserve(self.archive, self.root))
+
+    def test_staged_archive_copies_on_cross_filesystem_publish(self):
+        pending = artifacts.StagedArtifactArchive.reserve(self.archive, self.root)
+        self.addCleanup(pending.close)
+        artifacts.append_members(self.archive, {"evidence": b"abc" * 100000})
+        expected = pending.path.read_bytes()
+        move_module, move_name = (artifacts, "_publish_fresh") if os.name == "nt" else (artifacts.os, "link")
+        real_move = getattr(move_module, move_name)
+        def force_cross_device(stage, destination):
+            self.assertFalse(self.archive.exists())
+            stage_path = artifacts._canonical_path(stage)
+            if stage_path == pending.path:
+                raise OSError(errno.EXDEV, "different mount")
+            self.assertEqual(stage_path.parent, self.archive.parent)
+            real_move(stage, destination)
+
+        with mock.patch.object(move_module, move_name, side_effect=force_cross_device) as publish:
+            pending.publish()
+        self.assertEqual(publish.call_count, 2)
+        self.assertEqual(self.archive.read_bytes(), expected)
+        self.assertFalse(pending.path.parent.exists())
+
+    def test_staged_archive_close_publishes_committed_prefix_after_failure(self):
+        pending = artifacts.StagedArtifactArchive.reserve(self.archive, self.root)
+        self.addCleanup(pending.close)
+        artifacts.append_members(self.archive, {"evidence": b"committed"})
+        expected = pending.path.read_bytes()
+        with pending.path.open("ab") as stream:
+            stream.write(b"aborted append" * 1000)
+        pending.close()
+        self.assertEqual(self.archive.read_bytes(), expected)
+        self.assertEqual(artifacts.read_member(self.ref("evidence")), b"committed")
+
+    def test_staged_archive_failed_copy_preserves_recovery_archive(self):
+        pending = artifacts.StagedArtifactArchive.reserve(self.archive, self.root)
+        self.addCleanup(pending.close)
+        artifacts.append_members(self.archive, {"evidence": b"complete"})
+        move_module, move_name = (artifacts, "_publish_fresh") if os.name == "nt" else (artifacts.os, "link")
+        with (mock.patch.object(move_module, move_name, side_effect=OSError(errno.EXDEV, "different mount")),
+              mock.patch.object(artifacts.os, "fsync", side_effect=OSError(errno.ENOSPC, "target full")),
+              self.assertRaisesRegex(OSError, "target full")):
+            pending.publish()
+        pending.close()
+        self.assertFalse(self.archive.exists())
+        self.assertEqual(artifacts.physical_path(self.ref("evidence")), self.archive)
+        self.assertEqual(artifacts.read_member(artifacts.reference(pending.path, "evidence")), b"complete")
+        self.assertEqual(list(self.root.glob("*.assembling")), [])
+
+    @unittest.skipIf(os.name == "nt", "Windows does not fsync the directory")
+    def test_staged_archive_rename_failure_keeps_same_device_recovery(self):
+        from XTA import json_publication
+
+        pending = artifacts.StagedArtifactArchive.reserve(self.archive, self.root)
+        self.addCleanup(pending.close)
+        artifacts.append_members(self.archive, {"evidence": b"complete"})
+        with (mock.patch.object(json_publication, "_fsync_parent_directory", side_effect=OSError(errno.EIO, "sync failed")),
+              self.assertRaisesRegex(OSError, "sync failed")):
+            pending.publish()
+        pending.close()
+        self.assertEqual(artifacts.read_member(artifacts.reference(pending.path, "evidence")), b"complete")
+
+    def test_empty_staged_archive_retires_without_publishing_a_tar(self):
+        pending = artifacts.StagedArtifactArchive.reserve(self.archive, self.root)
+        self.addCleanup(pending.close)
+        pending.publish()
+        self.assertFalse(self.archive.exists())
+        self.assertFalse(pending.path.parent.exists())
+
+    @unittest.skipIf(os.name == "nt", "Windows does not fsync the directory")
+    def test_unsupported_directory_fsync_keeps_created_archive(self):
+        fsync = os.fsync
+
+        def unsupported_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EINVAL, "directory fsync unsupported")
+            fsync(fd)
+
+        with mock.patch.object(artifacts.os, "fsync", side_effect=unsupported_directory):
+            artifacts.append_members(self.archive, {"first": b"committed"})
+        self.assertEqual(artifacts.read_member(self.ref("first")), b"committed")
+
+    @unittest.skipIf(os.name == "nt", "POSIX shared reader lock")
+    def test_read_only_shared_lock_allows_another_process_to_index(self):
+        import fcntl
+
+        artifacts.append_members(self.archive, {"first": b"committed"})
+        lock = self.archive.with_suffix(".tar.lock")
+        code = ("import sys; from XTA import artifact_archive as archive; "
+                "assert archive.list_members(sys.argv[1]) == ['first']")
+        with lock.open("rb") as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)
+            subprocess.run([sys.executable, "-B", "-c", code, str(self.archive)],
+                           check=True, timeout=10, capture_output=True)
 
     def test_long_logical_paths_stream_exact_bytes_without_filesystem_directories(self):
         logical = "sam_interpolation/" + "/".join(["very_long_view" * 10] * 4) + "/evidence/masks.bin"
@@ -88,7 +204,7 @@ class ArtifactArchiveTests(unittest.TestCase):
                 release.set()
             writer.result(timeout=10)
             self.assertEqual(new.result(timeout=2), b"later")
-        self.assertNotIn(str(self.archive), artifacts._APPEND_SNAPSHOTS)
+        self.assertNotIn(artifacts._path_key(self.archive), artifacts._APPEND_SNAPSHOTS)
 
     def test_replacement_snapshot_and_failed_append_keep_exact_old_payload(self):
         artifacts.append_members(self.archive, {"old": b"committed"})
@@ -121,7 +237,7 @@ class ArtifactArchiveTests(unittest.TestCase):
                 finally:
                     if cursor is not None:
                         cursor.close()
-            self.assertNotIn(str(self.archive), artifacts._APPEND_SNAPSHOTS)
+            self.assertNotIn(artifacts._path_key(self.archive), artifacts._APPEND_SNAPSHOTS)
             self.assertEqual(artifacts.read_member(self.ref("old")), b"committed" if fail else b"replacement")
 
     def test_existing_prefix_projection_lookup_bypasses_append_but_new_inventory_waits(self):
@@ -163,6 +279,7 @@ class ArtifactArchiveTests(unittest.TestCase):
             self.assertEqual(full.result(timeout=2), ["existing/data.bin", "existing/meta.json", "pending/new"])
             self.assertEqual(missing.result(timeout=2), [Path(self.ref("pending/new"))])
 
+    @mock.patch.dict(os.environ, {"YOLO_TTA_ARCHIVE_LOCK_FREE_READS": "0"})
     def test_append_snapshot_rejects_replaced_file_or_shortened_prefix(self):
         artifacts.append_members(self.archive, {"old": b"committed"})
         replacement = self.root / "replacement.tar"
@@ -188,16 +305,16 @@ class ArtifactArchiveTests(unittest.TestCase):
                             with self.assertRaisesRegex(artifacts.ArchiveError, "prefix changed"):
                                 artifacts.read_member(self.ref("old"))
                     else:
-                        end = artifacts._APPEND_SNAPSHOTS[str(self.archive)][2]
+                        end = artifacts._APPEND_SNAPSHOTS[artifacts._path_key(self.archive)][2]
                         with self.archive.open("r+b") as stream:
                             stream.truncate(end - 1)
                         with self.assertRaisesRegex(artifacts.ArchiveError, "prefix changed"):
                             artifacts.member_info(self.ref("old"))
-                    self.assertNotIn(str(self.archive), artifacts._APPEND_SNAPSHOTS)
+                    self.assertNotIn(artifacts._path_key(self.archive), artifacts._APPEND_SNAPSHOTS)
                 finally:
                     release.set()
                 writer.result(timeout=10)
-            self.assertNotIn(str(self.archive), artifacts._APPEND_SNAPSHOTS)
+            self.assertNotIn(artifacts._path_key(self.archive), artifacts._APPEND_SNAPSHOTS)
 
     def test_fork_reset_does_not_inherit_append_snapshot_authority(self):
         with mock.patch.object(artifacts, "_APPEND_SNAPSHOTS", {"inherited": object()}):
@@ -343,6 +460,20 @@ class ArtifactArchiveTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             artifacts.publish_directory(stage, self.ref("scope"))
         self.assertEqual((stage / "new").read_bytes(), b"keep")
+
+    def test_fresh_prefix_does_not_bypass_unrelated_or_ancestor_conflicts(self):
+        artifacts.append_members(self.archive, {"outside/child": b"child", "parent": b"file"})
+        original = self.archive.read_bytes()
+        cases = [
+            ("new", {"new/data": b"file", "outside": b"conflict"}),
+            ("parent/new", {"parent/new/data": b"conflict"}),
+            ("new", {"new/data": b"file", "new/data/child": b"conflict"}),
+        ]
+        for fresh_prefix, members in cases:
+            with self.subTest(fresh_prefix=fresh_prefix, members=members):
+                with self.assertRaisesRegex(artifacts.ArchiveError, "file/directory names conflict"):
+                    artifacts.append_members(self.archive, members, fresh_prefix=fresh_prefix)
+                self.assertEqual(self.archive.read_bytes(), original)
 
     def test_concurrent_producers_publish_whole_transactions(self):
         def publish(index):

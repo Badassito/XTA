@@ -4,11 +4,9 @@ from __future__ import annotations
 import math
 
 
-def confidence_retention_requested(save_options=(), *, reconciliation_enabled=False,
-                                  sweep_cutoff=None):
-    """Keep scalar defaults unchanged; sweeps and explicit saves retain scores."""
-    return bool(reconciliation_enabled or sweep_cutoff is not None
-                or 'confidence' in save_options)
+def confidence_retention_requested(save_options=(), *, reconciliation_mode=None):
+    """Retain observed scores for score-based reconciliation or an explicit save."""
+    return reconciliation_mode == 'confidence' or 'confidence' in save_options
 
 
 def observed_confidence_contract(*, prediction_task=None, confidence_floor=None,

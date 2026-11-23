@@ -307,9 +307,9 @@ class RuntimeTelemetry:
             self._trace_dirty += 1
         # Never wait for the writer's global lock on a compute or credit path.
         # Other diagnostics and the periodic sampler also check write-due state.
-        if due and self.lock.acquire(blocking=False):
+        if (due or self._writer_thread is None) and self.lock.acquire(blocking=False):
             try:
-                if self._write_due_locked():
+                if self._writer_thread is None or self._write_due_locked():
                     self._request_writer_locked()
             finally:
                 self.lock.release()
@@ -431,11 +431,11 @@ class RuntimeTelemetry:
                 self._snapshot_dirty = self._dirty
             with self._trace_lock:
                 trace_events = list(self._trace_events[:max(1, self._trace_batch_limit)])
-                trace_dirty = self._trace_dirty
                 trace_dropped = self._trace_dropped
                 trace_first_dropped = self._trace_first_dropped_sequence
                 trace_buffer_peak = self._trace_buffer_peak
-                self._trace_snapshot_dirty = trace_dirty
+                # A snapshot records all drop counters alongside one event batch.
+                self._trace_snapshot_dirty = self._trace_dirty - (len(self._trace_events) - len(trace_events))
             phases: Dict[str, object] = {}
             for name, total_ns in phase_ns.items():
                 calls = int(phase_calls.get(name, 0))
@@ -547,9 +547,16 @@ class RuntimeTelemetry:
                     while not self._write_due_locked():
                         if not self.enabled or self._final_done:
                             return
-                        notified = self._writer_condition.wait(timeout=self._writer_idle_seconds)
+                        with self._trace_lock:
+                            trace_pending = bool(self._trace_dirty)
+                        timeout = self._writer_idle_seconds
+                        if trace_pending:
+                            timeout = min(timeout, max(0., self.flush_seconds - (time.monotonic() - self._last_flush)))
+                        notified = self._writer_condition.wait(timeout=timeout)
                         if not notified and not self._write_due_locked():
-                            return
+                            with self._trace_lock:
+                                if not self._trace_dirty:
+                                    return
                     # Recheck due state only here: hot-path requests never queue snapshots.
                     with self._trace_lock:
                         final = (self._final_requested and
@@ -614,7 +621,9 @@ class RuntimeTelemetry:
             with self._writer_condition:
                 self._writer_thread = None
                 # A request can arrive while an idle writer is closing its file.
-                if self._write_due_locked():
+                with self._trace_lock:
+                    trace_pending = bool(self._trace_dirty)
+                if trace_pending or self._write_due_locked():
                     self._request_writer_locked()
                 self._writer_condition.notify_all()
             self._report_writer_error()
@@ -818,9 +827,10 @@ class RuntimeSystemSampler:
     def _read_proc(cls) -> Dict[str, object]:
         result: Dict[str, object] = {'time': time.monotonic()}
         try:
-            fields = Path('/proc/self/stat').read_text().split()
-            result['cpu_ticks'] = int(fields[13]) + int(fields[14])
-            result['rss_pages'] = int(fields[23])
+            raw = Path('/proc/self/stat').read_text()
+            fields = raw[raw.rindex(')') + 2:].split()
+            result['cpu_ticks'] = int(fields[11]) + int(fields[12])
+            result['rss_pages'] = int(fields[21])
         except Exception:
             pass
         try:
@@ -958,10 +968,10 @@ class RuntimeSystemSampler:
             self._nvml_ready = False
 
 class _TeeStream:
-    def __init__(self, original: object, file_handle: object) -> None:
+    def __init__(self, original: object, file_handle: object, lock: Optional[threading.Lock] = None) -> None:
         self.original = original
         self.file_handle = file_handle
-        self.lock = threading.Lock()
+        self.lock = lock if lock is not None else threading.Lock()
 
     def write(self, data: str) -> object:
         with self.lock:
@@ -985,8 +995,9 @@ def _install_stdio_capture(telemetry: RuntimeTelemetry) -> Optional[object]:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         handle = target.open('a', encoding='utf-8', buffering=1)
-        sys.stdout = _TeeStream(sys.stdout, handle)  # type: ignore[assignment]
-        sys.stderr = _TeeStream(sys.stderr, handle)  # type: ignore[assignment]
+        lock = threading.Lock()
+        sys.stdout = _TeeStream(sys.stdout, handle, lock)  # type: ignore[assignment]
+        sys.stderr = _TeeStream(sys.stderr, handle, lock)  # type: ignore[assignment]
         return handle
     except Exception as exc:
         telemetry.fallback('telemetry.stdio_capture', exc)

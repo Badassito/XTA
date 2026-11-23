@@ -32,6 +32,10 @@ def seal(shape,receipts,**kwargs):
     return views.seal_view_family('detector','transverse__tta_a0',shape,(50,80),receipts=receipts,**kwargs)
 
 
+def has_complete_view(*args, **kwargs):
+    return views.view_family_status(*args, **kwargs) == 'ready'
+
+
 def basic(shape=(4,12,16),start=0,count=None,score=True):
     w=writer(shape,start,count)
     n=shape[0]-start if count is None else count
@@ -60,7 +64,7 @@ def test_exact_multi_range_hydration_and_stats_without_dense_bounds_scan(family)
         np.testing.assert_array_equal(scores,np.where(expected,cent+100,0))
         np.testing.assert_array_equal(stats['slice_any'],expected.any(axis=(1,2)))
         assert stats['prediction_count']==15 and stats['native_fanout_hydrated']
-        assert views.has_complete_view('detector','transverse__tta_a0',cent,native_shape=shape)
+        assert has_complete_view('detector','transverse__tta_a0',cent,native_shape=shape)
     for receipt in (a,b):
         meta=json.loads((Path(receipt['path'])/'metadata.json').read_text())
         assert meta['metrics']['full_plane_bounds_scans']==0
@@ -148,14 +152,14 @@ def test_thread_safe_out_of_order_frame_calls_and_duplicates(family):
 def test_missing_range_or_duplicate_coverage_is_fatal_not_fallback(family):
     a,_=basic((4,12,16),0,2)
     with pytest.raises(views.SweepViewIntegrityError,match='complete grid'):seal((4,12,16),[a])
-    with pytest.raises(views.SweepViewIntegrityError):views.has_complete_view('detector','transverse__tta_a0',50)
+    with pytest.raises(views.SweepViewIntegrityError):has_complete_view('detector','transverse__tta_a0',50)
 
 
 def test_explicit_unsupported_is_view_wide_and_generic_observations_are_valid(family):
     decision=seal((4,12,16),[{'status':'unsupported','reason':'unqualified resident route'}])
     assert decision['status']=='fallback' and 'unqualified' in decision['reason']
     assert views.view_family_status('detector','transverse__tta_a0',50)=='fallback'
-    assert not views.has_complete_view('detector','transverse__tta_a0',80)
+    assert not has_complete_view('detector','transverse__tta_a0',80)
 
 
 def test_lost_acknowledged_file_is_fatal_even_with_an_unsupported_observation(family):
@@ -167,7 +171,7 @@ def test_lost_acknowledged_file_is_fatal_even_with_an_unsupported_observation(fa
 def test_payload_corruption_is_rejected_when_crop_is_consumed(family):
     receipt,_=basic();seal((4,12,16),[receipt])
     path=Path(receipt['path'])/'payload.bin';raw=bytearray(path.read_bytes());raw[views._CHUNK.size]^=1;path.write_bytes(raw)
-    assert views.has_complete_view('detector','transverse__tta_a0',50)
+    assert has_complete_view('detector','transverse__tta_a0',50)
     with views.open_view('detector','transverse__tta_a0',50) as reader:
         with pytest.raises(views.SweepViewIntegrityError):list(reader.iter_crops(0))
 
@@ -177,7 +181,7 @@ def test_identity_grid_and_family_mismatch_cannot_hydrate(family,monkeypatch):
     with pytest.raises(views.SweepViewIntegrityError):views.open_view('detector','transverse__tta_a0',50,native_shape=(4,12,17))
     with pytest.raises(views.SweepViewIntegrityError):views.open_view('detector','transverse__tta_a0',50,identity={'different':True})
     monkeypatch.setenv('XTA_YOLO_SWEEP_ID','family-b')
-    with pytest.raises(views.SweepViewIntegrityError):views.has_complete_view('detector','transverse__tta_a0',50)
+    with pytest.raises(views.SweepViewIntegrityError):has_complete_view('detector','transverse__tta_a0',50)
 
 
 def test_capacity_refusal_and_abort_are_explicit_pre_ack_fallback(family,monkeypatch):
@@ -198,7 +202,7 @@ def test_zero_budget_rejects_before_any_payload_allocation(family,monkeypatch):
 
 def test_missing_consumer_decision_is_fatal_and_disabled_mode_is_noop(family,monkeypatch):
     monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_ROLE','consume')
-    with pytest.raises(views.SweepViewIntegrityError):views.has_complete_view('detector','transverse__tta_a0',50)
+    with pytest.raises(views.SweepViewIntegrityError):has_complete_view('detector','transverse__tta_a0',50)
     assert writer((1,4,5)) is None
 
 
@@ -214,7 +218,7 @@ def test_retirement_preserves_projected_decision_and_releases_payload(family):
     result=views.retire_view_payloads('detector','transverse__tta_a0',(50,80))
     assert result['status']=='projected' and result['freed_bytes']>0
     assert views.view_family_status('detector','transverse__tta_a0',50)=='projected'
-    assert not views.has_complete_view('detector','transverse__tta_a0',50)
+    assert not has_complete_view('detector','transverse__tta_a0',50)
     with pytest.raises(views.SweepViewRetiredError):views.open_view('detector','transverse__tta_a0',80)
     assert not (Path(receipt['path'])/'payload.bin').exists()
 
@@ -233,10 +237,8 @@ def test_task_identity_token_is_bound_once_and_checked_by_all_consumers(family):
     receipt=w.finish()
     identity=task['sweep_fanout_identity']
     seal((1,4,5),[receipt],identity=identity)
-    assert views.has_complete_view('detector','transverse__tta_a0',50,identity=identity)
-    with pytest.raises(views.SweepViewIntegrityError):views.has_complete_view('detector','transverse__tta_a0',50)
-    unsupported=views.unsupported_task_fanout(task,SimpleNamespace(),backend='cuda',reason='route',native_shape=(1,4,5))
-    assert unsupported['status']=='unsupported' and unsupported['native_shape']==[1,4,5]
+    assert has_complete_view('detector','transverse__tta_a0',50,identity=identity)
+    with pytest.raises(views.SweepViewIntegrityError):has_complete_view('detector','transverse__tta_a0',50)
 
 
 def test_nonempty_mask_with_zero_scores_has_a_present_unknown_lane(family):
@@ -290,11 +292,51 @@ def test_shared_quota_covers_concurrent_task_reservations(family,monkeypatch):
     assert seal((2,4,5),[receipt,second.finish()])['status']=='ready'
 
 
+def test_batched_quota_changes_are_atomic(family, monkeypatch):
+    family.mkdir()
+    monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_GIB', str(100 / 1024**3))
+    views._quota_many(family, [('range-a', 30), ('range-b', 20)])
+    with pytest.raises(views.SweepViewCapacityError):
+        views._quota_many(family, [('range-a', 0), ('range-b', 101)])
+    assert views.native_journal_usage(family, max_age_seconds=0) == (50, 100)
+    views._quota_many(family, [('range-a', 0), ('range-b', 70)])
+    assert views.native_journal_usage(family, max_age_seconds=0) == (70, 100)
+
+
+def test_separate_quota_database_keeps_payloads_and_unrelated_families_on_scratch(family, monkeypatch):
+    from XTA.sweep_quota import initialize_quota_database
+
+    fast = family.parent / 'metadata'
+    fast.mkdir()
+    monkeypatch.setenv('XTA_YOLO_SWEEP_QUOTA_DATABASE', str(fast / 'quota.sqlite'))
+    initialize_quota_database(fast / 'quota.sqlite')
+    receipt, _ = basic()
+    assert Path(receipt['path']).parent == family / 'ranges'
+    assert (Path(receipt['path']) / 'payload.bin').is_file()
+    assert not (family / 'quota.sqlite').exists()
+    from contextlib import closing
+    with closing(sqlite3.connect(fast / 'quota.sqlite')) as db:
+        used, = db.execute('SELECT used FROM usage').fetchone()
+    assert used > 0 and views.native_journal_usage(family, max_age_seconds=0)[0] == used
+
+    other = family.parent / 'other'
+    other.mkdir()
+    views._quota(other, 'independent', 47)
+    assert (other / 'quota.sqlite').is_file()
+    assert views.native_journal_usage(other, max_age_seconds=0)[0] == 47
+    assert views.native_journal_usage(family, max_age_seconds=0)[0] == used
+    (fast / 'quota.sqlite').unlink()
+    with pytest.raises(sqlite3.OperationalError):
+        views._quota(family, 'already-funded', 100)
+    assert not (fast / 'quota.sqlite').exists()
+    assert views.native_journal_usage(family, max_age_seconds=0)[0] is None
+
+
 def test_terminal_consumed_state_forbids_future_native_reads(family,monkeypatch):
     receipt,_=basic();seal((4,12,16),[receipt])
     views.retire_view_payloads('detector','transverse__tta_a0',(50,80),terminal_state='consumed')
     assert views.view_family_status('detector','transverse__tta_a0',80)=='consumed'
-    assert not views.has_complete_view('detector','transverse__tta_a0',80)
+    assert not has_complete_view('detector','transverse__tta_a0',80)
     with pytest.raises(views.SweepViewRetiredError):views.open_view('detector','transverse__tta_a0',50)
     marker=next(family.glob('views/*/metadata.json'));marker.unlink()
     monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_ROLE','consume')
@@ -394,7 +436,7 @@ def test_unicode_logical_names_keep_exact_product_identity(family):
     w=views.NativeTaskFanoutWriter(family,'模型','横断面',(1,3,4),(50,80),frame_start=0,expected_frames=1)
     for c in w.cutoffs:w.put_empty_range(c,0,1)
     views.seal_view_family('模型','横断面',(1,3,4),(50,80),receipts=[w.finish()])
-    assert views.has_complete_view('模型','横断面',50)
+    assert has_complete_view('模型','横断面',50)
 
 
 def test_explicit_scalar_owned_floor_keeps_counts_without_any_pixel_lane(family,monkeypatch):
@@ -418,8 +460,8 @@ def test_explicit_scalar_owned_floor_keeps_counts_without_any_pixel_lane(family,
     assert decision['frames_with_predictions']=={50:2,80:3}
     assert decision['has_foreground'][50] is None and decision['has_foreground'][80]
     assert views.view_family_status('detector','transverse__tta_a0',50)=='scalar_owned'
-    assert not views.has_complete_view('detector','transverse__tta_a0',50)
-    assert views.has_complete_view('detector','transverse__tta_a0',80)
+    assert not has_complete_view('detector','transverse__tta_a0',50)
+    assert has_complete_view('detector','transverse__tta_a0',80)
     with pytest.raises(views.SweepViewScalarOwnedError):views.open_view('detector','transverse__tta_a0',50)
     with views.open_view('detector','transverse__tta_a0',80) as reader:
         assert reader.prediction_count==3 and reader.read_mask_plane(1).sum()==2

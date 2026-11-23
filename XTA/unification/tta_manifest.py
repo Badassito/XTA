@@ -18,6 +18,23 @@ TTA_VOXEL_COUNT_SCHEMA = "xta.v18.voxel_count/1"
 
 _ARTIFACT_DIGESTS: dict[tuple[object, ...], str] = {}
 _ARTIFACT_DIGEST_LOCK = threading.Lock()
+_CHANGE_TIME_FIELD = "change_or_creation_time_ns"
+
+
+def _content_comparison_identity(identity):
+    return {key: value for key, value in identity.items() if key != _CHANGE_TIME_FIELD}
+
+
+def comparable_artifact_identities(identities):
+    """Exclude metadata change time only for files with a recorded digest."""
+    def comparable(record):
+        return _content_comparison_identity(record) if "sha256" in record else record
+
+    return {**identities, "source": comparable(identities["source"]), "models": {
+        name: None if model is None else {
+            **model, "artifacts": [comparable(item) for item in model["artifacts"]]}
+        for name, model in identities["models"].items()
+    }}
 
 
 def _sweep_startup_cache_path(kind: str, path: Path) -> Path | None:
@@ -35,13 +52,15 @@ def _sweep_startup_cache_path(kind: str, path: Path) -> Path | None:
 
 def _write_sweep_startup_cache(path: Path, record: Mapping[str, Any]) -> None:
     """Publish completed metadata; large model and video bytes stay elsewhere."""
+    from ..json_publication import _replace_published_json
+
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
             json.dump(record, stream, separators=(",", ":"))
-        os.replace(temporary, path)
+        _replace_published_json(temporary, path)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -208,6 +227,17 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _stable_artifact_digest(path, identity):
+    digest = _sha256_file(path)
+    current = _file_identity(path)
+    if current != identity:
+        # Metadata drift can also hide a same-size edit with a restored mtime.
+        if (_content_comparison_identity(current) != _content_comparison_identity(identity)
+                or _sha256_file(path) != digest or _file_identity(path) != current):
+            raise RuntimeError(f"TTA model artifact changed while reading its identity: {path}")
+    return digest, current
+
+
 def _file_identity(
     path: str | Path,
     *,
@@ -235,21 +265,33 @@ def _file_identity(
             cached = None
             if cache_path is not None and cache_path.exists():
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached is not None:
-                if cached.get("identity") != identity:
-                    raise RuntimeError(f"TTA model artifact changed within confidence sweep: {resolved}")
+            if cached is not None and _content_comparison_identity(
+                    cached["identity"]) != _content_comparison_identity(identity):
+                raise RuntimeError(f"TTA model artifact changed within confidence sweep: {resolved}")
+            if cached is not None and cached["identity"] == identity:
                 digest = cached["sha256"]
             else:
                 digest = _ARTIFACT_DIGESTS.get(key)
                 if digest is None:
-                    digest = _sha256_file(resolved)
-                    if _file_identity(resolved) != identity:
-                        raise RuntimeError(f"TTA model artifact changed while reading its identity: {resolved}")
-                    _ARTIFACT_DIGESTS[key] = digest
-                if cache_path is not None:
+                    digest, identity = _stable_artifact_digest(resolved, identity)
+                if cached is not None and digest != cached["sha256"]:
+                    raise RuntimeError(f"TTA model artifact changed within confidence sweep: {resolved}")
+                _ARTIFACT_DIGESTS[tuple(identity.values())] = digest
+                if cache_path is not None and cached is None:
                     _write_sweep_startup_cache(cache_path, {"identity": identity, "sha256": digest})
         identity["sha256"] = digest
     return identity
+
+
+def _artifact_stat_matches(record, current):
+    expected = {key: value for key, value in record.items() if key != "sha256"}
+    if expected == current:
+        return True
+    if ("sha256" not in record
+            or _content_comparison_identity(expected) != _content_comparison_identity(current)):
+        return False
+    verified = _file_identity(record["path"], content_digest=True, use_sweep_cache=False)
+    return _content_comparison_identity(verified) == _content_comparison_identity(record)
 
 
 def _resolve_openvino_artifacts(path: str | Path) -> tuple[Path, ...]:
@@ -345,7 +387,7 @@ def capture_tta_artifact_identities(
     if cache_path is not None:
         if cache_path.exists():
             previous = json.loads(cache_path.read_text(encoding="utf-8"))
-            if previous != result:
+            if comparable_artifact_identities(previous) != comparable_artifact_identities(result):
                 raise RuntimeError("TTA input/model artifact set changed within confidence sweep")
         else:
             _write_sweep_startup_cache(cache_path, result)
@@ -362,7 +404,6 @@ def assert_tta_artifacts_unchanged(identities: Mapping[str, Any], *, use_sweep_c
     compared_fields = (
         "size_bytes",
         "modified_time_ns",
-        "change_or_creation_time_ns",
         "device",
         "file_id",
     )
@@ -376,6 +417,8 @@ def assert_tta_artifacts_unchanged(identities: Mapping[str, Any], *, use_sweep_c
             field for field in compared_fields
             if int(current[field]) != int(record[field])
         ]
+        if "sha256" not in record and current[_CHANGE_TIME_FIELD] != record[_CHANGE_TIME_FIELD]:
+            changed.append(_CHANGE_TIME_FIELD)
         if "sha256" in record and str(current["sha256"]) != str(record["sha256"]):
             changed.append("sha256")
         if changed:

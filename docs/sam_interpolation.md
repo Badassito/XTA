@@ -64,10 +64,11 @@ FP8 checkpoint or replacement model. The profile retains eager execution,
 complex-valued RoPE, the original input grid and complete tracking intervals.
 
 `YOLO_TTA_SAM_ATTENTION_BACKEND` accepts `auto`, `sdpa`, or `fa3_fp8`. `auto`
-uses FA3 on the H100 profile and SDPA on the supported 4090 profile. `sdpa`
-provides the baseline for matched experiments. Explicit FP8 FA3 requires
-Hopper or newer. The worker configuration's `attention_backend` field takes
-precedence over the environment when supplied.
+selects FP8 FA3 on Hopper (compute capability 9.x) and SDPA on the A100 and
+supported 4090 profiles. The A100 profile retains FP32 weight storage and uses
+the regular batch sizes. `sdpa` provides the baseline for matched experiments.
+Explicit FP8 FA3 also requires Hopper. The worker configuration's
+`attention_backend` field takes precedence over the environment when supplied.
 
 Each FA3 worker checks the official `flash-attn-3==3.0.0` runtime and executes
 head-64 self-attention and head-32 cross-attention probes before model loading.
@@ -646,7 +647,7 @@ extra independent prediction votes or public NRRD layers; the two directional
 selected slots per pass/scope retain their existing publication role.
 
 Integrated runs retain SAM artifacts in `OUTPUT/sam-artifacts.tar`, with
-`sam-artifacts.tar.lock` serializing concurrent writers. Scope names are logical
+the active archive's lock serializing concurrent writers. Scope names are logical
 members under `sam_interpolation/MODEL/VIEW/fullframe` or `tile_CONFIG`;
 extrapolation uses the `sam_extrapolation/` namespace in the same container.
 Stats, layer references and receipts identify them as
@@ -656,8 +657,10 @@ paths. Long names do not become loose output directories or per-frame files.
 Active evidence and directional-store builders use short temporary stages.
 Each sealed bundle or CVOL store is appended as a committed TAR/PAX transaction,
 and its successful stage retires. JSON receipts commit independently as they
-become available. This publication happens during the run; it does not wait for
-full-run completion. Readers expose only committed transactions, so a torn final
+become available. A fresh archive with an explicit disk-backed `--temp` is built
+on that scratch disk and published to `OUTPUT` when its producers and readers
+settle. Use `YOLO_TTA_SAM_ARCHIVE_LIVE_OUTPUT=1` to expose committed members during
+execution. Readers expose only committed transactions, so a torn final
 append leaves earlier evidence readable. The next writer discards only the
 uncommitted tail. Scope completeness and required selection-receipt checks still
 apply; an archive with recoverable members is not a completed-run receipt.
@@ -706,18 +709,9 @@ connectivity as `not_assessed` while
 still measuring retained/removed bridge voxels; voxel survival alone does not
 establish a connected final repair.
 
-When plain-union reuse publishes the same final mask and all writers have
-settled, the final audit can reuse the source audit's receipts. This requires
-identity restoration, no configured global mask mutators, the same in-memory
-output and selected references, and matching SHA-256 content for the mask,
-selected backing, evidence, indices and selection metadata. The final audit's
-256 MiB workspace limit and source-integrity assertions still apply; topology
-receipts additionally require compatible audit budgets. Any failed guard runs
-the ordinary final audit. Reused receipts are copied and marked with their
-origin while retaining separate before/after stages and existing
-`not_assessed` scopes. Runtime telemetry separates the reuse checks from the
-audit itself: reading and hashing the mask and evidence has a real cost, so
-reuse does not imply a measured throughput improvement.
+Source reconciliation measures survival against the source-grid mask before
+global postprocessing. After postprocessing and writer settlement, the final
+audit measures the published mask with its own 256 MiB workspace budget.
 
 The publication path projects each selected directional mask into
 orthogonal/source coordinates before constructing its public layer reference.

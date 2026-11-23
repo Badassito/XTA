@@ -38,7 +38,7 @@ def test_cuda_affine_matches_reference_and_packbits(shape, translation):
 
 
 @pytest.mark.parametrize('space',['source','raster'])
-@pytest.mark.parametrize('kind',['smooth','fold','singular','constant','nan'])
+@pytest.mark.parametrize('kind',['smooth','fold','border_fold','border_halo','singular','constant','nan'])
 def test_cuda_elastic_conservative_inverse_matches_reference(kind,space):
     h,w=47,53
     yy,xx=torch.meshgrid(torch.arange(h,device='cuda',dtype=torch.float32),
@@ -47,6 +47,13 @@ def test_cuda_elastic_conservative_inverse_matches_reference(kind,space):
     field=torch.stack((2*torch.sin(yy/5),1.2*torch.sin(xx/8)))
     if kind=='fold':
         forward=torch.eye(3,device='cuda'); field=torch.stack((-2*xx,yy*0))
+    if kind == 'border_fold':
+        forward = torch.eye(3, device='cuda')
+        field = torch.stack((2 * (w - 1 - xx), yy * 0))
+    if kind == 'border_halo':
+        forward = torch.eye(3, device='cuda')
+        forward[0, 2] = 1.50005
+        field = torch.stack((2 * (w - 1 - xx) + 1.5, yy * 0))
     if kind=='singular':
         forward=torch.eye(3,device='cuda'); field=torch.stack((-xx,yy*0))
     if kind=='constant': field=torch.stack((xx*0+3,yy*0-1))
@@ -56,6 +63,7 @@ def test_cuda_elastic_conservative_inverse_matches_reference(kind,space):
     assert torch.equal(valid,support)
     torch.testing.assert_close(actual,expected,atol=2e-6,rtol=0)
     if kind=='nan': assert not valid.any()
+    if kind in ('border_fold', 'border_halo'): assert not valid[:, -1].any()
     if valid.any():
         xy=torch.stack(((actual[...,0]+1)*(w-1)/2,(actual[...,1]+1)*(h-1)/2),-1)
         delta,dx,dy=_bilinear_displacement(field,xy)

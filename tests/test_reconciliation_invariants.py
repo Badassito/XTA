@@ -7,12 +7,14 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+from unittest.mock import patch
 
 import numpy as np
 
 from XTA.reconciliation import EvidenceLayer, reconcile
 from XTA.reconciliation_policy import validate_policy, resolve_reconciliation, load_reconciliation_policy
 from XTA.reconciliation_geometry import section_codes, section_descriptor
+from XTA import reconciliation_geometry
 
 
 def evidence(name, mask, *, view=None, scores=None, observed=None, **metadata):
@@ -93,6 +95,74 @@ class ReconciliationInvariantTests(unittest.TestCase):
                 # the geometry helper accepts a narrower parameter range.
                 section_codes(descriptor, 0, 1, (1, 3, 4),
                               angular_tolerance_deg=policy['angular_tolerance_deg'])
+
+    def test_only_overlapping_positive_votes_count_as_removed_duplicates(self):
+        shape = (1, 1, 3)
+        first = evidence('transverse', np.array([[[1, 1, 0]]], np.uint8))
+        second = evidence('tilted_transverse_horizontal_p0p1',
+                          np.array([[[0, 1, 1]]], np.uint8))
+        output, report, _ = execute([first, second], shape, dict(threshold=1., min_sources=1))
+        self.assertTrue(output.all())
+        self.assertEqual(report['group_count'], 2)
+        self.assertEqual(report['counts']['duplicate_group_support_removed'], 1)
+
+    def test_section_geometry_reuses_xy_codes_and_recomputes_z_dependent_codes(self):
+        shape = (3, 5, 5)
+        mask = np.ones(shape, np.uint8)
+        layers = [EvidenceLayer(name, shape, dict(physical_view_name=name, view_family='azimuthal',
+                  mask_kind='yolo', azimuths_deg=(0., 45., 90., 135.)), lambda a, b: mask[a:b])
+                  for name in ('azimuthal_transverse', 'azimuthal_sagittal')]
+        context = dict(processing_shape_tyx=shape, source_shape_tyx=shape)
+        policy = dict(threshold=1., min_sources=2, min_prediction_sources=0)
+        expected, _, _ = execute(layers, shape, policy, context=context)
+        with patch.object(reconciliation_geometry, 'section_codes', wraps=section_codes) as code:
+            output, _, writes = execute(layers, shape, policy, context=context, memory_mib=.005)
+        self.assertEqual(writes, [(0, 1), (1, 2), (2, 3)])
+        self.assertEqual([(call.args[0]['base_view'], *call.args[1:3]) for call in code.call_args_list],
+                         [('transverse', 0, 1), ('sagittal', 0, 1), ('sagittal', 1, 2), ('sagittal', 2, 3)])
+        np.testing.assert_array_equal(output, expected)
+
+    def test_score_slab_keeps_boundaries_at_policy_threshold_precision(self):
+        shape = (1, 1, 1)
+        layer = evidence('transverse', np.ones(shape, np.uint8))
+        policy = dict(threshold=np.nextafter(1., 2.), min_sources=1)
+        output, _, _ = execute([layer], shape, policy)
+        self.assertFalse(output.any())
+
+    def test_active_anchor_bonus_keeps_custom_score_precision(self):
+        shape = (1, 1, 1)
+        mask = np.ones(shape, np.uint8)
+        layers = [evidence(name, mask, scores=np.full(shape, 255, np.uint8), observed=mask.astype(bool))
+                  for name in ('transverse', 'sagittal')]
+
+        def decide(block):
+            self.assertEqual(block['score'].dtype, np.float64)
+            self.assertEqual(block['score'].item(), 2. + 1e-8)
+            return block['score'] > 2.
+
+        output, _, _ = execute(layers, shape, dict(mode='confidence', anchor_bonus=1e-8, decide=decide))
+        self.assertTrue(output.all())
+
+    def test_builtin_anchor_bonus_reuses_one_plane_at_float64_policy_precision(self):
+        shape = (17, 2, 3)
+        mask = np.ones(shape, np.uint8)
+        observed = mask.astype(bool)
+        observed[:, 0, 0] = False
+        layers = [
+            evidence('transverse', mask, scores=np.full(shape, 255, np.uint8), observed=observed),
+            evidence('sagittal', mask, scores=np.full(shape, 255, np.uint8), observed=mask.astype(bool)),
+        ]
+        anchor_bonus = 1e-8
+        threshold = np.nextafter(2. + anchor_bonus, 2.)
+        policy = dict(mode='confidence', anchor_bonus=anchor_bonus, threshold=threshold)
+        with patch.object(np, 'copyto', wraps=np.copyto) as copy:
+            output, _, writes = execute(layers, shape, policy)
+        self.assertEqual(writes, [(0, 16), (16, 17)])
+        self.assertEqual(copy.call_count, shape[0])
+        plane = copy.call_args_list[0].args[0]
+        self.assertEqual((plane.shape, plane.dtype), (shape[1:], np.float64))
+        self.assertTrue(all(call.args[0] is plane for call in copy.call_args_list))
+        np.testing.assert_array_equal(output, observed)
 
     def test_shared_azimuth_cartesian_section_cannot_create_an_independent_anchor(self):
         shape = (3, 5, 5)

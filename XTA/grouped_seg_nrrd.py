@@ -1,6 +1,6 @@
 """Bounded stock Slicer segmentation NRRD publication for overlapping segments.
 
-Callbacks return full-reference C-order (t,y,x) binary slabs. The file uses
+Callbacks return (t,y,x) binary slabs on the reference grid or a declared XY crop. The file uses
 NRRD axes (x,y,t,list), one ordinary label=1 layer per logical segment.
 No custom payload codec or inference-runtime imports are required.
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -38,6 +39,8 @@ class GroupedSegment:
     read_slab: Callable[[int, int], np.ndarray]
     tags: Mapping[str, str] = field(default_factory=dict)
     extent_xyz: tuple[int, int, int, int, int, int] | None = None
+    # Optional reference coordinates (y0, x0, y1, x1), upper bounds exclusive.
+    source_window_yx: tuple[int, int, int, int] | None = None
 
 
 def _text(value: Any, name: str) -> str:
@@ -91,7 +94,14 @@ def _validated_segments(segments, shape):
             if not isinstance(value, str) or any(c in value for c in "|\r\n\0"):
                 raise ValueError("tag values must be single-line strings without '|'")
             tags[key] = value
-        result.append((segment, _extent(segment.extent_xyz, shape), color, tags))
+        window = segment.source_window_yx
+        if window is None:
+            window = (0, 0, *shape[1:])
+        if (not isinstance(window, (tuple, list)) or len(window) != 4
+                or any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) for v in window)
+                or not 0 <= window[0] < window[2] <= shape[1] or not 0 <= window[1] < window[3] <= shape[2]):
+            raise ValueError("source_window_yx must be a nonempty crop inside the reference plane")
+        result.append((segment, _extent(segment.extent_xyz, shape), color, tags, tuple(map(int, window))))
     return result
 
 
@@ -114,7 +124,7 @@ def _union_crop(extents, shape_tyx):
     return tuple(hi[i]-lo[i]+1 for i in (2, 1, 0)), tuple(lo)
 
 
-def _slab_extent(slab, z0, foreground):
+def _slab_extent(slab, origin_tyx, foreground):
     if not foreground:
         return _EMPTY_EXTENT
     bounds = []
@@ -122,10 +132,7 @@ def _slab_extent(slab, z0, foreground):
         projection = np.any(slab, axis=tuple(i for i in range(3) if i != axis))
         lo = int(np.argmax(projection))
         hi = len(projection) - 1 - int(np.argmax(projection[::-1]))
-        if axis == 0:
-            lo += z0
-            hi += z0
-        bounds.extend((lo, hi))
+        bounds.extend((lo + origin_tyx[axis], hi + origin_tyx[axis]))
         del projection
     return tuple(bounds)
 
@@ -137,6 +144,19 @@ def _merge_extent(first, second):
         return first
     return tuple(v for i in range(3)
                  for v in (min(first[2*i], second[2*i]), max(first[2*i+1], second[2*i+1])))
+
+
+def _group_slab(slab, window, crop_y, crop_x, height, width):
+    """Place a verified source slab directly into the group's shared XY grid."""
+    y0, x0, y1, x1 = window
+    if y0 <= crop_y and x0 <= crop_x and y1 >= crop_y + height and x1 >= crop_x + width:
+        return np.ascontiguousarray(
+            slab[:, crop_y-y0:crop_y-y0+height, crop_x-x0:crop_x-x0+width], dtype=np.uint8)
+    top, left = max(y0, crop_y), max(x0, crop_x)
+    bottom, right = min(y1, crop_y + height), min(x1, crop_x + width)
+    payload = np.zeros((len(slab), height, width), np.uint8)
+    payload[:, top-crop_y:bottom-crop_y, left-crop_x:right-crop_x] = slab[:, top-y0:bottom-y0, left-x0:right-x0]
+    return payload
 
 
 def _vector(values):
@@ -176,7 +196,7 @@ def write_grouped_seg_nrrd(
     path: str | Path, *, shape_tyx: tuple[int, int, int],
     segments: Sequence[GroupedSegment], geometry: ReferenceGeometry | None = None,
     memory_mib: float = 64, chunk_slices: int = 16, overwrite: bool = False,
-    temp_dir: str | Path | None = None,
+    temp_dir: str | Path | None = None, index_segments: bool = False,
 ) -> dict[str, Any]:
     """Write overlapping ordinary segments with one source pass and bounded slabs.
 
@@ -190,6 +210,7 @@ def write_grouped_seg_nrrd(
     Source data returned within a request is checked against its declared bound.
     The compressed spool uses temp_dir (system temporary storage by default);
     only the final assembled temporary file is placed beside its destination.
+    Indexed segments have complete gzip member ranges for direct channel reads.
     """
     shape = _shape(shape_tyx, "shape_tyx")
     budget = _budget(memory_mib)
@@ -198,11 +219,13 @@ def write_grouped_seg_nrrd(
         raise ValueError("Writer shape disagrees with spatial reference")
     if isinstance(chunk_slices, bool) or not isinstance(chunk_slices, int) or chunk_slices <= 0:
         raise ValueError("chunk_slices must be a positive integer")
-    if not isinstance(overwrite, bool):
-        raise ValueError("overwrite must be bool")
+    if not isinstance(overwrite, bool) or not isinstance(index_segments, bool):
+        raise ValueError("overwrite and index_segments must be bool")
     descriptors = _validated_segments(segments, shape)
-    stored_shape, offset_xyz = _union_crop([extent for _, extent, _, _ in descriptors], shape)
-    per_slice = math.prod(shape[1:]) if any(bound != _EMPTY_EXTENT for _, bound, _, _ in descriptors) else 1
+    stored_shape, offset_xyz = _union_crop([row[1] for row in descriptors], shape)
+    largest_input = max(((y1-y0)*(x1-x0) for _, bound, _, _, (y0,x0,y1,x1) in descriptors
+                         if bound != _EMPTY_EXTENT), default=1)
+    per_slice = max(largest_input, math.prod(stored_shape[1:]))
     zero_bytes = min(64 * 1024, per_slice)
     minimum = 3 * per_slice + zero_bytes
     depth = min(chunk_slices, shape[0], (budget - zero_bytes) // max(1, 3 * per_slice))
@@ -232,7 +255,9 @@ def write_grouped_seg_nrrd(
             raw, compresslevel=3, zero_member_bytes=zero_member_bytes,
             write_buffer_bytes=zero_write_buffer_bytes,
         ) as compressed:
-            for segment, bound, color, tags in descriptors:
+            for segment, bound, color, tags, window in descriptors:
+                y0, x0, y1, x1 = window
+                start = raw.tell() if index_segments else None
                 foreground, exact = 0, _EMPTY_EXTENT
                 if bound == _EMPTY_EXTENT:
                     first = stop = crop_z
@@ -242,20 +267,18 @@ def write_grouped_seg_nrrd(
                 for z0 in range(first, stop, depth):
                     z1 = min(stop, z0+depth)
                     slab = np.asarray(segment.read_slab(z0, z1))
-                    if slab.shape != (z1-z0, *shape[1:]) or slab.dtype not in (np.dtype(np.uint8), np.dtype(bool)):
-                        raise ValueError("read_slab must return the requested uint8 or bool reference TYX slab")
-                    if np.any(slab > 1):
+                    if slab.shape != (z1-z0, y1-y0, x1-x0) or slab.dtype not in (np.dtype(np.uint8), np.dtype(bool)):
+                        raise ValueError("read_slab must return the requested uint8 or bool TYX slab")
+                    if slab.dtype == np.uint8 and slab.max() > 1:
                         raise ValueError("Grouped segments require binary values 0/1")
                     count = int(np.count_nonzero(slab))
-                    extent = _slab_extent(slab, z0, count)
+                    extent = _slab_extent(slab, (z0, y0, x0), count)
                     if count and any(extent[2*i] < bound[2*i] or extent[2*i+1] > bound[2*i+1] for i in range(3)):
                         raise ValueError(f"Source data exceeds extent_xyz for {segment.segment_id}")
                     exact = _merge_extent(exact, extent)
                     foreground += count
                     if count:
-                        payload = np.ascontiguousarray(
-                            slab[:, crop_y:crop_y+stored_y, crop_x:crop_x+stored_x], dtype=np.uint8,
-                        )
+                        payload = _group_slab(slab, window, crop_y, crop_x, stored_y, stored_x)
                         compressed.write(memoryview(payload).cast("B"))
                         del payload
                     else:
@@ -271,13 +294,28 @@ def write_grouped_seg_nrrd(
                     "extent_xyz": list(exact), "stored_extent_xyz": list(local_extent),
                     "foreground_voxels": foreground, "empty_segment": foreground == 0,
                 })
+                if start is not None:
+                    compressed.finish_span()
+                    records[-1].update(gzip_offset=start, gzip_bytes=raw.tell() - start)
         header = _header(shape, stored_shape, offset_xyz, geometry, records)
+        digest = hashlib.sha256(header) if index_segments else None
         with final_stage.open("wb") as destination, payload_path.open("rb") as payload:
             destination.write(header)
-            shutil.copyfileobj(payload, destination, length=min(1024*1024, budget))
+            block_bytes = min(1024*1024, budget)
+            if digest is None:
+                shutil.copyfileobj(payload, destination, length=block_bytes)
+            else:
+                while block := payload.read(block_bytes):
+                    destination.write(block)
+                    digest.update(block)
+                destination.flush()
+                os.fsync(destination.fileno())
         if path.exists() and not overwrite:
             raise FileExistsError(f"Output already exists: {path}")
         os.replace(final_stage, path)
+        if digest is not None:
+            for record in records:
+                record["gzip_offset"] += len(header)
         return {
             "path": str(path), "shape_tyx": list(shape), "stored_shape_tyx": list(stored_shape),
             "offset_xyz": list(offset_xyz), "segment_count": len(records), "segments": records,
@@ -285,6 +323,7 @@ def write_grouped_seg_nrrd(
             "chunk_slices": depth, "payload_uncompressed_bytes": math.prod(stored_shape)*len(records),
             "gzip_spans": dict(compressed.stats),
             "bytes": path.stat().st_size,
+            **({"sha256": digest.hexdigest()} if digest is not None else {}),
         }
     finally:
         if payload_dir is not None:

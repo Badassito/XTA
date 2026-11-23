@@ -165,9 +165,12 @@ class SparseAzimuthalProjectionTests(unittest.TestCase):
                 'oracle', reserve_bytes=0, out_shape_tyx=(7, 8, 11))
             expected = np.asarray(oracle).copy()
             close_memmap_array(oracle)
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                results = list(pool.map(lambda i: sparse_projection.project_azimuthal_sparse_store(
-                    source_path, view, self.root/f'parallel-{i}', out_shape_tyx=(7, 8, 11), workers=2), range(4)))
+            with mock.patch.object(sparse_projection, '_map_key_strips', wraps=sparse_projection._map_key_strips) as strips:
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(lambda i: sparse_projection.project_azimuthal_sparse_store(
+                        source_path, replace(view, name=f'{view.name}-{i}', azimuths_deg=list(view.azimuths_deg)),
+                        self.root/f'parallel-{i}', out_shape_tyx=(7, 8, 11), workers=2), range(4)))
+                self.assertEqual(strips.call_count, 1)
         self.assertEqual(sum(bool(result['map_cache_hit']) for result in results), 3)
         self.assertTrue(all(result['map_bytes'] > 0 for result in results))
         for result in results:

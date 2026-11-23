@@ -174,7 +174,7 @@ def _cpr_categorical_warp(native, forward, height, width, *, torch, cache=None):
                 cache.popitem(last=False)
     if cache is not None:
         cache.move_to_end(key)
-    sampled = native.reshape(-1)[addresses.clamp(0, int(native.numel()) - 1)]
+    sampled = native.reshape(-1)[addresses]
     return torch.where(addresses >= 0, sampled, 0).to(torch.uint8).contiguous()
 
 
@@ -209,7 +209,7 @@ def _cpr_intensity_warp(native, forward, height, width, *, torch):
 # before first use.
 @lru_cache(maxsize=None)
 def _cpr_tile_resize_indices(torch, side, target_h, target_w, device):
-    """Device copies of OpenCV's INTER_NEAREST resize lattice used by resize_centered."""
+    """Device copies of the pixel-centered lattice used to resize categorical tiles."""
     from .pta_classification import _resize_tile_indices
 
     xs, ys = _resize_tile_indices(int(side), int(target_h), int(target_w))

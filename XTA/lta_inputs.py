@@ -1186,10 +1186,13 @@ def revalidate_lta_input_identities(discovery: LtaInputDiscovery) -> None:
                 raise RuntimeError(
                     f"LTA YOLO label changed during the run: {annotation.label_path}"
                 )
+    exemplar_digests = {}
     for exemplar in discovery.positive_pool:
         if exemplar.media_sha256 is None:
             continue
-        current = _sha256_path(exemplar.media_path)
+        if exemplar.media_path not in exemplar_digests:
+            exemplar_digests[exemplar.media_path] = _sha256_path(exemplar.media_path)
+        current = exemplar_digests[exemplar.media_path]
         if current != exemplar.media_sha256:
             raise RuntimeError(
                 f"LTA selected exemplar image changed during the run: {exemplar.media_path}"

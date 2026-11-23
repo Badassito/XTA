@@ -152,6 +152,41 @@ class RegistrationVideoTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid reconstruction header"):
             probe_video(path, header_path=header)
 
+    def test_probe_and_decode_verify_the_hash_after_ctime_only_drift(self):
+        from XTA.registration import video
+
+        path, pixels = self.native_movie()
+        stamp = video._stat_identity
+        run_probe = video._probe_stream
+        drift = 0
+
+        def simulate_ctime(file):
+            result = stamp(file)
+            result["ctime_ns"] += drift
+            return result
+
+        def probe_with_metadata_change(file, count_option=None):
+            nonlocal drift
+            drift = 1
+            return run_probe(file, count_option)
+
+        with (mock.patch.object(video, "_stat_identity", side_effect=simulate_ctime),
+              mock.patch.object(video, "_probe_stream", side_effect=probe_with_metadata_change),
+              mock.patch.object(video, "sha256_file", wraps=video.sha256_file) as digest):
+            info = probe_video(path)
+            self.assertEqual(digest.call_count, 2)
+            drift = 2
+            work = self.tmp_path / "work"
+            with decoded_volume(path, work, info=info) as decoded:
+                np.testing.assert_array_equal(decoded, pixels)
+            self.assertEqual(digest.call_count, 3)
+            with self.assertRaisesRegex(ValueError, "changed since it was probed"):
+                with decoded_volume(path, work, info=dict(info, sha256="0" * 64)):
+                    pass
+            with self.assertRaisesRegex(ValueError, "changed since it was probed"):
+                with decoded_volume(path, work, info={key: val for key, val in info.items() if key != "sha256"}):
+                    pass
+
     def test_source_replacement_since_probe_is_rejected_before_decode(self):
         path, _ = self.native_movie()
         info = probe_video(path)

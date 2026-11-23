@@ -91,6 +91,7 @@ def test_previously_projected_view_requires_durable_publication_receipt(monkeypa
 @pytest.mark.parametrize('kinds, eligible', (
     (['projected', 'projected'], True),
     (['projected', 'native'], False),
+    (['native', 'projected'], False),
     (['projected', None], False),
 ))
 def test_skip_warmup_only_for_fully_prepublished_consumer(monkeypatch,tmp_path,kinds,eligible):
@@ -100,3 +101,5 @@ def test_skip_warmup_only_for_fully_prepublished_consumer(monkeypatch,tmp_path,k
     scheduled, stored, fully_projected = plan.partition('model', views, lambda view:(2,3,4), None)
     assert fully_projected is eligible
     assert len(stored) + len(scheduled) == len(views)
+    assert [source for _, source in stored] == [source for source in ('projected', 'native')
+                                               for kind in kinds if kind == source]

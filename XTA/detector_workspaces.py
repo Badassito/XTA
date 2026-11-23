@@ -40,9 +40,11 @@ class DetectorWorkspacePreparation:
     def request(self, key, plans):
         if key in self.records:
             return False
+        plans = tuple(plans)
         if self.stop.is_set():
+            self.rollback(plans)
             raise RuntimeError('Detector workspace preparation is closed')
-        record = _Preparation(tuple(plans))
+        record = _Preparation(plans)
         self.records[key] = record
         try:
             record.future = self.executor.submit(self.build, record.plans, None, self.stop)

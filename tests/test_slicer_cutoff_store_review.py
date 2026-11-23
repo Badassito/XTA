@@ -819,7 +819,8 @@ def test_store_export_equals_today_export(S, kit, tmp_path):
         np.testing.assert_array_equal(target, mask)
 
 
-def test_built_store_export_equals_today_export(S, tmp_path):
+@pytest.mark.parametrize("consolidated", [False, True])
+def test_built_store_export_equals_today_export(S, tmp_path, consolidated):
     """Builder then export on a unit-LPS published review (transfer_fixture), against today's export of the same
     published masks loaded as tagged per-cutoff segments."""
     from tests import test_sweep_edits as tse
@@ -830,7 +831,19 @@ def test_built_store_export_equals_today_export(S, tmp_path):
         branch, expected = scalar(root, cent, transfer_fixture=True)
         branches.append(branch)
         found[cent] = expected
-    review = publish_sweep_review(root, branches, sweep_id="sweep-test", memory_mib=2, workers=1)
+    nrrd_stage = tmp_path / "nrrd-stage" if consolidated else None
+    if consolidated:
+        for _, branch in branches:
+            run_path = branch / "manifest.json"
+            run = json.loads(run_path.read_bytes())
+            run["confidence_sweep"]["nrrd_storage"] = "grouped"
+            tse.save(run_path, run)
+            staged = nrrd_stage / branch.name
+            staged.mkdir(parents=True)
+            for directory in ("nrrd", "low_quality"):
+                (branch / directory).rename(staged / directory)
+    review = publish_sweep_review(root, branches, sweep_id="sweep-test", memory_mib=2,
+                                  workers=1, nrrd_stage_root=nrrd_stage)
     store, _ = S._xta_store_build_from_review(review, LOW)
     namespace, node, _ = tse.export_api(review, {})
     data = namespace["_xta_sweep_review"](review)

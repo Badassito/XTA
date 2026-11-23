@@ -538,7 +538,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exemplar-root", required=True, help="Source exemplar pair directory")
     parser.add_argument("--output", required=True, help="New output directory, or existing with --resume")
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--profile", choices=("auto", "h100", "egpu"), default="auto")
+    parser.add_argument("--profile", choices=("auto", "h100", "egpu", "a100"), default="auto")
     parser.add_argument(
         "--tile-index",
         type=int,

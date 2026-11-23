@@ -351,6 +351,75 @@ def test_real_admitted_mapped_owner_retires_before_capture_completion(tmp_path, 
     assert not list((tmp_path / 'diagnostic' / 'runtime-temp').rglob('original.u8.dat'))
 
 
+@pytest.mark.parametrize(('streaming', 'height', 'expected'), [
+    (False, 12, ['decode', 'resize', 'pin', 'publication']),
+    (False, 32, ['decode', 'pin', 'lazy', 'publication']),
+    (True, 12, ['pin', 'decode', 'resize', 'publication']),
+])
+def test_sweep_startup_affinity_before_publication_and_overlapping_resize(
+    tmp_path, monkeypatch, request, streaming, height, expected,
+):
+    from XTA import assembly, sweep_input, tta_sweep_view_publication
+
+    source_shape = assembly.final_source_output_shape()
+    request.addfinalizer(lambda: assembly.set_final_source_output_shape(source_shape))
+
+    events = []
+
+    def publish(**_kwargs):
+        events.append('publication')
+        raise RuntimeError('sweep publication boundary')
+
+    def pin(cpus):
+        assert list(cpus) == [1, 2, 3]
+        events.append('pin')
+        return True
+
+    def decode(**_kwargs):
+        events.append('decode')
+        return np.zeros((16, height, 32), dtype=np.uint8)
+
+    def resize(source, shape, *_args, **_kwargs):
+        events.append('resize')
+        return np.zeros(shape, dtype=source.dtype)
+
+    def lazy(*_args, **_kwargs):
+        events.append('lazy')
+        return SimpleNamespace(nbytes=0, start_request_watcher=lambda: None, close=lambda: None)
+
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '-1')
+    monkeypatch.setenv('XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS', '25')
+    monkeypatch.setenv('XTA_YOLO_SWEEP_ID', 'affinity-fixture')
+    monkeypatch.setenv('XTA_YOLO_SWEEP_OUTPUT_ROOT', str(tmp_path))
+    monkeypatch.setenv('XTA_YOLO_SWEEP_WORK_DIR', str(tmp_path / 'work'))
+    monkeypatch.setattr(pipeline, 'cpu_affinity_unavailable_reason', lambda: None)
+    monkeypatch.setattr(pipeline, '_current_process_cpu_affinity', lambda: {0, 1, 2, 3})
+    monkeypatch.setattr(pipeline, '_sched_setaffinity_all_threads', pin)
+    monkeypatch.setattr(pipeline, 'plan_gpu_feeder_core_reservations', lambda _tokens: [[0]])
+    monkeypatch.setattr(pipeline, 'streaming_preprocess_enabled', lambda: streaming)
+    monkeypatch.setattr(pipeline, 'ffprobe_info', lambda _path: dict(
+        width=32, height=height, num_frames=16, fps=10.))
+    monkeypatch.setattr(pipeline, 'SweepViewSchedule', lambda *_args, **_kwargs:
+        SimpleNamespace(progress=None, role=None, eager_projection=True, cutoffs=(25, 50)))
+    monkeypatch.setattr(sweep_input, 'open_or_decode_sweep_input',
+        lambda *_args, decoder, **_kwargs: decoder())
+    monkeypatch.setattr(sweep_input, 'open_or_resize_sweep_cube',
+        lambda _work, _path, source, shape, *, resize, **_kwargs: resize(source, shape))
+    monkeypatch.setattr(pipeline, 'decode_video_to_memmap_gray8', decode)
+    monkeypatch.setattr(pipeline, 'decode_video_to_memmap_gray8_streaming', decode)
+    monkeypatch.setattr(pipeline, 'resize_volume_to_processing_cube_gray8', resize)
+    monkeypatch.setattr(pipeline, 'resize_volume_to_processing_cube_gray8_streaming', resize)
+    monkeypatch.setattr(pipeline, 'LazyProcessingCube', lazy)
+    monkeypatch.setattr(tta_sweep_view_publication, 'ViewMajorPublication', publish)
+    arguments = _arguments(tmp_path) + [
+        '--conf', '0.25', '--imgsz', '64', '--interpolation_distance', '0', '--extrapolation_distance', '0',
+    ]
+    monkeypatch.setattr(sys, 'argv', ['tta', *arguments])
+    with pytest.raises(RuntimeError, match='sweep publication boundary'):
+        pipeline.main()
+    assert events == expected
+
+
 @pytest.mark.parametrize('mode', ['capture', 'sam_disabled', 'sdf_disabled'])
 def test_capture_reaches_real_pipeline_gpu_task_inventory_without_sam(tmp_path, monkeypatch, request, mode):
     from XTA import assembly

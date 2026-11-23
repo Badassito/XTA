@@ -216,6 +216,7 @@ from .pta_rendering import (
     TileConfig,
     ViewInfo,
     edge_clamped_view_index,
+    EncodedSliceIndices,
     encoded_channel_source_positions,
     extract_padded_tile,
     get_native_view_frame,
@@ -903,14 +904,16 @@ def reassert_foreground_slice_anchors(
     mapped_depths: set[int] = set()
     repaired = 0
     radius = max(0, int(patch_radius))
+    side_y = min(output_h, 2 * radius + 1)
+    side_x = min(output_w, 2 * radius + 1)
     for source_z, source_y, source_x in anchors:
         z = _map_anchor_axis(int(source_z), source_t, output_t)
         y = _map_anchor_axis(int(source_y), source_h, output_h)
         x = _map_anchor_axis(int(source_x), source_w, output_w)
         mapped_depths.add(int(z))
-        y0, y1 = max(0, y - radius), min(output_h, y + radius + 1)
-        x0, x1 = max(0, x - radius), min(output_w, x + radius + 1)
-        region = mask[z, y0:y1, x0:x1]
+        y0 = min(max(0, y - side_y // 2), output_h - side_y)
+        x0 = min(max(0, x - side_x // 2), output_w - side_x)
+        region = mask[z, y0:y0 + side_y, x0:x0 + side_x]
         if np.any(region > 0):
             continue
         if np.any(mask[z] > 0):
@@ -1272,7 +1275,7 @@ def write_overlay_for_plan(*, volume: np.ndarray, mask: np.ndarray, plan: Render
                         tile_img = extract_padded_tile(img_canvas, tile.x, tile.y, tile.cfg.tile_size)
                         tile_mask = extract_padded_tile(mask_canvas, tile.x, tile.y, tile.cfg.tile_size)
                         tile_img_out = resize_centered(tile_img, tile.out_w, tile.out_h, cv2.INTER_LINEAR)
-                        tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
+                        tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT)
                     payloads.append((tile.tile_tag, overlay_rgb(tile_img_out, tile_mask_out).tobytes()))
                 return payloads
             for frame_payloads in parallel_map_ordered_limited(len(frame_indices), _render_tiles, workers=frame_worker_count, max_pending=pending, desc=f"Tile overlays {plan.tag} batch {batch_no}/{batch_total}"):
@@ -1561,8 +1564,9 @@ def assert_v18_pta_inputs_unchanged(
                 if isinstance(identity, Mapping):
                     identities.append(identity)
         for identity in identities:
+            path = Path(str(identity["path"]))
             try:
-                current = _v18_input_file_identity(Path(str(identity["path"])))
+                current = _v18_input_file_identity(path)
             except OSError as exc:
                 raise RuntimeError(
                     "PTA input artifact changed during execution; refusing a complete "
@@ -1574,6 +1578,12 @@ def assert_v18_pta_inputs_unchanged(
                 for field in _V18_IDENTITY_STAT_FIELDS
                 if int(current[field]) != int(identity[field])
             ]
+            if changed == ["change_or_creation_time_ns"] and "sha256" in identity:
+                from .file_hashing import sha256_file
+
+                if (sha256_file(path) == identity["sha256"]
+                        and _v18_input_file_identity(path) == current):
+                    continue
             if changed:
                 raise RuntimeError(
                     "PTA input artifact changed during execution; refusing a complete "
@@ -2155,7 +2165,7 @@ def _required_partial_sequence_positions(
             or channel_variants is None
             or any(path.suffix.lower() != '.png' for path in spec.image_paths_by_index.values())):
         return None
-    encoded = tuple(sorted(int(index) for index in spec.image_paths_by_index))
+    encoded = EncodedSliceIndices(sorted(int(index) for index in spec.image_paths_by_index))
     positions = {index: position for position, index in enumerate(encoded)}
     if any(int(index) not in positions for index in spec.labels_by_index):
         raise ValueError(f'Annotated sequence indices do not match source images: {spec.stem}')
@@ -2645,17 +2655,14 @@ def prepare_loaded_source(
             f"{processing_shape[0]} is smaller than input depth {source_shape[0]}"
         )
 
-    output_patch_radius = 0
-    if int(args.imgsz) > 0:
-        output_patch_radius = int(math.ceil(max(
-            float(processing_shape[1]) / float(args.imgsz),
-            float(processing_shape[2]) / float(args.imgsz),
-        )))
+    scale = max(processing_shape[1:]) / int(args.imgsz) if int(args.imgsz) > 0 else 1.0
+    # A repaired slice must still support a YOLO contour after output resizing.
+    output_patch_side = max(3, math.ceil(3.0 * scale) | 1)
     guaranteed_foreground_slices, processed_repairs = reassert_foreground_slice_anchors(
         mask_for_render,
         foreground_anchors,
         source_shape=source_shape,
-        patch_radius=output_patch_radius,
+        patch_radius=output_patch_side // 2,
     )
     foreground_preservation_stats["processed_anchor_repairs"] = int(processed_repairs)
     foreground_preservation_stats["guaranteed_output_foreground_transverse_slices"] = int(guaranteed_foreground_slices)
@@ -3393,7 +3400,7 @@ def classify_original_foregrounds_for_volume(
                             f"Tile classification requested without a mask canvas for {plan.tag}"
                         )
                     tile_mask = extract_padded_tile(mask_canvas, tile.x, tile.y, tile.cfg.tile_size)
-                    tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST)
+                    tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT)
                 if prep.semantic_foreground and prep.semantic_coverage_for_render is not None:
                     if tile.shared_job is not None and plan.view.shared_view is not None:
                         tile_coverage = shared_geometry.render_categorical_dense_tile_for_job(
@@ -3405,7 +3412,7 @@ def classify_original_foregrounds_for_volume(
                             raise RuntimeError(f"Tile coverage requested without canvas for {plan.tag}")
                         tile_coverage = resize_centered(
                             extract_padded_tile(coverage_canvas, tile.x, tile.y, tile.cfg.tile_size),
-                            tile.out_w, tile.out_h, cv2.INTER_NEAREST,
+                            tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT,
                         )
                     tile_mask_out = np.logical_and(tile_mask_out, tile_coverage)
                 local[(plan.tag, int(idx), tile.tile_tag, 0)] = bool(

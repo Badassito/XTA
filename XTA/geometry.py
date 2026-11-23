@@ -3383,6 +3383,7 @@ def _build_tilted_render_plan(
     )
 
 _TILTED_RENDER_TLS = threading.local()
+_TILTED_WARP_CANVAS_CACHE_MAX_BYTES = 16 * 1024**2
 
 def _tilted_tls_buffer(name: str, count: int, dtype: object) -> np.ndarray:
     """Reusable per-render-thread flat scratch buffer (grow-only)."""
@@ -3407,6 +3408,7 @@ def _render_tilted_array_on_grid(
     *,
     mask_mode: bool,
     block_rows: int = 256,
+    _native_window: Optional[Tuple[int, int, int, int]] = None,
 ) -> np.ndarray:
     """Render one Tilted frame on an arbitrary output grid.
 
@@ -3421,14 +3423,43 @@ def _render_tilted_array_on_grid(
         # v16.1.8 forward-pass in-plane interpolation: render the exact integer-grid
         # native frame, then apply the requested grid->src affine bilinearly (the same
         # warp Cartesian views use). Mask projections keep the nearest plan path.
+        affine = np.asarray(M_grid_to_src, dtype=np.float32).reshape(2, 3)
+        affine64 = affine.astype(np.float64)
+        window = None
+        if (min(grid_h, grid_w) > 0 and np.isfinite(affine64).all()
+                and max(np.abs(affine64) @ [grid_w, grid_h, 1]) < 16384
+                and max(view.src_h, view.src_w, grid_h, grid_w) < 32767):
+            corners = affine64 @ np.array(
+                [[0, grid_w - 1, 0, grid_w - 1], [0, 0, grid_h - 1, grid_h - 1], [1, 1, 1, 1]],
+            )
+            # Include both bilinear taps even when cv2 rounds up to the next pixel.
+            x0, y0 = (max(0, math.floor(value) - 1) for value in corners.min(axis=1))
+            x1 = min(int(view.src_w), math.ceil(float(corners[0].max())) + 2)
+            y1 = min(int(view.src_h), math.ceil(float(corners[1].max())) + 2)
+            if x0 >= x1 or y0 >= y1:
+                wait_for_volume_ready(volume_arr)
+                return np.zeros((grid_h, grid_w), dtype=np.uint8)
+            if (y1 - y0) * (x1 - x0) * 4 < 3 * int(view.src_h) * int(view.src_w):
+                window = (y0, y1, x0, x1)
+        native_shape = (int(view.src_h), int(view.src_w))
         native = _render_tilted_array_on_grid(
             volume_arr, view, int(frame_idx), _TILTED_IDENTITY_M,
-            int(view.src_h), int(view.src_w),
-            mask_mode=False, block_rows=int(block_rows),
+            *native_shape,
+            mask_mode=False, block_rows=int(block_rows), _native_window=window,
         )
+        if window is not None:
+            # Preserve OpenCV's full-source dispatch and unshifted fixed-point origin.
+            canvas = getattr(_TILTED_RENDER_TLS, 'warp_canvas', None)
+            if canvas is None or canvas.shape != native_shape:
+                canvas = np.empty(native_shape, dtype=np.uint8)
+                if canvas.nbytes <= _TILTED_WARP_CANVAS_CACHE_MAX_BYTES:
+                    _TILTED_RENDER_TLS.warp_canvas = canvas
+            # The padded footprint includes every tap, so stale pixels outside it are unused.
+            canvas[y0:y1, x0:x1] = native
+            native = canvas
         return cv2.warpAffine(
             native,
-            np.asarray(M_grid_to_src, dtype=np.float32).reshape(2, 3),
+            affine,
             (int(grid_w), int(grid_h)),
             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
             borderMode=cv2.BORDER_CONSTANT,
@@ -3441,7 +3472,9 @@ def _render_tilted_array_on_grid(
 
     plan = get_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
     stack_len = int(tilted_stack_axis_length(view))
-    out = np.zeros((int(grid_h), int(grid_w)), dtype=np.uint8)
+    y0, y1, x0, x1 = _native_window or (0, int(grid_h), 0, int(grid_w))
+    cols = slice(x0, x1)
+    out = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
     if stack_len <= 0:
         return out
 
@@ -3456,23 +3489,24 @@ def _render_tilted_array_on_grid(
     if not hoisted_usable:
         return _render_tilted_array_on_grid_reference(
             volume_arr, view, int(frame_idx), M_grid_to_src, int(grid_h), int(grid_w),
-            mask_mode=bool(mask_mode), block_rows=int(block_rows),
+            mask_mode=bool(mask_mode), block_rows=int(block_rows), _native_window=_native_window,
         )
 
     c = int(tilted_frame_center(view, int(frame_idx)))
-    band = np.flatnonzero((plan.row_c_lo <= c) & (c <= plan.row_c_hi))
+    band = np.flatnonzero((plan.row_c_lo[y0:y1] <= c) & (c <= plan.row_c_hi[y0:y1])) + y0
     if band.size == 0:
         return out
     last = int(stack_len - 1)
 
     if bool(plan.row_fast):
         sagittal = tilted_base_view_name(view) == 'sagittal'
-        row_a = _tilted_tls_buffer('rowfast_a', int(grid_w), np.float32)
-        row_b = _tilted_tls_buffer('rowfast_b', int(grid_w), np.float32)
+        row_a = _tilted_tls_buffer('rowfast_a', x1 - x0, np.float32)
+        row_b = _tilted_tls_buffer('rowfast_b', x1 - x0, np.float32)
         for r in band:
             r_i = int(r)
-            u0 = int(plan.row_u0[r_i])
-            u1 = int(plan.row_u1[r_i])
+            native_u0 = int(plan.row_u0[r_i])
+            u0 = max(x0, native_u0)
+            u1 = min(x1, int(plan.row_u1[r_i]))
             n = u1 - u0
             if n <= 0:
                 continue
@@ -3480,14 +3514,14 @@ def _render_tilted_array_on_grid(
             s1 = s0 + 1 if s0 < last else last
             a = float(plan.row_alpha[r_i])
             v = int(plan.row_v[r_i])
-            su0 = int(plan.row_su0[r_i])
+            su0 = int(plan.row_su0[r_i]) + u0 - native_u0
             if sagittal:
                 f0 = vol[v, s0, su0:su0 + n]
                 f1 = vol[v, s1, su0:su0 + n]
             else:
                 f0 = vol[s0, v, su0:su0 + n]
                 f1 = vol[s1, v, su0:su0 + n]
-            orow = out[r_i, u0:u1]
+            orow = out[r_i - y0, u0 - x0:u1 - x0]
             if a == 0.0:
                 if bool(mask_mode):
                     np.greater_equal(f0, 1, out=orow)
@@ -3510,8 +3544,8 @@ def _render_tilted_array_on_grid(
     r0 = int(band[0])
     r1 = int(band[-1]) + 1
     nrows = r1 - r0
-    n = nrows * int(grid_w)
-    shape2 = (nrows, int(grid_w))
+    n = nrows * (x1 - x0)
+    shape2 = (nrows, x1 - x0)
     idx = _tilted_tls_buffer('flat_idx', n, np.int64).reshape(shape2)
     f0 = _tilted_tls_buffer('flat_f0', n, np.uint8).reshape(shape2)
     f1 = _tilted_tls_buffer('flat_f1', n, np.uint8).reshape(shape2)
@@ -3522,7 +3556,7 @@ def _render_tilted_array_on_grid(
 
     vol_flat = vol.reshape(-1)
     stride = np.int64(plan.stack_stride)
-    np.add(plan.flat_base[r0:r1], np.int64(c) * stride, out=idx)
+    np.add(plan.flat_base[r0:r1, cols], np.int64(c) * stride, out=idx)
     # mode='clip' bounds out-of-volume indices; those pixels are zeroed by the validity merge.
     np.take(vol_flat, idx, mode='clip', out=f0)
     np.add(idx, stride, out=idx)
@@ -3530,27 +3564,27 @@ def _render_tilted_array_on_grid(
     # lerp weight is exactly 0, so the value never contributes.
     np.take(vol_flat, idx, mode='clip', out=f1)
 
-    np.less_equal(plan.c_lo2d[r0:r1], c, out=valid)
-    np.greater_equal(plan.c_hi2d[r0:r1], c, out=valid2)
+    np.less_equal(plan.c_lo2d[r0:r1, cols], c, out=valid)
+    np.greater_equal(plan.c_hi2d[r0:r1, cols], c, out=valid2)
     np.logical_and(valid, valid2, out=valid)
-    np.logical_and(valid, plan.valid_xy[r0:r1], out=valid)
+    np.logical_and(valid, plan.valid_xy[r0:r1, cols], out=valid)
 
     # Same fp32 expression as the reference path: (1-alpha)*f0 + alpha*f1.
-    np.multiply(f0, plan.om_alpha2d[r0:r1], out=val)
-    np.multiply(f1, plan.alpha2d[r0:r1], out=val2)
+    np.multiply(f0, plan.om_alpha2d[r0:r1, cols], out=val)
+    np.multiply(f1, plan.alpha2d[r0:r1, cols], out=val2)
     np.add(val, val2, out=val)
 
     if bool(mask_mode):
         np.greater_equal(val, 0.5, out=valid2)
         np.logical_and(valid2, valid, out=valid2)
-        out[r0:r1, :] = valid2
+        out[r0-y0:r1-y0, :] = valid2
     else:
         np.rint(val, out=val)
         np.clip(val, 0.0, 255.0, out=val)
         rendered = f0  # reuse the u8 buffer for the quantized output
         np.copyto(rendered, val, casting='unsafe')
         np.multiply(rendered, valid, out=rendered)
-        out[r0:r1, :] = rendered
+        out[r0-y0:r1-y0, :] = rendered
     return out
 
 def _render_tilted_array_on_grid_reference(
@@ -3563,24 +3597,27 @@ def _render_tilted_array_on_grid_reference(
     *,
     mask_mode: bool,
     block_rows: int = 256,
+    _native_window: Optional[Tuple[int, int, int, int]] = None,
 ) -> np.ndarray:
     """Legacy exact tilted render (per-block double fancy gather); fallback/reference."""
     plan = get_tilted_render_plan(view, M_grid_to_src, int(grid_h), int(grid_w))
     tan_alpha = float(math.tan(math.radians(float(view.tilt_angle_deg))))
     stack_len = int(tilted_stack_axis_length(view))
     base_view = tilted_base_view_name(view)
-    out = np.zeros((int(grid_h), int(grid_w)), dtype=np.uint8)
+    first_row, stop_row, x0, x1 = _native_window or (0, int(grid_h), 0, int(grid_w))
+    cols = slice(x0, x1)
+    out = np.zeros((stop_row - first_row, x1 - x0), dtype=np.uint8)
     if stack_len <= 0:
         return out
 
-    for y0 in range(0, int(grid_h), int(block_rows)):
-        y1 = min(int(grid_h), y0 + int(block_rows))
-        valid_xy = np.asarray(plan.valid_xy[y0:y1], dtype=bool)
+    for y0 in range(first_row, stop_row, int(block_rows)):
+        y1 = min(stop_row, y0 + int(block_rows))
+        valid_xy = np.asarray(plan.valid_xy[y0:y1, cols], dtype=bool)
         if not np.any(valid_xy):
             continue
 
         frame_center = float(tilted_frame_center(view, int(frame_idx)))
-        stack_src = frame_center + tan_alpha * np.asarray(plan.axis_offset[y0:y1], dtype=np.float32)
+        stack_src = frame_center + tan_alpha * np.asarray(plan.axis_offset[y0:y1, cols], dtype=np.float32)
         valid = valid_xy & (stack_src >= 0.0) & (stack_src <= float(stack_len - 1))
         if not np.any(valid):
             continue
@@ -3590,8 +3627,8 @@ def _render_tilted_array_on_grid_reference(
         s0 = np.clip(s0, 0, stack_len - 1).astype(np.int32, copy=False)
         alpha = (stack_src - s0).astype(np.float32, copy=False)
 
-        u_idx = np.asarray(plan.x_idx[y0:y1], dtype=np.int32)  # base-view horizontal axis
-        v_idx = np.asarray(plan.y_idx[y0:y1], dtype=np.int32)  # base-view vertical axis
+        u_idx = np.asarray(plan.x_idx[y0:y1, cols], dtype=np.int32)  # base-view horizontal axis
+        v_idx = np.asarray(plan.y_idx[y0:y1, cols], dtype=np.int32)  # base-view vertical axis
         if base_view == 'transverse':
             f0 = np.asarray(volume_arr[s0, v_idx, u_idx], dtype=np.float32)
             f1 = np.asarray(volume_arr[s1, v_idx, u_idx], dtype=np.float32)
@@ -3611,7 +3648,7 @@ def _render_tilted_array_on_grid_reference(
             rendered = (values >= 0.5).astype(np.uint8, copy=False)
         else:
             rendered = np.clip(np.rint(values), 0.0, 255.0).astype(np.uint8)
-        out_block = out[y0:y1]
+        out_block = out[y0-first_row:y1-first_row]
         out_block[valid] = rendered[valid]
 
     return out

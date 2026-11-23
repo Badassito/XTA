@@ -26,6 +26,10 @@ from .unification.sampling import require_forward_sampling
 from .workspace import _env_flag
 
 
+_CORONAL_SLAB_SLICES = 8
+_RETIREMENT_SHUTDOWN_SECONDS = 30.0
+
+
 def cpu_input_family_eligible(view):
     """Share the prepared-input device policy with scheduler priority hints."""
     family = str(getattr(view, 'family', ''))
@@ -70,6 +74,18 @@ class NativeCartesianRenderer:
             raise ValueError('CPU detector preparation requires the decoded uint8 native grid')
         self.base = tilted_base_view_name(view) if view.family == 'tilted' else physical_view_name(view)
         self.lo, self.hi, self.alpha = _t_map(self.volume.shape[0], int(view.full_t))
+        self.coronal_slab = None
+        self.coronal_start = 0
+
+    def prepare_coronal_slab(self, start, end):
+        if self.view.family != 'orthogonal' or self.base != 'coronal' or end - start <= 1:
+            return
+        if self.coronal_slab is not None and self.coronal_start <= start < self.coronal_start + self.coronal_slab.shape[2]:
+            return
+        self.coronal_slab = None
+        stop = min(end, start + _CORONAL_SLAB_SLICES)
+        self.coronal_slab = np.ascontiguousarray(self.volume[:, :, start:stop])
+        self.coronal_start = start
 
     def _values(self, t, y, x):
         a = self.volume[self.lo[t], y, x].astype(np.float32)
@@ -85,7 +101,12 @@ class NativeCartesianRenderer:
                 a, b = vol[self.lo[index]].astype(np.float32), vol[self.hi[index]].astype(np.float32)
                 native = np.rint(a + self.alpha[index] * (b - a)).clip(0., 255.).astype(np.uint8)
             else:
-                plane = vol[:, index, :] if self.base == 'sagittal' else vol[:, :, index]
+                if self.base == 'sagittal':
+                    plane = vol[:, index, :]
+                elif self.coronal_slab is not None and 0 <= index - self.coronal_start < self.coronal_slab.shape[2]:
+                    plane = self.coronal_slab[:, :, index - self.coronal_start]
+                else:
+                    plane = vol[:, :, index]
                 # Same center-aligned linear t reconstruction as the resident renderer.
                 a = plane[self.lo].astype(np.float32)
                 native = np.rint(a + self.alpha[:, None] * (plane[self.hi].astype(np.float32) - a))
@@ -376,11 +397,13 @@ class CpuInputPrefetch:
             if self.backing(array) is None:
                 raise OSError('CPU input preparation requires transferable shared RAM')
             render = NativeCartesianRenderer(self.volume, task['view'], task['job'])
-            for local, index in enumerate(range(int(task['slice_start']),
-                    int(task['slice_start']) + int(task['slice_count']))):
+            start = int(task['slice_start'])
+            end = start + int(task['slice_count'])
+            for local, index in enumerate(range(start, end)):
                 with self.lock:
                     if self.closed or packet.revoked or not packet.remaining:
                         return None
+                render.prepare_coronal_slab(index, end)
                 array[local] = render(index)
             self._record('prepared_frames', int(task['slice_count']))
             self._record('prepare_seconds', time.perf_counter() - started)
@@ -516,6 +539,9 @@ class CpuInputPrefetch:
                     # Native planes and NumPy lerp temporaries are live only while building.
                     size = self._size(packet) + int(view.src_h) * int(view.src_w) * 24
                     size += min(128, int(view.src_h)) * int(view.src_w) * 128
+                    count = min(_CORONAL_SLAB_SLICES, int(packet.task['slice_count']))
+                    if count > 1 and view.family == 'orthogonal' and physical_view_name(view) == 'coronal':
+                        size += int(self.volume.shape[0]) * int(self.volume.shape[1]) * count
                     limit = self.capacity_bytes if self.reclaim_target is None else self.reclaim_target
                     if self.bytes + size > limit:
                         break
@@ -654,8 +680,15 @@ class CpuInputPrefetch:
         with self.condition:
             while any(packet.building for packet in self.packets):
                 self.condition.wait()
-        for packet in self.packets:
-            while not self._close_packet(packet):
-                with self.condition:
-                    self.condition.wait(timeout=.05)
+        pending = self.packets
+        deadline = time.monotonic() + _RETIREMENT_SHUTDOWN_SECONDS
+        while pending:
+            pending = [packet for packet in pending if not self._close_packet(packet)]
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f'{len(pending)} YOLO CPU input packets still hold mappings after shutdown')
+            with self.condition:
+                self.condition.wait(timeout=min(.05, remaining))
         self._report()

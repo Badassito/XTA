@@ -8,10 +8,9 @@ retaining the prediction, bridge, and gated-tile layers used to construct it.
 python -m XTA --mode tta ... --reconciliation XTA/examples/external_reconciliation/confidence_core_rescue.py
 ```
 
-Runs with reconciliation also retain prediction-confidence evidence under
-`reconciliation_evidence/`. The `union.py` reference is useful when collecting
-this evidence while preserving the additive union decision. Omitting
-`--reconciliation` retains ordinary TTA behavior.
+Confidence-mode reconciliation retains prediction-confidence evidence under
+`reconciliation_evidence/`. Use `--save confidence` to retain these scores with a
+different policy or without reconciliation.
 
 In TTA, a plain union policy reuses the already assembled source union. It
 counts and validates that buffer without reopening component masks or allocating
@@ -22,10 +21,11 @@ that union, global postprocessing overlaps those exports. Other source backings
 and policies retain the export barrier. Every export must still succeed before
 the final run manifest is published.
 
-`reconciliation/manifest.json` records the policy and source hash, evidence
-groups, per-layer contributions, component statistics and weights, retained and
-rejected voxel counts, and working-memory plan. `reconciliation/policy.py` is
-the executed policy snapshot. These are distinct from final postprocessing.
+`reconciliation/manifest.json` records the policy path, source hash and resolved
+settings, evidence groups, per-layer contributions, component statistics and
+weights, retained and rejected voxel counts, and working-memory plan. Keep the
+original policy source and any dependencies if you plan to rerun a custom
+callback. Use the recorded SHA-256 to verify the policy source.
 
 ## Included policies
 
@@ -43,8 +43,8 @@ the executed policy snapshot. These are distinct from final postprocessing.
 
 Core rescue is the selected starting point for confidence-based decisions. The
 other examples retain distinct approaches for different evidence and tradeoffs;
-none is presented as universally accuracy-optimal. Use `union.py` for confidence
-collection while retaining the additive union. Confidence-based decisions still
+none is presented as universally accuracy-optimal. Use `union.py` with
+`--save confidence` to collect scores while preserving the additive union. Confidence-based decisions
 require source-grid score projection, which can be expensive on large views.
 
 The spatial core/rescue and hybrid rules operate independently within each
@@ -57,8 +57,8 @@ islands, and limited candidate-only local additions. These spatial decisions
 preserve the raw candidate boundary and do not fabricate confidence scores.
 
 Files beginning with `_` are packaged implementation helpers. Presets import
-them through `XTA`, so a saved `reconciliation/policy.py` snapshot can be loaded
-from another directory with the matching package installed.
+them through `XTA`, so you can load a copy of a preset from another directory
+with the matching package installed.
 
 ## Policy contract
 

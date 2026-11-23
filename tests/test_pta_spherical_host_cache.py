@@ -129,7 +129,8 @@ def state(monkeypatch):
     monkeypatch.setattr(pta_workers, 'runtime_trace_event', lambda *args, **kwargs: None)
     runtime = dict(torch=torch, device_id=0, azimuthal_renderer=engine,
                    gpu_volume_task_key=(0, 'source-a'),
-                   publication_resources=SimpleNamespace(poisoned=False, closed=False))
+                   publication_resources=SimpleNamespace(poisoned=False, closed=False,
+                       close=lambda: None, finalizer=SimpleNamespace(cancel=lambda: None)))
 
     def retire_category(actual):
         assert actual is runtime

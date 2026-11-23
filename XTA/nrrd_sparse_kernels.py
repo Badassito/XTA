@@ -341,16 +341,17 @@ class FusedStoreView:
 
     def __init__(self, store: object, chunks: np.ndarray) -> None:
         index = store.index  # type: ignore[attr-defined]
-        self.chunks = chunks
+        self.chunks = chunks.view()
+        self.chunks.setflags(write=False)
         self.packed = bool(getattr(store, '_packbits_payload', False))
-        # Always copy: a 1-slice readonly archive index would otherwise alias
-        # and need a readonly-kinds kernel signature compiled in the busy process.
-        self.kinds = np.array(index['kind'], dtype=np.uint8, copy=True)
-        self.offsets = np.ascontiguousarray(index['offset'], dtype=np.int64)
-        self.y0 = np.ascontiguousarray(index['y0'], dtype=np.int64)
-        self.x0 = np.ascontiguousarray(index['x0'], dtype=np.int64)
-        self.y1 = np.ascontiguousarray(index['y1'], dtype=np.int64)
-        self.x1 = np.ascontiguousarray(index['x1'], dtype=np.int64)
+        for attr, field, dtype in (
+            ('kinds', 'kind', np.uint8), ('offsets', 'offset', np.int64),
+            ('y0', 'y0', np.int64), ('x0', 'x0', np.int64),
+            ('y1', 'y1', np.int64), ('x1', 'x1', np.int64),
+        ):
+            values = np.ascontiguousarray(index[field], dtype=dtype).view()
+            values.setflags(write=False)
+            setattr(self, attr, values)
         self.payload_size = np.asarray(index['payload_size'], dtype=np.uint64)
         self.payload_nbytes = np.asarray(index['payload_nbytes'], dtype=np.uint64)
         self.shape = tuple(int(v) for v in store.shape)  # type: ignore[attr-defined]
@@ -484,6 +485,8 @@ class FusedSparseMirrorTee:
                     flat.extend(int(v) for v in targets)
                     ptr[z + 1] = len(flat)
                 index = np.asarray(flat, dtype=np.int64)
+                ptr.setflags(write=False)
+                index.setflags(write=False)
                 _m_t, m_h, m_w = (int(v) for v in job['shape'])  # type: ignore[union-attr]
                 mode, ys, ye, xs, xe = resize_mode_and_maps(self.in_h, self.in_w, m_h, m_w)
                 plan = (ptr, index, m_h, m_w, mode, ys, ye, xs, xe)
@@ -640,51 +643,34 @@ def iter_restored_member_groups(view: FusedStoreView, output_shape: Tuple[int, i
 # --------------------------------------------------------------------------------------
 
 def warm_nrrd_producer_kernels() -> Dict[str, object]:
-    """Compile every NRRD producer kernel signature before the main process is busy.
-
-    Production passes readonly payloads (shared ``mmap`` / readonly archive
-    ``np.memmap``) and tests also pass writable ``bytearray`` payloads; index views
-    are writable int64/uint8; resize axis maps are cached readonly int64 arrays;
-    CSR maps are readonly (restore) or writable (mirror targets). Each kernel runs
-    once per packed flag, payload writability, resize mode and map writability.
-    """
+    """Compile with the readonly payload, index and map types used at runtime."""
     started = time.perf_counter()
     h, w = 9, 21
     crop = np.zeros((h, w), np.uint8)
     crop[2:7, 3:19] = 1
     crop[4, 5] = 0
-    for packed in (False, True):
-        payload = (np.packbits(crop[2:7, 3:19], axis=1, bitorder='little') if packed
-                   else crop[2:7, 3:19]).tobytes()
-        for readonly in (False, True):
-            chunks = np.frombuffer(bytes(payload) if readonly else bytearray(payload), dtype=np.uint8)
-            kinds = np.array([1, 0], np.uint8)
-            offsets = np.array([0, 0], np.int64)
-            y0s, x0s = np.array([2, 0], np.int64), np.array([3, 0], np.int64)
-            y1s, x1s = np.array([7, 0], np.int64), np.array([19, 0], np.int64)
-            band = fill_crop_row_batch(chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds, 0, 2, w, 5)
-            first = np.array([0], np.int64)
-            count = np.array([2], np.int64)
-            members, records = fill_native_member_group(
-                chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds, first, count, 2, h, w)
-            for out_hw in ((h, w), (4, 8), (14, 30), (4, 30)):
-                for ro_maps in (True, False):
-                    mode, ys, ye, xs, xe = resize_mode_and_maps(h, w, *out_hw)
-                    if not ro_maps:
-                        ys, ye, xs, xe = (np.array(a) for a in (ys, ye, xs, xe))
-                    for ro_csr in (True, False):
-                        ptr, index = restore_source_csr(2, 2)
-                        if not ro_csr:
-                            ptr, index = np.array(ptr), np.array(index)
-                        fill_restored_member_group(
-                            chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds, first, count, 2,
-                            ptr, index, h, w, int(out_hw[0]), int(out_hw[1]), ys, ye, xs, xe, int(mode))
-                        volume = np.zeros((2, int(out_hw[0]), int(out_hw[1])), np.uint8)
-                        regions, results = resize_records_for_tee(
-                            members, records, ptr, h, w, int(out_hw[0]), int(out_hw[1]),
-                            ys, ye, xs, xe, int(mode))
-                        or_tee_records(regions, results, records, ptr, index, volume)
-            del band
+    chunks = np.frombuffer(crop[2:7, 3:19].tobytes(), dtype=np.uint8)
+    kinds = np.array([1, 0], np.uint8)
+    offsets = np.array([0, 0], np.int64)
+    y0s, x0s = np.array([2, 0], np.int64), np.array([3, 0], np.int64)
+    y1s, x1s = np.array([7, 0], np.int64), np.array([19, 0], np.int64)
+    for values in (kinds, offsets, y0s, x0s, y1s, x1s):
+        values.setflags(write=False)
+    fill_crop_row_batch(chunks, False, offsets, y0s, x0s, y1s, x1s, kinds, 0, 2, w, 5)
+    first = np.array([0], np.int64)
+    count = np.array([2], np.int64)
+    members, records = fill_native_member_group(
+        chunks, False, offsets, y0s, x0s, y1s, x1s, kinds, first, count, 2, h, w)
+    out_h, out_w = 4, 8
+    mode, ys, ye, xs, xe = resize_mode_and_maps(h, w, out_h, out_w)
+    ptr, index = restore_source_csr(2, 2)
+    fill_restored_member_group(
+        chunks, False, offsets, y0s, x0s, y1s, x1s, kinds, first, count, 2,
+        ptr, index, h, w, out_h, out_w, ys, ye, xs, xe, mode)
+    volume = np.zeros((2, out_h, out_w), np.uint8)
+    regions, results = resize_records_for_tee(
+        members, records, ptr, h, w, out_h, out_w, ys, ye, xs, xe, mode)
+    or_tee_records(regions, results, records, ptr, index, volume)
     return dict(
         seconds=time.perf_counter() - started,
         crop_row_signatures=len(fill_crop_row_batch.nopython_signatures),

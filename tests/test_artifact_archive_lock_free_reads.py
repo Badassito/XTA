@@ -78,11 +78,11 @@ def test_externally_extended_archive_falls_back_and_sees_new_members(tmp_path):
     # Simulate another process appending: the cached index no longer matches.
     other = tmp_path/'other.tar'
     shutil.copyfile(archive, other)
-    artifacts._ARCHIVE_INDEX_CACHE.pop(str(artifacts._canonical_path(other)), None)
+    artifacts._ARCHIVE_INDEX_CACHE.pop(artifacts._path_key(artifacts._canonical_path(other)), None)
     artifacts.append_members(other, {'new': b'later'})
     misses = artifacts.archive_read_stats()['fast_misses']
-    artifacts._ARCHIVE_INDEX_CACHE[str(artifacts._canonical_path(other))] = \
-        artifacts._ARCHIVE_INDEX_CACHE[str(artifacts._canonical_path(archive))]
+    artifacts._ARCHIVE_INDEX_CACHE[artifacts._path_key(artifacts._canonical_path(other))] = \
+        artifacts._ARCHIVE_INDEX_CACHE[artifacts._path_key(artifacts._canonical_path(archive))]
     assert artifacts.read_member(artifacts.reference(other, 'new')) == b'later'
     assert artifacts.read_member(artifacts.reference(other, 'old')) == b'committed'
     assert artifacts.archive_read_stats()['fast_misses'] > misses
@@ -229,7 +229,7 @@ def test_reader_outlives_its_opening_thread(tmp_path, lock_free):
 
 def _refuse_lock_file(monkeypatch, code):
     def unwritable_lock(file, mode='r', *args, **kwargs):
-        if mode == 'a+b' and str(file).endswith('.tar.lock'):
+        if mode in ('rb', 'a+b') and str(file).endswith('.tar.lock'):
             raise OSError(code, os.strerror(code), str(file))
         return builtins.open(file, mode, *args, **kwargs)
     monkeypatch.setattr(artifacts, 'open', unwritable_lock, raising=False)

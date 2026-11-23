@@ -11,7 +11,7 @@ from unittest import mock
 
 import numpy as np
 
-from XTA import spherical_projection as sp
+from XTA import backprojection, spherical_projection as sp
 from XTA import spherical_projection_cpu as compiled
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 from XTA.spherical_projection_bounds import SphericalOutputBounds
@@ -349,15 +349,16 @@ class SphericalCpuCompactTests(unittest.TestCase):
             else:
                 self.assertEqual(set(sink.kinds), {'dense'})
         empty = EncodedSink(self.shape)
-        with (mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
-              mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=False),
-              mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=compiled.pull_spherical_chunk_numba),
+        with (mock.patch.object(sp, '_try_spherical_cuda_stage', side_effect=AssertionError('CUDA admission')),
+              mock.patch.object(sp, '_select_spherical_cpu_pull', side_effect=AssertionError('CPU compilation')),
+              mock.patch.object(backprojection, '_cancel_main_process_spherical_retirement_request') as cancel,
               redirect_stdout(io.StringIO())):
             sp.backproject_spherical_volume_to_volume(self.source, self.view, Path('unused'), 'empty',
                 sink_only=True, projection_block_callback=empty,
                 known_slice_bboxes=np.zeros((self.view.num_slices, 4), np.int64))
-        self.assertEqual(set(empty.kinds), {'empty'})
+        self.assertEqual(empty.kinds, ['empty'])
         self.assertEqual(empty.seen, list(range(self.shape[0])))
+        cancel.assert_called_once_with(f'Spherical source projection {self.view.name}')
 
     def test_encoded_failure_aborts_once_and_joins_readers_without_replay(self):
         self._check_handoff(True)

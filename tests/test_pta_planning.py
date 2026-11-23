@@ -96,6 +96,8 @@ def test_canonical_view_affine_tiles_and_sampling_identity(tmp_path, imgsz):
 
 
 def test_partial_centers_discontinuities_and_frame_major_order(tmp_path, capsys):
+    import pickle
+
     variants = [rendering.DEFAULT_CHANNEL_VARIANT, *[
         rendering.ChannelVariant("C3S1", "custom", 3, 1, reverse, offsets)
         for reverse, offsets in ((False, (-1, 0, 1)), (True, (1, 0, -1)))
@@ -109,6 +111,12 @@ def test_partial_centers_discontinuities_and_frame_major_order(tmp_path, capsys)
     )
     assert [plan.eligible_frame_indices for plan in plans] == [(1, 4), (4,), (4,)]
     assert [plan.source_encoded_indices for plan in plans] == [(), (1, 2, 4, 6, 7, 8), (1, 2, 4, 6, 7, 8)]
+    assert plans[1].source_encoded_indices is plans[2].source_encoded_indices
+    restored = pickle.loads(pickle.dumps(plans))
+    lattice = restored[1].source_encoded_indices
+    assert type(lattice) is type(plans[1].source_encoded_indices)
+    assert lattice is restored[2].source_encoded_indices
+    assert rendering.encoded_channel_source_positions(lattice, 4, (1, 0, -1)) == ((5, 4, 3), ())
     assert list(planning.iter_render_source_frame_jobs_round_robin(plans)) == [(0, 1), (0, 4), (1, 4), (2, 4)]
     assert list(planning.iter_render_source_frame_jobs_round_robin([])) == []
     assert warnings.counts["channel_stack_discontinuity_centers_skipped"] == 1

@@ -126,12 +126,15 @@ class _SingleOccurrenceAction(argparse.Action):
     """Reject repeated scalar flags instead of silently accepting the last one."""
 
     def __call__(self, parser, namespace, values, option_string=None) -> None:  # type: ignore[no-untyped-def]
-        if getattr(self, "_seen", False):
+        seen = getattr(namespace, "_single_occurrence_options", None)
+        if seen is None:
+            seen = namespace._single_occurrence_options = set()
+        if self.dest in seen:
             raise argparse.ArgumentError(
                 self,
                 f"{option_string or self.option_strings[0]} may be provided only once",
             )
-        self._seen = True
+        seen.add(self.dest)
         setattr(namespace, self.dest, values)
 
 
@@ -490,6 +493,7 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
 
 
 def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
+    vars(args).pop("_single_occurrence_options", None)
     if isinstance(args.input, list) and len(args.input) == 1:
         args.input = args.input[0]
     if getattr(args, "nrrd_z_start_index", None) is not None and not bool(args.force):
@@ -538,7 +542,9 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
     if args.augmentation:
         from .augmentation_policy import resolve_augmentation_definitions
         definitions = resolve_augmentation_definitions(args.augmentation)
-        definition = definitions.get('gpu', definitions.get('cpu'))
+        if len(definitions) > 1:
+            raise ValueError("PTA --augmentation accepts one policy")
+        definition = next(iter(definitions.values()))
         args.augmentation = str(definition.path)
         if str(args.augmentation_execution) == "offline":
             args.offline_augmentation_backend = (

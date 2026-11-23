@@ -130,6 +130,13 @@ class ComponentProjectionQueue:
                 with self._condition:
                     if revoked:
                         raise CancelledError('Component projection submission was revoked')
+                    if self._aborted:
+                        raise RuntimeError('Component projection aborted before admission')
+                    # A physical-memory probe cannot admit any work while every
+                    # slot is occupied. Retirement and abort both wake this wait.
+                    if self._active >= self._workers or self._oversized_active:
+                        self._condition.wait()
+                        continue
                 # OS probes must not hold the lock needed by retirement and abort.
                 limit = None if self._working_budget is None else max(1, int(self._working_budget()))
                 with self._condition:

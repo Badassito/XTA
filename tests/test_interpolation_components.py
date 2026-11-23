@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import gc
+from threading import Event
 import tempfile
 import types
 import unittest
@@ -37,6 +39,34 @@ def _wait_for_membership_retirement(component_dir: Path) -> None:
 
 
 class InterpolationComponentDecompositionTests(unittest.TestCase):
+    def test_concurrent_projection_failure_is_shared_and_can_be_retried(self):
+        labels = np.zeros((1, 7, 9), dtype=np.uint32)
+        labels[0, 2:5, 3:6] = 1
+        cache = interpolation.SliceComponentTableCache(labels)
+        record = cache.get(0).components[0]
+        waiter_joined = Event()
+
+        class ObservedFuture(Future):
+            def result(self, timeout=None):
+                waiter_joined.set()
+                return super().result(timeout=10)
+
+        def fail_transform(_mask):
+            self.assertTrue(waiter_joined.wait(timeout=10))
+            raise ArithmeticError("test transform failed")
+
+        with (mock.patch.object(interpolation, 'Future', ObservedFuture),
+              mock.patch.object(interpolation, '_projection_cone_sdf_2d', side_effect=fail_transform) as transform,
+              ThreadPoolExecutor(2) as pool):
+            jobs = [pool.submit(cache.get_projection_sdf, record, 3, 20.0) for _ in range(2)]
+            for job in jobs:
+                with self.assertRaisesRegex(ArithmeticError, "test transform failed"):
+                    job.result(timeout=15)
+            transform.assert_called_once()
+        retry = cache.get_projection_sdf(record, 3, 20.0)
+        self.assertTrue(np.all(np.isfinite(retry.sdf)))
+        self.assertEqual(cache.telemetry()['projection_sdf_computations'], 1)
+
     @staticmethod
     def _render_plan() -> interpolation.SliceBridgeRenderPlan:
         sdf = np.ones((3, 3), dtype=np.float32)

@@ -17,7 +17,8 @@ _REPLAY_CONTRACTS = {'opencv-affine-elastic-v1': 'source', 'opencv-affine-elasti
 def _bilinear_displacement(field: np.ndarray, xy: np.ndarray):
     h, w = field.shape[:2]
     x, y = np.clip(xy[..., 0], 0, w - 1), np.clip(xy[..., 1], 0, h - 1)
-    x0, y0 = x.astype(np.intp), y.astype(np.intp)
+    x0 = np.minimum(x.astype(np.intp), max(0, w - 2))
+    y0 = np.minimum(y.astype(np.intp), max(0, h - 2))
     x1, y1 = np.minimum(x0 + 1, w - 1), np.minimum(y0 + 1, h - 1)
     a, b, c, d = field[y0, x0], field[y0, x1], field[y1, x0], field[y1, x1]
     u, v = (x - x0)[..., None], (y - y0)[..., None]
@@ -75,7 +76,8 @@ def inverse_policy_grid_cpu(forward: np.ndarray, displacement: np.ndarray | None
                                  (-c * residual[..., 0] + a * residual[..., 1]) / denominator), axis=-1)
                 current = np.nan_to_num(current - np.clip(step, -32., 32.),
                                         nan=-1e6, posinf=1e6, neginf=-1e6)
-            delta, dx, dy = _bilinear_displacement(displacement, current)
+            # The accepted roundoff halo is sampled at the raster edge.
+            delta, dx, dy = _bilinear_displacement(displacement, np.clip(current, (0, 0), (w - 1, h - 1)))
             residual = current @ linear.T + offset + delta - goal
             det = ((linear[0, 0] + dx[..., 0]) * (linear[1, 1] + dy[..., 1])
                    - (linear[0, 1] + dy[..., 0]) * (linear[1, 0] + dx[..., 1]))

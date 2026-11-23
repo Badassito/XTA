@@ -4,7 +4,6 @@ from __future__ import annotations
 from contextlib import ExitStack, redirect_stdout
 import io
 from pathlib import Path
-import subprocess
 import sys
 import threading
 import unittest
@@ -12,7 +11,7 @@ from unittest import mock
 
 import numpy as np
 
-from XTA import media
+from XTA import media, pta_inputs
 
 
 class _Progress:
@@ -30,31 +29,43 @@ class _Progress:
 
 
 class Gray8DecodeCleanupTests(unittest.TestCase):
-    def _run_decode(self, *, streaming, byte_count=12, exit_code=0, stderr_bytes=256 * 1024,
-                    strict_frame_count=False):
+    def _run_decode(self, *, streaming=False, pta=False, byte_count=12, exit_code=0, stderr_bytes=128 * 1024,
+                    strict_frame_count=False, stderr_first=False):
         """Use the actual host subprocess pipe implementation without FFmpeg/files."""
         spawned = []
+        watchdogs = []
         thread_errors = []
         producer_targets = []
         startup_events = []
         original_spawn = media._spawn_decode_process
-        child = (
-            'import sys; '
-            f'sys.stdout.buffer.write(bytes(i % 256 for i in range({byte_count}))); sys.stdout.buffer.flush(); '
-            f'sys.stderr.buffer.write(b"decode-diagnostic:" + b"x" * {stderr_bytes}); '
-            f'sys.stderr.buffer.flush(); sys.exit({exit_code})'
-        )
+        stdout_write = f'sys.stdout.buffer.write(bytes(i % 256 for i in range({byte_count}))); sys.stdout.buffer.flush(); '
+        stderr_write = (f'sys.stderr.buffer.write(b"decode-diagnostic:" + b"x" * {stderr_bytes}); '
+                        'sys.stderr.buffer.flush(); ')
+        writes = stderr_write + stdout_write if stderr_first else stdout_write + stderr_write
+        child = f'import sys; {writes}sys.exit({exit_code})'
 
-        def spawn_ffmpeg_replacement(command, **kwargs):
+        def spawn_ffmpeg_replacement(command):
             self.assertEqual(command[0], 'ffmpeg')
             self.assertEqual(command[-1], '-')
-            if strict_frame_count:
+            if strict_frame_count or streaming:
                 self.assertEqual(command[command.index('-map') + 1], '0:v:0')
-            process = original_spawn([sys.executable, '-B', '-c', child])
+            child_command = [sys.executable, '-B', '-c', child]
+            process = original_spawn(child_command)
             spawned.append((process, process.stdout, process.stderr))
+            if stderr_first:
+                watchdog = threading.Timer(10, process.kill)
+                watchdog.daemon = True
+                watchdog.start()
+                watchdogs.append(watchdog)
             return process
 
         result = error = readiness = None
+
+        def on_verified():
+            self.assertTrue(readiness._slice_events[0].is_set())
+            self.assertFalse(readiness._slice_events[-1].is_set())
+            self.assertFalse(readiness._all_event.is_set())
+
         with ExitStack() as stack:
             stack.enter_context(redirect_stdout(io.StringIO()))
             stack.enter_context(mock.patch.object(media, '_require_bin'))
@@ -64,6 +75,9 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(media, 'runtime_trace_event',
                 side_effect=lambda name, **fields: startup_events.append((name, fields))))
             stack.enter_context(mock.patch.object(media, '_spawn_decode_process', side_effect=spawn_ffmpeg_replacement))
+            if pta:
+                stack.enter_context(mock.patch.object(pta_inputs, '_require_bin'))
+                stack.enter_context(mock.patch.object(pta_inputs, 'tqdm', _Progress))
             stack.enter_context(mock.patch.object(threading, 'excepthook', side_effect=thread_errors.append))
             stack.enter_context(mock.patch.object(media, '_start_streaming_producer',
                 side_effect=lambda target, **kwargs: producer_targets.append(target)))
@@ -73,15 +87,27 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
             stack.enter_context(mock.patch.dict(media._VOLUME_READINESS_BY_ARRAY_ID, {}, clear=True))
             decoder = media.decode_video_to_memmap_gray8_streaming if streaming else media.decode_video_to_memmap_gray8
             try:
-                result = decoder(Path('unused-input.mkv'), Path('unused-output.dat'),
-                                 num_frames=2, width=3, height=2, overwrite=True,
-                                 **({'strict_frame_count': strict_frame_count} if not streaming else {}))
+                if pta:
+                    result, fps, block = pta_inputs.decode_video_gray8_to_memory(
+                        Path('unused-input.mkv'), warnings=pta_inputs.WarningLog(),
+                        probe_info={'num_frames': 2, 'width': 3, 'height': 2, 'fps': 7.0},
+                    )
+                    self.assertEqual(fps, 7.0)
+                    self.assertIsNone(block)
+                else:
+                    result = decoder(Path('unused-input.mkv'), Path('unused-output.dat'),
+                                     num_frames=2, width=3, height=2, overwrite=True,
+                                     **({'on_verified': on_verified} if streaming else
+                                        {'strict_frame_count': strict_frame_count}))
                 if streaming:
                     readiness = media.volume_readiness(result)
                     producer_targets[0]()
             except BaseException as exc:
                 error = exc
             finally:
+                for watchdog in watchdogs:
+                    watchdog.cancel()
+                    watchdog.join()
                 for process, stdout, stderr in spawned:
                     if process.poll() is None:
                         process.kill()
@@ -147,6 +173,35 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
         self.assertIsInstance(error, RuntimeError)
         self.assertIn('Unexpected EOF', str(error))
 
+    def test_streaming_drains_large_stderr_before_waiting_for_stdout(self):
+        result, error, readiness, code = self._run_decode(streaming=True, stderr_first=True)
+        self.assertIsNone(error)
+        self.assertEqual(code, 0)
+        readiness.wait_all()
+        np.testing.assert_array_equal(result, np.arange(12, dtype=np.uint8).reshape(2, 2, 3))
+
+    def test_synchronous_decoders_drain_large_stderr_before_stdout(self):
+        for pta in (False, True):
+            with self.subTest(pta=pta):
+                result, error, _, code = self._run_decode(pta=pta, stderr_first=True)
+                self.assertIsNone(error)
+                self.assertEqual(code, 0)
+                np.testing.assert_array_equal(result, np.arange(12, dtype=np.uint8).reshape(2, 2, 3))
+
+    def test_pta_reports_failed_decoder_after_all_expected_frames(self):
+        _, error, _, code = self._run_decode(pta=True, exit_code=7)
+        self.assertEqual(code, 7)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn('decode-diagnostic:', str(error))
+
+    def test_streaming_rejects_surplus_frames_and_fails_the_final_slice(self):
+        _, error, readiness, _ = self._run_decode(streaming=True, byte_count=18)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn('Frame count mismatch', str(error))
+        with self.assertRaises(RuntimeError) as caught:
+            readiness.wait_for_slice(1)
+        self.assertIs(caught.exception.__cause__, error)
+
     def test_plain_and_streaming_decode_preserve_gray8_bytes_and_drain_large_stderr(self):
         for streaming in (False, True):
             with self.subTest(streaming=streaming):
@@ -163,10 +218,10 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
                 _, error, readiness, code = self._run_decode(streaming=streaming, exit_code=7)
                 self.assertEqual(code, 7)
                 if streaming:
-                    self.assertIsNone(error)
                     with self.assertRaises(RuntimeError) as caught:
                         readiness.wait_all()
                     failure = caught.exception.__cause__
+                    self.assertIs(failure, error)
                 else:
                     failure = error
                 self.assertIsInstance(failure, RuntimeError)

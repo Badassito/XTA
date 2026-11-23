@@ -30,13 +30,14 @@ pairs for PTA and transfer scalar NRRD labelmaps.
 Use `--conf 0.50:0.10:1.00` for six operating points or
 `--conf 0.50:0.01:1.00` for 51. On eligible full-frame runs, the worker
 renders each batch once and evaluates the cutoffs from one YOLO forward. With
-interpolation off, compatible view masks are backprojected together and their
-NRRDs can appear across cutoff directories as each view finishes. With SDF or
+interpolation off, compatible view masks are backprojected together. With SDF or
 SAM, each cutoff runs its own interpolation from its own masks.
-With `--save nrrd low_quality:0.20`, the sweep also publishes a Slicer review:
-complete editable segments for smoothed 3D surfaces and one coverage-colored
-overlay over intensity in the slice views. One marker action applies to the
-usual visible masks across cutoffs. See the [confidence sweep guide](docs/confidence_sweeps.md).
+With `--save nrrd low_quality:0.20`, open `review/manifest.json` for the
+native and preview segmentations. Both resolutions have ordinary Slicer NRRDs
+grouped by cutoff. Each group preserves the individual layer masks.
+Requested overlay videos show how many final cutoff masks include each voxel.
+Binary outputs retain their cutoff, and `--save summary` combines the cutoff
+summaries in one file. See the [confidence sweep guide](docs/confidence_sweeps.md).
 
 TTA layer `.seg.nrrd` files store only each layer's segment bounding box, placed
 in the full output grid with Slicer's `Segmentation_ReferenceImageExtentOffset`

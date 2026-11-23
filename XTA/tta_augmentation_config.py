@@ -127,10 +127,12 @@ def resolve_tta_augmentation(args: Any, *, gpu_devices: Any, cpu_enabled: bool) 
                 raise ValueError(f'--augmentation requires a {backend}: policy for {backend.upper()} inference')
     cpu = definitions.get('cpu')
     gpu = definitions.get('gpu')
-    selected = gpu if gpu is not None else cpu
+    cpu_only = bool(cpu_enabled and not gpu_devices)
+    gpu_only = bool(gpu_devices and not cpu_enabled)
+    selected = cpu if cpu_only and cpu is not None else gpu or cpu
     digest = selected.content_sha256 if selected else ''
     path = str(selected.path) if selected else ''
-    if cpu is not None and gpu is not None:
+    if cpu is not None and gpu is not None and not (cpu_only or gpu_only):
         digest = hashlib.sha256(json.dumps({k: d.content_sha256 for k, d in sorted(definitions.items())},
                                           sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         path = ''

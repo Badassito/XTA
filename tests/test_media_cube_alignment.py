@@ -59,9 +59,12 @@ def test_xy_resizing_cube_takes_the_native_renderer_t_taps(streaming):
     out_shape = (29, 29, 30)
     resize = (media.resize_volume_to_processing_cube_gray8_streaming if streaming
               else media.resize_volume_to_processing_cube_gray8)
-    with mock.patch.object(media, 'allocate_workspace_array', side_effect=_in_memory):
+    with (mock.patch.object(media, 'allocate_workspace_array', side_effect=_in_memory),
+          mock.patch.object(media, '_resize_gray_slice_nearest_or_linear',
+                            wraps=media._resize_gray_slice_nearest_or_linear) as resize_plane):
         cube = resize(source, out_shape, Path('cube.uint8'), workers=1)
         media.wait_for_volume_ready(cube)
+    assert resize_plane.call_count == len(levels)
     rows = np.array(cube)[:, 0, 0]
     expected = _native_renderer_reference(levels, out_shape[0])
     assert _difference(rows, expected) <= 1

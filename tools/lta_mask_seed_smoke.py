@@ -48,10 +48,10 @@ from XTA.lta_experimental import (
 )
 from XTA.lta_inputs import parse_yolo_segmentation_label
 from XTA.lta_tiles import (
+    masks_for_tile,
     plan_object_tile,
-    rasterize_polygons,
+    rasterize_polygon_on_tile,
     select_polygon_row,
-    transform_polygon_to_tile,
 )
 from XTA.lta_sam import (
     LTA_MAX_NUM_OBJECTS,
@@ -116,19 +116,16 @@ def main() -> None:
         source_width=width,
         source_height=height,
     )
-    local_polygons = tuple(transform_polygon_to_tile(item, tile) for item in polygons)
-    local_selected_polygon = transform_polygon_to_tile(selected_polygon, tile)
     if args.seed_scope == "selected":
-        ground_truth = rasterize_polygons((local_selected_polygon,))
+        ground_truth = rasterize_polygon_on_tile(selected_polygon, tile)
         object_masks = None
         peak = _distance_peaks(ground_truth, 1)[0]
         seed = PointClick(*_pixel_center_normalized(peak[0], peak[1], tile.size), True, "object_creation_seed")
     else:
-        masks = tuple(rasterize_polygons((polygon,)) for polygon in local_polygons)
-        object_masks = tuple(mask for mask in masks if bool(mask.any()))
-        ground_truth = rasterize_polygons(
-            tuple(polygon for polygon, mask in zip(local_polygons, masks) if bool(mask.any()))
-        )
+        object_masks = masks_for_tile(polygons, tile)
+        ground_truth = np.zeros((tile.size, tile.size), dtype=bool)
+        for mask in object_masks:
+            ground_truth |= mask
         seed = None
         if args.propagation_mode != "tracker-only":
             raise ValueError("--seed-scope all-in-tile requires --propagation-mode tracker-only")

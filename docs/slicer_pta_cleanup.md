@@ -53,8 +53,9 @@ copy existed work from `review/manifest.json`; copying that file into the grid
 folder by hand has the same effect.
 
 Importer offers grouped review grids only, smallest low-quality grid first.
-When the sweep has a low-quality tier, its native grid is reference-only: it
-binds exported edits to the native branch NRRDs and is never loaded. Use the
+Sweeps from v26.1.0 group both the native and requested low-quality masks by
+cutoff. Older studies and independently packed reviews can have a reference-only
+native grid whose masks live in the scalar branch directories. Use the
 matching LQ intensity or confirm **Align Native Intensity** when pairing a
 full-size intensity stack with an LQ grid.
 
@@ -466,6 +467,15 @@ that dependency; a new XTA installation can use the `cleanup` extra. For a
 standalone machine, install `numpy scipy scikit-image` and keep
 `tools/xta_native_filter.py`, `tools/xta_native_sparse.py`, and `tools/xta_auto.py`
 together.
+
+For a consolidated confidence sweep, use the XTA checkout or installed package
+with grouped source catalogue support. Select one cutoff from the Slicer export.
+Its `edits.json` lists `preview_manifest_relative` and
+`native_manifest_relative` under `sweep_context`. These paths are relative to
+the sweep root and identify the catalogues to pass as `--low-manifest` and
+`--full-manifest`. The filter authenticates the review and reads the selected
+segments at their indexed positions. Older scalar studies use the original
+per-layer manifests.
 
 Example cluster command, from the XTA source directory (replace example paths):
 

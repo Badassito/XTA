@@ -315,6 +315,8 @@ class LtaPropagationTests(unittest.TestCase):
         self.assertGreater(result.hole_fill_added_pixels, 0)
 
     def test_backward_session_reinjects_prompt_and_uses_first_frame_boundary(self) -> None:
+        tracker_mask = _donut().astype(np.uint8)[::-1]
+
         def adapter(_measured, _raw, **kwargs):
             session = kwargs["session"]
             return {
@@ -326,7 +328,7 @@ class LtaPropagationTests(unittest.TestCase):
                         object_id=0,
                         initial_detection_score=1.0,
                         frame_tracker_score=0.8,
-                        binary_mask=np.ones((7, 7), dtype=bool),
+                        binary_mask=tracker_mask,
                     )
                     for frame in range(session.frame_start, kwargs["prompt_frame"])
                 ),
@@ -358,7 +360,6 @@ class LtaPropagationTests(unittest.TestCase):
             resource=[object()] * 5,
             request=request,
             adapter=adapter,
-            fill_mask=lambda mask: np.asarray(mask, dtype=bool).copy(),
         )
 
         self.assertEqual(
@@ -366,6 +367,15 @@ class LtaPropagationTests(unittest.TestCase):
             {10, 11, 12, 13},
         )
         self.assertEqual(result.dogfood_seeds[0].frame_index, 10)
+        prediction = result.predictions[0].prediction.binary_mask
+        np.testing.assert_array_equal(prediction, tracker_mask)
+        np.testing.assert_array_equal(result.dogfood_seeds[0].mask, tracker_mask)
+        self.assertTrue(prediction.flags.c_contiguous)
+        self.assertFalse(np.shares_memory(prediction, tracker_mask))
+        self.assertFalse(np.shares_memory(prediction, result.dogfood_seeds[0].mask))
+        self.assertEqual(result.hole_fill_added_pixels, 0)
+        self.assertEqual(result.adapter_receipt["seed_hole_fill_added_pixels"], 0)
+        self.assertEqual(result.adapter_receipt["prediction_hole_fill_added_pixels"], 0)
 
     def test_streaming_matches_retained_union_and_dogfood_without_retaining_masks(self) -> None:
         def adapter(_measured, _raw, **kwargs):

@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import gc
+import json
 import threading
 from types import MappingProxyType, SimpleNamespace
 import weakref
@@ -192,12 +193,17 @@ def test_actual_runtime_serializer_preserves_every_diagnostic_field(monkeypatch,
     monkeypatch.setenv('YOLO_TTA_TELEMETRY_DIR', str(tmp_path/'telemetry'))
     telemetry = runtime.RuntimeTelemetry()
     monkeypatch.setattr(runtime, '_RUNTIME_TELEMETRY', telemetry)
-    args = inputs()
-    bounds = diagnostic.begin_retry_attempt_bounds(*args)
-    diagnostic.observe_retry_scope(bounds, scope())
-    finish(bounds, args)
-    assert len(telemetry._trace_events) == 1
-    row = telemetry._trace_events[0]
+    try:
+        args = inputs()
+        bounds = diagnostic.begin_retry_attempt_bounds(*args)
+        diagnostic.observe_retry_scope(bounds, scope())
+        finish(bounds, args)
+    finally:
+        telemetry.flush(final=True)
+    rows = [event for line in telemetry.path.read_text(encoding='utf-8').splitlines()
+            for event in json.loads(line)['events']]
+    assert len(rows) == 1
+    row = rows[0]
     assert row['event'] == EVENT
     assert FIELDS <= row.keys()
     assert 'unproved_owner_flags' in row

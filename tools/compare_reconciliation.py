@@ -25,6 +25,7 @@ from XTA.reconciliation import EvidenceLayer, reconcile
 import XTA as _xta_package
 from XTA.reconciliation_components import component_statistics
 from XTA.reconciliation_io import read_layer_manifest, write_seg_nrrd
+from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, open_grouped_catalog
 from XTA.reconciliation_policy import load_reconciliation_policy, resolve_reconciliation
 
 _POLICIES = Path(_xta_package.__file__).resolve().parent / "examples" / "external_reconciliation"
@@ -54,8 +55,12 @@ def _atomic_json(path: Path, value) -> None:
 def discover_geometry_context(layer_manifest: str | Path) -> tuple[dict, Path | None, dict | None]:
     """Find the nearest completed-run manifest and retain both source T scales."""
     manifest = Path(layer_manifest).resolve()
-    for directory in manifest.parents:
-        candidate = directory / "manifest.json"
+    catalogue = json.loads(manifest.read_bytes())
+    if catalogue.get("layout") == GROUPED_CATALOG_LAYOUT:
+        candidates = (open_grouped_catalog(manifest).run_manifest,)
+    else:
+        candidates = (directory / "manifest.json" for directory in manifest.parents)
+    for candidate in candidates:
         if candidate == manifest or not candidate.is_file():
             continue
         data = json.loads(candidate.read_text(encoding="utf-8"))
@@ -316,9 +321,17 @@ def compare(inputs, policy_paths, output, *, memory_mib=2048, previews=True, pro
                 collection, run_manifest_path, reader_cleanup=reader_cleanup)
             dataset["confidence_evidence"] = confidence_info
             _confidence_summary(report)
-            for layer in collection:
-                if layer.path is not None:
-                    dataset["input_fingerprints"][str(layer.path)] = _file_fingerprint(layer.path)
+            if collection.grouped_catalog is None:
+                for layer in collection:
+                    if layer.path is not None:
+                        dataset["input_fingerprints"][str(layer.path)] = _file_fingerprint(layer.path)
+            else:
+                grouped = collection.grouped_catalog
+                dataset["input_fingerprints"][str(grouped.review_path)] = _file_fingerprint(grouped.review_path)
+                for path, (stamp, digest) in grouped.verified_files.items():
+                    dataset["input_fingerprints"][str(path)] = {
+                        "size_bytes": stamp[2], "modified_time_ns": stamp[3], "sha256": digest,
+                    }
             dataset["input_fingerprints"][str(manifest_path)] = _file_fingerprint(manifest_path)
             if run_manifest_path:
                 dataset["input_fingerprints"][str(run_manifest_path)] = _file_fingerprint(run_manifest_path)

@@ -5,6 +5,8 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -12,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .artifact_archive import append_members, split_reference
+from .run_transport import TransportError
 
 
 class _LockEntry:
@@ -72,10 +75,85 @@ def _fsync_parent_directory(parent: Path) -> None:
         try:
             os.fsync(descriptor)
         except OSError as exc:
-            if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+            if exc.errno not in {errno.EBADF, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EROFS}:
                 raise
     finally:
         os.close(descriptor)
+
+
+def _publish_sweep_directory(stage: Path, destination: Path) -> None:
+    """Publish one private sweep directory without replacing another publisher's output."""
+    from .run_transport import (
+        TransportError, _ExclusiveDirectoryRenameUnavailable, _api_path, _publish_fresh,
+    )
+
+    try:
+        _publish_fresh(stage, destination, directory=True)
+        return
+    except _ExclusiveDirectoryRenameUnavailable:
+        # Some shared filesystems support rename but reject the exclusive flag.
+        # mkdir arbitrates between publishers before the ordinary POSIX rename.
+        pass
+
+    target = _api_path(destination)
+    os.mkdir(target, mode=0o700)
+    held = None
+    reservation = None
+    try:
+        reservation = os.lstat(target)
+        held = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if (not stat.S_ISDIR(reservation.st_mode) or not os.path.samestat(reservation, os.fstat(held))
+                or os.listdir(held) or not os.path.samestat(reservation, os.lstat(target))):
+            raise TransportError(f"Sweep destination reservation changed: {destination}")
+        # POSIX rename over a nonempty directory or a symlink fails. All XTA
+        # publishers leave a destination whose mkdir they did not win alone.
+        os.rename(_api_path(stage), target)
+    except BaseException:
+        if reservation is not None and stat.S_ISDIR(reservation.st_mode):
+            try:
+                if os.path.samestat(reservation, os.lstat(target)):
+                    os.rmdir(target)
+            except OSError:
+                # A moved or populated reservation belongs to its current owner.
+                pass
+        raise
+    finally:
+        if held is not None:
+            os.close(held)
+
+
+class SweepDirectoryPublicationError(TransportError):
+    """A completed product tree is still available on the output filesystem."""
+
+    def __init__(self, destination, stage, cause):
+        self.destination = destination
+        self.stage = stage
+        super().__init__(f"{cause}. Completed sweep products remain at {stage}")
+
+
+@contextmanager
+def _staged_sweep_directory(destination: Path, *, prefix: str):
+    """Keep completed products on disk if their final publication fails."""
+    container = Path(tempfile.mkdtemp(prefix=prefix, dir=destination.parent))
+    stage = container / destination.name
+    preserve = False
+    try:
+        stage.mkdir()
+        yield stage
+        try:
+            _publish_sweep_directory(stage, destination)
+            _fsync_parent_directory(destination.parent)
+        except Exception as exc:
+            if stage.is_dir():
+                preserve = True
+                raise SweepDirectoryPublicationError(destination, stage, exc) from exc
+            raise
+        except BaseException:
+            preserve = stage.is_dir()
+            raise
+    finally:
+        if not preserve:
+            shutil.rmtree(container)
 
 
 def _replace_published_json(stage: Path, destination: Path) -> None:
@@ -93,6 +171,29 @@ def _replace_published_json(stage: Path, destination: Path) -> None:
     os.replace(stage, destination)
 
 
+@contextmanager
+def _atomic_file_writer(destination: Path, *, suffix: str = ".assembling", encoding: str | None = None):
+    """Write a sibling stage and commit it after the supported syncs."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, stage_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=suffix, dir=destination.parent
+    )
+    stage = Path(stage_name)
+    try:
+        mode = "wb" if encoding is None else "w"
+        with os.fdopen(descriptor, mode, encoding=encoding, newline=None if encoding is None else "\n") as handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Windows can reject simultaneous replacements of one destination.
+        # Independent artifacts remain free to publish concurrently.
+        with _destination_lock(destination):
+            _replace_published_json(stage, destination)
+            _fsync_parent_directory(destination.parent)
+    finally:
+        stage.unlink(missing_ok=True)
+
+
 def write_json_atomic(
     path: str | Path,
     payload: object,
@@ -100,12 +201,14 @@ def write_json_atomic(
     sort_keys: bool = False,
     trailing_newline: bool = False,
     suffix: str = ".assembling",
-) -> Path:
+    return_byte_count: bool = False,
+) -> Path | int:
     """Publish strict JSON, acknowledging success only after supported syncs.
 
     A unique sibling stage keeps concurrent writers independent. A failed write or
     file sync leaves the previous artifact intact; a failed supported directory
-    sync raises even if the replacement has already become visible.
+    sync raises even if the replacement has already become visible. Callers can
+    request the exact serialized size instead of the destination path.
     """
 
     serialized = json.dumps(
@@ -123,25 +226,11 @@ def write_json_atomic(
     if archived is not None:
         archive, member = archived
         append_members(archive, {member: serialized.encode("utf-8")}, replace=True)
-        return destination
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, stage_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=suffix, dir=destination.parent
-    )
-    stage = Path(stage_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+    else:
+        with _atomic_file_writer(destination, suffix=suffix, encoding="utf-8") as handle:
             handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # Windows can reject simultaneous replacements of one destination.
-        # Independent artifacts remain free to publish concurrently.
-        with _destination_lock(destination):
-            _replace_published_json(stage, destination)
-            _fsync_parent_directory(destination.parent)
-    finally:
-        stage.unlink(missing_ok=True)
-    return destination
+    # ensure_ascii=True and explicit LF newlines make every character one byte.
+    return len(serialized) if return_byte_count else destination
 
 
 __all__ = ("write_json_atomic",)

@@ -127,10 +127,12 @@ class SweepViewSchedule:
             return
         # Reuse source/model identities captured at scalar startup. Never read
         # the acquisition, checkpoint or per-range pixels to build these keys.
+        from .unification.tta_manifest import comparable_artifact_identities
+
         def digest(value):
             return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
                                              allow_nan=False).encode('utf-8')).hexdigest()
-        common = digest([artifacts, {key: value for key, value in vars(args).items()
+        common = digest([comparable_artifact_identities(artifacts), {key: value for key, value in vars(args).items()
             if key not in {'conf','output','temp','capture_component_replay'}}])
         self.identities = {str(view.name): digest([common, asdict(view)]) for view in views}
 
@@ -265,9 +267,9 @@ class SweepViewSchedule:
                 continue
             if other.__cause__ is first or other.__cause__ is self._publish_failure:
                 skipped += 1
-            else:
+            elif callable(getattr(first, 'add_note', None)):
                 first.add_note(f'Another sweep view publication also failed: {other!r}')
-        if skipped:
+        if skipped and callable(getattr(first, 'add_note', None)):
             first.add_note(f'{skipped} queued sweep view publication(s) were skipped after this failure')
         raise first
 
@@ -347,7 +349,7 @@ class SweepViewSchedule:
         return None
 
     def partition(self, model, views, shape_for, publication):
-        detector_views, stored = [], deque()
+        detector_views, projected, native = [], deque(), deque()
         for view in views:
             if int(view.augmentation_pass) != 0:
                 continue
@@ -356,11 +358,13 @@ class SweepViewSchedule:
                 source = self.consumer_source(model, view, shape_for(view), publication)
             if source is None:
                 detector_views.append(view)
+            elif source == 'projected':
+                projected.append((view, source))
             else:
-                stored.append((view, source))
-        fully_projected = bool(stored) and not detector_views and all(
-            source == 'projected' for _, source in stored)
-        return detector_views, stored, fully_projected
+                native.append((view, source))
+        fully_projected = bool(projected) and not detector_views and not native
+        projected.extend(native)
+        return detector_views, projected, fully_projected
 
     def close(self):
         if self.executor is not None:

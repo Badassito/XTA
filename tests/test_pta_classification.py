@@ -11,7 +11,7 @@ from XTA import geometry as shared_geometry
 from XTA import pta
 from XTA import pta_rendering
 from XTA import pta_classification
-from XTA.pta_classification import _any_sampled, _lookup_for_matrix, classify_semantic_plan_frame
+from XTA.pta_classification import _NativeOccupancy, _lookup_for_matrix, classify_semantic_plan_frame
 from XTA.pta_config import parse_pta_args
 
 
@@ -31,14 +31,31 @@ def test_axis_lookup_matches_opencv_nearest_even_at_border(matrix):
     assert lookup is not None
     x, y, swap = lookup
     active = source.T if swap else source
-    row_any = np.any(active, axis=1)
-    col_any = np.any(active, axis=0)
-    assert _any_sampled(active, x, y, row_any, col_any) == bool(np.any(expected))
+    sampled = _lookup_for_matrix(matrix, 7, 9, 19, 17, sampled_only=True)
+    assert _NativeOccupancy(source).any_sampled(*sampled) == bool(np.any(expected))
     xx, yy = np.meshgrid(x, y)
     sampled = np.zeros(expected.shape, dtype=np.uint8)
     valid = (xx >= 0) & (xx < active.shape[1]) & (yy >= 0) & (yy < active.shape[0])
     sampled[valid] = active[yy[valid], xx[valid]]
     np.testing.assert_array_equal(sampled, expected)
+
+
+def test_semantic_support_is_cached_and_reductions_follow_axis_coverage():
+    matrix = np.eye(2, 3, dtype=np.float32)
+    plane = np.zeros((4, 5), dtype=np.uint8)
+    plane[1, 3] = 1
+    occupancy = _NativeOccupancy(plane)
+    pta_classification._axis_indices.cache_clear()
+    with mock.patch.object(pta_classification, '_sampled_axis', wraps=pta_classification._sampled_axis) as reduce_axis:
+        for _ in range(3):
+            lookup = _lookup_for_matrix(matrix, *plane.shape, *plane.shape, sampled_only=True)
+            assert occupancy.any_sampled(*lookup)
+        assert reduce_axis.call_count == 2
+    assert occupancy.rows is None and occupancy.columns is None
+    assert not occupancy.any_sampled(np.arange(5), np.array([0, 3]), False)
+    assert occupancy.rows is not None and occupancy.columns is None
+    assert occupancy.any_sampled(np.arange(4), np.array([3]), True)
+    assert occupancy.columns is not None
 
 
 def _build_plan(tmp_path: Path, options: list[str], *, angle: float = 0.0,
@@ -163,6 +180,12 @@ def test_tilted_source_shell_positive_native_samples(tmp_path, options, family):
     assert actual == expected
 
 
+def test_categorical_tile_resize_samples_pixel_centers():
+    x, y = pta_classification._resize_tile_indices(4, 2, 2)
+    np.testing.assert_array_equal(x, [1, 3])
+    np.testing.assert_array_equal(y, [1, 3])
+
+
 def test_downsampled_fullframe_and_negative_padded_legacy_tile(tmp_path):
     view, plan = _build_plan(tmp_path, ['--enable_cartesian', 'transverse'], imgsz=4)
     original_tile = plan.tile_layout[0]
@@ -182,11 +205,11 @@ def test_downsampled_fullframe_and_negative_padded_legacy_tile(tmp_path):
     )
     tile_mask = pta_rendering.resize_centered(
         pta_rendering.extract_padded_tile(canvas_mask, -2, -1, negative_tile.cfg.tile_size),
-        negative_tile.out_w, negative_tile.out_h, pta_rendering.cv2.INTER_NEAREST,
+        negative_tile.out_w, negative_tile.out_h, pta_rendering.cv2.INTER_NEAREST_EXACT,
     )
     tile_coverage = pta_rendering.resize_centered(
         pta_rendering.extract_padded_tile(canvas_coverage, -2, -1, negative_tile.cfg.tile_size),
-        negative_tile.out_w, negative_tile.out_h, pta_rendering.cv2.INTER_NEAREST,
+        negative_tile.out_w, negative_tile.out_h, pta_rendering.cv2.INTER_NEAREST_EXACT,
     )
     assert actual == {
         'full': bool(np.any(full_mask & full_coverage)),

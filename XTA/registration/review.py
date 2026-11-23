@@ -15,7 +15,7 @@ import numpy as np
 from ..file_hashing import sha256_file
 from .packet import load_packet
 from .pairs import checked_registered_video
-from .video import _probe_stream, _publish_new, _read_exact, _stat_identity, probe_video
+from .video import _probe_stream, _publish_new, _read_exact, _source_stat_matches, _stat_identity, probe_video
 
 
 def _decoder_command(path, width, height, selection=None):
@@ -242,7 +242,7 @@ def render_review(
                         if proc.poll() is None:
                             proc.kill()
             for path, info in [(fixed, fixed_info), (registered_video, registered_info)]:
-                if _stat_identity(path) != info["_source_stat"]:
+                if not _source_stat_matches(path, info["_source_stat"], _stat_identity(path), info.get("sha256")):
                     raise ValueError("A review source changed during rendering")
             written = _probe_stream(movie, "-count_frames")
             if int(written.get("nb_read_frames", 0)) != depth or [

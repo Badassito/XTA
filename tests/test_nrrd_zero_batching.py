@@ -118,6 +118,23 @@ class NrrdZeroBatchingTests(unittest.TestCase):
         self.assertTrue(blocker.cancelled())
         self.assertFalse(writer._completed)
 
+    def test_owned_batch_streams_large_leading_and_interior_zero_gaps(self):
+        gap = 64 * 1024 * 1024
+        sink = io.BytesIO()
+        writer = self.writer(sink)
+        original = nrrd_compression.canonical_zero_run_bytes
+        with mock.patch.object(nrrd_compression, 'canonical_zero_run_bytes', wraps=original) as encode:
+            written = writer.write_owned_member_batch(
+                b'abc', [(gap, 0, 1), (5, 1, 2), (gap + 3, 2, 3)],
+            )
+            writer.close()
+        assert written == 2 * gap + 11
+        assert all(call.args[0] < gap for call in encode.call_args_list)
+        assert sink.getvalue() == (
+            _old_zero_stream(gap) + _compress(b'a') + _old_zero_stream(5) + _compress(b'b')
+            + _old_zero_stream(gap + 3) + _compress(b'c')
+        )
+
     def test_actual_encoded_writes_are_bounded_and_coalesce_mixed_zero_sizes(self):
         sink = _CountingSink()
         writer = self.writer(sink)
@@ -158,13 +175,14 @@ class NrrdZeroBatchingTests(unittest.TestCase):
 
     def test_invalid_write_progress_closes_and_settles_writer(self):
         for result in (0, -1, 10**9):
-            writer = self.writer(SimpleNamespace(write=lambda _data: result))
-            with self.subTest(result=result), self.assertRaisesRegex(OSError, 'forward progress'):
-                writer.write_canonical_zeros(1)
-            self.assertTrue(writer.closed)
-            self.assertFalse(writer._pending)
-            self.assertFalse(writer._completed)
-            self.assertEqual(writer._writer_stats['failed_writers'], 1)
+            for method in ('write_zeros', 'write_aligned_zeros', 'write_canonical_zeros'):
+                writer = self.writer(SimpleNamespace(write=lambda _data: result))
+                with self.subTest(result=result, method=method), self.assertRaisesRegex(OSError, 'forward progress'):
+                    getattr(writer, method)(1)
+                self.assertTrue(writer.closed)
+                self.assertFalse(writer._pending)
+                self.assertFalse(writer._completed)
+                self.assertEqual(writer._writer_stats['failed_writers'], 1)
 
     def test_write_failure_keeps_previous_published_file(self):
         with tempfile.TemporaryDirectory() as directory:

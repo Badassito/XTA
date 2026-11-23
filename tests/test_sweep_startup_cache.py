@@ -1,11 +1,15 @@
 """Confidence cutoffs share discovery without rereading unchanged model files."""
 
 import hashlib
+import os
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from XTA import startup_io
+from XTA import confidence_sweep
 from XTA.unification import tta_manifest
 
 
@@ -76,6 +80,91 @@ def test_model_mutation_stops_later_cutoff_without_rereading(files, tmp_path, mo
         with pytest.raises(RuntimeError, match="model artifact changed within confidence sweep"):
             capture(source, model)
         digest.assert_not_called()
+
+
+def test_model_metadata_drift_is_checked_against_original_digest(files, tmp_path, monkeypatch):
+    source, model = files
+    monkeypatch.setenv("XTA_YOLO_SWEEP_WORK_DIR", str(tmp_path / "private_work"))
+    original = capture(source, model)
+    baseline = model.stat()
+    stat = Path.stat
+    extra_time = 1000
+
+    def changed_time(path, *args, **kwargs):
+        result = stat(path, *args, **kwargs)
+        if path == model:
+            result = SimpleNamespace(**{name: getattr(result, name) for name in dir(result)
+                                        if name.startswith("st_")})
+            result.st_ctime_ns = baseline.st_ctime_ns + extra_time
+        return result
+
+    monkeypatch.setattr(Path, "stat", changed_time)
+    with mock.patch.object(tta_manifest, "_write_sweep_startup_cache",
+                           side_effect=AssertionError("an authenticated cache record remains immutable")):
+        current = capture(source, model)
+    assert current != original
+    assert tta_manifest.comparable_artifact_identities(current) == tta_manifest.comparable_artifact_identities(original)
+    tta_manifest.assert_tta_artifacts_unchanged(original)
+
+    model.write_bytes(b"mODEL bytes")
+    os.utime(model, ns=(baseline.st_atime_ns, baseline.st_mtime_ns))
+    extra_time += 1000
+    with pytest.raises(RuntimeError, match="model artifact changed within confidence sweep"):
+        capture(source, model)
+
+
+@pytest.mark.parametrize("edit", [False, True])
+def test_model_rechecks_ctime_drift_during_the_first_hash(files, monkeypatch, edit):
+    source, model = files
+    baseline = model.stat()
+    original_stat = Path.stat
+    digest = tta_manifest._sha256_file
+    changed = False
+
+    def stat(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if changed and path == model:
+            result = SimpleNamespace(**{name: getattr(result, name) for name in dir(result)
+                                        if name.startswith("st_")})
+            result.st_ctime_ns = baseline.st_ctime_ns + 1
+        return result
+
+    def hash_with_intervening_change(path):
+        nonlocal changed
+        result = digest(path)
+        if not changed and edit:
+            model.write_bytes(b"mODEL bytes")
+            os.utime(model, ns=(baseline.st_atime_ns, baseline.st_mtime_ns))
+        changed = True
+        return result
+
+    monkeypatch.setattr(Path, "stat", stat)
+    with mock.patch.object(tta_manifest, "_sha256_file", side_effect=hash_with_intervening_change) as hashed:
+        if edit:
+            with pytest.raises(RuntimeError, match="changed while reading its identity"):
+                capture(source, model)
+        else:
+            current = capture(source, model)["models"]["gpu"]["artifacts"][0]
+            assert current["change_or_creation_time_ns"] == baseline.st_ctime_ns + 1
+        assert hashed.call_count == 2
+
+
+def test_sweep_receipt_ctime_drift_requires_same_digest(tmp_path):
+    receipt = tmp_path / "receipt.json"
+    receipt.write_bytes(b'{"done":1}')
+    identity = tta_manifest._file_identity(receipt, content_digest=True)
+    identity["change_or_creation_time_ns"] -= 1
+    confidence_sweep._check_receipt_versions({receipt: identity})
+    with pytest.raises(RuntimeError, match="receipt changed"):
+        confidence_sweep._check_receipt_versions({receipt: {**identity, "sha256": "0" * 64}})
+
+
+def test_unhashed_source_ctime_drift_is_not_treated_as_content_proof(files):
+    source, model = files
+    initial = capture(source, model)
+    initial["source"]["change_or_creation_time_ns"] -= 1
+    with pytest.raises(RuntimeError, match="change_or_creation_time_ns"):
+        tta_manifest.assert_tta_artifacts_unchanged(initial)
 
 
 def test_openvino_artifact_inventory_change_stops_later_cutoff(files, tmp_path, monkeypatch):

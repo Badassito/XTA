@@ -1,6 +1,8 @@
 """Intensity/categorical QSC plans share owners without changing coordinates."""
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import os
+import sys
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -8,6 +10,32 @@ import pytest
 
 from XTA import pta_cuda_shells as shells, spherical_cuda as sc
 from tests.test_spherical_cuda import resident_engine, spherical_view, rotation_xyz
+
+
+def test_categorical_kernels_compile_in_each_requested_device(monkeypatch):
+    active, built = [], []
+
+    @contextmanager
+    def device(index):
+        active.append(index)
+        try:
+            yield
+        finally:
+            active.pop()
+
+    def raw_module(**kwargs):
+        index = active[-1]
+        built.append(index)
+        return SimpleNamespace(get_function=lambda name: (index, name))
+
+    monkeypatch.setitem(sys.modules, 'cupy', SimpleNamespace(
+        RawModule=raw_module, cuda=SimpleNamespace(Device=device)))
+    monkeypatch.setattr(shells, '_SHELL_CATEGORICAL_KERNELS', {})
+    first = shells._kernels(0)
+    second = shells._kernels(1)
+    assert shells._kernels(0) is first
+    assert second.radial == (1, 'radial_categorical')
+    assert built == [0, 1]
 
 
 @pytest.mark.parametrize('face', range(6))

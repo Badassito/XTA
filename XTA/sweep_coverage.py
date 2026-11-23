@@ -1,6 +1,7 @@
 """Accumulate direct-layer coverage while grouped review masks are being streamed."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -17,13 +18,16 @@ _COLORS = ((1, (94, 1, 166)), (2, (165, 31, 153)), (4, (214, 85, 109)),
            (8, (247, 145, 67)), (16, (249, 220, 36)))
 
 
-def write_coverage_colors(path: Path, maximum: int) -> None:
+def write_coverage_colors(path: Path, maximum: int, *, durable=False) -> None:
     """Every label is the exact count even when adjacent counts share a color."""
     with path.open("x", encoding="ascii", newline="\n") as stream:
         stream.write("# Color table file\n0 Background 0 0 0 0\n")
         for value in range(1, maximum + 1):
             color = next(rgb for floor, rgb in reversed(_COLORS) if floor <= value)
             stream.write(f"{value} {value}_direct_layers {color[0]} {color[1]} {color[2]} 255\n")
+        if durable:
+            stream.flush()
+            os.fsync(stream.fileno())
 
 
 class DirectCoverage:
@@ -46,11 +50,12 @@ class DirectCoverage:
     def close(self):
         self._spool.close()
 
-    def observe(self, first_z, slab, extent_xyz):
+    def observe(self, first_z, slab, extent_xyz, *, origin_yx=(0, 0)):
         """Record a binary source slab using the declared layer extent as an upper bound."""
         x0, x1, y0, y1, _, _ = extent_xyz
+        origin_y, origin_x = origin_yx
         for offset, source in enumerate(slab):
-            crop = source[y0:y1+1, x0:x1+1]
+            crop = source[y0-origin_y:y1-origin_y+1, x0-origin_x:x1-origin_x+1]
             rows = np.flatnonzero(np.any(crop, axis=1))
             if not rows.size:
                 continue
@@ -69,7 +74,7 @@ class DirectCoverage:
             self.row_bounds[z] = (first, stop) if previous is None else (
                 min(first, previous[0]), max(stop, previous[1]))
 
-    def write(self, path, *, sweep_id, grid_id, cutoff_cent, memory_mib=128):
+    def write(self, path, *, sweep_id, grid_id, cutoff_cent, memory_mib=128, durable=False):
         _, height, width = self.geometry.shape_tyx
         nrtype = {"u1":"uint8", "u2":"uint16", "u4":"uint32"}[f"u{self.dtype.itemsize}"]
         def vector(values):
@@ -124,6 +129,9 @@ class DirectCoverage:
                     encoded.write_zeros(first * row_bytes)
                     encoded.write(memoryview(band).cast("B"))
                     encoded.write_zeros((height-stop) * row_bytes)
+            if durable:
+                raw.flush()
+                os.fsync(raw.fileno())
         return {"dtype":nrtype, "direct_layer_count": self.layer_count,
                 "maximum_count":maximum, "positive_voxels":positive, "voxel_votes":votes,
                 "row_band_bytes":band_bytes, "gzip_spans":dict(encoded.stats)}

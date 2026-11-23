@@ -21,7 +21,8 @@ __device__ __forceinline__ Bilinear displacement_at(
         const float* field, float px, float py, int h, int w) {
     float x = fminf(fmaxf(px, 0.f), w - 1.f);
     float y = fminf(fmaxf(py, 0.f), h - 1.f);
-    int x0 = (int)floorf(x), y0 = (int)floorf(y);
+    int x0 = min((int)floorf(x), max(0, w - 2));
+    int y0 = min((int)floorf(y), max(0, h - 2));
     int x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
     float u = x - x0, v = y - y0;
     int i00 = y0*w+x0, i10 = y0*w+x1, i01 = y1*w+x0, i11 = y1*w+x1;
@@ -87,7 +88,9 @@ extern "C" __global__ void policy_grids(
             dy = isnan(dy) ? dy : fminf(fmaxf(dy, -32.f), 32.f);
             x=finite_coordinate(x-dx); y=finite_coordinate(y-dy);
         }
-        Bilinear s = displacement_at(field, x, y, h, w);
+        // The accepted roundoff halo is sampled at the raster edge.
+        Bilinear s = displacement_at(field, fminf(fmaxf(x, 0.f), w - 1.f),
+                                     fminf(fmaxf(y, 0.f), h - 1.f), h, w);
         rx=na*x+nb*y+nbx+s.x-gx; ry=nc*x+nd*y+nby+s.y-gy;
         float det=(na+s.xx)*(nd+s.yy)-(nb+s.xy)*(nc+s.yx);
         orientation_ok=det*(na*nd-nb*nc) > 0.f && fabsf(det) > 1.e-7f;
@@ -115,9 +118,9 @@ extern "C" __global__ void pack_validity(const unsigned char* valid, unsigned ch
     packed[i]=value;
 }
 
-extern "C" __global__ void quantize_boundary(const void* input, void* output, int count,
+extern "C" __global__ void quantize_boundary(const void* input, void* output, long long count,
                                             int input_half, int output_half, int clamp_input) {
-    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i>=count) return;
     float value;
     if (input_half) {
@@ -252,7 +255,7 @@ def quantize_boundary_cuda(images: Any, *, dtype: Any, clamp_input: bool) -> Any
     stream = torch.cuda.current_stream(images.device)
     with cp.cuda.Device(images.device.index):
         kernel(((images.numel()+255)//256,), (256,),
-               (_borrow(cp,images), _borrow(cp,output), np.int32(images.numel()),
+               (_borrow(cp,images), _borrow(cp,output), np.int64(images.numel()),
                 np.int32(images.dtype==torch.float16), np.int32(dtype==torch.float16), np.int32(clamp_input)),
                stream=_cupy_external_stream(cp,stream))
     images.record_stream(stream)

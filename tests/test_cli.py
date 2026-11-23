@@ -132,7 +132,8 @@ class CliTests(unittest.TestCase):
         runtime.run = mock.Mock(side_effect=AssertionError("runtime must not start"))
         required = ["--mode", "tta", "--input", "input.mkv", "--model", "gpu:model.engine"]
         with mock.patch.dict(sys.modules, {"XTA.tta_mode": runtime}):
-            for option in ("--conf=nan", "--conf=2", "--imgsz=0", "--min_radius=inf"):
+            for option in ("--conf=nan", "--conf=2", "--imgsz=0", "--min_radius=inf",
+                           "--channel_format=invalid", "--cpu_threads=bad"):
                 with self.subTest(option=option):
                     stderr = io.StringIO()
                     with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
@@ -183,6 +184,7 @@ class CliTests(unittest.TestCase):
                     "--task", task, "--input", "volume.mkv", "--device", "cpu",
                     "--model", "cpu:detector.xml", "--output", "review",
                     "--temp", "work", "--conf=0.50:0.10:0.70", "--min_conf=0.20",
+                    "--save=summary,voxel_volume",
                 ]
                 with mock.patch("XTA.confidence_sweep.run_confidence_sweep") as sweep:
                     with mock.patch("XTA.tta_mode.run") as scalar:
@@ -190,8 +192,20 @@ class CliTests(unittest.TestCase):
                 sweep.assert_called_once_with(
                     arguments, cutoffs_hundredths=(50, 60, 70),
                     output_root=Path("review"), temp_root=Path("work"), min_conf=0.2,
+                    save_options=("summary", "voxel_volume"),
                 )
                 scalar.assert_not_called()
+
+    def test_sweep_handoff_expands_user_output_and_scratch(self) -> None:
+        arguments = [
+            '--task', 'segment', '--input', 'volume.mkv', '--device', 'cpu',
+            '--model', 'cpu:detector.xml', '--output', '~/review', '--temp', '~/work',
+            '--conf=0.50:0.10:0.70',
+        ]
+        with mock.patch('XTA.confidence_sweep.run_confidence_sweep') as sweep:
+            cli.run(['--mode', 'tta', *arguments])
+        self.assertEqual(sweep.call_args.kwargs['output_root'], Path.home() / 'review')
+        self.assertEqual(sweep.call_args.kwargs['temp_root'], Path.home() / 'work')
 
     def test_pta_module_is_imported_only_by_pta_delegate(self) -> None:
         fake_module = types.ModuleType("XTA.pta_mode")

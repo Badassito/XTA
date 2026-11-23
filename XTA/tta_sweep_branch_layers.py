@@ -176,7 +176,7 @@ class TtaSweepBranchLayers:
             try:
                 self._drain_all(primary_sink)
             except BaseException as drain_error:
-                if drain_error is not error:
+                if drain_error is not error and callable(getattr(error, 'add_note', None)):
                     error.add_note(f'Branch layer drain also failed: {drain_error}')
             raise
 

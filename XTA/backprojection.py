@@ -10,6 +10,7 @@ import threading
 import time
 from collections import (
     Counter,
+    OrderedDict,
     deque,
 )
 from concurrent.futures import (
@@ -141,6 +142,10 @@ class DenseAzimuthalBackprojectionMap:
     valid_mask: np.ndarray
     source_idx_map: np.ndarray
     u_idx_map: np.ndarray
+
+    @property
+    def nbytes(self) -> int:
+        return self.valid_mask.nbytes + self.source_idx_map.nbytes + self.u_idx_map.nbytes
 
 @dataclass(frozen=True)
 class AzimuthalProcessingGrid:
@@ -280,7 +285,11 @@ def _azimuthal_dense_map_for_processing(
         u_idx_map=np.ascontiguousarray(grid.native_u_to_processing[native_u]),
     )
 
-_DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[object, ...], DenseAzimuthalBackprojectionMap] = {}
+_DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE: OrderedDict[Tuple[object, ...], DenseAzimuthalBackprojectionMap] = OrderedDict()
+_DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_LOCK = threading.Lock()
+_DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_MAX_BYTES = GIB // 4
+_DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_MAX_ENTRIES = 8
+_DENSE_AZIMUTHAL_BACKPROJECT_MAP_BUILDS: Dict[Tuple[object, ...], Future] = {}
 
 def azimuthal_full_coverage_angle_deg(diameter: int) -> float:
     """Return the azimuthal spacing that gives approximately 1x ROI edge coverage."""
@@ -361,11 +370,43 @@ def build_dense_azimuthal_backprojection_map(
         float(azimuthal_view.center_x), float(azimuthal_view.center_y),
         float(azimuthal_view.roi_radius), _azimuthal_plan_signature(plan),
     )
-    cached = _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE.get(key)
-    if cached is not None:
-        return cached
+    cache = _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE
+    with _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_LOCK:
+        cached = cache.get(key)
+        if cached is not None:
+            cache.move_to_end(key)
+            return cached
+        in_flight = _DENSE_AZIMUTHAL_BACKPROJECT_MAP_BUILDS.get(key)
+        build = in_flight is None
+        if build:
+            in_flight = _DENSE_AZIMUTHAL_BACKPROJECT_MAP_BUILDS[key] = Future()
+    if not build:
+        return in_flight.result()
+    try:
+        dense_map = _make_dense_azimuthal_backprojection_map(
+            azimuthal_view, plan, (work_plane_h, work_plane_w), (out_h, out_w), u_len,
+        )
+        with _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_LOCK:
+            limit = _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_MAX_BYTES
+            if dense_map.nbytes <= limit:
+                cached_bytes = sum(value.nbytes for value in cache.values())
+                while cache and (cached_bytes + dense_map.nbytes > limit
+                                 or len(cache) >= _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_MAX_ENTRIES):
+                    _, old = cache.popitem(last=False)
+                    cached_bytes -= old.nbytes
+                cache[key] = dense_map
+        in_flight.set_result(dense_map)
+        return dense_map
+    except BaseException as error:
+        in_flight.set_exception(error)
+        raise
+    finally:
+        with _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE_LOCK:
+            del _DENSE_AZIMUTHAL_BACKPROJECT_MAP_BUILDS[key]
 
-    diameter = int(u_len)
+
+def _make_dense_azimuthal_backprojection_map(azimuthal_view, plan, work_shape, out_shape, diameter):
+    out_h, out_w = out_shape
     from .projection_coverage import effective_azimuthal_radius
     radius = effective_azimuthal_radius(azimuthal_view)
 
@@ -388,8 +429,8 @@ def build_dense_azimuthal_backprojection_map(
         stop = min(out_h * out_w, first + 65536)
         indices = np.arange(first, stop, dtype=np.int64)
         strip_valid, strip_source, strip_u = azimuthal_plane_samples(
-            indices // out_w, indices % out_w, (work_plane_h, work_plane_w),
-            (out_h, out_w), azimuthal_view.center_y, azimuthal_view.center_x,
+            indices // out_w, indices % out_w, work_shape,
+            out_shape, azimuthal_view.center_y, azimuthal_view.center_x,
             radius, diameter, plan_angles, plan_sources, plan_reverses,
             sorted_angles, owner_order)
         strip_source[~strip_valid] = 0
@@ -398,13 +439,13 @@ def build_dense_azimuthal_backprojection_map(
         source_idx.reshape(-1)[first:stop] = strip_source
         u_idx.reshape(-1)[first:stop] = strip_u
 
-    dense_map = DenseAzimuthalBackprojectionMap(
+    for array in (valid, source_idx, u_idx):
+        array.flags.writeable = False
+    return DenseAzimuthalBackprojectionMap(
         valid_mask=np.ascontiguousarray(valid),
         source_idx_map=np.ascontiguousarray(source_idx),
         u_idx_map=np.ascontiguousarray(u_idx),
     )
-    _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE[key] = dense_map
-    return dense_map
 
 class _MainProcessGpuStageLease:
     """Exclusive main-process lease for one logical CUDA device."""
@@ -3584,11 +3625,8 @@ class SinkOnlyProjectionResult:
 
     shape: Tuple[int, int, int]
 
-_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL: Optional[object] = None
-
-_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_FAILED = False
-
-_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_ERROR: Optional[str] = None
+_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNELS = {}
+_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_LOCK = threading.Lock()
 
 def gpu_resident_azimuthal_backproject_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_BACKPROJECT_RESIDENT', True)
@@ -3597,13 +3635,18 @@ def fused_angle_variant_azimuthal_component_layer_enabled() -> bool:
     """Project one post-interpolation Azimuthal union in the angle-variant fast path."""
     return _env_flag('YOLO_TTA_FUSED_ANGLE_VARIANT_AZIMUTHAL_LAYER', True)
 
-def _azimuthal_resident_backproject_kernel() -> Optional[object]:
-    global _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL
-    global _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_FAILED, _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_ERROR
-    if _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL is not None:
-        return _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL
-    if _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_FAILED:
-        return None
+def _azimuthal_resident_backproject_kernel(device_index=None) -> Optional[object]:
+    if device_index is None:
+        import cupy as cp
+
+        device_index = cp.cuda.runtime.getDevice()
+    with _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_LOCK:
+        if device_index not in _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNELS:
+            _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNELS[device_index] = _build_azimuthal_backproject_kernel(device_index)
+        return _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNELS[device_index]
+
+
+def _build_azimuthal_backproject_kernel(device_index):
     try:
         import cupy as cp  # type: ignore
         code = r'''
@@ -3688,25 +3731,22 @@ def _azimuthal_resident_backproject_kernel() -> Optional[object]:
           }
         }
         '''
-        module = cp.RawModule(code=code, options=('--std=c++14',))
-        compile_fn = getattr(module, 'compile', None)
-        if callable(compile_fn):
-            compile_fn()
-        kernel_azmajor = module.get_function('azimuthal_backproject_azmajor_u8')
-        _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL = argparse.Namespace(
-            cp=cp,
-            module=module,
-            kernel_azmajor=kernel_azmajor,
-            kernel_tmajor=module.get_function('azimuthal_backproject_tmajor_u8'),
-            transpose=module.get_function('azimuthal_azmajor_to_tmajor_u8'),
-        )
-        return _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL
+        with cp.cuda.Device(device_index):
+            module = cp.RawModule(code=code, options=('--std=c++14',))
+            compile_fn = getattr(module, 'compile', None)
+            if callable(compile_fn):
+                compile_fn()
+            return argparse.Namespace(
+                cp=cp,
+                module=module,
+                kernel_azmajor=module.get_function('azimuthal_backproject_azmajor_u8'),
+                kernel_tmajor=module.get_function('azimuthal_backproject_tmajor_u8'),
+                transpose=module.get_function('azimuthal_azmajor_to_tmajor_u8'),
+            )
     except Exception as exc:
-        _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_FAILED = True
-        _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_ERROR = f'{type(exc).__name__}: {exc}'
         print(
             'Warning: resident Azimuthal backprojection kernel unavailable '
-            f'({_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_ERROR}); using the streaming GPU path.'
+            f'(cuda:{device_index}: {type(exc).__name__}: {exc}); using the streaming GPU path.'
         )
         return None
 
@@ -3749,7 +3789,7 @@ def _azimuthal_backproject_gpu_resident(
         # NVRTC/module initialization is itself a CUDA allocation. Keep it inside the
         # same exclusive interval as the large source upload.
         with torch.cuda.device(dev):
-            kernels = _azimuthal_resident_backproject_kernel()
+            kernels = _azimuthal_resident_backproject_kernel(dev.index)
         if kernels is None:
             return False
         return _azimuthal_backproject_gpu_resident_on_device(
@@ -3956,6 +3996,8 @@ def _azimuthal_backproject_gpu_resident_on_device(
                     compute_tensor = tmajor_dev
                     compute_kernel = kernels.kernel_tmajor
                     layout = 't-major'
+                    cp_azmajor = None
+                    azimuthal_dev = None
                 except Exception as exc:
                     tmajor_dev = None
                     compute_tensor = azimuthal_dev
@@ -4669,6 +4711,7 @@ def _local_native_pull_ordered_planes(count, operation, workers):
         while pending:
             z, future = pending.popleft()
             yield z, future.result()
+            del future
             following = next(indices, None)
             if following is not None:
                 pending.append((following, pool.submit(operation, following)))
@@ -5047,16 +5090,18 @@ def _backproject_native_destination_pull(
                 prefer_memory=bool(prefer_memory), prefer_memfd=bool(prefer_memory),
                 reserve_bytes=int(reserve_bytes))
         def project_plane(z, stage=None):
-            if sink_only and (support_bbox is None or not support_bbox[0] <= z < support_bbox[3]):
+            in_support = support_bbox is not None and support_bbox[0] <= z < support_bbox[3]
+            if sink_only and not in_support:
                 return None, 0
-            plane = (np.zeros(shape[1:], np.uint8) if sink_only
+            plane = (np.empty(shape[1:], np.uint8) if sink_only
                      else np.asarray(destination[z]))
-            if not sink_only:
+            # Compiled pull kernels overwrite the whole span, including off-bbox zeros.
+            if not in_support or plan is None:
                 plane.fill(0)
             flat = plane.reshape(-1)
             first = z * plane_size
             addresses = 0
-            if support_bbox is not None and support_bbox[0] <= z < support_bbox[3]:
+            if in_support:
                 if plan is not None:
                     strip = max(1, int(stage.max_output_voxels if stage is not None
                                        else plan.max_strip_voxels))

@@ -83,6 +83,7 @@ from .workspace import (
     v1613_fast_bundle_requested,
 )
 from .runtime import (
+    _current_process_cpu_affinity,
     CpuInferenceInstancePlan,
     HYBRID_DEFERRED_RESULT_MODE,
     INTERPOLATION_PROCESS_WORKER_DEFAULT_CAP,
@@ -155,11 +156,13 @@ from .runtime import (
     resolve_worker_count,
     runtime_telemetry,
     runtime_trace_event,
+    run_termination_watchdog,
     scratch_dir_is_memory_backed,
     set_gpu_worker_aux_interpolation_pool,
     set_interpolation_process_executor,
     shutdown_parallel_pool_cache,
     tail_worker_budget_expansion_enabled,
+    wait_for_retired_memmap_unlinks,
     workspace_anon_cap_bytes,
 )
 from .media import (
@@ -200,7 +203,6 @@ from .geometry import (
     pretty_view_name,
     mirrored_azimuthal_parent_crop,
     azimuthal_batch_padding_count,
-    azimuthal_batch_padding_mirror_groups,
     azimuthal_batch_padding_tile_id,
     azimuthal_batch_padding_tile_result_ids,
     azimuthal_base_view_name,
@@ -305,6 +307,7 @@ from .assembly import (
     apply_gaussian_smoothing_inplace,
     defer_open_tile_result_store,
     finalize_consolidated_tile_volume_for_parent,
+    retire_azimuthal_seam_tile,
     finalize_parent_without_tile_contribution_for_sparse_retirement,
     gate_tile_residual_against_parent_bridge,
     gate_tile_result_against_parent_mask,
@@ -503,6 +506,7 @@ def _cleanup_tta_selected_run_scratch(*, temp_dir: Path, out_dir: Path) -> None:
         temp_dir=temp_dir,
         out_dir=out_dir,
         release_memfd_owners_under=release_memfd_owners_under,
+        wait_for_memmap_unlinks=wait_for_retired_memmap_unlinks,
         remove_tree=shutil.rmtree,
     )
 
@@ -631,11 +635,6 @@ def _run_physical_view_finalization_with_handoff(
     )
 
 
-def _source_bridge_survival_reuse_enabled(args, gaussian_smoothing_enabled):
-    return not (bool(args.enable_3d_void_fill) or int(args.centerline_filter_passes) > 0
-                or bool(gaussian_smoothing_enabled) or int(args.keep_objects) > 0)
-
-
 def _close_tta_output_artifacts(
     artifacts: TtaOutputArtifacts,
     *,
@@ -681,8 +680,9 @@ def _close_sam_context_after_scheduler(context, scheduler_error):
         # Context.close retains any mapped sources whose owners have not
         # settled. Recording its failure must not pretend those owners retired,
         # or skip shutdown of unrelated finalization and reduction executors.
-        scheduler_error.add_note(
-            f'SAM context cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}')
+        if callable(getattr(scheduler_error, 'add_note', None)):
+            scheduler_error.add_note(
+                f'SAM context cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}')
 
 
 def _cancel_scheduler_prepares(error, *, sam_context, sam_parent_staging,
@@ -694,17 +694,20 @@ def _cancel_scheduler_prepares(error, *, sam_context, sam_parent_staging,
         traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
         sys.stderr.flush()
     except Exception as diagnostic_error:
-        error.add_note(f'Scheduler error logging also failed: {diagnostic_error}')
+        if callable(getattr(error, 'add_note', None)):
+            error.add_note(f'Scheduler error logging also failed: {diagnostic_error}')
     if sam_context is not None:
         try:
             sam_context.cancel(f'TTA scheduler failed before SAM completion: {type(error).__name__}: {error}')
         except BaseException as cleanup_error:
-            error.add_note(f'SAM cancellation also failed: {cleanup_error}')
+            if callable(getattr(error, 'add_note', None)):
+                error.add_note(f'SAM cancellation also failed: {cleanup_error}')
     if sam_parent_staging is not None:
         try:
             sam_parent_staging.abort()
         except BaseException as cleanup_error:
-            error.add_note(f'Parent checkpoint cancellation also failed: {cleanup_error}')
+            if callable(getattr(error, 'add_note', None)):
+                error.add_note(f'Parent checkpoint cancellation also failed: {cleanup_error}')
     def cancel_publications(done):
         if done.cancelled() or done.exception() is not None:
             return
@@ -721,6 +724,7 @@ def _cancel_scheduler_prepares(error, *, sam_context, sam_parent_staging,
         future.cancel()
 
 
+@run_termination_watchdog()
 def main() -> None:
     """Execute one pipeline run with a lifecycle boundary spanning the full function."""
     global _ACTIVE_PIPELINE_RUN_RESOURCES
@@ -857,6 +861,12 @@ def _main_impl() -> None:
     save_voxel_volume_enabled = 'voxel_volume' in save_option_set
     save_high_quality_enabled = 'high_quality' in save_option_set
     save_summary_enabled = 'summary' in save_option_set
+    sweep_heatmap_root = None
+    if sweep_branch is not None and (save_high_quality_enabled or save_low_quality_enabled):
+        from .sweep_heatmaps import HEATMAP_STAGING_ENV
+        heatmap_root = os.environ.get(HEATMAP_STAGING_ENV)
+        if heatmap_root:
+            sweep_heatmap_root = Path(heatmap_root)
     channel_format = resolve_channel_format(args.channel_format)
     print(
         f'[v{SCRIPT_VERSION}] every --angle value is an independent view variant through cleanup, '
@@ -959,8 +969,8 @@ def _main_impl() -> None:
                 generation_mode=interpolation_settings.sam_crop_mode)
         from .confidence_retention import confidence_retention_requested
         args.retain_observed_confidence = confidence_retention_requested(
-            save_option_set, reconciliation_enabled=reconciliation_settings.enabled,
-            sweep_cutoff=sweep_cutoff)
+            save_option_set,
+            reconciliation_mode=reconciliation_policy['mode'] if reconciliation_policy is not None else None)
         # Existing worker/allocation/retirement paths share this internal flag.
         args.reconciliation_retain_confidence = args.retain_observed_confidence
     except (ValueError, OSError) as exc:
@@ -991,10 +1001,8 @@ def _main_impl() -> None:
             'CPU masks are not applied in this run.'
         )
         runtime_telemetry().fallback('startup.cpu_affinity', RuntimeError(cpu_affinity_unavailable))
-    try:
-        _allowed_main_cpus = {int(cpu) for cpu in os.sched_getaffinity(0)}
-    except Exception:
-        _allowed_main_cpus = set(range(max(1, int(_cpu_count()))))
+    _allowed_main_cpus = _current_process_cpu_affinity() or set(range(_cpu_count()))
+    allocated_cpu_count = len(_allowed_main_cpus)
     gpu_logical_indices = [
         int(str(device).split(':')[-1]) for device in backend_devices.gpu_devices
     ]
@@ -1170,16 +1178,6 @@ def _main_impl() -> None:
                 f'outside the {len(gpu_feeder_reserved_cpus)} dedicated GPU-feeder logical CPU(s); '
                 f'{len(main_process_reserved_cpus)} shared logical CPU(s) remain for parent work.'
             )
-
-    if gpu_worker_process_active and gpu_feeder_reserved_cpus:
-        # Apply feeder exclusivity before decode, render-pool creation, or worker startup. The
-        # later steady-state mask may narrow this further to exclude OpenVINO, but no parent
-        # thread can run on another worker's four dedicated physical cores from this point on.
-        _apply_parent_cpu_mask(
-            feeder_safe_parent_cpus,
-            fail_fast=True,
-            phase_label='GPU worker startup and preprocessing',
-        )
 
     args.gpu_model = gpu_model_path
     args.cpu_model = cpu_model_path
@@ -1595,7 +1593,10 @@ def _main_impl() -> None:
     # NRRD layer projections and the final backprojection queue target it directly (one resample).
     set_final_source_output_shape((input_T, input_H, input_W))
 
-    nrrd_dir = out_dir / 'nrrd'
+    sweep_nrrd_root = os.environ.get('XTA_YOLO_SWEEP_NRRD_STAGE_ROOT') if sweep_branch is not None else None
+    nrrd_root = (Path(sweep_nrrd_root) / f'conf_{sweep_cutoff:03d}'
+                 if sweep_nrrd_root else out_dir)
+    nrrd_dir = nrrd_root / 'nrrd'
     if bool(nrrd_sink_needed):
         sink_low_quality_specs = (
             list(low_quality_downbin_specs)
@@ -1609,26 +1610,13 @@ def _main_impl() -> None:
             output_shape_tyx=(input_T, input_H, input_W),
             max_workers=nrrd_layer_sink_workers(),
             low_quality_specs=sink_low_quality_specs,
-            low_quality_root=(out_dir / 'low_quality'),
+            low_quality_root=(nrrd_root / 'low_quality'),
+            relative_artifact_paths=not sweep_nrrd_root,
         )
         _run_resources().track_sink(layer_sink_for_run)
         set_nrrd_layer_sink(layer_sink_for_run)
     else:
         set_nrrd_layer_sink(None)
-
-    sweep_view_publication = None
-    if sweep_fanout_plan.eager_projection:
-        from .tta_sweep_view_publication import ViewMajorPublication
-        sweep_view_publication = ViewMajorPublication(
-            family_root=os.environ['XTA_YOLO_SWEEP_OUTPUT_ROOT'],
-            workspace=os.environ['XTA_YOLO_SWEEP_WORK_DIR'],
-            sweep_id=sweep_branch['sweep_id'], cutoffs_hundredths=sweep_fanout_plan.cutoffs,
-            current_cutoff=sweep_cutoff, scalar_sink=layer_sink_for_run,
-            source_shape_tyx=(input_T, input_H, input_W), model_name=model_name,
-            task=args.task, min_conf=args.min_conf,
-            confidence_floor_by_backend=confidence_floor_by_backend,
-            progress=sweep_fanout_progress)
-        _run_resources().track_closeable(sweep_view_publication)
 
     preprocess_streaming_active = bool(streaming_preprocess_enabled())
     vol_path = temp_dir / 'input_volume.gray8.dat'
@@ -1643,12 +1631,20 @@ def _main_impl() -> None:
     # resident-upload the NATIVE decoded volume (t-resizing on device) without a copy pass
     # first.
     decoder = decode_video_to_memmap_gray8_streaming if preprocess_streaming_active else decode_video_to_memmap_gray8
+    reserve_gpu_feeders = bool(gpu_worker_process_active and gpu_feeder_reserved_cpus)
+    if reserve_gpu_feeders and preprocess_streaming_active:
+        # Streaming FFmpeg overlaps inference and inherits the spawning thread's mask.
+        _apply_parent_cpu_mask(feeder_safe_parent_cpus, fail_fast=True,
+                               phase_label='streaming preprocessing and GPU worker startup')
     sweep_work = os.environ.get('XTA_YOLO_SWEEP_WORK_DIR') if sweep_branch is not None else None
     input_volume_rgb = None
-    if sweep_work:
+    shared_source_root = Path(sweep_work) if sweep_work else (
+        sweep_heatmap_root.parent if sweep_heatmap_root is not None else None
+    )
+    if shared_source_root is not None:
         from .sweep_input import open_or_decode_sweep_input
         input_volume_rgb = open_or_decode_sweep_input(
-            Path(sweep_work), input_path, input_processing_shape,
+            shared_source_root, input_path, input_processing_shape,
             streaming=preprocess_streaming_active, decoder=decoder,
         )
     if preprocess_streaming_active:
@@ -1668,7 +1664,6 @@ def _main_impl() -> None:
             prefer_memory=False,
             prefer_memfd=True,
         )
-
     if cube_resize_will_apply:
         processing_shape = legacy_cube_shape
         print(
@@ -1686,6 +1681,9 @@ def _main_impl() -> None:
             == tuple(int(v) for v in input_processing_shape[1:])
         )
         if lazy_cube_eligible:
+            if reserve_gpu_feeders:
+                _apply_parent_cpu_mask(feeder_safe_parent_cpus, fail_fast=True,
+                                       phase_label='deferred processing-cube construction')
             lazy_cube_path = temp_dir / 'input_volume.cube.gray8.dat'
             volume_rgb = LazyProcessingCube(
                 input_volume_rgb,
@@ -1730,6 +1728,25 @@ def _main_impl() -> None:
                 'Processing geometry: native decoded volume, no cube resize. '
                 f'input/processing shape (t,Y,X)={processing_shape}; approximately-cubic target would have been {legacy_cube_shape}.'
             )
+
+    if reserve_gpu_feeders:
+        _apply_parent_cpu_mask(feeder_safe_parent_cpus, fail_fast=True,
+                               phase_label='GPU worker startup')
+
+    sweep_view_publication = None
+    if sweep_fanout_plan.eager_projection:
+        from .tta_sweep_view_publication import ViewMajorPublication
+        sweep_view_publication = ViewMajorPublication(
+            family_root=os.environ['XTA_YOLO_SWEEP_OUTPUT_ROOT'],
+            workspace=os.environ['XTA_YOLO_SWEEP_WORK_DIR'],
+            sweep_id=sweep_branch['sweep_id'], cutoffs_hundredths=sweep_fanout_plan.cutoffs,
+            current_cutoff=sweep_cutoff, scalar_sink=layer_sink_for_run,
+            source_shape_tyx=(input_T, input_H, input_W), model_name=model_name,
+            task=args.task, min_conf=args.min_conf,
+            confidence_floor_by_backend=confidence_floor_by_backend,
+            retain_confidence=args.retain_observed_confidence,
+            progress=sweep_fanout_progress, nrrd_stage_root=sweep_nrrd_root)
+        _run_resources().track_closeable(sweep_view_publication)
 
     T, H, W = (int(processing_shape[0]), int(processing_shape[1]), int(processing_shape[2]))
 
@@ -1986,7 +2003,9 @@ def _main_impl() -> None:
     # Size main-process pools around live inference subprocess reservations.
     # inference subprocesses already consume ~visible_cpu render threads (the GPU-blocking pools), so
     # the main-process GPU-non-blocking pools take only the remaining headroom of the 2x box target.
-    worker_budget = int(main_process_worker_budget(int(gpu_device_count), bool(gpu_worker_process_active)))
+    worker_budget = main_process_worker_budget(
+        gpu_device_count, gpu_worker_process_active, cpu_count=allocated_cpu_count,
+    )
     if cpu_worker_process_active and not hybrid_cpu_affinity_overlap_active:
         # Exclusive mode bounds parent pools to CPUs outside OpenVINO masks. Hybrid overlap
         # mode intentionally preserves the ordinary CUDA-side worker budget instead.
@@ -1996,7 +2015,7 @@ def _main_impl() -> None:
     # ``default_worker_budget()`` would size the later tail from that temporary mask and
     # fail to reclaim the four dedicated physical cores per GPU after inference drains.
     # Preserve the original full SLURM/cpuset allocation explicitly for tail expansion.
-    whole_box_worker_budget = max(1, 2 * int(len(_allowed_main_cpus)))
+    whole_box_worker_budget = 2 * allocated_cpu_count
     tail_budget_expansion_active = bool(tail_worker_budget_expansion_enabled())
     tail_worker_budget = int(whole_box_worker_budget if tail_budget_expansion_active else worker_budget)
     # Native destination projection is a separate CPU stage. Dividing its
@@ -2026,7 +2045,7 @@ def _main_impl() -> None:
         'YOLO_TTA_OUTPUT_WORKERS',
         worker_budget,
     )
-    output_frame_workers = max(1, _env_int('YOLO_TTA_OUTPUT_FRAME_WORKERS', max(1, min(_cpu_count(), output_workers))))
+    output_frame_workers = max(1, _env_int('YOLO_TTA_OUTPUT_FRAME_WORKERS', min(allocated_cpu_count, output_workers)))
     slice_postprocess_workers = max(1, int(augmentation_workers))
 
     interpolation_process_backend_active = bool(
@@ -2179,7 +2198,7 @@ def _main_impl() -> None:
         f'(YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND={int(tail_budget_expansion_active)})'
     )
     if bool(gpu_worker_process_active):
-        _gpu_share = int(gpu_worker_cpu_share(int(gpu_device_count)))
+        _gpu_share = gpu_worker_cpu_share(gpu_device_count, cpu_count=allocated_cpu_count)
         if hybrid_cpu_affinity_overlap_active:
             print(
                 'Hybrid helper overlap is intentional: CUDA workers retain topology-local helper '
@@ -2300,6 +2319,7 @@ def _main_impl() -> None:
         view_prediction_labels[key] = pretty_view_name(_view_for_stats)
     interpolation_stats: List[Dict[str, object]] = []
     sam_context = None
+    staged_sam_archive = None
     sam_parent_staging = None
     sam_gray_cache_root = None
     gray_capture_reserve_bytes = 0
@@ -2313,7 +2333,18 @@ def _main_impl() -> None:
 
     if interpolation_settings.sam_enabled:
         from .sam_integration import SamInterpolationContext
-        from .artifact_archive import reference as artifact_reference
+        from .artifact_archive import StagedArtifactArchive, reference as artifact_reference
+        sam_archive = out_dir / 'sam-artifacts.tar'
+        archive_scratch_root = (os.environ.get('XTA_YOLO_SWEEP_SAM_ARCHIVE_ROOT')
+                                if sweep_branch is not None else temp_dir.parent if args.temp else None)
+        if (archive_scratch_root is not None and not path_is_memory_backed(Path(archive_scratch_root))
+                and not _env_flag('YOLO_TTA_SAM_ARCHIVE_LIVE_OUTPUT', False)):
+            # The archive is a retained artifact. Give it a private sibling of
+            # the PID scratch or family tree so a failed copy remains recoverable.
+            staged_sam_archive = StagedArtifactArchive.reserve(sam_archive, archive_scratch_root)
+            if staged_sam_archive is not None:
+                _run_resources().track_closeable(staged_sam_archive)
+                print(f'SAM archive staging: {staged_sam_archive.path}', flush=True)
         source_stat = input_path.stat()
         gray_capture_enabled = _env_flag('YOLO_TTA_SAM_GRAY_CACHE', True)
         if not gray_capture_enabled:
@@ -2329,9 +2360,9 @@ def _main_impl() -> None:
             model_path=str(interpolation_settings.sam_model),
             enable_2D_hole_fill=('sam' in getattr(args, 'enable_2D_hole_fill', ())),
             device_ids=interpolation_settings.sam_devices, temp_dir=temp_dir,
-            evidence_root=Path(artifact_reference(out_dir / 'sam-artifacts.tar', 'sam_interpolation')),
+            evidence_root=Path(artifact_reference(sam_archive, 'sam_interpolation')),
             source_volume=volume_rgb,
-            extrapolation_evidence_root=Path(artifact_reference(out_dir / 'sam-artifacts.tar', 'sam_extrapolation')),
+            extrapolation_evidence_root=Path(artifact_reference(sam_archive, 'sam_extrapolation')),
             source_identity=f'{input_path}:{source_stat.st_size}:{source_stat.st_mtime_ns}',
             policy=reconciliation_policy,
             bundle_identity=str(sam_bundle.checkpoint_identity_sha256),
@@ -3023,6 +3054,9 @@ def _main_impl() -> None:
                             future_ram_bytes=max(0, plan['logical_bytes']-int(union_mm.nbytes)
                                 -(0 if conf_mm is None else int(conf_mm.nbytes)))),
                         proofs=capture_memfd_owner_proofs({'mask': union_mm, 'confidence': conf_mm}))
+                    hydrate_sweep = plan.get('hydrate_sweep')
+                    if hydrate_sweep is not None:
+                        bundle['sweep_hydration'] = hydrate_sweep(union_mm, conf_mm, stop)
                     del union_mm, conf_mm
             if stop.is_set():
                 raise RuntimeError('Detector workspace preparation cancelled')
@@ -3080,6 +3114,8 @@ def _main_impl() -> None:
             baseline_union_paths[key] = bundle['union_backing']
             baseline_confmap_paths[key] = bundle['conf_backing']
             baseline_slice_locks_by_model_view[key] = bundle['slice_locks']
+            if 'sweep_hydration' in bundle:
+                view_slice_meta[key] = bundle['sweep_hydration']
             if lease is not None:
                 lease.ram_backed, lease.memfd_owner_proofs = bundle['ram_backed'], bundle['proofs']
                 if lease.phase == 'preparing':
@@ -3912,6 +3948,8 @@ def _main_impl() -> None:
                 ))
             # Every tile in this configuration was empty after cleanup. Other configured
             # sets still have their own consolidation and parent-terminal barrier.
+            from .confidence_tiles import retire_tile_confidence
+            retire_tile_confidence(*set_key)
             tile_consolidation_completed.add(set_key)
             _maybe_finalize_tile_parent(str(model_name), str(view_name))
             return
@@ -4221,209 +4259,90 @@ def _main_impl() -> None:
         padding_frames: Sequence[Dict[str, object]],
         threshold_plane_shape: Sequence[int],
     ) -> None:
-        """Regroup compact seam slots into parity-specific full-depth tile results."""
+        """Retire both seam parity groups on the existing tile cleanup executor."""
 
         def _retire_compact_sink() -> None:
-            close_memmap_array(
-                padding_conf_mm,
-                unlink_path=scratch_unlink_path_for_memmap(padding_conf_mm, padding_conf_path),
-            )
-            close_memmap_array(
-                padding_mask_mm,
-                unlink_path=scratch_unlink_path_for_memmap(padding_mask_mm, padding_mask_path),
-            )
-            for compact_path in (padding_mask_path, padding_conf_path):
-                if compact_path is not None:
+            for mapping, path in (
+                (padding_conf_mm, padding_conf_path),
+                (padding_mask_mm, padding_mask_path),
+            ):
+                unlink_path = scratch_unlink_path_for_memmap(mapping, path)
+                close_memmap_array_without_flush(mapping, unlink_path=unlink_path)
+                if path is not None and unlink_path is None:
                     try:
-                        Path(compact_path).unlink(missing_ok=True)
-                    except Exception:
+                        Path(path).unlink(missing_ok=True)
+                    except OSError:
                         pass
 
-        compact_shape = tuple(int(value) for value in np.asarray(padding_mask_mm).shape)
-        if len(compact_shape) != 3 or int(compact_shape[0]) != int(len(padding_frames)):
-            _retire_compact_sink()
-            raise ValueError(
-                f'{model_name}/{view.name}/{tile_job.tile_id}: compact azimuthal padding '
-                f'shape {compact_shape} does not match {len(padding_frames)} frame specs'
-            )
-        threshold_shape = tuple(int(value) for value in threshold_plane_shape)
-        if len(threshold_shape) != 2:
-            _retire_compact_sink()
-            raise ValueError(f'Invalid tile threshold plane shape: {threshold_shape}')
-        original_crop = tuple(int(value) for value in tile_job.parent_crop)
-        grouped_frames: Dict[bool, List[Dict[str, object]]] = {}
-        for frame in padding_frames:
-            ordinal = int(frame.get('ordinal', -1))
-            destination = int(frame.get('destination', -1))
-            if ordinal < 0 or ordinal >= int(compact_shape[0]):
-                _retire_compact_sink()
-                raise IndexError(f'Azimuthal padding ordinal {ordinal} is outside {compact_shape}')
-            if destination < 0 or destination >= int(view.num_slices):
-                _retire_compact_sink()
-                raise IndexError(
-                    f'Azimuthal padding destination {destination} is outside '
-                    f'{view.name} ({int(view.num_slices)} slices)'
-                )
-            grouped_frames.setdefault(bool(frame.get('mirror_azimuthal_u', False)), []).append(
-                dict(frame)
-            )
+        def _cleanup_padding():
+            results = {}
+            try:
+                compact_shape = tuple(padding_mask_mm.shape)
+                if (len(compact_shape) != 3 or compact_shape[0] != len(padding_frames)
+                        or padding_conf_mm is not None and padding_conf_mm.shape != compact_shape):
+                    raise ValueError('Azimuthal padding sink geometry differs from its frame metadata')
+                threshold_shape = tuple(map(int, threshold_plane_shape))
+                if len(threshold_shape) != 2:
+                    raise ValueError(f'Invalid tile threshold plane shape: {threshold_shape}')
+                original_crop = tuple(map(int, tile_job.parent_crop))
+                grouped_frames = {}
+                seen_ordinals = set()
+                for frame in padding_frames:
+                    ordinal = int(frame.get('ordinal', -1))
+                    destination = int(frame.get('destination', -1))
+                    if not 0 <= ordinal < compact_shape[0] or ordinal in seen_ordinals:
+                        raise IndexError(f'Invalid azimuthal padding ordinal {ordinal}')
+                    if not 0 <= destination < int(view.num_slices):
+                        raise IndexError(f'Invalid azimuthal padding destination {destination}')
+                    seen_ordinals.add(ordinal)
+                    mirror = bool(frame.get('mirror_azimuthal_u', False))
+                    grouped_frames.setdefault(mirror, []).append((ordinal, destination, frame))
 
-        grouped_results: List[
-            Tuple[str, Tuple[int, int, int, int], np.ndarray, Optional[np.ndarray], Path, Optional[Path]]
-        ] = []
-
-        def _discard_grouped_result(
-            grouped_result: Tuple[
-                str, Tuple[int, int, int, int], np.ndarray, Optional[np.ndarray],
-                Path, Optional[Path],
-            ],
-        ) -> None:
-            _result_id, _crop, mask_mm, conf_mm, mask_path, conf_path = grouped_result
-            close_memmap_array_without_flush(
-                conf_mm,
-                unlink_path=scratch_unlink_path_for_memmap(conf_mm, conf_path),
-            )
-            close_memmap_array_without_flush(
-                mask_mm,
-                unlink_path=scratch_unlink_path_for_memmap(mask_mm, mask_path),
-            )
-            for grouped_path in (mask_path, conf_path):
-                if grouped_path is not None:
-                    try:
-                        Path(grouped_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-        try:
-            for mirror_azimuthal_u in (True, False):
-                frames = grouped_frames.get(bool(mirror_azimuthal_u), [])
-                if not frames:
-                    continue
-                auxiliary_id = azimuthal_batch_padding_tile_id(
-                    str(tile_job.tile_id), mirror_azimuthal_u=bool(mirror_azimuthal_u),
-                )
-                auxiliary_crop = (
-                    mirrored_azimuthal_parent_crop(original_crop, int(threshold_shape[1]))
-                    if bool(mirror_azimuthal_u) else original_crop
-                )
-                declared_crops = {
-                    tuple(int(value) for value in frame.get('parent_crop', auxiliary_crop))
-                    for frame in frames
-                }
-                if declared_crops != {tuple(auxiliary_crop)}:
-                    raise ValueError(
-                        f'{model_name}/{view.name}/{auxiliary_id}: inconsistent azimuthal '
-                        f'padding crops {sorted(declared_crops)}; expected {auxiliary_crop}'
+                for mirror, frames in grouped_frames.items():
+                    auxiliary_id = azimuthal_batch_padding_tile_id(
+                        str(tile_job.tile_id), mirror_azimuthal_u=mirror,
                     )
-                full_shape = (
-                    int(view.num_slices), int(compact_shape[1]), int(compact_shape[2]),
-                )
-                auxiliary_dir = (
-                    temp_dir / 'tile_volumes' / str(model_name) / str(view.name)
-                )
-                auxiliary_dir.mkdir(parents=True, exist_ok=True)
-                auxiliary_mask_path = auxiliary_dir / f'{auxiliary_id}.u8.dat'
-                auxiliary_conf_path = (
-                    auxiliary_dir / f'{auxiliary_id}.confmap.u8.dat'
-                    if padding_conf_mm is not None else None
-                )
-                auxiliary_mask_mm: Optional[np.ndarray] = None
-                auxiliary_conf_mm: Optional[np.ndarray] = None
+                    crop = (mirrored_azimuthal_parent_crop(original_crop, threshold_shape[1])
+                            if mirror else original_crop)
+                    if any(tuple(map(int, frame.get('parent_crop', crop))) != crop
+                           for _, _, frame in frames):
+                        raise ValueError(f'{auxiliary_id}: inconsistent azimuthal padding crops')
+                    results[auxiliary_id] = retire_azimuthal_seam_tile(
+                        padding_mask_mm, padding_conf_mm,
+                        tuple((ordinal, destination) for ordinal, destination, _ in frames),
+                        model_name=str(model_name), view=view, config_id=str(tile_job.config_id),
+                        tile_id=auxiliary_id, parent_crop=crop, threshold_plane_shape=threshold_shape,
+                        precleaned=bool(angle_variant_streaming_cleanup_active),
+                        min_conf=float(args.min_conf), min_radius=float(args.min_radius),
+                        workers=int(tile_dense_retirement_slice_workers), work_dir=temp_dir,
+                    )
+                _retire_compact_sink()
+            except BaseException as error:
+                from .confidence_tiles import discard_unpublished_tile_confidence
+                for partial in results.values():
+                    if partial is not None:
+                        for cleanup in (_delete_tile_result_storage, discard_unpublished_tile_confidence):
+                            try:
+                                cleanup(partial)
+                            except Exception as cleanup_error:
+                                if hasattr(error, 'add_note'):
+                                    error.add_note(f'Partial seam result cleanup failed: {cleanup_error}')
                 try:
-                    auxiliary_mask_mm = allocate_workspace_array(
-                        shape=full_shape,
-                        dtype=np.uint8,
-                        path=auxiliary_mask_path,
-                        desc=f'{model_name}/{view.name}/{auxiliary_id} azimuthal seam tile volume',
-                        prefer_memory=True,
-                        initialize_zero=True,
-                    )
-                    auxiliary_conf_mm = (
-                        allocate_workspace_array(
-                            shape=full_shape,
-                            dtype=np.uint8,
-                            path=auxiliary_conf_path,
-                            desc=(
-                                f'{model_name}/{view.name}/{auxiliary_id} azimuthal seam '
-                                'tile confidence workspace'
-                            ),
-                            prefer_memory=True,
-                            initialize_zero=True,
-                        )
-                        if auxiliary_conf_path is not None else None
-                    )
-                    for frame in frames:
-                        ordinal = int(frame['ordinal'])
-                        destination = int(frame['destination'])
-                        np.bitwise_or(
-                            auxiliary_mask_mm[destination],
-                            np.asarray(padding_mask_mm[ordinal], dtype=np.uint8),
-                            out=auxiliary_mask_mm[destination],
-                        )
-                        if auxiliary_conf_mm is not None and padding_conf_mm is not None:
-                            np.maximum(
-                                auxiliary_conf_mm[destination],
-                                np.asarray(padding_conf_mm[ordinal], dtype=np.uint8),
-                                out=auxiliary_conf_mm[destination],
-                            )
-                    grouped_results.append((
-                        str(auxiliary_id), tuple(auxiliary_crop),
-                        auxiliary_mask_mm, auxiliary_conf_mm,
-                        auxiliary_mask_path, auxiliary_conf_path,
-                    ))
-                except BaseException:
-                    if auxiliary_mask_mm is not None:
-                        _discard_grouped_result((
-                            str(auxiliary_id), tuple(auxiliary_crop),
-                            auxiliary_mask_mm, auxiliary_conf_mm,
-                            auxiliary_mask_path, auxiliary_conf_path,
-                        ))
-                    for grouped_result in grouped_results:
-                        _discard_grouped_result(grouped_result)
-                    grouped_results.clear()
-                    raise
-        finally:
-            _retire_compact_sink()
+                    _retire_compact_sink()
+                except Exception as cleanup_error:
+                    if hasattr(error, 'add_note'):
+                        error.add_note(f'Compact seam sink cleanup failed: {cleanup_error}')
+                raise
+            return results
 
-        submitted_count = 0
         try:
-            for (
-                auxiliary_id, auxiliary_crop, auxiliary_mask_mm, auxiliary_conf_mm,
-                auxiliary_mask_path, auxiliary_conf_path,
-            ) in grouped_results:
-                task = TilePostprocessTask(
-                    model_name=str(model_name),
-                    view_name=str(view.name),
-                    aug_id=str(view.tta_aug_id),
-                    angle_deg=float(view.tta_angle_deg),
-                    config_id=str(tile_job.config_id),
-                    tile_id=str(auxiliary_id),
-                    parent_crop=tuple(auxiliary_crop),
-                    tile_mask_mm=auxiliary_mask_mm,
-                    tile_confmap_mm=auxiliary_conf_mm,
-                    tile_mask_path=auxiliary_mask_path,
-                    tile_confmap_path=auxiliary_conf_path,
-                    precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
-                    processing_shape=tuple(int(value) for value in np.asarray(auxiliary_mask_mm).shape),
-                    threshold_plane_shape=threshold_shape,
-                )
-                tile_fut = tile_dense_retirement_executor.submit(
-                    postprocess_tile_volume_after_inference,
-                    task,
-                    view=view,
-                    min_conf=float(args.min_conf),
-                    min_radius=float(args.min_radius),
-                    slice_workers=int(tile_dense_retirement_slice_workers),
-                    sparse_retire_dir=temp_dir,
-                )
-                tile_cleanup_futures[tile_fut] = (
-                    str(model_name), str(view.name), str(tile_job.config_id), str(auxiliary_id),
-                )
-                submitted_count += 1
+            future = tile_dense_retirement_executor.submit(_cleanup_padding)
         except BaseException:
-            for grouped_result in grouped_results[int(submitted_count):]:
-                _discard_grouped_result(grouped_result)
+            _retire_compact_sink()
             raise
+        tile_cleanup_futures[future] = (
+            str(model_name), str(view.name), str(tile_job.config_id), str(tile_job.tile_id),
+        )
 
     background_drain_budget = BackgroundDrainBudget(
         lambda: scheduler.service_pending_compute_credits(),
@@ -4635,26 +4554,18 @@ def _main_impl() -> None:
                 continue
             ready_key = tile_cleanup_futures.pop(fut)
             result = fut.result()
-            if result is None:
-                _release_tile_dense_result_for_key(
-                    str(ready_key[0]), str(ready_key[1]), str(ready_key[3]),
-                    reason='tile empty after cleanup',
-                )
-                _mark_tile_complete(
-                    str(ready_key[0]), str(ready_key[1]),
-                    str(ready_key[2]), str(ready_key[3]),
-                )
-                background_drain_budget.completed(2)
-                continue
-            if isinstance(result, DeferredTilePostprocessResult):
-                # v16.4.3: CTILE publication is the array-backed-result retirement boundary.
-                # Release the parent-owned memfd/path mapping before interpolation or either
-                # gate can queue behind unrelated CPU work.
-                _release_tile_dense_result_for_key(
-                    str(ready_key[0]), str(ready_key[1]), str(ready_key[3]),
-                    reason='immediate CTILE retirement after tile cleanup',
-                )
-            _submit_tile_parent_gate(result)
+            model_name, view_name, config_id, main_tile_id = ready_key
+            results = result if isinstance(result, dict) else {main_tile_id: result}
+            for tile_id, tile_result in results.items():
+                # Both main tiles and seam groups return their inference credit at CTILE retirement.
+                if tile_result is None or isinstance(tile_result, DeferredTilePostprocessResult):
+                    _release_tile_dense_result_for_key(
+                        model_name, view_name, tile_id, reason='tile dense result retired after cleanup',
+                    )
+                if tile_result is None:
+                    _mark_tile_complete(model_name, view_name, config_id, tile_id)
+                else:
+                    _submit_tile_parent_gate(tile_result)
             background_drain_budget.completed(2)
 
         _flush_ready_postprocessed_tiles()
@@ -5034,7 +4945,6 @@ def _main_impl() -> None:
             memfd_workspace_enabled=memfd_workspace_enabled,
             preflight_multiprocessing_payload=preflight_multiprocessing_payload,
             azimuthal_batch_padding_count=azimuthal_batch_padding_count,
-            azimuthal_batch_padding_mirror_groups=azimuthal_batch_padding_mirror_groups,
             runtime_telemetry=runtime_telemetry,
             tile_dense_worker_result_warn_seconds=tile_dense_worker_result_warn_seconds,
             view_processing_volume_shape=view_processing_volume_shape,
@@ -5078,6 +4988,12 @@ def _main_impl() -> None:
             raise RuntimeError('inference-worker shared source volume has no reopenable backing path')
         return str(shared_backing), shape, str(np.asarray(shared_mm).dtype)
 
+    _configure_main_process_gpu_stage_workers(gpu_logical_indices)
+    if not gpu_worker_process_active or not scheduled_inference_views:
+        # Fanout-only and SAM stages need the selected devices without detector priority.
+        _set_main_process_gpu_inference_priority_active(False)
+        _set_main_process_gpu_asset_retirement_pending(False)
+
     if scheduled_inference_views:
         gpu_worker_result_dir.mkdir(parents=True, exist_ok=True)
         # CUDA workers drive render/postprocess parallelism through their own thread pools.
@@ -5090,7 +5006,7 @@ def _main_impl() -> None:
                 1,
                 _env_int(
                     'YOLO_TTA_GPU_WORKER_CPU',
-                    max(1, int(_cpu_count()) // max(1, gpu_device_count)),
+                    _gpu_share,
                 ),
             )
             if gpu_worker_process_active else 1
@@ -5111,6 +5027,7 @@ def _main_impl() -> None:
                 )
 
         worker_init = {
+            'allocated_cpus': sorted(_allowed_main_cpus),
             'task': args.task,
             'augmentation_settings': policy_settings,
             'reconciliation_retain_confidence': bool(getattr(args, 'reconciliation_retain_confidence', False)),
@@ -5138,15 +5055,6 @@ def _main_impl() -> None:
             'angle_variant_gpu_fastpath_min_radius': angle_variant_gpu_fastpath_min_radius_value,
             'fused_preflight_specs': tuple(fused_preflight_specs),
         }
-        # Torch logical indices and their physical CUDA_VISIBLE_DEVICES tokens were resolved
-        # before OpenVINO planning so dedicated feeder cores could be excluded job-wide.
-        # Only actual detector workers inherit inference priority. Explicit
-        # stage leases also cover SAM-only CUDA devices outside this pool.
-        _configure_main_process_gpu_stage_workers(gpu_logical_indices)
-        if not gpu_worker_process_active:
-            # SAM-only CUDA devices are stage owners, not detector workers.
-            _set_main_process_gpu_inference_priority_active(False)
-            _set_main_process_gpu_asset_retirement_pending(False)
         if gpu_worker_process_active:
             if v1613_d1_owner_active:
                 print(
@@ -6827,6 +6735,38 @@ def _main_impl() -> None:
     _check_inference_workers_alive = scheduler.check_inference_workers_alive
     _shutdown_inference_worker_processes = scheduler.shutdown_inference_worker_processes
 
+    def _request_sweep_hydration(view, key):
+        from .sweep_views import hydrate, retire_view_payloads
+
+        shape = view_processing_volume_shape(view, int(args.imgsz))
+        needed_bytes = scheduler._direct_union_parent_bytes({'view': view, 'processing_shape': shape})
+        if (direct_union_inference_bytes or direct_union_postprocess_bytes) and (
+                len(direct_union_inference_views) >= direct_union_inference_view_limit
+                or sum(direct_union_inference_bytes.values()) + sum(direct_union_postprocess_bytes.values())
+                    + needed_bytes > direct_union_total_dense_byte_limit):
+            return
+
+        identity = sweep_fanout_plan.identities.get(str(view.name))
+        retire = (sweep_cutoff == sweep_fanout_plan.cutoffs[-1]
+                  and os.environ.get('XTA_YOLO_SWEEP_DEFER_NATIVE_RETIREMENT') != '1')
+
+        def hydrate_owned_workspace(union, scores, stop):
+            metadata = hydrate(model_name, str(view.name), sweep_cutoff,
+                               union, scores, identity=identity, stop=stop)
+            # Concurrent earlier cutoffs may still read these shared payloads.
+            if retire and not stop.is_set():
+                retire_view_payloads(model_name, str(view.name), sweep_fanout_plan.cutoffs,
+                                     identity=identity, terminal_state='consumed')
+            return dict(valid=True, slice_any=metadata['slice_any'], slice_bboxes=metadata['slice_bboxes'],
+                        row_metadata_complete=False, prediction_count=metadata['prediction_count'])
+
+        plan = _plan_baseline_workspace(model_name, view, legacy=True)
+        lease = _DirectUnionBackingLease(key, plan['logical_bytes'], phase='preparing')
+        direct_union_backing_leases[key] = lease
+        direct_union_inference_views.add(key)
+        direct_union_inference_bytes[key] = lease.nbytes
+        detector_workspace_preparation.request(key, (dict(plan, lease=lease, hydrate_sweep=hydrate_owned_workspace),))
+
     try:
         if fanout_consumers and not scheduled_inference_views:
             # All detector products are already published. SAM can independently
@@ -6837,38 +6777,31 @@ def _main_impl() -> None:
             _check_inference_workers_alive()
             scheduler.service_gpu_stage_admission_retry()
             _drain_completed_background_futures()
-            if (fanout_consumers and not _process_inference_outstanding()
-                    and not view_processing_futures and not physical_view_finalization_futures
-                    and not physical_view_union_futures):
-                view, source = fanout_consumers.popleft()
+            if fanout_consumers:
+                view, source = fanout_consumers[0]
                 key = (model_name, str(view.name))
-                fullframe_remaining[key] = 0
+                if source == 'native':
+                    detector_workspace_preparation.drain()
                 if source == 'projected':
+                    fullframe_remaining[key] = 0
                     ref, predictions = sweep_view_publication.adopt_view(view)
                     if ref is not None:
                         nrrd_layer_refs.append(ref)
                     view_processing_submitted.add(key)
                     _mark_view_variant_terminal(*key)
-                else:
-                    from .sweep_views import hydrate
-                    _ensure_baseline_workspaces(model_name, view)
-                    metadata = hydrate(model_name, str(view.name), sweep_cutoff,
-                        baseline_union_by_model_view[key], baseline_confmap_by_model_view.get(key),
-                        identity=sweep_fanout_plan.identities.get(str(view.name)))
-                    predictions = metadata['prediction_count']
-                    view_slice_meta[key] = dict(valid=True, slice_any=metadata['slice_any'],
-                        slice_bboxes=metadata['slice_bboxes'], row_metadata_complete=False)
-                    # Concurrent later-cut children may still read these shared
-                    # payloads; the family owner then removes the workspace.
-                    if (sweep_cutoff == sweep_fanout_plan.cutoffs[-1]
-                            and os.environ.get('XTA_YOLO_SWEEP_DEFER_NATIVE_RETIREMENT') != '1'):
-                        from .sweep_views import retire_view_payloads
-                        retire_view_payloads(model_name, str(view.name), sweep_fanout_plan.cutoffs,
-                            identity=sweep_fanout_plan.identities.get(str(view.name)), terminal_state='consumed')
+                elif key in view_slice_meta:
+                    fullframe_remaining[key] = 0
+                    predictions = view_slice_meta[key]['prediction_count']
                     _submit_view_prepare(model_name, view)
-                view_prediction_stats[str(view.summary_family)] += int(predictions)
-                sweep_fanout_plan.consumed += 1
-                continue
+                else:
+                    predictions = None
+                    if key not in detector_workspace_preparation.records and not _process_inference_outstanding():
+                        _request_sweep_hydration(view, key)
+                if predictions is not None:
+                    fanout_consumers.popleft()
+                    view_prediction_stats[str(view.summary_family)] += int(predictions)
+                    sweep_fanout_plan.consumed += 1
+                    continue
 
             # Recheck arrivals after the cooperative background pass as well.
             _drain_process_inference_results()
@@ -6970,9 +6903,9 @@ def _main_impl() -> None:
                     if sam_context is not None and sam_cpu_futures['runtime'] is not None:
                         sam_context.ensure_all_devices()
                     break
-                if sam_parent_staging is not None and sam_parent_staging.pending:
-                    # Admission can be waiting without a future to register;
-                    # keep it wakeable and bound retries by the same heartbeat.
+                if fanout_consumers or (sam_parent_staging is not None and sam_parent_staging.pending):
+                    # A deferred SAM parent or sweep hydration may be waiting
+                    # for a dense-backing retirement with no future to register.
                     scheduler_wake.wait(timeout=float(scheduler_push_drain_heartbeat_seconds()))
                     scheduler_wake.clear()
                 continue
@@ -7022,7 +6955,7 @@ def _main_impl() -> None:
         if scheduler_error is not None:
             for future, key in view_processing_futures.items():
                 cleanup_error = getattr(future, '_xta_cancelled_prepare_cleanup_error', None)
-                if cleanup_error is not None:
+                if cleanup_error is not None and callable(getattr(scheduler_error, 'add_note', None)):
                     scheduler_error.add_note(f'Cancelled parent {key} cleanup also failed: {cleanup_error}')
                 view_prepare_leases.retire_cancelled(key, future,
                     retired_callback=_publish_parent_dense_retired)
@@ -7407,7 +7340,6 @@ def _main_impl() -> None:
         )
 
     reconciliation_report = None
-    source_survival_reuse = None
     if reconciliation_settings.enabled:
         print('\n=== Reconciling independent source-space evidence layers ===')
         layer_sink = nrrd_layer_sink()
@@ -7423,17 +7355,13 @@ def _main_impl() -> None:
             else:
                 layer_sink.wait()
         original_union = final_union_mm
-        # Scheduler writers have joined; exporters only read immutable component stores.
-        if (sam_context is not None and layer_sink is not None
-                and _source_bridge_survival_reuse_enabled(args, gaussian_smoothing_enabled)):
-            source_survival_reuse = {}
         with runtime_telemetry().span('tta.final.reconciliation'):
             final_union_mm, reconciliation_report = reconcile_tta_layers(
                 nrrd_layer_refs, views=inference_views,
                 source_shape_tyx=source_output_shape_tyx, processing_shape_tyx=(int(T), int(H), int(W)),
                 settings=reconciliation_settings, policy=reconciliation_policy,
                 output_dir=out_dir / 'reconciliation', workspace=temp_dir / 'reconciliation',
-                assembled_union=original_union, _survival_reuse=source_survival_reuse)
+                assembled_union=original_union)
         if final_union_mm is not original_union:
             if streaming_final_union_holder.get(str(model_name)) is original_union:
                 streaming_final_union_holder[str(model_name)] = final_union_mm
@@ -7605,8 +7533,26 @@ def _main_impl() -> None:
         final_paths['confidence_evidence_manifest'] = confidence_manifest
 
 
+    stage_low_quality_heatmap = None
+    if sweep_heatmap_root is not None:
+        from .sweep_heatmaps import stage_heatmap_mask
+
+        heatmap_grids = {}
+        if save_high_quality_enabled:
+            stage_heatmap_mask(sweep_heatmap_root, sweep_cutoff, 'native', final_output_mask_mm)
+            heatmap_grids['native'] = list(final_output_mask_mm.shape)
+        heatmap_grids.update(
+            (f'low_quality/{spec.token}', list(spec.output_shape_t_y_x))
+            for spec in low_quality_downbin_specs
+        )
+        sweep_branch['heatmap_inputs'] = {'grids': heatmap_grids, 'streaming_decode': preprocess_streaming_active}
+
+        def stage_low_quality_heatmap(spec, mask):
+            stage_heatmap_mask(sweep_heatmap_root, sweep_cutoff, f'low_quality/{spec.token}', mask)
+
+    save_native_overlay = save_high_quality_enabled and sweep_heatmap_root is None
     native_final_outputs_requested = bool(
-        save_high_quality_enabled or save_binary_enabled or save_labels_enabled or save_semantic_enabled
+        save_native_overlay or save_binary_enabled or save_labels_enabled or save_semantic_enabled
     )
     if native_final_outputs_requested:
         print('\n=== Scheduling selected native-resolution outputs in background ===')
@@ -7617,7 +7563,7 @@ def _main_impl() -> None:
             out_dir=out_dir,
             stem=input_path.stem,
             fps=fps,
-            save_high_quality=bool(save_high_quality_enabled),
+            save_high_quality=bool(save_native_overlay),
             save_binary_pattern_value='__DEFAULT__' if save_binary_enabled else None,
             save_semantic_pattern_value='__DEFAULT__' if save_semantic_enabled else None,
             save_labels_pattern_value='__DEFAULT__' if save_labels_enabled else None,
@@ -7647,6 +7593,8 @@ def _main_impl() -> None:
             temp_dir=temp_dir,
             workers=tail_output_workers,
             show_progress=False,
+            save_overlay=sweep_heatmap_root is None,
+            stage_mask=stage_low_quality_heatmap,
         )
         final_paths.update(low_quality_paths)
         output_manager.submit(BackgroundOutputSubmission(
@@ -7701,25 +7649,24 @@ def _main_impl() -> None:
             layer_sink.wait()
         if sam_context is not None:
             from .tta_outputs import measure_bridge_output_survival
-            from .reconciliation_runtime import reuse_source_bridge_survival
             with runtime_telemetry().span('tta.survival.final_audit'):
-                survival_receipts = reuse_source_bridge_survival(
-                    nrrd_layer_refs, final_output_mask_mm, source_survival_reuse, reconciliation_report,
-                    writers_settled=True,
-                    postprocessing_disabled=_source_bridge_survival_reuse_enabled(args, gaussian_smoothing_enabled))
-                if survival_receipts is None:
-                    survival_receipts = measure_bridge_output_survival(nrrd_layer_refs, final_output_mask_mm)
+                survival_receipts = measure_bridge_output_survival(nrrd_layer_refs, final_output_mask_mm)
                 layer_sink.record_final_bridge_survival(survival_receipts)
-        source_survival_reuse = None
+        layer_sink.shutdown()
+    if staged_sam_archive is not None:
+        with runtime_telemetry().span('tta.final.sam_archive_publication'):
+            staged_sam_archive.publish()
+    if layer_sink is not None:
         with runtime_telemetry().span('tta.final.nrrd_manifest'):
             nrrd_manifest_path = layer_sink.write_manifest()
-        layer_sink.shutdown()
         set_nrrd_layer_sink(None)
-        final_paths['nrrd_dir'] = nrrd_dir
-        if nrrd_manifest_path is not None:
-            final_paths['nrrd_manifest'] = nrrd_manifest_path
+        if not sweep_nrrd_root:
+            final_paths['nrrd_dir'] = nrrd_dir
+            if nrrd_manifest_path is not None:
+                final_paths['nrrd_manifest'] = nrrd_manifest_path
+        elif nrrd_manifest_path is not None:
+            sweep_branch['nrrd_storage'] = 'grouped'
 
-    source_survival_reuse = None
     if bool(save_images_enabled):
         print('\n=== Publishing canonical model-input image sequences ===')
         if canonical_images_stage_root is None:  # pragma: no cover - guarded at setup
@@ -7759,9 +7706,13 @@ def _main_impl() -> None:
         print(f'WARNING: Requested SAM work is incomplete in {len(sam_planning_omissions)} scopes; '
               'valid outputs will be retained and the run will finish with an incomplete status.', flush=True)
     summary_path: Optional[Path] = None
+    summary_section = None
     if bool(save_summary_enabled):
+        if sweep_branch is not None:
+            from .confidence_sweep import SWEEP_SUMMARY_FILENAME, SWEEP_SUMMARY_SECTION_ENV
+            summary_section = os.environ.get(SWEEP_SUMMARY_SECTION_ENV)
         summary_path = write_summary_file(
-            out_dir / f'{input_path.stem}_Summary.txt',
+            Path(summary_section) if summary_section else out_dir / f'{input_path.stem}_Summary.txt',
             command=shlex.join([str(x) for x in sys.argv]),
             input_path=input_path,
             out_dir=out_dir,
@@ -7791,7 +7742,10 @@ def _main_impl() -> None:
             slice_postprocess_workers=slice_postprocess_workers,
             interpolation_workers=interpolation_workers,
             output_workers=tail_output_workers,
+            encoding='utf-8' if summary_section else None,
         )
+        if summary_section:
+            summary_path = out_dir.parent.parent / SWEEP_SUMMARY_FILENAME
         final_paths['summary'] = summary_path
 
     if run_manifest_path is not None:
@@ -7936,7 +7890,7 @@ def _main_impl() -> None:
             prediction_processing={
                 'owner': 'tta_only',
                 'observed_confidence': (
-                    {'retained': True, 'generated_only_support': 'unknown',
+                    {'retained': confidence_manifest is not None, 'generated_only_support': 'unknown',
                      'prediction_confidence_threshold': float(args.conf),
                      'capture_confidence_floor_by_backend': confidence_floor_by_backend,
                      'component_min_conf': float(args.min_conf),
@@ -7947,7 +7901,7 @@ def _main_impl() -> None:
                     {'policy_path': reconciliation_settings.path, 'policy_sha256': reconciliation_settings.sha256,
                      'name': reconciliation_report['policy']['name'],
                      'stage': 'source_grid_before_global_postprocessing',
-                     'source_layers_preserved': True, 'retained_confidence': True}
+                     'source_layers_preserved': True, 'retained_confidence': confidence_manifest is not None}
                     if reconciliation_report is not None else None),
                 'interpolation': {
                     'requested_work_complete': not any(item['operation'] == 'interpolation' for item in sam_planning_omissions),
@@ -8117,7 +8071,7 @@ def _main_impl() -> None:
     print(f'Scratch dir: {temp_dir}')
     if 'overlay' in final_paths:
         print(f"Final overlay: {final_paths['overlay']}")
-    if summary_path is not None:
+    if summary_path is not None and summary_section is None:
         print(f'Summary: {summary_path}')
     if run_manifest_path is not None:
         print(f'Manifest: {run_manifest_path}')

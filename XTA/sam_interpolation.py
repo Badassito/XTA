@@ -12,6 +12,8 @@ import dataclasses
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
+import errno
+from functools import partial
 import hashlib
 import heapq
 import inspect
@@ -27,7 +29,7 @@ from typing import Any
 
 import numpy as np
 from .sam_resources import sam_worker_count
-from .artifact_archive import split_reference, read_member, artifact_directory
+from .artifact_archive import artifact_directory, artifact_stage_parent, read_member, split_reference
 from .env_flags import env_flag
 from .json_publication import write_json_atomic
 
@@ -751,7 +753,8 @@ class _SamImageCohortLeases:
                 except BaseException as cleanup_error:
                     # A lease whose own __enter__ already unwound may refuse a
                     # second close; keep the original admission/build cause.
-                    error.add_note(f"SAM image cohort lease cleanup also failed: {cleanup_error!r}")
+                    if callable(getattr(error, "add_note", None)):
+                        error.add_note(f"SAM image cohort lease cleanup also failed: {cleanup_error!r}")
             raise
         self._stack, self.index, self.current = stack, index, provider
         return provider
@@ -1052,14 +1055,14 @@ def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provid
         runtime, resource_profile, upstream_lineage, min_radius, cancel_event, original_run_ids):
     """Track only the enlarged family, retaining its own immutable raw attempt."""
     from .sam_evidence import SamEvidenceWriter
-    from .sam_crop_tiling import TiledRunAssembly, tile_descriptor
+    from .sam_crop_tiling import (TiledRunAssembly, _remove_scratch_directory,
+                                 _settle_scratch_cleanup, tile_descriptor)
     groups = {str(group.group_id): group for group in prepared.groups}
     by_id = prepared.plan.by_id
     cache = getattr(image_provider, 'cache_ref', image_provider)
     assemblies = {}
-    assembly_root = (Path(tempfile.mkdtemp(prefix='sam-retry-tiles-'))
-        if prepared.crop_mode == 'tiled' and split_reference(destination) is not None
-        else destination / 'tile_assemblies')
+    assembly_root = destination / 'tile_assemblies'
+    owned_assembly_root = None
     stream = None
     completed = set()
     worker_count = min(sam_worker_count(runtime,legacy=resource_profile is None),
@@ -1068,6 +1071,9 @@ def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provid
             None if prepared.crop_mode=='tiled' else resource_profile,worker_count) as permit:
         writer = SamEvidenceWriter(destination / 'evidence', metadata)
         try:
+            if prepared.crop_mode == 'tiled' and split_reference(destination) is not None:
+                assembly_root = owned_assembly_root = Path(tempfile.mkdtemp(
+                    prefix='sam-retry-tiles-', dir=artifact_stage_parent(destination)))
             for group in prepared.groups:
                 _write_group(writer, group, by_id, min_radius)
             tiled = prepared.crop_mode == 'tiled'
@@ -1148,12 +1154,13 @@ def _regenerate_sam_group_retry(prepared, *, destination, metadata, image_provid
             _failure_receipt(destination, error, 'crop_retry_generation', len(completed))
             raise
         finally:
-            for assembly in assemblies.values():
-                assembly.close()
+            cleanup = []
             if stream is not None:
-                stream.close()
-            if split_reference(destination) is not None and prepared.crop_mode == 'tiled':
-                assembly_root.rmdir()
+                cleanup.append(stream.close)
+            cleanup.extend(assembly.close for assembly in assemblies.values())
+            if owned_assembly_root is not None:
+                cleanup.append(partial(_remove_scratch_directory, owned_assembly_root))
+            _settle_scratch_cleanup(cleanup, sys.exc_info()[1])
 
 
 def _apply_sam_crop_retries(bundle, prepared, *, destination, metadata, runtime,
@@ -1972,6 +1979,30 @@ def _publish_directions_with_reader(bundle: object, receipt: Mapping[str, object
         raise
 
 
+@contextmanager
+def _sam_runtime_workspace(work_dir, runtime_work_dir, gap_distance):
+    if runtime_work_dir is not None or int(gap_distance) <= 0 or split_reference(work_dir) is None:
+        yield runtime_work_dir
+        return
+    from .sam_crop_tiling import _remove_scratch_directory, _settle_scratch_cleanup
+    owned = Path(tempfile.mkdtemp(prefix='sam-runtime-', dir=artifact_stage_parent(work_dir)))
+    try:
+        yield owned
+    finally:
+        def remove_empty_workspace():
+            # Archive failure stages and a caller-owned merged mmap may still live here.
+            for directory, _, files in os.walk(owned, topdown=False):
+                path = Path(directory)
+                if files or any(part.startswith('.artifact-stage-') for part in path.relative_to(owned).parts):
+                    continue
+                try:
+                    _remove_scratch_directory(path)
+                except OSError as error:
+                    if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                        raise
+        _settle_scratch_cleanup((remove_empty_workspace,), sys.exc_info()[1])
+
+
 def interpolate_sam_view_volume_pass(
     observation_volume: np.ndarray, *, image_provider: object = None, view: object = None,
     work_dir: Path, pass_index: int = 1, gap_distance: int = 15, min_radius: float = 3.0,
@@ -2012,14 +2043,20 @@ def interpolate_sam_view_volume_pass(
         runtime=runtime, scope=scope, upstream_lineage=upstream_lineage,
         return_bridge_components=return_bridge_components, interpolation_passes=interpolation_passes,
         policy=policy, spacing_zyx=spacing_zyx, planner_limits=planner_limits,
-        canonical_labels=canonical_labels, runtime_work_dir=runtime_work_dir,
+        canonical_labels=canonical_labels,
         cancel_event=cancel_event, prepared_plan=prepared_plan, crop_mode=crop_mode,
         resource_profile=resource_profile, crop_retry_policy=crop_retry_policy,
         retry_image_provider=retry_image_provider, _observation_inventory=_observation_inventory)
+
+    def execute(leases=None):
+        with _sam_runtime_workspace(work_dir, runtime_work_dir, gap_distance) as workspace:
+            return _interpolate_sam_view_volume_pass(observation_volume, **options,
+                runtime_work_dir=workspace, _image_cohort_leases=leases)
+
     if image_cohorts is None:
         if image_cohort_provider is not None or image_cohort_prefetch is not None:
             raise ValueError("SAM image cohort providers require explicit image cohorts")
-        return _interpolate_sam_view_volume_pass(observation_volume, **options)
+        return execute()
     cohorts = tuple(image_cohorts)
     if prepared_plan is None or not prepared_plan.needs_tracking or int(gap_distance) <= 0:
         raise ValueError("SAM interpolation image cohorts require an active prepared plan")
@@ -2042,8 +2079,7 @@ def interpolate_sam_view_volume_pass(
             options["image_provider"] = leases.enter(0)
         except Exception as error:
             raise SamImageCohortAdmissionError(error) from error
-        return _interpolate_sam_view_volume_pass(observation_volume, **options,
-            _image_cohort_leases=leases)
+        return execute(leases)
     finally:
         leases.close(sys.exc_info()[1])
 
@@ -2257,8 +2293,6 @@ def _interpolate_sam_view_volume_pass(
     destination = Path(work_dir) / f"sam_{scope_hash}"
     if split_reference(destination) is None:
         destination.mkdir(parents=True, exist_ok=True)
-    if runtime_work_dir is None and split_reference(destination) is not None:
-        runtime_work_dir = Path(tempfile.mkdtemp(prefix='sam-runtime-'))
     observation_by_id = {str(observation.observation_id): observation for observation in plan.observations}
     groups = {str(group.group_id): group for group in plan.groups}
     generated_by_index: dict[int, dict[str, object]] = {}
@@ -2777,7 +2811,9 @@ def _interpolate_sam_view_volume_pass(
         "sam_merged_workspace_bytes": int(merged.nbytes) if added else 0,
         "generator_wall_seconds": time.perf_counter() - started,
     })
-    write_json_atomic(destination / "generation.json", _plain(stats))
+    write_json_atomic(destination / "generation.json", _plain({
+        key: value for key, value in stats.items() if key != "sam_selection_receipt"
+    }))
     return merged, stats, components if return_bridge_components else []
 
 

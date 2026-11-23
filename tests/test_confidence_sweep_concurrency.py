@@ -18,9 +18,11 @@ import types
 import pytest
 
 from XTA import confidence_sweep as sweep
+from XTA import runtime
 
 
 _POPEN = subprocess.Popen
+_CONSUMER_CPU_SLOTS = sweep._consumer_cpu_slots
 _CHILD = r'''
 import json, os, signal, sys, time
 from pathlib import Path
@@ -49,6 +51,14 @@ if role == 'produce' and plan.get('shared_cube'):
     (Path(os.environ['XTA_YOLO_SWEEP_WORK_DIR']) / 'cube.gray8.json').write_text('{}')
 record = {'cent': cent, 'pid': os.getpid(), 'role': role, 'started': time.time(),
           'defer': os.environ.get('XTA_YOLO_SWEEP_DEFER_NATIVE_RETIREMENT')}
+if plan.get('observe_resources'):
+    from XTA.runtime import GIB, _current_process_cpu_affinity, resolve_parent_memory_limits
+    from XTA.workspace import _cpu_count
+    record['cpus'] = sorted(_current_process_cpu_affinity() or ())
+    record['cpu_count'] = _cpu_count()
+    record['memory_caps'] = resolve_parent_memory_limits(1400 * GIB, sam_enabled=False, policy_enabled=False)
+    record['workers'] = [os.environ.get(f'YOLO_TTA_{stage}_WORKERS')
+                         for stage in ('AUG', 'INTERPOLATION', 'OUTPUT', 'OUTPUT_FRAME')]
 print('fixture-out-' + str(cent), flush=True)
 print('fixture-err-' + str(cent), file=sys.stderr, flush=True)
 if step.get('bulk'):
@@ -117,7 +127,9 @@ def harness(tmp_path, monkeypatch):
     model.write_bytes(b'model fixture')
     monkeypatch.setenv('SWEEP_TEST_VERSION', sweep.__version__)
     for name in ('SWEEP_CONCURRENCY_PLAN', 'XTA_YOLO_SWEEP_VIEW_MAJOR', 'XTA_YOLO_SWEEP_CACHE_GIB',
-                 'XTA_YOLO_SWEEP_CONSUMER_PARALLEL', 'XTA_YOLO_SWEEP_DEFER_NATIVE_RETIREMENT'):
+                 'XTA_YOLO_SWEEP_CONSUMER_PARALLEL', 'XTA_YOLO_SWEEP_DEFER_NATIVE_RETIREMENT',
+                 'YOLO_TTA_DIRECT_UNION_INFERENCE_GIB', 'YOLO_TTA_DIRECT_UNION_TOTAL_GIB',
+                 'YOLO_TTA_PARENT_TRANSIENT_GIB'):
         monkeypatch.delenv(name, raising=False)
     system_temp = tmp_path / 'system-temp'
     system_temp.mkdir()
@@ -125,6 +137,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(sweep, '_CHILD_SETTLE_SECONDS', .5)
     monkeypatch.setattr(sweep, '_CHILD_GRACE_SECONDS', 1.)
     monkeypatch.setattr(sweep, '_CHILD_KILL_SECONDS', 5.)
+    monkeypatch.setattr(sweep, '_consumer_cpu_slots', lambda limit: [])
     state = types.SimpleNamespace(root=tmp_path, launches=[], publications=[], on_launch=None,
         arguments=['--input', str(source), '--model', f'gpu:{model}'])
 
@@ -136,7 +149,10 @@ def harness(tmp_path, monkeypatch):
             assert options['stdout'] is subprocess.PIPE and options['stderr'] is subprocess.PIPE
         process = _POPEN([sys.executable, '-B', str(child), json.dumps(command[5:])], **options)
         cutoff = int(options['env']['XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS'])
-        state.launches.append(types.SimpleNamespace(cutoff=cutoff, piped=piped, process=process))
+        budgets = tuple(options['env'].get(name) for name in (
+            'YOLO_TTA_DIRECT_UNION_INFERENCE_GIB', 'YOLO_TTA_DIRECT_UNION_TOTAL_GIB',
+            'YOLO_TTA_PARENT_TRANSIENT_GIB'))
+        state.launches.append(types.SimpleNamespace(cutoff=cutoff, piped=piped, process=process, budgets=budgets))
         if state.on_launch is not None:
             state.on_launch(cutoff, process)
         return process
@@ -190,7 +206,9 @@ def test_limit_order_prefixes_and_retirement_marker(harness, capfd):
     assert family['status'] == 'complete'
     assert [row['cutoff_hundredths'] for row in family['branches']] == [50, 60, 70, 80, 90]
     assert [row['status'] for row in family['branches']] == ['complete'] * 5
-    assert family['consumer_execution'] == {'consumers': 4, 'requested': 2, 'limit': 2,
+    execution = family['consumer_execution']
+    assert {key: value for key, value in execution.items() if key not in ('memory_share_bytes', 'cpu_slots')} == {
+        'consumers': 4, 'requested': 2, 'limit': 2,
         'reason': 'XTA_YOLO_SWEEP_CONSUMER_PARALLEL=2', 'mode': 'concurrent'}
     assert family['upstream_fanout']['status'] == 'shared_native_products'
     assert family['upstream_fanout']['validated_arms'] == 5
@@ -221,7 +239,7 @@ def test_limit_order_prefixes_and_retirement_marker(harness, capfd):
 def test_auto_limit_admits_consumers_by_source_volume_memory(harness, monkeypatch):
     per_consumer = sweep._CONSUMER_SOURCE_VOLUME_FACTOR * 2 * 3 * 4
     monkeypatch.setattr(sweep, '_available_memory', lambda: (2 * per_consumer + 5, ('fixture',)))
-    plan = {str(cent): {'sleep': 1.5} for cent in (60, 70, 80)}
+    plan = {'observe_resources': True, **{str(cent): {'sleep': 1.5} for cent in (60, 70, 80)}}
     family = _read(harness.run('auto', (50, 60, 70, 80), plan=plan))
     execution = family['consumer_execution']
     assert execution['requested'] == 'auto' and execution['mode'] == 'concurrent'
@@ -229,7 +247,9 @@ def test_auto_limit_admits_consumers_by_source_volume_memory(harness, monkeypatc
     assert execution['estimated_bytes_per_consumer'] == per_consumer
     assert execution['available_memory_bytes'] == 2 * per_consumer + 5
     assert execution['memory_sources'] == ['fixture']
+    assert execution['memory_share_bytes'] == per_consumer + 2
     assert max(_observed(harness.output, cent)['peak_active'] for cent in (60, 70, 80)) == 2
+    assert all(_observed(harness.output, cent)['memory_caps'] == [15, 30, 30] for cent in (60, 70, 80))
 
 
 def test_unknown_memory_keeps_auto_sequential(harness, monkeypatch, capfd):
@@ -244,6 +264,108 @@ def test_unknown_memory_keeps_auto_sequential(harness, monkeypatch, capfd):
     assert any('consumers run sequentially (auto: available physical memory is unknown)' in line for line in out)
 
 
+def test_child_dense_budget_uses_smaller_of_explicit_limit_and_shared_memory(harness, monkeypatch):
+    gib = runtime.GIB
+    monkeypatch.setattr(sweep, '_available_memory', lambda: (400 * gib, ('fixture',)))
+    monkeypatch.setenv('YOLO_TTA_DIRECT_UNION_TOTAL_GIB', '32')
+    monkeypatch.setenv('YOLO_TTA_PARENT_TRANSIENT_GIB', '16')
+    result = _read(harness.run('ram-share', (50, 60, 70), parallel=2, plan={'observe_resources': True}))
+    assert result['consumer_execution']['memory_share_bytes'] == 200 * gib
+    assert harness.launches[0].budgets == (None, '32', '16')
+    assert _observed(harness.output, 50)['memory_caps'] == [32 * gib, 32 * gib, 16 * gib]
+    assert all(_observed(harness.output, cent)['memory_caps'] == [32 * gib, 32 * gib, 16 * gib]
+               for cent in (60, 70))
+
+
+def test_concurrent_children_get_disjoint_cpu_masks_and_partition_overrides(harness, monkeypatch):
+    monkeypatch.setattr(sweep, '_consumer_cpu_slots', _CONSUMER_CPU_SLOTS)
+    slots = sweep._consumer_cpu_slots(2)
+    if len(slots) != 2:
+        pytest.skip('Whole-core CPU affinity cannot be verified on this host')
+    for stage in ('AUG', 'INTERPOLATION', 'OUTPUT', 'OUTPUT_FRAME'):
+        monkeypatch.setenv(f'YOLO_TTA_{stage}_WORKERS', '8')
+    family = _read(harness.run('cpu-share', (50, 60, 70, 80), parallel=2,
+                              plan={'observe_resources': True}))
+    assert family['consumer_execution']['cpu_slots'] == slots
+    assert not set(slots[0]).intersection(slots[1])
+    assert sorted(slots[0] + slots[1]) == _observed(harness.output, 50)['cpus']
+    assert [_observed(harness.output, cent)['cpus'] for cent in (60, 70)] == slots
+    for cent in (60, 70, 80):
+        observed = _observed(harness.output, cent)
+        assert observed['cpus'] in slots
+        logical = len(observed['cpus'])
+        assert observed['cpu_count'] == logical
+        assert observed['workers'] == [str(min(4, 2 * logical))] * 3 + [str(min(4, logical))]
+
+
+def test_interrupted_posix_affinity_change_restores_original_mask(monkeypatch):
+    mask = {0, 1, 2, 3}
+    original = mask.copy()
+    interrupt = KeyboardInterrupt('interrupted after setting child affinity')
+
+    def set_affinity(pid, cpus):
+        assert pid == 0
+        mask.clear()
+        mask.update(cpus)
+        if mask != original:
+            raise interrupt
+
+    monkeypatch.setattr(sweep, 'os', types.SimpleNamespace(name='posix',
+        sched_getaffinity=lambda pid: mask.copy(), sched_setaffinity=set_affinity))
+    child = sweep._ConcurrentChild({'cpus': (0, 1)})
+    with pytest.raises(KeyboardInterrupt) as caught:
+        child.start()
+    assert caught.value is interrupt
+    assert mask == original
+    assert child.process is None
+
+
+@pytest.mark.parametrize('family, flag', [
+    ('tilted', 'YOLO_TTA_NATIVE_PULL_CUDA'),
+    ('azimuthal', 'YOLO_TTA_GPU_BACKPROJECT'),
+    ('radial', 'YOLO_TTA_GPU_RADIAL_BACKPROJECT'),
+    ('spherical', 'YOLO_TTA_GPU_SPHERICAL_BACKPROJECT'),
+])
+def test_shared_native_cuda_projection_serializes_consumers(monkeypatch, family, flag):
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')
+    monkeypatch.setenv(flag, '1')
+    monkeypatch.setenv('YOLO_TTA_GPU_BACKPROJECT', '1')
+    monkeypatch.setattr(sweep, '_consumer_cpu_slots', lambda limit: [])
+    evidence = {'scalar_views': 0, 'produced_views': 2, 'native_views_retired_after_projection': 1}
+    geometry = {'physical_views': [{'family': family}]}
+    record = sweep._consumer_execution(2, 2, evidence, [10, 20, 30], geometry=geometry)
+    assert record['limit'] == 1
+    assert 'native backprojection' in record['reason']
+    assert sweep._consumer_execution(2, 2, {**evidence, 'native_views_retired_after_projection': 2},
+                                     [10, 20, 30], geometry=geometry)['limit'] == 2
+    monkeypatch.setenv(flag, '0')
+    assert sweep._consumer_execution(2, 2, evidence, [10, 20, 30], geometry=geometry)['limit'] == 2
+
+
+def test_gpu_keep_objects_serializes_even_without_a_gpu_detector(monkeypatch):
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')
+    monkeypatch.setenv('YOLO_TTA_GPU_SLICE_LABELING', '1')
+    monkeypatch.setattr(sweep, '_consumer_cpu_slots', lambda limit: [])
+    config = {'keep_objects': 2, 'device': 'cpu'}
+    record = sweep._consumer_execution(2, 2, {'scalar_views': 0}, [10, 20, 30], configuration=config)
+    assert record['limit'] == 1 and 'keep_objects' in record['reason']
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '-1')
+    assert sweep._consumer_execution(2, 2, {'scalar_views': 0}, [10, 20, 30], configuration=config)['limit'] == 2
+
+
+@pytest.mark.parametrize('config, backend', [
+    ({'interpolation_distance': 1, 'interpolation_backend': 'sam'}, 'SAM'),
+    ({'interpolation_distance': 0, 'extrapolation_distance': 1}, 'SAM'),
+    ({'interpolation_distance': 1}, 'SDF'),
+])
+def test_shared_interpolation_gpu_serializes_consumers(monkeypatch, config, backend):
+    monkeypatch.setenv('YOLO_TTA_GPU_INTERPOLATION', '1')
+    monkeypatch.setenv('YOLO_TTA_GPU_INTERPOLATION_CREATE_CONTEXT', '1')
+    record = sweep._consumer_execution(8, 3, {'scalar_views': 0}, [10, 20, 30], configuration=config)
+    assert record['limit'] == 1
+    assert backend in record['reason']
+
+
 @pytest.mark.parametrize('requested,scalar,available,expected', (
     (None, 0, None, 1),
     (None, 0, 10**15, 3),
@@ -256,6 +378,7 @@ def test_unknown_memory_keeps_auto_sequential(harness, monkeypatch, capfd):
 ))
 def test_consumer_limit_decision(monkeypatch, requested, scalar, available, expected):
     monkeypatch.setattr(sweep, '_available_memory', lambda: (available, ('fixture',) if available else ()))
+    monkeypatch.setattr(sweep, '_consumer_cpu_slots', lambda limit: [])
     record = sweep._consumer_execution(requested, 3, {'scalar_views': scalar}, [10, 20, 30])
     assert record['limit'] == expected
     assert record['mode'] == ('concurrent' if expected > 1 else 'sequential')

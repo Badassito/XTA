@@ -795,7 +795,8 @@ def test_failed_lease_entry_keeps_original_cause_when_cleanup_refuses():
     with pytest.raises(RuntimeError, match='real cause') as info:
         leases.enter(0)
     assert Lease.closes == 1
-    assert any('cleanup also failed' in note for note in getattr(info.value, '__notes__', ()))
+    if callable(getattr(info.value, 'add_note', None)):
+        assert any('cleanup also failed' in note for note in info.value.__notes__)
     leases.close()
 
 

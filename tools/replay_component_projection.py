@@ -357,30 +357,11 @@ def execute_backend(capture, work_dir, backend, workers):
                 out_shape_tyx=replay.output_shape, workers=int(workers))
             decode_seconds = 0.0
         else:
-            # Subclass only the syscall adapter on Windows; the reference's mask
-            # projection, bounding boxes, packing and writer implementation remain
-            # unchanged. Production SLURM uses its ordinary pwrite implementation.
-            class ReplayWriter(IncrementalRawBBoxMaskStoreWriter):
-                _windows_lock = threading.Lock()
-
-                @staticmethod
-                def _pwrite_all(fd, data, offset):
-                    if hasattr(os, 'pwrite'):
-                        return IncrementalRawBBoxMaskStoreWriter._pwrite_all(fd, data, offset)
-                    with ReplayWriter._windows_lock:
-                        os.lseek(fd, offset, os.SEEK_SET)
-                        written = 0
-                        while written < len(data):
-                            count = os.write(fd, data[written:])
-                            if count <= 0:
-                                raise OSError('Short replay writer write')
-                            written += count
-
             decode_started = time.perf_counter()
             decoded = materialize_raw_bbox_mask_store_workspace(replay.source_path, work_dir/'decoded.u8',
                 desc='Legacy component input decode', workers=int(workers))
             decode_seconds = time.perf_counter()-decode_started
-            writer = ReplayWriter(shape=replay.output_shape, store_dir=destination,
+            writer = IncrementalRawBBoxMaskStoreWriter(shape=replay.output_shape, store_dir=destination,
                                   format_name=CVOL_FORMAT, desc='Legacy component replay')
             try:
                 with _gpu_reference_tracking(backend == 'legacy_cuda') as selected:
@@ -609,7 +590,8 @@ def main():
                             file=name, type=type(exc).__name__, message=str(exc)))
                         if worker_error is None:
                             raise
-                        worker_error.add_note(f'Replay diagnostic persistence failed: {exc}')
+                        if callable(getattr(worker_error, 'add_note', None)):
+                            worker_error.add_note(f'Replay diagnostic persistence failed: {exc}')
             runs.append(json.loads((root/f'{backend}.metrics.json').read_text(encoding='utf-8')))
             save_report()
         comparisons = {run['requested_backend']: compare_projected_stores(runs[0]['result_store'], run['result_store'])
@@ -627,7 +609,8 @@ def main():
         try:
             save_report()  # Retain the failure before potentially slow scratch cleanup.
         except Exception as save_error:
-            exc.add_note(f'Replay failure report could not be saved: {save_error}')
+            if callable(getattr(exc, 'add_note', None)):
+                exc.add_note(f'Replay failure report could not be saved: {save_error}')
         raise
     finally:
         cleanup_error = None
@@ -644,7 +627,8 @@ def main():
         except Exception as save_error:
             if failure is None:
                 raise
-            failure.add_note(f'Replay cleanup report could not be saved: {save_error}')
+            if callable(getattr(failure, 'add_note', None)):
+                failure.add_note(f'Replay cleanup report could not be saved: {save_error}')
         if cleanup_error is not None and failure is None:
             raise cleanup_error
     print(json.dumps({'all_exact': report['all_exact'], 'report': str(root/'replay.json'),

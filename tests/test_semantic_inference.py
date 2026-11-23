@@ -1,5 +1,8 @@
 """Binary semantic logits retain foreground confidence through native accumulation."""
 
+import os
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -114,6 +117,125 @@ def test_semantic_conf_below_half_is_respected():
     )
     np.testing.assert_array_equal(union[0], [[0, 1]])
     assert confidence[0, 0, 1] == round(0.4 * 255)
+
+
+def test_semantic_mask_only_does_not_quantize_scores(monkeypatch):
+    probability = np.array([[0.2, 0.4]], dtype=np.float32)
+    union = np.zeros((1, 1, 2), dtype=np.uint8)
+
+    def unexpected_quantization(*args):
+        raise AssertionError('Mask-only inference quantized observed scores')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(semantic_inference.np, 'rint', unexpected_quantization)
+        counts = semantic_inference.accumulate_semantic_probability_frame(
+            probability, frame_index=0, conf_threshold=0.3, view_union_mm=union, view_confmap_mm=None,
+            M_out_to_native=np.eye(2, 3, dtype=np.float32), native_h=1, native_w=2,
+        )
+    assert counts == (1, 1)
+    np.testing.assert_array_equal(union[0], [[0, 1]])
+
+
+_CUDA_SEMANTIC = pytest.mark.skipif(
+    os.environ.get('XTA_TEST_NATIVE_TRT_POST_CUDA') != '1', reason='CUDA opt-in',
+)
+
+
+@pytest.mark.parametrize('route', [
+    'cpu',
+    'cpu-warp-failure',
+    pytest.param('cuda', marks=_CUDA_SEMANTIC),
+    pytest.param('cuda-filter-failure', marks=_CUDA_SEMANTIC),
+    pytest.param('cuda-filter-disabled', marks=_CUDA_SEMANTIC),
+])
+def test_semantic_filter_uses_temporary_scores_without_confidence_output(monkeypatch, route):
+    torch = pytest.importorskip('torch')
+    from XTA import semantic_cuda
+
+    device = 'cuda' if route.startswith('cuda') else 'cpu'
+    native_scores = torch.tensor([
+        [.6, 0., 0., 0.],
+        [0., .9, 0., 0.],
+        [0., 0., 0., 0.],
+        [0., 0., 0., .6],
+    ], device=device)
+    calls = []
+    original = semantic_cuda.filter_semantic_components_cuda
+
+    def filter_on_device(mask, scores, threshold, *, stream):
+        calls.append(threshold)
+        if route == 'cuda-filter-failure':
+            raise RuntimeError('injected semantic CUDA filter failure')
+        return original(mask, scores, threshold, stream=stream)
+
+    monkeypatch.setattr(semantic_cuda, 'filter_semantic_components_cuda', filter_on_device)
+    if route == 'cpu-warp-failure':
+        def fail_warp(*_args):
+            raise RuntimeError('injected Torch warp failure')
+
+        monkeypatch.setattr(inference, '_warp_flattened_native_planes', fail_warp)
+    payload = inference.GpuFlattenedRetinaPayload(
+        (native_scores > 0).float(), native_scores, semantic_min_conf_u8=200,
+        semantic_gpu_filter=route != 'cuda-filter-disabled',
+    )
+    out = np.zeros((1, 4, 4), dtype=np.uint8)
+    assert inference._process_gpu_flattened_prediction_frame(
+        0, payload, 4, out, None, np.eye(2, 3, dtype=np.float32), 4, 4,
+    ) == (1, 1)
+    assert calls == ([200] if route in ('cuda', 'cuda-filter-failure') else [])
+    np.testing.assert_array_equal(out[0], np.diag([1, 1, 0, 0]))
+
+
+@pytest.mark.parametrize('output', [
+    'persistent', 'transient', 'padding-without-confidence',
+    'split-padding-without-confidence', 'shared-padding',
+])
+def test_semantic_min_conf_and_radius_stay_on_the_host_cleanup_path(monkeypatch, output):
+    torch = pytest.importorskip('torch')
+    scores = torch.zeros((8, 8))
+    scores[:3, :3] = .9
+    scores[-3:, -3:] = .6
+    scores[0, -1] = .95
+    payload = inference.GpuFlattenedRetinaPayload((scores > 0).float(), scores, 1)
+    for name in ('ensure_yolo_ready_for_predict', 'validate_yolo_model_input_channels'):
+        monkeypatch.setattr(inference, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(inference, '_ensure_predictor_for_direct_predict', lambda *args: object())
+    has_padding = 'padding' in output
+    results = [SimpleNamespace(_tta_gpu_flattened_payload=payload)] * (1 + int(has_padding))
+    monkeypatch.setattr(inference, '_semantic_predict_stream', lambda *args: iter(results))
+    monkeypatch.setattr(inference, 'angle_variant_gpu_fastpath', lambda: (0.8, 1.0))
+    monkeypatch.setattr(inference, 'gpu_retina_cleanup_enabled', lambda: True)
+    mask = np.zeros((1, 8, 8), dtype=np.uint8)
+    confidence = None if output in ('transient', 'padding-without-confidence') else np.zeros_like(mask)
+    source = SimpleNamespace(
+        azimuthal_padding_count=int(has_padding),
+        result_frame_spec=lambda i: inference.BatchResultFrameSpec(
+            result_index=i, task_index=0, global_destination_index=0,
+            mirror_azimuthal_u=False, azimuthal_padding_ordinal=0 if i else None,
+        ),
+    )
+    arguments = dict(
+        source_label='semantic test', num_frames=1, out_size=8,
+        cfg=inference.PredictConfig(imgsz=8, conf=.5, device='cpu', quantize=None, task='semantic'),
+        view_union_mm=mask, view_confmap_mm=confidence,
+        M_out_to_native=np.eye(2, 3, dtype=np.float32), native_h=8, native_w=8,
+        streaming_cleanup_enabled=True, streaming_cleanup_min_conf=.8, streaming_cleanup_min_radius=2.,
+    )
+    if output.startswith('split-padding'):
+        arguments['azimuthal_padding_union_mm'] = np.zeros_like(mask)
+    if output.endswith('without-confidence'):
+        with pytest.raises(ValueError, match='azimuthal padding requires confidence planes'):
+            inference.predict_source_and_accumulate(object(), source, **arguments)
+        assert not mask.any()
+        return
+    inference.predict_source_and_accumulate(object(), source, **arguments)
+
+    assert not payload.run_gpu_cleanup
+    expected = np.zeros_like(mask)
+    expected[0, :3, :3] = 1
+    np.testing.assert_array_equal(mask, expected)
+    if confidence is not None:
+        assert not confidence[mask == 0].any()
 
 
 @pytest.mark.parametrize(

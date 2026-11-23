@@ -25,7 +25,8 @@ import xta_native_filter as nf
 def toolbar_contract():
     path = Path(__file__).resolve().parents[1]/'tools/slicer/xta_slicerrc.py'
     tree = ast.parse(path.read_text(encoding='utf-8'))
-    names = {'_xta_sweep_scalar','_xta_sweep_review','_xta_sweep_binding','_xta_sweep_grid_rows'}
+    names = {'_xta_sweep_scalar','_xta_sweep_review','_xta_sweep_binding','_xta_sweep_grid_rows',
+             '_xta_check_review_family'}
     body = [node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in names]
     assert {node.name for node in body} == names
     namespace = dict(vars(edits))
@@ -407,7 +408,8 @@ def export_api(review,arrays):
     path=Path(__file__).resolve().parents[1]/'tools/slicer/xta_slicerrc.py'
     tree=ast.parse(path.read_text(encoding='utf-8'))
     body=[node for node in tree.body if isinstance(node,ast.FunctionDef)
-          and (node.name.startswith('_xta_sweep_') or node.name in {'ExportXTASweepEdits','ExportXTAEdits'})]
+          and (node.name.startswith('_xta_sweep_')
+               or node.name in {'ExportXTASweepEdits','ExportXTAEdits','_xta_check_review_family'})]
     namespace=dict(vars(edits),np=np,os=os,shutil=shutil,tempfile=tempfile,datetime=datetime,timezone=timezone)
     statuses=[]
     vtk=SimpleNamespace(mutable=MutableTag,vtkMatrix4x4=Matrix)
@@ -572,6 +574,72 @@ def test_published_reference_only_native_binds_each_cutoff_without_native_payloa
         assert binding['branch_dir_relative']==f'confidence_cutoffs/conf_{cent:03d}'
         assert {row['layer_key'] for row in binding['logical_segments']}=={'d','t','b','g'}
         assert all(row['segment_id']==low_rows[row['logical_id']]['segment_id'] for row in binding['logical_segments'])
+
+
+def test_canonical_grouped_sweep_export_and_native_transfer(tmp_path, monkeypatch):
+    from XTA import sweep_grouped_reader
+    from XTA.sweep_publication import publish_sweep_review
+
+    legacy_review, arrays = sweep_fixture(tmp_path)
+    root = legacy_review.parent.parent
+    stage = tmp_path / 'nrrd-stage'
+    branches = []
+    for cent in (25, 75):
+        cutoff = f'conf_{cent:03d}'
+        branch = root / 'confidence_cutoffs' / cutoff
+        branches.append((cent, branch))
+        run_path = branch / 'manifest.json'
+        run = edits._xta_sweep_json(run_path)
+        run['confidence_sweep']['nrrd_storage'] = 'grouped'
+        save(run_path, run)
+        staged = stage / cutoff
+        staged.mkdir(parents=True)
+        (branch / 'native' / 'nrrd').rename(staged / 'nrrd')
+        (branch / 'low_quality').rename(staged / 'low_quality')
+        for catalog in staged.rglob('*_nrrd_manifest.json'):
+            metadata = edits._xta_sweep_json(catalog)
+            metadata['exported_axes'] = '(X, Y, t)'
+            save(catalog, metadata)
+    review = publish_sweep_review(root, branches, sweep_id='sweep-fixture',
+                                  review_name='canonical-review', nrrd_stage_root=stage,
+                                  memory_mib=2)
+    assert not list((root / 'confidence_cutoffs').rglob('*.seg.nrrd'))
+    namespace, _, _ = export_api(review, arrays)
+    exported = tmp_path / 'export'
+    namespace['ExportXTAEdits'](review, exported)
+    child = edits.resolve_cut_bundle(exported, 75)
+    bundle = edits._xta_sweep_json(child / 'edits.json')
+    binding = bundle['sweep_context']
+    assert binding['source_storage'] == 'grouped'
+    low = root / binding['preview_manifest_relative']
+    full = root / binding['native_manifest_relative']
+    arguments = ['--edits', str(child), '--low-manifest', str(low), '--full-manifest', str(full)]
+
+    hash_group = sweep_grouped_reader.sha256_file
+
+    def only_preview_hashes(path):
+        assert 'native' not in Path(path).relative_to(review.parent).parts
+        return hash_group(path)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(sweep_grouped_reader, 'sha256_file', only_preview_hashes)
+        validate = nf.parser().parse_args([*arguments, '--output', str(tmp_path / 'checked'), '--validate-only'])
+        assert nf.run(validate) == 0
+
+    target = tmp_path / 'native'
+    transfer = nf.parser().parse_args([*arguments, '--output', str(target), '--workers', '2'])
+    assert nf.run(transfer) == 0
+    np.testing.assert_array_equal(nf.Nrrd(target / 'sample.nrrd').array(), arrays['native', 75])
+
+    source = sweep_grouped_reader.open_grouped_catalog(low).segment(bundle['segments'][0]['source_filename'])
+    with source.path.open('r+b') as raw:
+        raw.seek(-1, os.SEEK_END)
+        original = raw.read(1)
+        raw.seek(-1, os.SEEK_END)
+        raw.write(bytes([original[0] ^ 1]))
+    with pytest.raises(ValueError, match='checksum'):
+        nf.run(nf.parser().parse_args([*arguments, '--output', str(tmp_path / 'corrupt'), '--validate-only']))
+    assert not (tmp_path / 'corrupt').exists()
 
 
 @pytest.mark.parametrize('field,value',[('status','incomplete'),('mode','pta'),('source_mode','confidence_sweep')])

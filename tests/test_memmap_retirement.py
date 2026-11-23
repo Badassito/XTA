@@ -127,7 +127,9 @@ def test_retirement_does_not_delete_replacement_file(tmp_path):
 def test_retirement_unlinks_its_symlink_without_deleting_target(tmp_path):
     target = tmp_path / 'target.dat'
     target.write_bytes(bytes([23]) * 8)
-    link = tmp_path / 'owner-link.dat'
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    link = scratch / 'owner-link.dat'
     try:
         link.symlink_to(target)
     except OSError as exc:
@@ -136,6 +138,10 @@ def test_retirement_unlinks_its_symlink_without_deleting_target(tmp_path):
     view = owner[:]
     runtime.close_memmap_array_without_flush(owner, unlink_path=link)
     assert int(view[0]) == 23 and link.is_symlink()
+    with pytest.raises(TimeoutError, match='remains blocked'):
+        runtime.wait_for_retired_memmap_unlinks(path=target, timeout_s=0)
+    with pytest.raises(TimeoutError, match='remains blocked'):
+        runtime.wait_for_retired_memmap_unlinks(under=scratch, timeout_s=0)
     del owner, view
     gc.collect()
     runtime.wait_for_retired_memmap_unlinks(path=link)
@@ -176,8 +182,10 @@ def test_external_buffer_export_prevents_unsafe_unmap(tmp_path):
     del owner
     gc.collect()
     assert mapping() is not None and not mapping().closed and int(external.sum()) == 88
+    alias_parent = tmp_path / 'alias-parent'
+    alias_parent.mkdir()
     with pytest.raises(TimeoutError, match='remains blocked'):
-        runtime.wait_for_retired_memmap_unlinks(path=path, timeout_s=0.05)
+        runtime.wait_for_retired_memmap_unlinks(path=alias_parent / '..' / path.name, timeout_s=0)
     assert path.exists()
     del external
     gc.collect()
@@ -208,6 +216,8 @@ def test_deferred_cleanup_removes_only_an_empty_owned_directory(tmp_path):
     runtime.defer_retired_memmap_directory_cleanup(guarded)
     with pytest.raises(TimeoutError, match='remains blocked'):
         runtime.wait_for_retired_memmap_directory_cleanup(guarded, timeout_s=0.05)
+    with pytest.raises(TimeoutError, match='remains blocked'):
+        runtime.wait_for_retired_memmap_unlinks(under=tmp_path, timeout_s=0)
     assert unrelated.read_text() == 'keep'
     unrelated.unlink()
     runtime.wait_for_retired_memmap_directory_cleanup(guarded)

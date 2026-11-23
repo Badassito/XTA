@@ -432,7 +432,7 @@ def _execute_interpolation_tracker_task(context, kind, payload):
     if _sha256(seed_path) != str(payload["seed_sha256"]):
         raise RuntimeError("SAM interpolation seed artifact checksum changed")
     with np.load(seed_path, allow_pickle=False) as saved:
-        seed = np.asarray(saved["seed"], dtype=np.bool_).copy()
+        seed = np.asarray(saved["seed"], dtype=np.bool_)
     crop = tuple(_integer(value, "crop coordinate") for value in payload["crop_xyxy"])
     if len(crop) != 4:
         raise ValueError("SAM crop requires four XYXY coordinates")
@@ -489,15 +489,30 @@ def _execute_interpolation_tracker_task(context, kind, payload):
         tuple(input_preparation.get('image_std', ())))
     feature_cache = getattr(context, "feature_cache", None)
     cache_before = None if feature_cache is None else feature_cache.snapshot()
-    observations: dict[int, object] = {}
+    expected = range(prompt, stop) if direction == "forward" else range(start, prompt + 1)
+    packed = np.empty((len(expected), (math.prod(shape) + 7) // 8), dtype=np.uint8)
+    scores = np.empty(len(expected), dtype=np.float64)
+    removed = np.empty(len(expected), dtype=np.bool_)
+    observed_frames: set[int] = set()
+    foreground_pixels = 0
 
     def observe(item: object) -> None:
+        nonlocal foreground_pixels
         frame = int(item.frame_index)
-        if int(item.object_id) != 0 or frame in observations:
+        if int(item.object_id) != 0 or frame in observed_frames:
             raise RuntimeError("SAM raw tracker returned an unexpected or duplicate object/frame")
-        if tuple(item.binary_mask.shape) != shape:
+        mask = item.binary_mask
+        if tuple(mask.shape) != shape:
             raise RuntimeError("SAM raw tracker output changed crop coordinates")
-        observations[frame] = item
+        if frame not in expected:
+            raise RuntimeError("SAM raw tracker did not observe every expected frame including terminal")
+        index = frame - expected.start
+        packed[index] = np.packbits(mask)
+        scores[index] = np.nan if item.frame_tracker_score is None else float(item.frame_tracker_score)
+        removed[index] = item.status == "removed"
+        foreground_pixels += np.count_nonzero(mask)
+        owners.append(weakref.ref(mask))
+        observed_frames.add(frame)
 
     tracker_started = time.perf_counter()
     result = run_mask_seed_session(
@@ -523,28 +538,15 @@ def _execute_interpolation_tracker_task(context, kind, payload):
     if torch_mod is not None:
         torch_mod.cuda.synchronize(0)
         cuda_quiescence['synchronized'] = True
-    expected = (
-        tuple(range(prompt, stop)) if direction == "forward"
-        else tuple(range(start, prompt + 1))
-    )
-    if tuple(sorted(observations)) != expected or not result["raw_observation_complete"]:
+    if len(observed_frames) != len(expected) or not result["raw_observation_complete"]:
         raise RuntimeError("SAM raw tracker did not observe every expected frame including terminal")
     if not bool(result["seed_roundtrip_passed"]):
         raise RuntimeError("SAM tracker mask injection failed its geometry contract")
-    frames = np.stack([observations[frame].binary_mask for frame in expected])
-    scores = np.asarray([
-        np.nan if observations[frame].frame_tracker_score is None
-        else float(observations[frame].frame_tracker_score)
-        for frame in expected
-    ], dtype=np.float64)
-    removed = np.asarray([
-        observations[frame].status == "removed" for frame in expected
-    ], dtype=np.bool_)
     output_dir = Path(str(payload["output_dir"])).resolve(strict=False)
     mask_path = output_dir / "raw_masks.npz"
     pack_started = time.perf_counter()
     _atomic_npz(
-        mask_path, packed_masks=np.packbits(frames.reshape(len(expected), -1), axis=1),
+        mask_path, packed_masks=packed,
         frame_indices=np.asarray(expected, dtype=np.int64),
         shape=np.asarray(shape, dtype=np.int64), tracker_scores=scores, removed=removed,
     )
@@ -599,10 +601,9 @@ def _execute_interpolation_tracker_task(context, kind, payload):
     }
     if isinstance(result.get('session_host_timings'), Mapping):
         manifest['session_host_timings'] = _jsonable(result['session_host_timings'])
-    owners.extend(weakref.ref(owner) for owner in (seed, frames, scores, removed))
-    owners.extend(weakref.ref(item.binary_mask) for item in observations.values())
+    owners.extend(weakref.ref(owner) for owner in (seed, packed, scores, removed))
     return {
-        "metrics": {"frame_count": len(expected), "foreground_pixels": int(frames.sum())},
+        "metrics": {"frame_count": len(expected), "foreground_pixels": foreground_pixels},
         "metadata": {"raw": True, "status": str(manifest["status"])},
     }, manifest, tuple(owners), dict(result.get('session_retirement', {}))
 
@@ -694,13 +695,17 @@ def load_tracker_run_result(
     _consumer_time('raw_packet_verify', started, cpu_started)
     started, cpu_started = time.perf_counter(), time.thread_time()
     with np.load(artifact, allow_pickle=False) as saved:
-        packed = saved["packed_masks"].copy()
-        if saved["shape"].dtype.kind not in "iu" or saved["frame_indices"].dtype.kind not in "iu":
+        packed = saved["packed_masks"]
+        raw_shape = saved["shape"]
+        if raw_shape.dtype.kind not in "iu":
             raise RuntimeError("SAM raw frame/shape packet requires integer coordinates")
-        shape = tuple(_integer(value, "raw shape") for value in saved["shape"])
-        frames = tuple(_integer(value, "raw frame") for value in saved["frame_indices"])
-        scores = saved["tracker_scores"].copy()
-        removed = saved["removed"].copy()
+        raw_frames = saved["frame_indices"]
+        if raw_frames.dtype.kind not in "iu":
+            raise RuntimeError("SAM raw frame/shape packet requires integer coordinates")
+        shape = tuple(_integer(value, "raw shape") for value in raw_shape)
+        frames = tuple(_integer(value, "raw frame") for value in raw_frames)
+        scores = saved["tracker_scores"]
+        removed = saved["removed"]
     _consumer_time('raw_packet_decode', started, cpu_started)
     crop = tuple(_integer(value, "manifest crop") for value in manifest["crop_xyxy"])
     expected_shape = (crop[3] - crop[1], crop[2] - crop[0])
@@ -1725,8 +1730,16 @@ class SamInterpolationTracker:
             proof = self._source_cache_retirement_proofs[scope.cache_key]
             if proof['active_scopes'] <= 0:
                 raise RuntimeError('SAM scoped image owner count underflow')
+        packing_error = None
         if scope.admission is not None:
-            scope.admission.release_scope()
+            try:
+                scope.admission.release_scope()
+            except BaseException as exc:
+                with scope.admission._lock:
+                    if scope.admission._scope_active:
+                        raise
+                packing_error = exc
+                complete = False
         with self._state_condition:
             if self._scopes.pop(scope.token, None) is not scope:
                 raise RuntimeError('SAM scoped iterator changed during credit retirement')
@@ -1745,6 +1758,8 @@ class SamInterpolationTracker:
             scope.ready.clear()
             scope.completed.clear()
             self._state_condition.notify_all()
+        if packing_error is not None:
+            raise packing_error
 
     def _retire_abandoned_scopes(self):
         if not self.workers_settled:

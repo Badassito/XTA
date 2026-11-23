@@ -79,6 +79,25 @@ class YoloCpuInputTests(unittest.TestCase):
                             expected=render_fullframe_frame_for_job(cube,descriptor['view'],descriptor['job'],index)
                             np.testing.assert_array_equal(render(index),expected)
 
+    def test_coronal_prefetch_preserves_plane_order_across_slab_boundaries(self):
+        descriptor = task('coronal', count=10)
+        owner, executor, _closed = self._prefetch([descriptor])
+        executor.run()
+        reference = NativeCartesianRenderer(self.volume, descriptor['view'], descriptor['job'])
+        np.testing.assert_array_equal(owner.packets[0].array, np.stack([reference(i) for i in range(10)]))
+
+    def test_shutdown_leaves_unretired_mapping_charged_on_deadline(self):
+        descriptor = task(count=1)
+        owner, executor, _closed = self._prefetch([descriptor])
+        executor.run()
+        with mock.patch.object(owner, '_close_packet', return_value=False), \
+                mock.patch('XTA.yolo_cpu_input._RETIREMENT_SHUTDOWN_SECONDS', 0):
+            with self.assertRaisesRegex(TimeoutError, 'still hold mappings'):
+                owner.shutdown()
+        self.assertGreater(owner.bytes, 0)
+        owner.shutdown()
+        self.assertEqual(owner.bytes, 0)
+
     def _prefetch(self, tasks, max_bytes=100000):
         executor=ManualExecutor()
         closed=[]

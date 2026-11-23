@@ -7,6 +7,7 @@ There is no padding, crop growth, predicted seed handoff, or neighbor fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
@@ -153,18 +154,46 @@ def tile_descriptor(run, tile):
         status="not_attempted_empty_original_seed" if not tile.attempted else "not_attempted")
 
 
+def _remove_scratch_directory(directory):
+    try:
+        directory.rmdir()
+    except FileNotFoundError:
+        pass
+
+
+def _settle_scratch_cleanup(actions, primary_error=None):
+    first_error = primary_error
+    for action in actions:
+        try:
+            action()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+            else:
+                add_note = getattr(first_error, 'add_note', None)
+                if callable(add_note):
+                    add_note(f'SAM scratch cleanup also failed: {error}')
+    if primary_error is None and first_error is not None:
+        raise first_error
+
+
 class TiledRunAssembly:
     """File-backed fixed owners; halo arrays are streamed to the evidence writer."""
     def __init__(self, run, group, tiles, directory):
         self.run, self.group, self.tiles = run, group, tuple(tiles)
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
         y0, x0, y1, x1 = group.context_bbox_yx
         self.shape = (len(run.expected_frames), y1-y0, x1-x0)
         self.frame_indices = {int(frame): index for index, frame in enumerate(run.expected_frames)}
         self.raw_path, self.available_path = self.directory / "owned.bool.dat", self.directory / "available.bool.dat"
-        self.raw = np.memmap(self.raw_path, mode="w+", dtype=bool, shape=self.shape)
-        self.available = np.memmap(self.available_path, mode="w+", dtype=bool, shape=self.shape)
+        self.raw = self.available = None
+        self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            self.raw = np.memmap(self.raw_path, mode="w+", dtype=bool, shape=self.shape)
+            self.available = np.memmap(self.available_path, mode="w+", dtype=bool, shape=self.shape)
+        except BaseException as error:
+            _settle_scratch_cleanup((self.close,), error)
+            raise
         self.finished, self.receipts = set(), {}
 
     @property
@@ -216,12 +245,7 @@ class TiledRunAssembly:
         return {frame: self.available[index] for frame, index in self.frame_indices.items()}
 
     def close(self):
-        for array in (self.raw, self.available):
-            array.flush()
-            array._mmap.close()
-        for path in (self.raw_path, self.available_path):
-            path.unlink(missing_ok=True)
-        try:
-            self.directory.rmdir()
-        except OSError:
-            pass
+        cleanup = [array._mmap.close for array in (self.raw, self.available) if array is not None]
+        cleanup.extend(partial(path.unlink, missing_ok=True) for path in (self.raw_path, self.available_path))
+        cleanup.append(partial(_remove_scratch_directory, self.directory))
+        _settle_scratch_cleanup(cleanup)

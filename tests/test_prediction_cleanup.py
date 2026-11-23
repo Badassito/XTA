@@ -20,6 +20,20 @@ def ring_volume():
     return mask
 
 
+@pytest.mark.parametrize('radius, kept', [(4.9, True), (5.0, True), (5.1, False)])
+def test_full_foreground_radius_matches_all_unpadded_cleanup_paths(radius, kept):
+    plane = np.ones((3, 4), dtype=np.uint8)
+    structure = np.ones((3, 3), dtype=bool)
+    for result in (
+        cleanup._filter_connected_components_by_min_radius_opencv(plane, radius),
+        cleanup._filter_connected_components_by_min_radius_scipy(plane, structure, radius),
+        inference._min_radius_filter_ndimage(np, ndimage, plane, radius),
+    ):
+        assert result.dtype == np.bool_
+        assert not np.shares_memory(plane, result)
+        np.testing.assert_array_equal(result, kept)
+
+
 @pytest.mark.parametrize('backend', ['opencv', 'scipy'])
 def test_component_order_and_confidence_retirement(backend):
     mask = ring_volume()

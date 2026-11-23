@@ -44,6 +44,15 @@ def _patterns():
     return source
 
 
+def test_border_label_scatter_matches_separate_plane_hole_fills():
+    from XTA._prediction_cleanup import _device_enclosed_background
+
+    source = _patterns().astype(bool)
+    expected = np.stack([ndimage.binary_fill_holes(plane) for plane in source])
+    actual = source | _device_enclosed_background(np, ndimage, ~source)
+    np.testing.assert_array_equal(actual, expected)
+
+
 @pytest.mark.skipif(os.environ.get('XTA_TEST_NATIVE_PULL_CUDA')!='1',reason='GPU lock and explicit actual CUDA required')
 @pytest.mark.parametrize('leases',[(17,),(7,5,5)],ids=['whole-stack','disjoint-split-leases'])
 def test_actual_device_fill_matches_scipy_and_reports_all_lease_frames(monkeypatch,leases):

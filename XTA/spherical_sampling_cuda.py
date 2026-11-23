@@ -18,6 +18,7 @@ __device__ __forceinline__ float voxel(
     int t0 = clip_i((int)floorf(rf), nt), t1 = clip_i(t0 + 1, nt);
     float alpha = clip_r(rf - (float)t0, 0.f, 1.f);
     float a = (float)src[(unsigned long long)t0 * stride + at];
+    if (t0 == t1 || alpha == 0.f) return a;
     float b = (float)src[(unsigned long long)t1 * stride + at];
     return (float)__float2uint_rn(fminf(255.f, fmaxf(0.f, a + alpha * (b - a))));
 }
@@ -39,14 +40,16 @@ extern "C" __global__ void spherical_virtual_fp32(
     #pragma unroll
     for (int it=0; it<2; ++it) {
         int ti=t0+it; float wt=it ? dt : 1.f-dt;
+        if (wt == 0.f || ti < 0 || ti >= lt) continue;
         #pragma unroll
         for (int iy=0; iy<2; ++iy) {
             int yi=y0+iy; float wy=iy ? dy : 1.f-dy;
+            if (wy == 0.f || yi < 0 || yi >= h) continue;
             #pragma unroll
             for (int ix=0; ix<2; ++ix) {
                 int xi=x0+ix; float wx=ix ? dx : 1.f-dx;
-                if (ti>=0 && ti<lt && yi>=0 && yi<h && xi>=0 && xi<w)
-                    value += voxel(src,ti,yi,xi,nt,lt,h,w) * ((wt*wy)*wx);
+                if (wx == 0.f || xi < 0 || xi >= w) continue;
+                value += voxel(src,ti,yi,xi,nt,lt,h,w) * ((wt*wy)*wx);
             }
         }
     }

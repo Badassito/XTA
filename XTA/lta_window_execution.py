@@ -306,7 +306,15 @@ def _drive_windows_with_coverage(
                 if list(manifest["output_frame_range"]) != [parent_payload["output_frame_start"], parent_payload["output_frame_stop"]]:
                     raise RuntimeError("worker result changed its owned window frame range")
                 _relays, union_artifact = coordinator._consume_chain_manifest(manifest, view_union=view_union)
-                outgoing = coordinator._verified_dogfood_artifacts(manifest, parent_payload)
+                input_seeds = ()
+                if manifest.get("dogfood_seed_artifacts") or manifest.get("lineage_coverage") is not None:
+                    input_seeds = read_seed_artifact(
+                        str(parent_payload["seed_artifact_path"]),
+                        expected_sha256=str(parent_payload["seed_artifact_sha256"]),
+                    )
+                outgoing = coordinator._verified_dogfood_artifacts(manifest, input_seeds)
+                input_lineages = tuple(seed.lineage for seed in input_seeds)
+                del input_seeds
             coordinator._unlink_consumed_temp_artifacts((union_artifact,), temp_root=temp_root)
             reduced_work_ids.add(worker_result.work_id)
             empty_children: list[str] = []
@@ -344,7 +352,9 @@ def _drive_windows_with_coverage(
                 used_seed_paths.add(str(artifact["path"]))
             coverage_phase = trace.phase("lineage_coverage_ingest", work_id=worker_result.work_id) if trace is not None else nullcontext()
             with coverage_phase:
-                coordinator._ingest_lineage_coverage(manifest, parent_payload, coverage, temp_root=temp_root)
+                coordinator._ingest_lineage_coverage(
+                    manifest, parent_payload, coverage, temp_root=temp_root, input_lineages=input_lineages,
+                )
             scheduler.complete(claim, worker_result)
             for child_id in empty_children:
                 skip_branch(child_id)

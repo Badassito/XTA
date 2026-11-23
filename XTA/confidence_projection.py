@@ -263,14 +263,16 @@ def resize_score_plane_max(plane, output_hw):
     return result
 
 
-def read_score_slice_in_output_shape(source, output_shape, z):
+def read_score_slice_in_output_shape(source, output_shape, z, *, read_native=None):
     from .outputs import _restore_source_indices_for_output_z
     shape = tuple(map(int, output_shape))
     if not 0 <= int(z) < shape[0]:
         raise IndexError('Confidence output slice is outside its grid')
     result = np.zeros(shape[1:], dtype=np.uint8)
     for index in _restore_source_indices_for_output_z(int(source.shape[0]), shape[0], int(z)):
-        np.maximum(result, resize_score_plane_max(source[index], shape[1:]), out=result)
+        plane = source[index] if read_native is None else read_native(index)
+        if plane is not None:
+            np.maximum(result, resize_score_plane_max(plane, shape[1:]), out=result)
     return result
 
 

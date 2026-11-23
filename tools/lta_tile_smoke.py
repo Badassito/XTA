@@ -44,14 +44,15 @@ from lta_point_smoke import (
     build_centerline_strategy,
     build_distance_strategy,
     mask_metrics,
-    rasterize_polygons,
     run_point_strategy,
     write_strategy_artifacts,
 )
 from XTA.lta_inputs import parse_yolo_segmentation_label
 from XTA.lta_tiles import (
     TilePlan,
+    masks_for_tile,
     plan_object_tile,
+    rasterize_polygon_on_tile,
     select_polygon_row,
     transform_polygon_to_tile,
 )
@@ -369,10 +370,11 @@ def main() -> None:
         source_width=source_width,
         source_height=source_height,
     )
-    local_polygons = tuple(transform_polygon_to_tile(item, tile) for item in polygons)
     local_polygon = transform_polygon_to_tile(selected_polygon, tile)
-    target_mask = rasterize_polygons((local_polygon,))
-    all_foreground = rasterize_polygons(local_polygons)
+    target_mask = rasterize_polygon_on_tile(selected_polygon, tile)
+    all_foreground = target_mask.copy()
+    for mask in masks_for_tile(polygons, tile):
+        all_foreground |= mask
     runtime = resolve_pinned_sam_runtime_provenance()
 
     torch.cuda.set_device(int(args.device))

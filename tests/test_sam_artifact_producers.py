@@ -1,13 +1,14 @@
 """Live archived SAM outputs preserve masks, retries, and interrupted evidence."""
+import errno
 import json
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 import tempfile
 
 import numpy as np
 import pytest
 
-from XTA.artifact_archive import iter_artifacts, read_artifact, reference, split_reference
+from XTA.artifact_archive import StagedArtifactArchive, iter_artifacts, read_artifact, reference, split_reference
 from XTA.interpolation import RawBBoxMaskStore
 from XTA.sam_evidence import SamEvidenceBundle, load_sam_online_selection
 from XTA.sam_interpolation import SamInterpolationInfrastructureError, interpolate_sam_view_volume_pass
@@ -43,7 +44,15 @@ def _decode_components(components, shape):
     return result
 
 
-def test_interpolation_publishes_evidence_receipt_and_cvol_during_run(archive_root, tmp_path):
+@pytest.mark.parametrize('staged', [False, True])
+def test_interpolation_publishes_evidence_receipt_and_cvol_during_run(archive_root, tmp_path, staged):
+    output_archive, _ = split_reference(archive_root)
+    pending = StagedArtifactArchive.reserve(output_archive, tmp_path) if staged else None
+    with (closing(pending) if staged else nullcontext()):
+        _assert_interpolation_publishes_evidence(archive_root, tmp_path, pending)
+
+
+def _assert_interpolation_publishes_evidence(archive_root, tmp_path, pending):
     original = _observations()
     merged, stats, components = interpolate_sam_view_volume_pass(original,
         work_dir=archive_root, runtime_work_dir=tmp_path/'runtime', runtime=RepeatedSeedTracker(),
@@ -55,8 +64,16 @@ def test_interpolation_publishes_evidence_receipt_and_cvol_during_run(archive_ro
         assert selection['selection_identity'] == stats['sam_selection_identity']
         generation = json.loads(read_artifact(bundle.directory.parent/'generation.json'))
         assert generation['sam_selected_runs'] == 2
+        assert 'sam_selection_receipt' not in generation
+        assert stats['sam_selection_receipt']['selection_identity'] == selection['selection_identity']
         np.testing.assert_array_equal(_decode_components(components, original.shape), merged & ~original)
         assert stats['added_voxels'] == 108
+        if pending is not None:
+            assert not pending.destination.exists()
+            assert Path(stats['sam_evidence_path']).is_relative_to(archive_root)
+            pending.publish()
+            assert pending.destination.exists()
+            np.testing.assert_array_equal(_decode_components(components, original.shape), merged & ~original)
         _assert_output_has_no_loose_artifacts(archive_root)
     finally:
         merged._mmap.close()
@@ -73,10 +90,39 @@ def test_failed_tracker_preserves_committed_partial_evidence_without_outputs(arc
     failures = list(iter_artifacts(archive_root, 'failure.json'))
     assert len(failures) == 1 and json.loads(read_artifact(failures[0]))['complete'] is False
     assert not list(iter_artifacts(archive_root, 'meta.json'))
+    assert not list(Path(tempfile.gettempdir()).glob('sam-runtime-*'))
     _assert_output_has_no_loose_artifacts(archive_root)
 
 
-def test_failed_cvol_append_preserves_recovery_stage_and_committed_evidence(archive_root, tmp_path, monkeypatch):
+def test_noop_archived_interpolation_removes_empty_runtime(archive_root):
+    source = np.zeros_like(_observations())
+    result, stats, components = interpolate_sam_view_volume_pass(source,
+        work_dir=archive_root, crop_mode='tiled', return_bridge_components=True)
+    assert result is source and stats['added_voxels'] == 0 and len(components) == 2
+    assert not list(Path(tempfile.gettempdir()).glob('sam-runtime-*'))
+
+
+def test_tiled_tail_cleanup_does_not_mask_allocation_failure(archive_root, monkeypatch):
+    from XTA.sam_crop_tiling import TiledRunAssembly
+    case = _case(archive_root, mode='tiled')
+    failure = OSError(errno.ENOSPC, 'controlled assembly disk exhaustion')
+
+    def fail_assembly(_self, _run, _group, _tiles, directory):
+        # Simulate a partial child whose own cleanup did not finish.
+        directory.mkdir(parents=True)
+        raise failure
+
+    monkeypatch.setattr(TiledRunAssembly, '__init__', fail_assembly)
+    with pytest.raises(OSError) as raised:
+        case.run()
+    assert raised.value is failure
+    if hasattr(failure, 'add_note'):
+        assert any('scratch cleanup also failed' in note for note in failure.__notes__)
+
+
+@pytest.mark.parametrize('caller_workspace', [False, True])
+def test_failed_cvol_append_preserves_recovery_stage_and_committed_evidence(archive_root, tmp_path, monkeypatch,
+                                                                         caller_workspace):
     from XTA import artifact_archive
     publish = artifact_archive.publish_directory
 
@@ -86,19 +132,34 @@ def test_failed_cvol_append_preserves_recovery_stage_and_committed_evidence(arch
         return publish(staging, destination)
 
     monkeypatch.setattr(artifact_archive, 'publish_directory', fail_cvol)
+    work = tmp_path/'runtime' if caller_workspace else None
     with pytest.raises(SamInterpolationInfrastructureError, match='controlled archive append failure'):
         interpolate_sam_view_volume_pass(_observations(), work_dir=archive_root,
-            runtime_work_dir=tmp_path/'runtime', runtime=RepeatedSeedTracker(), gap_distance=5,
+            runtime_work_dir=work, runtime=RepeatedSeedTracker(), gap_distance=5,
             min_radius=0, interpolation_walk_back=0, return_bridge_components=True)
     evidence = next(iter_artifacts(archive_root, 'manifest.json'))
     assert json.loads(read_artifact(evidence))['complete'] is True
     assert list(iter_artifacts(archive_root, 'selection.json'))
     assert not list(iter_artifacts(archive_root, 'generation.json'))
     assert not list(iter_artifacts(archive_root, 'meta.json'))
-    stages = list((tmp_path/'runtime').rglob('.artifact-stage-*'))
+    stages = list((work or Path(tempfile.gettempdir())).rglob('.artifact-stage-*'))
     assert len(stages) == 1
     assert {path.name for path in stages[0].iterdir()} == {'meta.json', 'index.bin', 'chunks.bin'}
     _assert_output_has_no_loose_artifacts(archive_root)
+
+
+def test_tiled_retry_cleanup_preserves_tracker_failure(archive_root, monkeypatch):
+    rmdir = Path.rmdir
+
+    def block_retry_cleanup(path):
+        if path.name.startswith('sam-retry-tiles-'):
+            raise OSError(errno.ENOTEMPTY, 'controlled retry scratch retention')
+        return rmdir(path)
+
+    monkeypatch.setattr(Path, 'rmdir', block_retry_cleanup)
+    with pytest.raises(RuntimeError, match='optional retry SDK failure'):
+        _execute(archive_root, crop_mode='tiled', fail_retry=True)
+    assert not list(Path(tempfile.gettempdir()).glob('sam-runtime-*'))
 
 
 @pytest.mark.parametrize('mode', ['whole', 'tiled'])

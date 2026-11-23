@@ -72,18 +72,37 @@ def test_wholly_erased_foreground_slice_keeps_a_bounded_patch():
     ) == (1, 0)
 
 
-def test_boundary_patch_is_clipped_to_the_erased_slice():
-    source = np.zeros((3, 5, 5), dtype=np.uint8)
+@pytest.mark.parametrize("imgsz, side", [(0, 3), (32, 7)])
+def test_boundary_patch_remains_polygon_capable(tmp_path, monkeypatch, imgsz, side):
+    from XTA.pta_config import parse_pta_args
+    from XTA.pta_runtime import build_runtime_options
+
+    source = np.zeros((3, 64, 64), dtype=np.uint8)
     source[0, 0, 0] = 1
-    processed = np.zeros_like(source)
-
-    assert pta.reassert_foreground_slice_anchors(
-        processed, _anchors(source), source_shape=source.shape, patch_radius=2,
-    ) == (1, 1)
-
+    loaded = pta.SourceVolume(
+        input_dir=tmp_path, stem="sample", kind="sequence", image_paths=[], video_path=None,
+        labels_by_frame={}, segmentation_nrrd_path=tmp_path / "sample.nrrd", mask_volume=source,
+        volume_class="fully_labeled", label_source="nrrd", input_start_index=0,
+        encoded_indices=(0, 1, 2), volume=np.zeros_like(source), fps=1.0,
+    )
+    monkeypatch.setattr(pta, "resize_to_approximately_cube", lambda image, mask, **kwargs:
+                        (image, np.zeros_like(mask), mask.shape))
+    args = build_runtime_options(parse_pta_args([
+        "--input", str(tmp_path), "--enable_cartesian", "transverse", "--imgsz", str(imgsz),
+        "--save", "images", "labels",
+    ]))
+    prepared = pta.prepare_loaded_source(
+        loaded, args=args, warnings=pta.WarningLog(), workers=1, out_dir=tmp_path,
+        tile_configs=(), channel_variants=(pta.DEFAULT_CHANNEL_VARIANT,), write_side_effects=False,
+    )
+    assert prepared.foreground_preservation_stats["processed_anchor_repairs"] == 1
     expected = np.zeros_like(source)
-    expected[0, :3, :3] = 1
-    np.testing.assert_array_equal(processed, expected)
+    expected[0, :side, :side] = 1
+    np.testing.assert_array_equal(prepared.mask_for_render, expected)
+    rendered, _canvas = pta.render_plan_frame_mask_source(
+        mask=prepared.mask_for_render, plan=prepared.plans[0], idx=0,
+    )
+    assert pta.mask_has_yolo_polygon(rendered)
 
 
 @pytest.mark.parametrize("shape", [(22, 19, 23), (22, 25, 29)])

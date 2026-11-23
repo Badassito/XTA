@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
+from contextlib import ExitStack
 from functools import wraps
 from typing import Mapping
 
@@ -13,6 +15,9 @@ _NATIVE_THREAD_VARIABLES = (
     "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
     "BLIS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
 )
+_HOST_THREAD_LOCK = threading.Lock()
+_HOST_THREAD_RESTORE = ExitStack()
+_HOST_THREAD_USERS = 0
 
 
 def _positive_prefix(value: object) -> int | None:
@@ -122,7 +127,7 @@ def host_native_thread_counts() -> dict[str, int | None]:
 
 
 def bounded_lta_host_threads(function):
-    """Limit nested native pools while LTA's explicit CPU workers share the node.
+    """Limit OpenCV's host pool while LTA's explicit CPU workers share the node.
 
     OpenCV's default whole-node pool can otherwise compete with every GPU
     worker or multiply an explicit ThreadPoolExecutor's parallelism. Restore
@@ -130,21 +135,23 @@ def bounded_lta_host_threads(function):
     """
     @wraps(function)
     def wrapped(*args, **kwargs):
+        global _HOST_THREAD_RESTORE, _HOST_THREAD_USERS
         import cv2
-        libraries = [(cv2, "getNumThreads", "setNumThreads")]
-        torch = sys.modules.get("torch")
-        if torch is not None and callable(getattr(torch, "get_num_threads", None)):
-            libraries.append((torch, "get_num_threads", "set_num_threads"))
-        previous = []
+        with _HOST_THREAD_LOCK:
+            if not _HOST_THREAD_USERS:
+                with ExitStack() as restore:
+                    restore.callback(cv2.setNumThreads, int(cv2.getNumThreads()))
+                    cv2.setNumThreads(1)
+                    _HOST_THREAD_RESTORE = restore.pop_all()
+            _HOST_THREAD_USERS += 1
         try:
-            for module, getter, setter in libraries:
-                old = int(getattr(module, getter)())
-                previous.append((module, setter, old))
-                getattr(module, setter)(1)
+            # Torch CPU work runs in the spawned workers, which set their own limits.
             return function(*args, **kwargs)
         finally:
-            for module, setter, old in reversed(previous):
-                getattr(module, setter)(old)
+            with _HOST_THREAD_LOCK:
+                _HOST_THREAD_USERS -= 1
+                if not _HOST_THREAD_USERS:
+                    _HOST_THREAD_RESTORE.close()
     return wrapped
 
 

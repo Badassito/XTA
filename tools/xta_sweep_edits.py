@@ -126,6 +126,11 @@ def validate_sweep_source_pair(bundle_dir, bundle, low_manifest, full_manifest, 
     _xta_sweep_run(original_run,run_sha,cent,binding['sweep_id'],source_mode)
     for key in ('preview_manifest_relative','native_manifest_relative','run_manifest_relative','branch_dir_relative'):
         _xta_sweep_child(root,binding[key])
+    storage = binding.get('source_storage', 'scalar')
+    if storage not in {'scalar', 'grouped'}:
+        raise ValueError('Unsupported sweep edit source storage.')
+    if storage == 'grouped':
+        _xta_sweep_child(root, binding['review_manifest_relative'])
     if verify_original_paths:
         relative_low = Path(binding['preview_manifest_relative'])
         # Relocation preserves the declared branch tree, not a particular machine path.
@@ -136,9 +141,19 @@ def validate_sweep_source_pair(bundle_dir, bundle, low_manifest, full_manifest, 
         expected_low = _xta_sweep_child(source_root,binding['preview_manifest_relative'])
         expected_full = _xta_sweep_child(source_root,binding['native_manifest_relative'])
         expected_run = _xta_sweep_child(source_root,binding['run_manifest_relative'])
+        if storage == 'grouped':
+            review = _xta_sweep_child(source_root, binding['review_manifest_relative'])
+            if (_xta_sweep_digest(review) != binding['review_manifest_sha256']
+                    or review.parent == source_root
+                    or not review.parent.is_relative_to(source_root)):
+                raise ValueError('Original grouped sweep review changed since export.')
+            source_directory = review.parent
+        else:
+            source_directory = branch
         standard_branch = branch.name == f'conf_{cent:03d}' and branch.parent.name == 'confidence_cutoffs'
         if ((source_mode == 'confidence_sweep' and not standard_branch) or branch == source_root
-                or not all(path.is_relative_to(branch) for path in (expected_low,expected_full,expected_run))
+                or not all(path.is_relative_to(source_directory) for path in (expected_low, expected_full))
+                or not expected_run.is_relative_to(branch)
                 or expected_run.parent != branch or expected_run.name != 'manifest.json'
                 or expected_low != Path(low_manifest).resolve() or expected_full != Path(full_manifest).resolve()):
             raise ValueError('Sweep source paths do not belong to the bound cutoff branch.')
@@ -152,6 +167,9 @@ def validate_sweep_source_pair(bundle_dir, bundle, low_manifest, full_manifest, 
     if _xta_sweep_digest(original_full) != full_sha or _xta_sweep_digest(full_manifest) != full_sha:
         raise ValueError('Sweep cutoff native source-manifest mismatch.')
     low, full = _xta_sweep_json(original_low), _xta_sweep_json(original_full)
+    if any((record.get('layout') == 'grouped_sweep_segments') != (storage == 'grouped')
+           for record in (low, full)):
+        raise ValueError('Sweep edit source storage disagrees with its bound source catalogues.')
     if (_xta_sweep_shape(bundle.get('preview_shape_tyx')) != _xta_sweep_shape(low['output_shape_tyx'])
             or _xta_sweep_shape(bundle.get('full_quality_shape_tyx')) != _xta_sweep_shape(full['output_shape_tyx'])
             or _xta_sweep_shape(low['full_quality_output_shape_tyx']) != _xta_sweep_shape(full['output_shape_tyx'])):
@@ -185,10 +203,13 @@ def validate_sweep_source_pair(bundle_dir, bundle, low_manifest, full_manifest, 
                 raise ValueError(f'Sweep source logical identity mismatch: {key}')
         if edit.get('name') != row['segment_name'] or edit.get('recomposition_op') != original.get('recomposition_op'):
             raise ValueError('Sweep edited name/operation differs from its original scalar layer.')
-    return dict(schema=binding['schema'], sweep_id=binding['sweep_id'], cutoff_cent=cent,
+    report = dict(schema=binding['schema'], sweep_id=binding['sweep_id'], cutoff_cent=cent,
                 source_mode=source_mode,grid_id=grid_id, preview_manifest_sha256=low_sha, native_manifest_sha256=full_sha,
                 run_manifest_sha256=run_sha,logical_layer_count=len(identities),
                 status='source_pair_metadata_verified_before_native_payload')
+    if storage == 'grouped':
+        report.update(source_storage='grouped', review_manifest_sha256=binding['review_manifest_sha256'])
+    return report
 
 
 def resolve_cut_bundle(root, cutoff_cent, *, grid_id=None):

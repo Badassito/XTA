@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import contextvars
-import gc
 import inspect
 import math
 import os
@@ -513,7 +512,8 @@ class GpuFlattenedRetinaPayload:
     run_gpu_cleanup: bool = False
     gpu_min_radius: float = 0.0
     semantic_min_conf_u8: int = 0
-    cleanup_done_on_gpu: bool = False
+    semantic_gpu_filter: bool = field(default=True, kw_only=True)
+    cleanup_done_on_gpu: bool = False  # The frame processor already handled cleanup (including semantic recovery).
     # CUDA event recorded on the producing stream after union/conf were computed,
     # so the postprocess side stream can order against the producer without a host sync.
     ready_event: Optional[object] = None
@@ -939,11 +939,13 @@ def _iter_cpu_retina_payload_rois(
 def _accumulate_cpu_retina_payload_to_prediction_frame(
     payload: CpuRetinaMaskPayload,
     out_size: int,
-) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Build a prediction-space union/confidence frame from CPU-side retina payload tensors."""
+    *,
+    track_confidence: bool = True,
+) -> Tuple[np.ndarray, Optional[np.ndarray], int]:
+    """Build a prediction-space union and an optional observed-score plane."""
     target_shape = (int(out_size), int(out_size))
     frame_union = np.zeros(target_shape, dtype=np.uint8)
-    frame_confmap = np.zeros(target_shape, dtype=np.uint8)
+    frame_confmap = np.zeros(target_shape, dtype=np.uint8) if track_confidence else None
     kept_instances = 0
 
     # The generated inference videos are square --imgsz frames. If a future source ever reports a
@@ -952,9 +954,10 @@ def _accumulate_cpu_retina_payload_to_prediction_frame(
     for _inst_idx, conf_val, y1, y2, x1, x2, roi_mask in _iter_cpu_retina_payload_rois(payload, target_shape):
         roi_u8 = roi_mask.astype(np.uint8, copy=False)
         frame_union[y1:y2, x1:x2] |= roi_u8
-        conf_u8 = quantize_conf_to_u8(float(conf_val))
-        conf_patch = frame_confmap[y1:y2, x1:x2]
-        conf_patch[roi_mask] = np.maximum(conf_patch[roi_mask], conf_u8)
+        if frame_confmap is not None:
+            conf_u8 = quantize_conf_to_u8(float(conf_val))
+            conf_patch = frame_confmap[y1:y2, x1:x2]
+            conf_patch[roi_mask] = np.maximum(conf_patch[roi_mask], conf_u8)
         kept_instances += 1
 
     return frame_union, frame_confmap, int(kept_instances)
@@ -1444,7 +1447,8 @@ def _torch_warp_planes_to_native(
         and _warp_matrix_is_identity(M_out_to_native)
     ):
         return prepared
-    inp = torch.stack(prepared, dim=0).unsqueeze(0)  # (1, K, out_size, out_size)
+    inp = (prepared[0][None, None] if len(prepared) == 1
+           else torch.stack(prepared, dim=0).unsqueeze(0))
     theta_np = _affine_theta_for_grid_sample(M_out_to_native, int(out_size), int(native_h), int(native_w))
     grid = _get_cached_affine_grid(theta_np, int(native_h), int(native_w), inp.device)
     out = F.grid_sample(inp, grid, mode='nearest', padding_mode='zeros', align_corners=False)
@@ -1462,6 +1466,8 @@ def _min_radius_filter_ndimage(xp, ndi, mask_bool, min_radius: float):
     num_i = int(num)
     if num_i <= 0:
         return xp.zeros(mask_bool.shape, dtype=bool)
+    if num_i == 1 and bool(mask_bool.all()):
+        return xp.full(mask_bool.shape, math.hypot(*mask_bool.shape) >= float(min_radius), dtype=bool)
     label_ids = xp.arange(1, num_i + 1)
     dist = ndi.distance_transform_edt(mask_bool)
     radii = xp.asarray(ndi.maximum(dist, labels=labels2d, index=label_ids))
@@ -1658,6 +1664,7 @@ def _process_cpu_retina_prediction_frame(
     frame_union, frame_confmap, kept_instances = _accumulate_cpu_retina_payload_to_prediction_frame(
         payload,
         int(out_size),
+        track_confidence=view_confmap_mm is not None or restore_planes is not None,
     )
     if restore_planes is not None:
         frame_union, frame_confmap = restore_planes([frame_union, frame_confmap])
@@ -1674,7 +1681,7 @@ def _process_cpu_retina_prediction_frame(
     ) > 0
 
     native_conf: Optional[np.ndarray] = None
-    if frame_confmap is not None and np.any(frame_confmap):
+    if view_confmap_mm is not None and frame_confmap is not None and np.any(frame_confmap):
         native_conf = cv2.warpAffine(
             frame_confmap,
             M_out_to_native,
@@ -2077,7 +2084,7 @@ class _DeviceUnionAccumulator:
         self.register_producer_stream(producer_stream)
         # Runs on the calling thread's side stream (inside the frame processor's stream ctx);
         # slice indices are disjoint across threads, so no lock is needed.
-        self.union_dev[int(idx)] = union_bool_t.to(self.torch.uint8)
+        self.union_dev[int(idx)].copy_(union_bool_t, non_blocking=True)
         if self.conf_dev is not None and conf_u8_t is not None:
             self.conf_dev[int(idx)] = conf_u8_t
         if prediction_count_dev is not None:
@@ -2133,9 +2140,7 @@ class _DeviceUnionAccumulator:
     def fill_holes_2d(self) -> int:
         """Fill enclosed per-slice 2D background on the device.
 
-        Each block runs in a nested scope so its CuPy labels and Boolean temporaries lose
-        their final references before the CuPy pool is trimmed. Returns the filled frame
-        count, or zero so the caller performs the CPU pass when the device path is unsafe.
+        Return the number of device-cleaned frames, or zero to use the completed-view CPU path.
         """
         torch = self.torch
         if self.union_dev is None or bool(self.host_written):
@@ -2148,7 +2153,6 @@ class _DeviceUnionAccumulator:
         if n <= 0 or h < 3 or w < 3:
             return 0
         dev_idx = int(getattr(self.device, 'index', 0) or 0)
-        structure = None
         filled = 0
         try:
             torch.cuda.synchronize(self.device)
@@ -2162,42 +2166,23 @@ class _DeviceUnionAccumulator:
                     if int(free_bytes) >= int(need):
                         break
                     block //= 2
-                structure = cp.zeros((3, 3, 3), dtype=cp.bool_)
-                structure[1, 1, 1] = True
-                structure[1, 0, 1] = True
-                structure[1, 2, 1] = True
-                structure[1, 1, 0] = True
-                structure[1, 1, 2] = True
-
                 def _fill_block(z0: int, z1: int) -> None:
                     blk = cp.asarray(self.union_dev[int(z0):int(z1)])
-                    bg = blk == 0
-                    labels, num = cpx_ndi.label(bg, structure=structure)
-                    if int(num) <= 0:
-                        return
-                    touches = cp.zeros((int(num) + 1,), dtype=cp.bool_)
-                    touches[cp.unique(labels[:, 0, :])] = True
-                    touches[cp.unique(labels[:, -1, :])] = True
-                    touches[cp.unique(labels[:, :, 0])] = True
-                    touches[cp.unique(labels[:, :, -1])] = True
-                    enclosed = bg & ~touches[labels]
-                    if bool(enclosed.any()):
-                        blk[enclosed] = cp.uint8(1)
+                    enclosed = _prediction_cleanup._device_enclosed_background(cp, cpx_ndi, blk == 0)
+                    cp.maximum(blk, enclosed, out=blk)
 
-                for z0 in range(0, n, int(block)):
-                    _fill_block(int(z0), min(n, int(z0) + int(block)))
-                cp.cuda.get_current_stream().synchronize()
+                # Release only this task's scratch so sibling CUDA stages can claim it.
+                pool = cp.cuda.MemoryPool()
+                with cp.cuda.using_allocator(pool.malloc):
+                    try:
+                        for z0 in range(0, n, int(block)):
+                            _fill_block(int(z0), min(n, int(z0) + int(block)))
+                    finally:
+                        cp.cuda.get_current_stream().synchronize()
+                        pool.free_all_blocks()
                 filled = int(n)
         except Exception:
             filled = 0
-        finally:
-            structure = None
-            gc.collect()
-            try:
-                with cp.cuda.Device(dev_idx):
-                    cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
         return int(filled)
 
     def compute_slice_metadata(
@@ -2550,7 +2535,13 @@ def _process_gpu_flattened_prediction_frame(
             owner.consume_empty(ordinal, owner.floor_cent, instance_count, frames=0)
         return int(instance_count), 0
 
-    track_conf = view_confmap_mm is not None or bool(getattr(device_union, 'retain_confidence', False))
+    semantic_min_conf = int(payload.semantic_min_conf_u8)
+    semantic_conf_pending = semantic_min_conf > 0
+    track_conf = (
+        view_confmap_mm is not None
+        or bool(getattr(device_union, 'retain_confidence', False))
+        or semantic_min_conf > 0
+    )
     native_union_np: Optional[np.ndarray] = None
     native_conf_np: Optional[np.ndarray] = None
     cleaned_on_gpu = False
@@ -2591,23 +2582,24 @@ def _process_gpu_flattened_prediction_frame(
             native_union_bool_t, native_conf_t = _warp_flattened_native_planes(
                 payload, M_out_to_native, out_size, native_h, native_w, track_conf)
 
-            if int(payload.semantic_min_conf_u8) > 0:
+            if semantic_conf_pending and payload.semantic_gpu_filter and native_union_bool_t.is_cuda:
                 from .semantic_cuda import filter_semantic_components_cuda
                 if native_conf_t is None:
                     raise RuntimeError('Semantic component filtering requires a confidence plane')
                 native_mask_t, native_conf_t = filter_semantic_components_cuda(
                     native_union_bool_t.to(torch.uint8), native_conf_t,
-                    int(payload.semantic_min_conf_u8), stream=side_stream,
+                    semantic_min_conf, stream=side_stream,
                 )
                 native_union_bool_t = native_mask_t > 0
                 payload.instance_count_device = native_union_bool_t.any().to(torch.int32).reshape(1)
+                semantic_conf_pending = False
                 cleaned_on_gpu = True
 
             # with a per-task device union, the warped plane stays ON DEVICE —
             # no per-frame D2H, no host |=; the task-end flush does one chunked transfer.
             # Frames that still need the cupy --min_radius cleanup (which lands on host) fall
             # through to the legacy path; the flush's OR/max merge keeps both consistent.
-            if device_union is not None and not (
+            if device_union is not None and not semantic_conf_pending and not (
                 bool(payload.run_gpu_cleanup) and float(payload.gpu_min_radius) > 0.0
             ):
                 if fanout is not None:
@@ -2674,9 +2666,11 @@ def _process_gpu_flattened_prediction_frame(
         # Robust CPU fallback: copy the flattened GPU planes down and warp on the CPU (cv2).
         native_union_np = None
         native_conf_np = None
+        semantic_conf_pending = semantic_min_conf > 0
         cleaned_on_gpu = False
         try:
-            import torch  # type: ignore
+            if payload.ready_event is not None:
+                payload.ready_event.synchronize()
             frame_union = np.ascontiguousarray((union_gpu.detach().cpu().numpy() > 0).astype(np.uint8))
         except Exception as exc:
             raise RuntimeError(
@@ -2699,8 +2693,19 @@ def _process_gpu_flattened_prediction_frame(
                 flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
             ).astype(np.uint8, copy=False)
             native_conf_np = np.where(native_union_np, native_conf_np, np.uint8(0)).astype(np.uint8, copy=False)
+    if semantic_conf_pending:
+        if native_conf_np is None:
+            raise RuntimeError('Semantic component filtering requires a confidence plane')
+        native_union_np = _prediction_cleanup._filter_connected_components_by_min_conf_opencv(
+            native_union_np, native_conf_np, semantic_min_conf,
+        )
+        native_conf_np[~native_union_np] = 0
+        cleaned_on_gpu = float(payload.gpu_min_radius) <= 0.0
 
-    if payload.instance_count_device is not None and not bool(payload.accumulated_on_device):
+    native_has_foreground = native_union_np is not None and bool(native_union_np.any())
+    if semantic_min_conf > 0:
+        instance_count = int(native_has_foreground)
+    elif payload.instance_count_device is not None and not bool(payload.accumulated_on_device):
         # This host/cupy fallback already performs a mask D2H; only the normal device-union
         # path is synchronization-free per frame. Preserve exact informational counts here.
         try:
@@ -2708,7 +2713,7 @@ def _process_gpu_flattened_prediction_frame(
         except Exception:
             instance_count = 0
 
-    if native_union_np is None or not np.any(native_union_np):
+    if not native_has_foreground:
         # Empty after warp/cleanup: nothing written, so report no contributing frame (matches the
         # CPU retina path). Still record whether the GPU cleanup ran so the CPU cleanup stays skipped.
         payload.cleanup_done_on_gpu = bool(cleaned_on_gpu)
@@ -2815,7 +2820,7 @@ def _process_prediction_frame(
             frame_confmap[inst_bool] = np.maximum(frame_confmap[inst_bool], conf_u8)
 
     if not np.any(frame_union):
-        return int(num_inst), 1
+        return int(num_inst), 0
 
     native_union = cv2.warpAffine(
         frame_union,
@@ -3183,16 +3188,13 @@ def _resident_mask_kernels() -> Optional[object]:
 
         // Proto-scale box crop, shared with the Torch proto path: cell c is kept when its
         // centre c+0.5 lies in [lo, hi), and the cell holding a non-empty box's centre is
-        // always kept so sub-cell boxes still contribute. Rejection and acceptance forms
-        // keep each kernel's historical result for NaN boxes (scalar/f32-tiled accept,
-        // f16-tiled rejects); the float equality keeps a NaN centre from matching cell 0.
-        __device__ __forceinline__ bool proto_cell_rejected(int c, float lo, float hi) {
-          float m = (float)c + 0.5f;
-          return (m < lo || m >= hi) && !(hi > lo && (float)c == floorf(0.5f * (lo + hi)));
-        }
+        // always kept so sub-cell boxes still contribute.
         __device__ __forceinline__ bool proto_cell_accepted(int c, float lo, float hi) {
           float m = (float)c + 0.5f;
           return (m >= lo && m < hi) || (hi > lo && (float)c == floorf(0.5f * (lo + hi)));
+        }
+        __device__ __forceinline__ bool proto_cell_rejected(int c, float lo, float hi) {
+          return !proto_cell_accepted(c, lo, hi);
         }
 
         template <typename H, typename P>
@@ -3624,8 +3626,10 @@ def _resident_mask_kernels() -> Optional[object]:
               if (out_conf != nullptr) {
                 // Nearest-proto confidence, with the bilinear-tap fallback on raw
                 // foreground pixels whose nearest score is zero (generic-path rule).
-                int ny = max(0, min(ph - 1, (int)floorf(iy * ((float)ph / (float)ih))));
-                int nx = max(0, min(pw - 1, (int)floorf(ix * ((float)pw / (float)iw))));
+                int ky = max(0, min(ih - 1, (int)nearbyintf(iy)));
+                int kx = max(0, min(iw - 1, (int)nearbyintf(ix)));
+                int ny = min(ph - 1, (int)floorf((float)ky * ((float)ph / (float)ih)));
+                int nx = min(pw - 1, (int)floorf((float)kx * ((float)pw / (float)iw)));
                 float cf = fminf(1.0f, fmaxf(0.0f, conf_proto[ny * pw + nx]));
                 if (fg && !(cf > 0.0f)) {
                   cf = proto_tap_confidence(conf_proto, raw_logit, pw, y0, x0, y1, x1, fy, fx);
@@ -4565,6 +4569,15 @@ def predict_source_and_accumulate(
         stream_min_radius = float(streaming_cleanup_min_radius)
         stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
 
+        source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
+        if (
+            semantic_task and stream_cleanup and stream_min_conf_u8 > 0
+            and source_padding_count and (
+                view_confmap_mm is None
+                or (azimuthal_padding_union_mm is not None and azimuthal_padding_confmap_mm is None)
+            )
+        ):
+            raise ValueError('Semantic azimuthal padding requires confidence planes for --min_conf cleanup')
         semantic_gpu_path = _semantic_gpu_path_available(cfg, source, stream_min_radius)
 
         # Admit raw device-union accumulation whenever no host-only cleanup must run before
@@ -4691,7 +4704,6 @@ def predict_source_and_accumulate(
                 f'{source_label}: D1 requires the resident TensorRT ring before backprojection'
             )
 
-        source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
         result_coverage = _PredictionResultCoverage(source_label, num_frames, source_padding_count)
         effective_slice_locks = slice_locks
         if effective_slice_locks is None and source_padding_count > 0:
@@ -4729,11 +4741,16 @@ def predict_source_and_accumulate(
                 # The payload builder sees only the process-global/native radius. Override it
                 # with this source's scaled processing-grid radius before GPU cleanup.
                 masks_obj.gpu_min_radius = float(stream_min_radius)
+                masks_obj.semantic_gpu_filter = semantic_gpu_path
                 masks_obj.semantic_min_conf_u8 = (
-                    int(stream_min_conf_u8) if semantic_gpu_path and stream_cleanup else 0
+                    stream_min_conf_u8
+                    if semantic_task and stream_cleanup
+                    and (semantic_gpu_path or (target_conf is None and source_padding_count == 0))
+                    else 0
                 )
                 masks_obj.run_gpu_cleanup = bool(
-                    angle_variant_gpu_fastpath() is not None
+                    not semantic_task
+                    and angle_variant_gpu_fastpath() is not None
                     and gpu_retina_cleanup_enabled()
                     and float(stream_min_radius) > 0.0
                 )
@@ -4756,11 +4773,8 @@ def predict_source_and_accumulate(
                     # slots are few and retire through their explicit host/auxiliary sink.
                     device_union=(device_union if count_stats else None),
                 )
-                # skip the per-slice CPU streaming cleanup when the GPU fast path already ran
-                # min_conf + --min_radius + hole fill on this slice (cleanup_done_on_gpu is set by the frame
-                # processor only when the on-GPU connected-component cleanup actually completed).
-                # also skip it for device-accumulated frames — their host slice is
-                # written by the task-end flush, and this cleanup was gated to scan-only work anyway.
+                # Frame cleanup may already have settled confidence or radius. For device-owned
+                # frames the host slice is written at task-end flush.
                 if (
                     stream_cleanup
                     and not (require_device_union and count_stats)

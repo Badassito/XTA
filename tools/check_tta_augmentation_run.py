@@ -12,6 +12,12 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sys
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, open_grouped_catalog, run_layer_catalogs
 
 
 def _output_group(row: dict) -> tuple[str, str, str]:
@@ -75,16 +81,19 @@ def check(root: Path, *, require_nrrd: bool = True) -> dict:
             'rendered_batches':sum(r['rendered_batches'] for r in execution),
             'model_batches':sum(r['model_batches'] for r in execution),
             'coverage_files':len(coverage),'fullframe_groups':0,'fullframe_nrrds':0,'tile_groups':0}
-    nrrd_manifests=list((root/'nrrd').glob('*_nrrd_manifest.json'))
+    nrrd_manifest = run_layer_catalogs(root / 'manifest.json').get('native')
     if require_nrrd:
-        assert len(nrrd_manifests)==1, 'expected one primary NRRD manifest; use a fresh output directory and --save nrrd'
-    if nrrd_manifests:
-        assert len(nrrd_manifests)==1, 'ambiguous NRRD manifests in reused output directory'
-        data=json.loads(nrrd_manifests[0].read_text())
+        assert nrrd_manifest is not None, 'expected one primary NRRD manifest; use a fresh output directory and --save nrrd'
+    if nrrd_manifest is not None:
+        data=json.loads(nrrd_manifest.read_bytes())
+        grouped = open_grouped_catalog(nrrd_manifest) if data.get('layout') == GROUPED_CATALOG_LAYOUT else None
         full=defaultdict(set);tiles=defaultdict(set);filenames=[]
         for layer in data['layers']:
             filename=layer['filename'];filenames.append(filename)
-            assert (nrrd_manifests[0].parent/filename).is_file(), f'missing NRRD {filename}'
+            if grouped is None:
+                assert (nrrd_manifest.parent/filename).is_file(), f'missing NRRD {filename}'
+            else:
+                grouped.segment(filename)
             name=layer.get('view_name','')
             match=re.search(r'__policy_(\d+)$',name)
             p=int(match.group(1)) if match else 0

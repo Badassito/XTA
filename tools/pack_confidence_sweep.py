@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 import uuid
@@ -38,6 +39,13 @@ def main(argv=None):
     try:
         branches = [(_confidence_hundredths(c, "branch cutoff"), study / Path(p).expanduser())
                     for c, p in args.branch]
+        for _, branch in branches:
+            run_path = branch / "manifest.json"
+            if run_path.is_file():
+                run = json.loads(run_path.read_bytes())
+                if (run.get("confidence_sweep") or {}).get("nrrd_storage") == "grouped":
+                    review = branch.resolve().parents[1] / "review" / "manifest.json"
+                    raise ValueError(f"This cutoff already has canonical grouped NRRDs. Open {review}.")
         # With a low-quality tier, native stays reference-only: no native payload is read.
         output = publish_sweep_review(study, branches, sweep_id=uuid.uuid4().hex,
                                       source_mode="independent_scalar", review_name=args.name,

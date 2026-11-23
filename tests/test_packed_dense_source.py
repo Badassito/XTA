@@ -71,6 +71,26 @@ def test_simd_membership_masks_cover_every_byte_pattern_and_uint8_nonzero_value(
     assert payload.tobytes() == expected_payload == bytes(range(1, 256))
 
 
+@pytest.mark.parametrize('packed', [False, True])
+@pytest.mark.parametrize('width', [1, 8, 9, 47])
+def test_owned_projection_plane_compacts_in_place(width, packed):
+    rng = np.random.default_rng(width)
+    plane = rng.integers(0, 2, (9, width), dtype=np.uint8)
+    plane[0] = plane[-1] = 0
+    if width > 1:
+        plane[:, 0] = 0
+    plane[1, -1] = 1
+    original = plane.copy()
+    assert dense.encode_owned_u8_projection_plane(np.zeros_like(plane), 2, packed=packed) is None
+    record, payload = dense.encode_owned_u8_projection_plane(plane, 3, packed=packed)
+    assert np.shares_memory(plane, payload)
+    expected, packed_payload = _oracle(original[None], 0, 1)
+    _, y0, y1, x0, x1, foreground, offset, _ = expected[0]
+    expected_payload = packed_payload if packed else original[y0:y1, x0:x1].tobytes()
+    assert _actual((record,)) == [(3, y0, y1, x0, x1, foreground, offset, len(expected_payload))]
+    assert payload.tobytes() == expected_payload
+
+
 def test_reusable_payload_slot_matches_reference_index_and_chunk_bytes(tmp_path):
     rng = np.random.default_rng(151)
     data = rng.integers(0, 2, (9, 23, 47), dtype=np.uint8)

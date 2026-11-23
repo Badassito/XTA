@@ -56,6 +56,57 @@ def _oracle(source, view, target):
     return expected
 
 
+@pytest.mark.parametrize('backend', ['cpu', 'gpu', 'empty'])
+def test_only_schedules_planes_inside_certified_support(tmp_path, monkeypatch, backend):
+    from XTA import backprojection
+
+    target = (64, 7, 9)
+    view = geometry._build_tilted_view_infos(*target, tilt_views=('transverse',),
+        tilt_angles=(30.,), tilt_directions=('horizontal',))[0]
+    source = np.zeros((view.num_slices, 7, 9), np.uint8)
+    if backend != 'empty':
+        source[view.num_slices // 2, 3, 4] = 1
+    else:
+        monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_WORKSPACE_MIB', '1')
+    path = tmp_path / 'native.cvol'
+    write_raw_bbox_mask_store(source, path, format_name=INTERNAL_PACKED_CVOL_FORMAT, desc='sparse interior')
+    expected = _oracle(source, view, target)
+    submitted, empty_ranges = [], []
+    cpu_ordered = backprojection._native_pull_ordered_planes
+    gpu_ordered = backprojection._native_pull_gpu_ordered_planes
+    consume_empty = IncrementalRawBBoxMaskStoreWriter.consume_empty_range
+    def cpu_planes(count, *args, **kwargs):
+        submitted.append(('cpu', count))
+        return cpu_ordered(count, *args, **kwargs)
+    def gpu_planes(first, stop, operation):
+        submitted.append(('gpu', stop - first))
+        return gpu_ordered(first, stop, operation)
+    def record_empty(writer, first, count):
+        empty_ranges.append((first, first + count))
+        return consume_empty(writer, first, count)
+    monkeypatch.setattr(backprojection, '_native_pull_ordered_planes', cpu_planes)
+    monkeypatch.setattr(backprojection, '_native_pull_gpu_ordered_planes', gpu_planes)
+    monkeypatch.setattr(IncrementalRawBBoxMaskStoreWriter, 'consume_empty_range', record_empty)
+    if backend == 'gpu':
+        monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', '0')
+        class Stage:
+            max_output_voxels = target[1] * target[2]
+            def pull_flat_into(self, output, *, first_flat, destination_bbox_tyx):
+                output[:] = expected.reshape(-1)[first_flat:first_flat + output.size]
+            def close(self):
+                pass
+        monkeypatch.setattr(backprojection, '_try_native_pull_encoded_cuda_stage', lambda *a, **k: Stage())
+    result = encoded.project_tilted_sparse_store(path, view, tmp_path / 'out.cvol', out_shape_tyx=target)
+    np.testing.assert_array_equal(_decode(tmp_path / 'out.cvol'), expected)
+    if backend == 'empty':
+        assert empty_ranges == [(0, target[0])] and submitted == []
+        assert result['worker_window'] == 0
+    else:
+        prefix, suffix = empty_ranges[0], empty_ranges[-1]
+        assert prefix[0] == 0 < prefix[1] < suffix[0] < suffix[1] == target[0]
+        assert submitted == [(backend, suffix[0] - prefix[1])]
+
+
 @pytest.mark.parametrize('view', _VIEWS, ids=lambda v: v.name)
 @pytest.mark.parametrize('format_name', [CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT])
 @pytest.mark.parametrize('target', [(8, 4, 11), (3, 11, 5)])

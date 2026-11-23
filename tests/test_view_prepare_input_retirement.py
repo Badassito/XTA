@@ -4,14 +4,14 @@ import gc
 from io import StringIO
 import os
 from pathlib import Path
-from threading import Event
+from threading import Event, current_thread
 from types import SimpleNamespace
 import weakref
 
 import numpy as np
 import pytest
 
-from XTA import assembly, geometry, runtime
+from XTA import assembly, geometry, pipeline, runtime
 from XTA.interpolation import CVOL_FORMAT, PreparedViewResult, materialize_raw_bbox_mask_store_workspace, write_raw_bbox_mask_store
 from XTA.projection_queue import settle_prepared_view_components
 from XTA.view_prepare import AdmittedViewPrepare, _array_lifetime_owner
@@ -212,6 +212,61 @@ def test_prepare_failure_keeps_existing_alias_safe_cleanup_behavior(tmp_path):
     gc.collect()
     runtime.wait_for_retired_memmap_unlinks(path=path)
     assert not path.exists()
+
+
+def test_selected_scratch_cleanup_waits_for_pending_unlink_only_under_its_root(tmp_path, monkeypatch):
+    selected = tmp_path / 'temp'
+    owned, _ = _task(selected)
+    other, _ = _task(tmp_path / 'temp-sibling')
+    owned_path, other_path = owned.union_path, other.union_path
+    pending, allow_unlink = Event(), Event()
+    unlink = Path.unlink
+
+    def delayed_unlink(path, *args, **kwargs):
+        if path == owned_path:
+            if current_thread().name != 'xta-memmap-unlink':
+                raise PermissionError('Windows mapping is still being released')
+            pending.set()
+            assert allow_unlink.wait(5)
+        return unlink(path, *args, **kwargs)
+
+    def wait(*, under):
+        assert under == selected
+        allow_unlink.set()
+        runtime.wait_for_retired_memmap_unlinks(under=under)
+
+    monkeypatch.setattr(Path, 'unlink', delayed_unlink)
+    monkeypatch.setattr(pipeline, 'wait_for_retired_memmap_unlinks', wait, raising=False)
+    try:
+        runtime.close_memmap_array_without_flush(owned.union_mm, unlink_path=owned_path)
+        runtime.close_memmap_array_without_flush(other.union_mm, unlink_path=other_path)
+        owned = None
+        assert pending.wait(5)
+        pipeline._cleanup_tta_selected_run_scratch(temp_dir=selected, out_dir=tmp_path)
+        assert not owned_path.exists()
+        assert other_path.exists()
+    finally:
+        allow_unlink.set()
+        owned = other = None
+        runtime.wait_for_retired_memmap_unlinks(path=owned_path)
+        runtime.wait_for_retired_memmap_unlinks(path=other_path)
+
+
+def test_selected_scratch_cleanup_reports_live_mapping(tmp_path, monkeypatch):
+    selected = tmp_path / 'temp'
+    task, _ = _task(selected)
+    path = task.union_path
+    runtime.close_memmap_array_without_flush(task.union_mm, unlink_path=path)
+    monkeypatch.setattr(pipeline, 'wait_for_retired_memmap_unlinks',
+        lambda *, under: runtime.wait_for_retired_memmap_unlinks(under=under, timeout_s=0))
+    try:
+        with pytest.raises(RuntimeError, match='scratch cleanup failed') as caught:
+            pipeline._cleanup_tta_selected_run_scratch(temp_dir=selected, out_dir=tmp_path)
+        assert isinstance(caught.value.__cause__, TimeoutError)
+        assert path.exists()
+    finally:
+        task = None
+        runtime.wait_for_retired_memmap_unlinks(path=path)
 
 
 def test_original_retirement_does_not_block_or_damage_pending_sam_publication(tmp_path):

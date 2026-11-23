@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +15,75 @@ import numpy as np
 # Control-flow mocks belong to individual tests. Replacing required packages
 # during collection can break Numba initialization and poison later modules.
 from XTA import outputs, nrrd_compression
+
+
+class OutputOwnershipTests(unittest.TestCase):
+    def test_failed_submission_settles_other_futures_before_releasing_resources(self):
+        resource = object()
+        failed, queued = Future(), Future()
+        failure = OSError('encoding failed')
+        failed.set_exception(failure)
+        submission = outputs.BackgroundOutputSubmission('test', {}, [failed, queued], [resource])
+
+        def close(value):
+            self.assertIs(value, resource)
+            self.assertTrue(queued.cancelled())
+
+        with mock.patch.object(outputs, 'close_memmap_array', side_effect=close) as release:
+            with self.assertRaisesRegex(RuntimeError, 'Background output generation failed') as caught:
+                submission.wait()
+        release.assert_called_once_with(resource)
+        self.assertIs(caught.exception.__cause__, failure)
+
+    def test_oversized_integer_downbin_keeps_native_scale_and_aligns_down(self):
+        specs, warnings = outputs.resolve_low_quality_downbin_specs(None, True, (17, 18, 21))
+        self.assertFalse(warnings)
+        self.assertEqual(specs[0].scale, 1.0)
+        self.assertEqual(specs[0].output_shape_t_y_x, (16, 16, 20))
+
+    def test_upsampling_mirror_skips_gpu_stage_admission(self):
+        with mock.patch.object(outputs, 'nrrd_gpu_mirror_tee_enabled', return_value=True), \
+                mock.patch.object(outputs, '_acquire_output_gpu_stage') as acquire:
+            self.assertIsNone(outputs._try_create_gpu_mirror_tee(
+                [{'shape': (4, 16, 4)}], 8, (8, 8),
+            ))
+        acquire.assert_not_called()
+
+    def test_single_stream_ffv1_publishes_atomically_without_memfd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            public = root / 'run'
+            public.mkdir()
+            destination = public / 'binary.mkv'
+            destination.write_bytes(b'completed prior video')
+            for segments, memfd in ((4, None), (1, mock.Mock())):
+                with self.subTest(segments=segments), \
+                        mock.patch.object(outputs, 'ffv1_segment_count', return_value=segments), \
+                        mock.patch.object(outputs.os, 'memfd_create', memfd, create=True), \
+                        mock.patch.object(outputs, '_open_memory_backed_encoded_chunk') as open_shard:
+                    def encode_range(start, stop, stage, cancel, register, unregister, progress):
+                        self.assertEqual((start, stop), (0, 4))
+                        self.assertEqual(stage.suffix, '.mkv')
+                        self.assertFalse(stage.is_relative_to(public))
+                        self.assertEqual(destination.read_bytes(), b'completed prior video')
+                        stage.write_bytes(b'staged video')
+
+                    kwargs = dict(out_path=destination, total_frames=4, description='Test',
+                                  show_progress=False, publication_root=public)
+
+                    def broken_range(*args):
+                        encode_range(*args)
+                        raise OSError('encode failed')
+
+                    with self.assertRaisesRegex(OSError, 'encode failed'):
+                        outputs._run_sharded_ffv1_encode(encode_range=broken_range, **kwargs)
+                    self.assertEqual(destination.read_bytes(), b'completed prior video')
+                    self.assertEqual(list(root.iterdir()), [public])
+                    outputs._run_sharded_ffv1_encode(encode_range=encode_range, **kwargs)
+                    self.assertEqual(destination.read_bytes(), b'staged video')
+                    self.assertEqual(list(root.iterdir()), [public])
+                    open_shard.assert_not_called()
+                    destination.write_bytes(b'completed prior video')
 
 
 def _serial_indices(total: int, function: object, **_kwargs: object) -> None:
@@ -27,6 +97,43 @@ def _payload_writer(file_handle: object, **_kwargs: object):
 
 
 class SummaryTests(unittest.TestCase):
+    def test_sweep_summary_copies_unicode_from_the_scalar_formatter(self) -> None:
+        from XTA.confidence_sweep import _publish_sweep_summary
+        from XTA.unification.tta_manifest import _file_identity
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = outputs.write_summary_file(
+                root / 'scratch' / 'conf_050.txt',
+                command='xta --input sample.mkv',
+                input_path=Path('sample.mkv'),
+                out_dir=root,
+                scratch_dir=root / 'scratch',
+                source_shape_x_y_t=(8, 8, 4),
+                volume_shape=(4, 8, 8),
+                fps=24.0,
+                model_paths=[],
+                view_names=['Tilted transverse 30\N{DEGREE SIGN}'],
+                view_prediction_stats={},
+                interpolation_stats=[],
+                enable_3d_void_fill=False,
+                gaussian_smoothing_stats=None,
+                keep_objects_stats=None,
+                voxel_volume=None,
+                final_paths={},
+                augmentation_workers=1,
+                slice_postprocess_workers=1,
+                interpolation_workers=1,
+                output_workers=1,
+                encoding='utf-8',
+            )
+            destination = root / 'summary.txt'
+            _publish_sweep_summary(destination, (50,), {50: (stage, _file_identity(stage))})
+            original = stage.read_text(encoding='utf-8')
+            self.assertIn('Views: Tilted transverse 30\N{DEGREE SIGN}\n', original)
+            self.assertEqual(destination.read_text(encoding='utf-8'),
+                             '=== Confidence cutoff 0.50 ===\n' + original)
+
     def test_summary_contains_run_results_without_specification_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

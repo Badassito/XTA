@@ -1,9 +1,10 @@
-"""CPU reference cases for the semantic CUDA native decoder contract."""
+"""Reference and actual CUDA cases for the semantic native decoder."""
 
+import os
 import numpy as np
 import pytest
 
-from XTA.semantic_cuda import semantic_native_reference
+from XTA.semantic_cuda import filter_semantic_components_cuda, semantic_native_reference
 
 
 IDENTITY = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
@@ -86,3 +87,42 @@ def test_native_reference_nonfinite_logits_follow_torch_thresholding():
     np.testing.assert_array_equal(two_mask[0], [0, 1, 0])
     np.testing.assert_array_equal(two_conf[0], [0, 255, 0])
     assert not two_mask[1:].any()
+
+
+@pytest.mark.skipif(os.environ.get('XTA_TEST_NATIVE_TRT_POST_CUDA') != '1', reason='CUDA opt-in')
+def test_cuda_union_retains_all_pixels_joined_to_a_strong_pixel():
+    torch = pytest.importorskip('torch')
+    pytest.importorskip('cupy')
+    from scipy import ndimage
+
+    w_shape = np.array([[1, 0, 1, 0, 1], [1, 1, 1, 1, 1], [1, 0, 1, 0, 1]], dtype=bool)
+    repeated = np.tile(np.pad(w_shape, ((0, 1), (0, 1))), (19, 23))
+    rng = np.random.default_rng(402)
+    structure = np.ones((3, 3), dtype=bool)
+    for mask in [repeated, *(rng.random((63, 187)) < p for p in (0.25, 0.4, 0.55, 0.8))]:
+        score = np.where(mask, rng.integers(1, 240, mask.shape), 0).astype(np.uint8)
+        labels, count = ndimage.label(mask, structure=structure)
+        keep = np.zeros(count + 1, dtype=bool)
+        np.logical_or.at(keep, labels, score >= 206)
+        expected = keep[labels]
+        for _ in range(5):
+            actual, actual_score = filter_semantic_components_cuda(
+                torch.as_tensor(mask, dtype=torch.uint8, device='cuda'),
+                torch.tensor(score, device='cuda'), 206,
+            )
+            np.testing.assert_array_equal(actual.cpu().numpy(), expected)
+            np.testing.assert_array_equal(actual_score.cpu().numpy(), np.where(expected, score, 0))
+
+
+@pytest.mark.skipif(os.environ.get('XTA_TEST_NATIVE_TRT_POST_CUDA') != '1', reason='CUDA opt-in')
+@pytest.mark.parametrize('plane', ('mask', 'confidence'))
+def test_cuda_components_reject_strided_inputs(plane):
+    torch = pytest.importorskip('torch')
+    contiguous = torch.zeros((3, 4), dtype=torch.uint8, device='cuda')
+    strided = torch.zeros((4, 3), dtype=torch.uint8, device='cuda').T
+    with pytest.raises(ValueError, match='contiguous'):
+        filter_semantic_components_cuda(
+            strided if plane == 'mask' else contiguous,
+            strided if plane == 'confidence' else contiguous,
+            100,
+        )

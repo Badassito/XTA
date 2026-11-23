@@ -8,6 +8,7 @@ from XTA.pta_config import (
     build_pta_argparser,
     parse_pta_args,
     resolve_preprocessing_options,
+    resolve_pta_config,
     resolve_pta_device_ids,
     resolve_pta_save_request,
     resolve_tile_requests,
@@ -113,6 +114,26 @@ class PtaConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.tilted_groups[0].views, ("coronal",))
         self.assertEqual(config.tiles[0].tile_stride, 256)
+
+    def test_channel_occurrence_is_local_to_each_parse(self) -> None:
+        parser = build_pta_argparser()
+        for layout in ("gray", "RGB"):
+            args = parser.parse_args(["--input", "dataset", "--channel_format", layout])
+            self.assertEqual(resolve_pta_config(args).args.channel_format, layout)
+            self.assertNotIn("_single_occurrence_options", vars(args))
+
+    def test_pta_requires_one_augmentation_policy(self) -> None:
+        from pathlib import Path
+
+        examples = Path(__file__).resolve().parents[1] / "XTA" / "examples" / "external_augmentations"
+        gpu = f"gpu:{examples / 'GPU_baseline.py'}"
+        cpu = f"cpu:{examples / 'CPU_baseline.py'}"
+        parser = build_pta_argparser()
+        args = parser.parse_args(["--input", "dataset", "--augmentation", gpu, cpu])
+        with self.assertRaisesRegex(ValueError, "accepts one policy"):
+            resolve_pta_config(args)
+        args = parser.parse_args(["--input", "dataset", "--augmentation", gpu])
+        self.assertEqual(resolve_pta_config(args).args.augmentation_execution, "deferred")
 
     def test_tile_values_are_strict_and_covered(self) -> None:
         self.assertEqual(resolve_tile_requests("64:32")[0].config_id, "s64_st32")

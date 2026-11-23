@@ -37,9 +37,11 @@ def _field(volume, supplied):
 
 def _contrast(volume, field, cut):
     result = np.empty(volume.shape, np.float32)
+    inside = None
     for z, plane in enumerate(volume):
-        observed = field if field.ndim == 2 else field[z]
-        inside = ndimage.binary_erosion(observed, iterations=2)
+        if inside is None or field.ndim != 2:
+            observed = field if field.ndim == 2 else field[z]
+            inside = ndimage.binary_erosion(observed, iterations=2)
         if not inside.any():
             result[z] = 0
             continue
@@ -262,6 +264,7 @@ def _candidate_centers(volume, field, cut, radius, search, maximum):
     margin = radius + search + 1
     stride = max(2 * radius + 3, int(round((volume.size / max(1, maximum)) ** (1 / 3))))
     candidates = []
+    excluded = None
     for z in range(max(margin, cut + margin), len(volume) - margin, stride):
         plane = volume[z].astype(np.float32)
         mean = ndimage.uniform_filter(plane, size=2 * radius + 1)
@@ -269,8 +272,10 @@ def _candidate_centers(volume, field, cut, radius, search, maximum):
             ndimage.uniform_filter(plane * plane, size=2 * radius + 1) - mean * mean,
             0.0,
         )
-        mask = field if field.ndim == 2 else field[z]
-        variance[~ndimage.binary_erosion(mask, iterations=margin)] = 0
+        if excluded is None or field.ndim != 2:
+            mask = field if field.ndim == 2 else field[z]
+            excluded = ~ndimage.binary_erosion(mask, iterations=margin)
+        variance[excluded] = 0
         for y in range(margin, volume.shape[1] - margin, stride):
             for x in range(margin, volume.shape[2] - margin, stride):
                 sub = variance[

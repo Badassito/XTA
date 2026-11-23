@@ -11,15 +11,20 @@ from __future__ import annotations
 from collections import OrderedDict
 from types import SimpleNamespace
 import math
+import threading
 import time
 
 import numpy as np
 
+from .geometry import _cupy_external_stream
+
 
 _SHELL_DIRECTION_CACHE_BYTES = 256 * 1024**2
 _SHELL_DIRECTION_CACHE: "OrderedDict[tuple, tuple[object, object, int]]" = OrderedDict()
+_SHELL_DIRECTION_LOCK = threading.Lock()
 _SHELL_DIRECTION_BYTES = 0
-_SHELL_CATEGORICAL_KERNELS = None
+_SHELL_CATEGORICAL_KERNELS = {}
+_SHELL_KERNEL_LOCK = threading.Lock()
 _SHELL_DIRECTION_STATS = dict(
     shared_hits=0, shared_misses=0, cache_hits=0, cache_misses=0,
     host_build_seconds=0.0, upload_seconds=0.0, h2d_copies=0, h2d_bytes=0,
@@ -28,8 +33,9 @@ _SHELL_DIRECTION_STATS = dict(
 
 def shell_direction_cache_stats(renderer=None):
     """Sampler snapshot without retaining temporary direction tensor owners."""
-    stats = dict(_SHELL_DIRECTION_STATS, cache_bytes=_SHELL_DIRECTION_BYTES,
-                 cache_entries=len(_SHELL_DIRECTION_CACHE))
+    with _SHELL_DIRECTION_LOCK:
+        stats = dict(_SHELL_DIRECTION_STATS, cache_bytes=_SHELL_DIRECTION_BYTES,
+                     cache_entries=len(_SHELL_DIRECTION_CACHE))
     if renderer is not None:
         from .spherical_cuda import spherical_direction_cache_stats
         stats.update(('intensity_' + key, value)
@@ -132,28 +138,32 @@ extern "C" __global__ void spherical_categorical(
 '''
 
 
-def _kernels():
-    global _SHELL_CATEGORICAL_KERNELS
-    if _SHELL_CATEGORICAL_KERNELS is None:
-        import cupy as cp
+def _kernels(device_index):
+    import cupy as cp
 
-        module = cp.RawModule(code=_SOURCE, options=('--std=c++11', '--fmad=false'))
-        _SHELL_CATEGORICAL_KERNELS = SimpleNamespace(
-            cp=cp,
-            radial=module.get_function('radial_categorical'),
-            spherical=module.get_function('spherical_categorical'),
-        )
-    return _SHELL_CATEGORICAL_KERNELS
+    with _SHELL_KERNEL_LOCK:
+        kernels = _SHELL_CATEGORICAL_KERNELS.get(device_index)
+        if kernels is None:
+            with cp.cuda.Device(device_index):
+                module = cp.RawModule(code=_SOURCE, options=('--std=c++11', '--fmad=false'))
+                kernels = SimpleNamespace(
+                    cp=cp,
+                    radial=module.get_function('radial_categorical'),
+                    spherical=module.get_function('spherical_categorical'),
+                )
+            _SHELL_CATEGORICAL_KERNELS[device_index] = kernels
+        return kernels
 
 
 def clear_shell_direction_cache() -> None:
     """Release cached GPU QSC directions at an owning worker's volume boundary."""
     global _SHELL_DIRECTION_BYTES
-    _SHELL_DIRECTION_CACHE.clear()
-    _SHELL_DIRECTION_BYTES = 0
+    with _SHELL_DIRECTION_LOCK:
+        _SHELL_DIRECTION_CACHE.clear()
+        _SHELL_DIRECTION_BYTES = 0
 
 
-def _spherical_directions(view, device, stream, *, direction_renderer=None):
+def _spherical_directions_locked(view, device, stream, *, direction_renderer=None):
     """Return GPU direction and validity arrays; host QSC work occurs once per patch."""
     global _SHELL_DIRECTION_BYTES
     from .spherical_cuda import cached_spherical_directions, spherical_direction_key
@@ -212,6 +222,11 @@ def _spherical_directions(view, device, stream, *, direction_renderer=None):
     return dirs, valid
 
 
+def _spherical_directions(view, device, stream, *, direction_renderer=None):
+    with _SHELL_DIRECTION_LOCK:
+        return _spherical_directions_locked(view, device, stream, direction_renderer=direction_renderer)
+
+
 def _inverse_affine(M_grid_to_src, M_src_to_out):
     if M_src_to_out is not None:
         forward = np.asarray(M_src_to_out, dtype=np.float32).reshape(2, 3)
@@ -259,6 +274,7 @@ def render_shell_categorical_pair(
     if coverage_tyx is not None and (
         not isinstance(coverage_tyx, torch.Tensor) or not coverage_tyx.is_cuda
         or coverage_tyx.dtype != torch.uint8 or not coverage_tyx.is_contiguous()
+        or coverage_tyx.device != mask_tyx.device
         or tuple(coverage_tyx.shape) != tuple(mask_tyx.shape)
     ):
         raise ValueError('Shell coverage must be contiguous CUDA uint8 TYX with mask shape')
@@ -301,9 +317,12 @@ def render_shell_categorical_pair(
         if int(view.spherical_face) not in range(6) or int(view.spherical_face_intervals) <= 0:
             return None
 
-    kernels = _kernels()
+    device_index = mask_tyx.device.index
+    if stream.device != mask_tyx.device:
+        raise ValueError('Shell stream must belong to the mask CUDA device')
+    kernels = _kernels(device_index)
     cp = kernels.cp
-    with torch.cuda.stream(stream):
+    with cp.cuda.Device(device_index), torch.cuda.stream(stream), _cupy_external_stream(cp, stream) as cp_stream:
         directions = valid = None
         if family == 'spherical':
             directions, valid = _spherical_directions(
@@ -311,7 +330,6 @@ def render_shell_categorical_pair(
             )
         output_mask = torch.empty((output_h, output_w), dtype=torch.uint8, device=mask_tyx.device)
         output_coverage = (torch.empty_like(output_mask) if coverage_tyx is not None else None)
-        cp_stream = cp.cuda.ExternalStream(stream.cuda_stream)
         common = (
             cp.asarray(mask_tyx), cp.asarray(coverage_tyx) if coverage_tyx is not None else np.uint64(0),
         )

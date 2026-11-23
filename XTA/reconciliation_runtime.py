@@ -1,10 +1,8 @@
 """TTA adapter for the frontend-independent reconciliation engine."""
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import fields
 from contextlib import ExitStack
-import hashlib
 import json
 import math
 import os
@@ -122,11 +120,22 @@ class RuntimeLayer:
                        if _nrrd_layer_ref_is_raw_bbox_store(ref) else _open_nrrd_layer_ref(ref))
 
     def read_slab(self, z0, z1):
+        from .interpolation import RawBBoxMaskStore
         from .outputs import _read_layer_slice_in_output_shape
         if not 0 <= z0 <= z1 <= self.shape_tyx[0]:
             raise IndexError('Reconciliation read is outside the reference grid')
-        return np.stack([_read_layer_slice_in_output_shape(self.source, self.shape_tyx, z)
-                         for z in range(z0, z1)]).astype(np.uint8, copy=False)
+        if z0 == z1:
+            raise ValueError('need at least one array to stack')
+        native_shape = self.source.shape == self.shape_tyx
+        if native_shape and not isinstance(self.source, RawBBoxMaskStore):
+            return np.array(self.source[z0:z1], dtype=np.uint8, copy=True, order='C')
+        slab = np.empty((z1-z0, *self.shape_tyx[1:]), np.uint8)
+        for destination, z in zip(slab, range(z0, z1)):
+            if native_shape:
+                self.source.fill_decoded_slice_into(z, destination)
+            else:
+                destination[:] = _read_layer_slice_in_output_shape(self.source, self.shape_tyx, z)
+        return slab
 
     def close(self):
         from .outputs import _close_nrrd_layer_source
@@ -192,11 +201,17 @@ def _reconciliation_refs(refs, shape, *, needs_confidence):
 
 
 def _publish_reconciliation_report(report, records, settings, output_dir):
-    """Publish the selected policy and truthful metadata for either execution path."""
-    settings.assert_unchanged()
+    """Publish the report with the selected policy's source identity."""
+    from .confidence_evidence import confidence_evidence_enabled
+    from .confidence_retention import published_confidence_manifest
+
+    output_dir = Path(output_dir)
+    confidence_manifest = (published_confidence_manifest(output_dir.parent)
+                           if confidence_evidence_enabled() else None)
     report.update(policy_path=settings.path, policy_sha256=settings.sha256,
                   stage='source_grid_before_global_postprocessing',
-                  confidence_evidence='reconciliation_evidence/manifest.json',
+                  confidence_evidence=(confidence_manifest.relative_to(output_dir.parent).as_posix()
+                                       if confidence_manifest is not None else None),
                   source_layers_preserved=True)
     for identity, _ref, metadata, _confidence in records:
         report['layers'][identity]['metadata'] = {
@@ -208,21 +223,17 @@ def _publish_reconciliation_report(report, records, settings, output_dir):
         report['layers'][identity]['metadata'].update(interpolation_layer_provenance(_ref, relative_to=Path(output_dir)))
         if metadata.get('interpolation_backend') == 'sam' and metadata.get('mask_kind') == 'bridge':
             report['layers'][identity]['final_connection_survival'] = 'not_assessed_after_global_postprocessing'
-    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    snapshot = output_dir / 'policy.py'
-    snapshot.write_bytes(Path(settings.path).read_bytes())
-    settings.assert_unchanged()
     pending = output_dir / 'manifest.json.partial'
     try:
         pending.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+        settings.assert_unchanged()
         pending.replace(output_dir / 'manifest.json')
     finally:
         pending.unlink(missing_ok=True)
 
 
-def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy, output_dir,
-                           survival_reuse=None):
+def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy, output_dir):
     """Borrow the final additive union, counting it once without rebuilding it."""
     if (not isinstance(assembled_union, np.ndarray) or tuple(assembled_union.shape) != shape
             or assembled_union.dtype not in (np.dtype(np.uint8), np.dtype(np.bool_))):
@@ -261,15 +272,13 @@ def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy,
                            'confidence_known_voxels', 'confidence_unknown_prediction_voxels',
                            'duplicate_group_support_removed', 'anchored_voxels'],
         evidence_interpretation='reuse of the pipeline-assembled additive union before global postprocessing')
-    _record_source_bridge_survival(report, records, assembled_union, settings,
-                                   survival_reuse=survival_reuse)
+    _record_source_bridge_survival(report, records, assembled_union, settings)
     _publish_reconciliation_report(report, records, settings, output_dir)
     return assembled_union, report
 
 
 def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
-                         settings, output_dir, workspace, policy=None, assembled_union=None,
-                         _survival_reuse=None):
+                         settings, output_dir, workspace, policy=None, assembled_union=None):
     """Produce one source-grid result; component backings remain unmodified."""
     policy = load_reconciliation_policy(settings) if policy is None else validate_policy(policy)
     settings.assert_unchanged()
@@ -278,8 +287,7 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
     records = _reconciliation_refs(refs, shape, needs_confidence=needs_confidence)
     if policy['mode'] == 'union' and policy['decide'] is None and assembled_union is not None:
         return _reuse_assembled_union(assembled_union, records, shape=shape, settings=settings,
-                                     policy=policy, output_dir=output_dir,
-                                     survival_reuse=_survival_reuse)
+                                     policy=policy, output_dir=output_dir)
     output_dir, workspace = Path(output_dir), Path(workspace)
     output_dir.mkdir(parents=True, exist_ok=True)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -342,123 +350,16 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
             raise
 
 
-def _survival_bridge_refs(refs):
-    selected = {}
-    for ref in refs:
-        if (ref.mask_kind == 'bridge' and ref.interpolation_backend == 'sam'
-                and ref.layer_role == 'additive_component' and ref.recomposition_op == 'union'):
-            key = (ref.model_name, ref.key)
-            if key in selected and selected[key] is not ref:
-                raise ValueError('Survival reuse requires exact unique bridge refs')
-            selected[key] = ref
-    return tuple(selected[key] for key in sorted(selected))
-
-
-def _survival_reuse_fingerprint(refs, output):
-    """Bind selected backings, fixed evidence, and every final mask byte."""
-    from .artifact_archive import artifact_exists, artifact_size
-    from .interpolation import MASK_STORE_FORMATS
-    from .runtime import runtime_telemetry
-    from .sam_evidence import _file_hash, fingerprint
-
-    try:
-        bridges = _survival_bridge_refs(refs)
-        if (not bridges or not isinstance(output, np.ndarray) or output.ndim != 3
-                or not output.flags.c_contiguous
-                or output.dtype not in (np.dtype(np.uint8), np.dtype(bool))):
-            return None
-        files, metadata = {}, []
-        for ref in bridges:
-            if ref.live_array is not None or not ref.proposal_evidence_path:
-                return None
-            metadata.append({field.name: getattr(ref, field.name) for field in fields(ref)
-                             if field.name != 'live_array'})
-            backing = Path(ref.path)
-            paths = ([backing / name for name in ('meta.json', 'index.bin', 'chunks.bin')]
-                     if ref.storage_format in MASK_STORE_FORMATS else [backing])
-            evidence = Path(ref.proposal_evidence_path)
-            if evidence.name == 'manifest.json':
-                evidence = evidence.parent
-            paths.extend(evidence / name for name in ('manifest.json', 'index.json', 'masks.bin'))
-            for path in paths:
-                key = str(path)
-                if key not in files:
-                    files[key] = _file_hash(path)
-                    runtime_telemetry().add('tta.survival.fingerprint_payload_bytes', artifact_size(path))
-            for path in (evidence / 'online_selection.json', evidence / 'export.json',
-                         evidence.parent / 'selection.json'):
-                key = str(path)
-                if key not in files:
-                    files[key] = _file_hash(path) if artifact_exists(path) else None
-                    if files[key] is not None:
-                        runtime_telemetry().add('tta.survival.fingerprint_payload_bytes', artifact_size(path))
-        digest = hashlib.sha256(fingerprint(dict(refs=metadata, files=files,
-                            shape=list(output.shape), dtype=str(output.dtype))).encode('ascii'))
-        for plane in output:
-            digest.update(memoryview(plane).cast('B'))
-        runtime_telemetry().add('tta.survival.fingerprint_mask_bytes', output.nbytes)
-        return digest.hexdigest()
-    except (OSError, ValueError, TypeError, KeyError):
-        return None  # Unknown or changed evidence keeps the established fresh audit.
-
-
-def reuse_source_bridge_survival(refs, output, state, source_report, *, writers_settled,
-                                postprocessing_disabled):
-    """Reuse only one settled pipeline transaction with identical bytes and refs."""
-    from .runtime import runtime_telemetry
-    if (not state or not writers_settled or not postprocessing_disabled
-            or output is not state.get('output') or source_report is not state.get('report')):
-        return None
-    if output.shape[1] * output.shape[2] * 4 > 256 * 1024**2:
-        return None
-    try:
-        current = _survival_bridge_refs(refs)
-        previous = state['refs']
-        if len(current) != len(previous) or any(a is not b for a, b in zip(current, previous)):
-            return None
-        audits = [source_report['layers'][f'{ref.model_name}/{ref.key}']['source_reconciliation_survival']
-                  for ref in current]
-        if audits != state['receipts']:
-            return None
-        # The final audit uses 256 MiB; topology assessment depends on that budget.
-        if float(state['memory_mib']) != 256 and any(audit.get('group_connections') for audit in audits):
-            return None
-        with runtime_telemetry().span('tta.survival.validate_fingerprint'):
-            signature = _survival_reuse_fingerprint(refs, output)
-        if signature is None or signature != state['fingerprint']:
-            return None
-        receipts = deepcopy(state['receipts'])
-        for receipt in receipts:
-            receipt['measurement_origin_stage'] = receipt['stage']
-            receipt['measurement_reused'] = True
-            receipt['reuse_validation_sha256'] = signature
-            receipt['stage'] = 'final_output_after_global_postprocessing'
-            for group in receipt.get('group_connections', ()):
-                group['stage'] = receipt['stage']
-        runtime_telemetry().add('tta.survival.reused_source_audits')
-        return receipts
-    except (KeyError, ValueError, TypeError, RuntimeError, OSError):
-        return None
-
-
-def _record_source_bridge_survival(report, records, output, settings, *, survival_reuse=None):
+def _record_source_bridge_survival(report, records, output, settings):
     """Record source filtering separately from native selection and final cleanup."""
     from .tta_outputs import measure_bridge_output_survival
     from .runtime import runtime_telemetry
     refs = [ref for _identity, ref, _metadata, _confidence in records]
-    signature = None
-    if survival_reuse is not None:
-        survival_reuse.clear()
-        with runtime_telemetry().span('tta.survival.capture_fingerprint'):
-            signature = _survival_reuse_fingerprint(refs, output)
     with runtime_telemetry().span('tta.survival.source_audit'):
         receipts = measure_bridge_output_survival(
             refs, output, memory_mib=settings.memory_mib,
             stage='source_grid_before_global_postprocessing',
         )
-    if survival_reuse is not None and signature is not None:
-        survival_reuse.update(output=output, report=report, refs=tuple(_survival_bridge_refs(refs)),
-                              fingerprint=signature, receipts=deepcopy(receipts), memory_mib=settings.memory_mib)
     for receipt in receipts:
         identity = f"{receipt['model_name']}/{receipt['layer_key']}"
         report['layers'][identity]['source_reconciliation_survival'] = receipt

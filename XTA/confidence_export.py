@@ -55,6 +55,16 @@ def _inside(base, relative, description):
     return path
 
 
+def retained_evidence_manifest(run_manifest):
+    path = Path(run_manifest).parent / "reconciliation_evidence" / "manifest.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Run has no retained observed-confidence catalogue at {path}. "
+            "Keep scores with --save confidence or use confidence-mode reconciliation."
+        )
+    return path
+
+
 def _remove_stage(path, parent, prefix):
     resolved, expected = Path(path).resolve(), Path(parent).resolve()
     if resolved.parent != expected or not resolved.name.startswith(prefix):
@@ -182,7 +192,7 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
     if target_shape != expected:
         raise ValueError("Compact dimensions disagree with the declared pipeline downbin scale")
     plan = export_memory_plan(source_shape, target_shape, memory_mib)
-    evidence_manifest = run_manifest.parent / "reconciliation_evidence" / "manifest.json"
+    evidence_manifest = retained_evidence_manifest(run_manifest)
     evidence = json.loads(evidence_manifest.read_text(encoding="utf-8"))
     if compact.get("run_id") != run.get("run_id") or evidence.get("run_id") != run.get("run_id"):
         raise ValueError("The compact masks, confidence evidence and run manifest come from different runs")
@@ -213,6 +223,13 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
         for directory in (mask_output, score_output, provenance_output):
             directory.mkdir()
         with read_layer_manifest(compact_manifest, workspace=work, memory_mib=memory_mib) as collection:
+            grouped = collection.grouped_catalog
+            if grouped is not None:
+                if grouped.run_manifest != run_manifest:
+                    raise ValueError("Grouped mask catalogue belongs to a different cutoff run")
+                watched[grouped.review_path] = _fingerprint(grouped.review_path)
+                for path, (stamp, sha256) in grouped.verified_files.items():
+                    watched[path] = {"bytes": stamp[2], "mtime_ns": stamp[3], "sha256": sha256}
             geometry = collection.geometry
             if (geometry.space != "left-posterior-superior"
                     or not np.allclose(geometry.directions_xyz, np.eye(3), rtol=0, atol=1e-9)
@@ -271,17 +288,25 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
                 metadata = dict(layer.metadata)
                 destination = _inside(mask_output, metadata["filename"], "Output mask")
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                if layer.path is not None:
+                if layer.path is not None and grouped is None:
                     watched[layer.path] = _fingerprint(layer.path)
                     shutil.copyfile(layer.path, destination)
                     if _fingerprint(destination)["sha256"] != watched[layer.path]["sha256"]:
                         raise RuntimeError("Copied compact mask differs from its input")
                 else:
-                    write_seg_nrrd(destination, shape_tyx=target_shape, read_slab=layer.read_slab,
-                                   geometry=geometry, segment_name=metadata.get("segment_name", layer.layer_id), memory_mib=memory_mib)
+                    color = metadata.get("segment_color_rgb")
+                    if color is None:
+                        color = [float(value) for value in layer.header.get("Segment0_Color", "0.2 0.8 0.4").split()]
+                    written_mask = write_seg_nrrd(
+                        destination, shape_tyx=target_shape, read_slab=layer.read_slab,
+                        geometry=geometry, segment_name=metadata.get("segment_name", layer.layer_id),
+                        color_rgb=tuple(color), memory_mib=memory_mib,
+                    )
                     metadata["stored_shape_tyx"] = list(target_shape)
+                    if grouped is not None:
+                        metadata["empty_segment"] = written_mask["empty_segment"]
                     # The rewritten file stores the complete grid; cropped-layout rows say so.
-                    if "stored_offset_tyx" in metadata or "stored_layout" in metadata:
+                    if grouped is not None or "stored_offset_tyx" in metadata or "stored_layout" in metadata:
                         metadata["stored_offset_tyx"] = [0, 0, 0]
                         metadata["stored_layout"] = "full_reference"
                 if metadata.get("mask_kind") == "yolo":
@@ -340,6 +365,10 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
                 if progress:
                     progress("layers", index+1, len(collection))
             portable_manifest = {**compact,"layer_count":len(portable_layers),"layers":portable_layers}
+            if grouped is not None:
+                portable_manifest["layout"] = "one_single_layer_nrrd_per_component"
+                for key in ("source_storage", "review_manifest", "grid_id", "cutoff_cent"):
+                    portable_manifest.pop(key, None)
             (mask_output / compact_manifest.name).write_text(json.dumps(portable_manifest,indent=2)+"\n",encoding="utf-8")
         score_catalog = {"schema":SOURCE_SCHEMA, "layers":result["confidence_layers"]}
         if "run_id" in run:
@@ -353,6 +382,10 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
             "compact_evidence_export":{"schema":EXPORT_SCHEMA,"source_shape_tyx":list(source_shape),
                 "output_shape_tyx":list(target_shape),"original_manifest":"provenance/original_run_manifest.json",
                 "input_paths_role":"historical source identities; replay artifacts use relative output paths"}}
+        if grouped is not None:
+            portable_run["confidence_sweep"] = {
+                key: value for key, value in run["confidence_sweep"].items() if key != "nrrd_storage"
+            }
         (stage / "manifest.json").write_text(json.dumps(portable_run,indent=2)+"\n",encoding="utf-8")
         (stage / "README.md").write_text(
             "# Portable compact reconciliation evidence\n\n"
@@ -387,4 +420,5 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
             _remove_stage(stage,output.parent,prefix)
 
 
-__all__ = ["export_compact_evidence","compact_score_plane","max_crop_into","source_frames","export_memory_plan"]
+__all__ = ["export_compact_evidence","compact_score_plane","max_crop_into","source_frames","export_memory_plan",
+           "retained_evidence_manifest"]

@@ -1,11 +1,9 @@
-"""Package completed scalar TTA branches as stock Slicer segments and count overlays.
+"""Publish TTA cutoffs as stock Slicer segments and count overlays.
 
-A review grid is either ``grouped`` (stock grouped .seg.nrrd files plus
-per-cutoff direct coverage labelmaps) or ``reference_only``. When a
-low-quality grid exists, the native grid is reference-only: the review keeps
-its branch origins and per-segment identity rows for edit transfer, but never
-reads, counts or re-encodes native mask payloads. Those masks stay in their
-scalar branch NRRDs.
+Managed sweeps publish canonical groups for every exported grid using their
+private cutoff files. Offline packaging of existing scalar branches leaves
+their NRRDs in place and can keep the native grid reference-only when a preview
+grid exists.
 """
 from __future__ import annotations
 
@@ -20,11 +18,13 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from urllib.parse import quote
 import uuid
 
+from .artifact_archive import split_reference
 from .grouped_seg_nrrd import GroupedSegment, write_grouped_seg_nrrd
-from .json_publication import write_json_atomic
+from .json_publication import _fsync_parent_directory, _staged_sweep_directory, write_json_atomic
 from .reconciliation_io import FileLayer, _budget, _same_geometry, read_layer_manifest
 from .sweep_coverage import DirectCoverage, write_coverage_colors
 
@@ -114,10 +114,13 @@ class _Member:
     extent: tuple
 
     def descriptor(self, sweep_id, grid_id, coverage):
+        _, y, x = self.source.offset_tyx
+        _, height, width = self.source.stored_shape_tyx
+
         def read(z0, z1):
-            slab = self.source.read_slab(z0, z1)
+            slab = self.source.read_slab(z0, z1, stored_xy=True)
             if self.info["role"] == "direct":
-                coverage.observe(z0, slab, self.extent)
+                coverage.observe(z0, slab, self.extent, origin_yx=(y, x))
             return slab
 
         tags = {}
@@ -131,7 +134,8 @@ class _Member:
                 "XTA.Model": quote(self.info["model_name"], safe="._-/"),
                 "XTA.LayerKey": quote(self.info["layer_key"], safe="._-/")})
         return GroupedSegment(self.info["segment_id"], self.info["display_name"],
-                              tuple(self.info["color_rgb"]), read, tags, self.extent)
+                              tuple(self.info["color_rgb"]), read, tags, self.extent,
+                              source_window_yx=(y, x, y + height, x + width))
 
 
 def _member(cutoff, layer, sweep_id, grid_id):
@@ -180,7 +184,45 @@ def _packs(members):
         yield group
 
 
-def _grid_sources(grid_id, branches, review, scratch, sweep_id, memory_mib, source_mode, resources):
+def _rebase_source_reference(metadata, field, old_directory, new_directory):
+    if not metadata.get(field):
+        return
+    value = Path(metadata[field])
+    original = value if value.is_absolute() else old_directory / value
+    archived = split_reference(original)
+    physical = archived[0] if archived is not None else original
+    relative = _relative(physical, new_directory)
+    metadata[field] = relative if archived is None else relative + "#/" + archived[1]
+    metadata[field + "_base"] = "manifest_directory"
+
+
+def _write_grouped_source_manifest(path, collection, *, grid_id, cutoff, review, stage):
+    """Preserve scalar metadata while locating payloads through the group index."""
+    catalog = Path(grid_id) / "sources" / f"conf_{cutoff:03d}" / path.name
+    destination = review / catalog
+    document = dict(collection.manifest)
+    document.pop("stored_layout", None)
+    rows = []
+    for source in document["layers"]:
+        row = dict(source)
+        for field in ("stored_layout", "stored_shape_tyx", "stored_offset_tyx"):
+            row.pop(field, None)
+
+        _rebase_source_reference(row, "proposal_evidence_path", path.parent, destination.parent)
+        if isinstance(row.get("extrapolation"), dict):
+            row["extrapolation"] = dict(row["extrapolation"])
+            _rebase_source_reference(row["extrapolation"], "evidence_path", path.parent, destination.parent)
+        rows.append(row)
+    document.update(layout="grouped_sweep_segments", source_storage="grouped",
+                    review_manifest=_relative(review / "manifest.json", destination.parent),
+                    grid_id=grid_id, cutoff_cent=cutoff, layers=rows,
+                    notes=["Layer filenames are stable identifiers. The review index locates each grouped segment."])
+    published = write_json_atomic(stage / catalog, document)
+    return destination, _read_identity(published)[1]
+
+
+def _grid_sources(grid_id, branches, review, scratch, sweep_id, memory_mib, source_mode, resources,
+                  catalog_stage=None):
     """Read each cutoff's manifest and NRRD headers; payloads stay unopened."""
     origins, members = [], []
     geometry = None
@@ -198,13 +240,20 @@ def _grid_sources(grid_id, branches, review, scratch, sweep_id, memory_mib, sour
         elif not _same_geometry(geometry, collection.geometry):
             raise ValueError(f"Physical geometry changed at cutoff {cutoff} on {grid_id}")
         evidence_manifest = branch / "reconciliation_evidence" / "manifest.json"
-        origins.append({"cutoff_cent":cutoff, "source_mode":source_mode, "run_id":run_id,
+        if catalog_stage is not None:
+            path, manifest_digest = _write_grouped_source_manifest(
+                path, collection, grid_id=grid_id, cutoff=cutoff, review=review, stage=catalog_stage,
+            )
+        origin = {"cutoff_cent":cutoff, "source_mode":source_mode, "run_id":run_id,
                         "branch_dir":_relative(branch, review),
                         "run_manifest":_relative(branch / "manifest.json", review),
                         "run_manifest_sha256":run_digest, "source_manifest":_relative(path, review),
                         "source_manifest_sha256":manifest_digest,
                         "observed_confidence_manifest":(_relative(evidence_manifest, review)
-                            if evidence_manifest.is_file() else None)})
+                            if evidence_manifest.is_file() else None)}
+        if catalog_stage is not None:
+            origin["source_storage"] = "grouped"
+        origins.append(origin)
         members.extend(_member(cutoff, layer, sweep_id, grid_id) for layer in collection)
     ids = [m.info["segment_id"] for m in members]
     if len(set(ids)) != len(ids):
@@ -236,19 +285,21 @@ class _Cancelled(Exception):
     """Another cutoff failed; stop before starting further group files."""
 
 
-def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mib, source_mode, workers=1):
+def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mib, source_mode,
+                  workers=1, *, consolidated=False):
     destination = stage / grid_id
     destination.mkdir(parents=True)
     with ExitStack() as resources:
         geometry, origins, members = _grid_sources(grid_id, branches, review, scratch, sweep_id,
-                                                   memory_mib, source_mode, resources)
+                                                   memory_mib, source_mode, resources,
+                                                   catalog_stage=stage if consolidated else None)
         by_cut = defaultdict(list)
         for member in members:
             by_cut[member.cutoff].append(member)
         direct_by_cut = {cutoff: [m.info["segment_id"] for m in by_cut[cutoff] if m.info["role"] == "direct"]
                          for cutoff, *_ in branches}
         table = destination / "direct_layer_count.ctbl"
-        write_coverage_colors(table, max(map(len, direct_by_cut.values()), default=0))
+        write_coverage_colors(table, max(map(len, direct_by_cut.values()), default=0), durable=consolidated)
         # File numbers are fixed before any worker starts, so output names are deterministic.
         plan, index = [], 0
         for cutoff, *_ in branches:
@@ -271,8 +322,10 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
                     path = destination / f"group_{index:04d}.seg.nrrd"
                     descriptors = [m.descriptor(sweep_id, grid_id, counter) for m in pack]
                     try:
+                        options = {"index_segments": True} if consolidated else {}
                         stats = write_grouped_seg_nrrd(path, shape_tyx=geometry.shape_tyx, segments=descriptors,
-                                                        geometry=geometry, memory_mib=memory_mib, temp_dir=scratch)
+                                                        geometry=geometry, memory_mib=memory_mib, temp_dir=scratch,
+                                                        **options)
                     finally:
                         for m in pack:
                             m.source.close()
@@ -281,14 +334,19 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
                         records.append({**member.info, "empty_segment":written["empty_segment"],
                                         "extent_xyz":written["extent_xyz"], "layer":written["layer"],
                                         "foreground_voxels":written["foreground_voxels"]})
+                        if consolidated:
+                            records[-1].update({field: written[field] for field in
+                                                ("label_value", "gzip_offset", "gzip_bytes")})
                         if member.info["role"] == "direct":
                             votes += written["foreground_voxels"]
                     groups.append({"path":_relative(path, stage), "cutoff_cent":cutoff, "segments":records,
                                    "bytes":stats["bytes"], "stored_shape_tyx":stats["stored_shape_tyx"],
                                    "offset_xyz":stats["offset_xyz"]})
+                    if consolidated:
+                        groups[-1]["sha256"] = stats["sha256"]
                 path = destination / f"conf_{cutoff:03d}_coverage.label.nrrd"
                 info = counter.write(path, sweep_id=sweep_id, grid_id=grid_id, cutoff_cent=cutoff,
-                                     memory_mib=memory_mib)
+                                     memory_mib=memory_mib, durable=consolidated)
                 if info["voxel_votes"] != votes:
                     raise RuntimeError(f"Direct coverage count conservation failed for {grid_id}, cutoff {cutoff}")
                 overlay = {"cutoff_cent":cutoff, "path":_relative(path, stage),
@@ -383,7 +441,7 @@ def _independent_identity(run, cutoff, branch):
 
 def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
                          source_mode="confidence_sweep", review_name="review", temp_dir=None,
-                         workers=None):
+                         workers=None, nrrd_stage_root=None, sweep_status="complete"):
     """Atomically publish a new review directory for one multi-cutoff scalar-input family.
 
     Each (hundredth, branch output directory) must designate a completed scalar
@@ -394,9 +452,12 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
     Seek-heavy coverage spools and intermediate compression use temp_dir or the
     system temporary filesystem. Complete review assets stage beside their destination.
 
-    When a low-quality grid exists, the native grid is published reference-only
-    (identities and branch origins, no payload reads); otherwise native is the
-    reviewable grouped grid. A grouped grid publishes its cutoffs concurrently
+    Managed runs provide their private NRRD stage and publish every grid as
+    canonical grouped NRRDs. A managed partial run can publish validated masks
+    with its incomplete or failed family status recorded in the index.
+    Offline publication keeps the native grid reference-only when a preview
+    exists, because its original scalar NRRDs remain available.
+    A grouped grid publishes its cutoffs concurrently
     on up to ``workers`` threads (default: one per cutoff, at most 8, bounded by
     the CPU count). Each worker uses its own ``memory_mib`` slab budget.
     """
@@ -409,6 +470,12 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
     output_dir = Path(output_dir).resolve()
     if source_mode not in ("confidence_sweep", "independent_scalar"):
         raise ValueError("Unknown sweep publication source mode")
+    consolidated = nrrd_stage_root is not None
+    if (sweep_status not in ("complete", "incomplete", "failed", "cancelled")
+            or (consolidated and source_mode != "confidence_sweep")
+            or (not consolidated and sweep_status != "complete")):
+        raise ValueError("Invalid staging scope or status for sweep publication")
+    source_root = Path(nrrd_stage_root).resolve() if consolidated else None
     if (not isinstance(review_name, str) or not review_name.strip() or review_name in (".", "..")
             or "/" in review_name or "\\" in review_name or ":" in review_name):
         raise ValueError("Review name must be a single directory name")
@@ -417,7 +484,7 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
         c.isalnum() or c in "-_" for c in sweep_id
     ):
         raise ValueError("Invalid sweep ID")
-    if review.exists():
+    if os.path.lexists(review):
         raise FileExistsError(f"Review output already exists: {review}")
     resolved = []
     seen = set()
@@ -437,7 +504,9 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
         run_data, digest = _read_identity(run_path)
         run = json.loads(run_data)
         identity = run.get("confidence_sweep") or {}
-        if run.get("status") != "complete":
+        if run.get("status") != "complete" and not (
+            consolidated and sweep_status != "complete" and run.get("status") == "incomplete"
+        ):
             raise ValueError(f"Scalar branch is incomplete: {branch}")
         if source_mode == "confidence_sweep":
             if identity.get("sweep_id") != sweep_id or identity.get("cutoff_hundredths") != cutoff:
@@ -454,7 +523,13 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
         run_id = run.get("run_id")
         if "run_id" in run and (not isinstance(run_id, str) or not run_id.strip()):
             raise ValueError(f"Invalid scalar run_id: {branch}")
-        resolved.append((cutoff, branch, digest, _manifest_paths(branch), run_id))
+        backing = source_root / f"conf_{cutoff:03d}" if source_root is not None else branch
+        if source_root is not None and not backing.resolve().is_relative_to(source_root):
+            raise ValueError(f"Staged NRRD paths escape the sweep workspace: {backing}")
+        paths = _manifest_paths(backing)
+        if consolidated and bool(paths) != (identity.get("nrrd_storage") == "grouped"):
+            raise ValueError(f"Staged NRRD catalogs differ from the cutoff receipt: {branch}")
+        resolved.append((cutoff, branch, digest, paths, run_id))
     if not resolved:
         raise ValueError("Sweep publication requires at least one cutoff")
     resolved.sort(key=lambda b: b[0])
@@ -470,30 +545,43 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
         if temp_dir.is_relative_to(review):
             raise ValueError("The temporary directory must be outside the review being published")
         temp_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".xta-review-", dir=output_dir) as staging, \
-            tempfile.TemporaryDirectory(prefix="xta-review-work-", dir=temp_dir) as workspace:
+    with (tempfile.TemporaryDirectory(prefix="xta-review-work-", dir=temp_dir) as workspace,
+          _staged_sweep_directory(review, prefix=".review.atomic-result-") as stage):
         scratch = Path(workspace)
-        stage = Path(staging) / "review"
-        stage.mkdir()
-        reference_native = any(g != "native" for g in grids)
+        reference_native = not consolidated and any(g != "native" for g in grids)
         products = []
         for grid_id in sorted(grids, key=lambda g: (g != "native", g)):
+            grid_started = time.monotonic()
+            if consolidated:
+                print(f"Confidence review grid {grid_id} started.", flush=True)
             if grid_id == "native" and reference_native:
                 products.append(_reference_grid(grid_id, resolved, review, scratch, sweep_id,
                                                 memory_mib, source_mode))
             else:
                 products.append(_publish_grid(grid_id, resolved, stage, review, scratch, sweep_id,
-                                              memory_mib, source_mode, workers))
+                                              memory_mib, source_mode, workers, consolidated=consolidated))
+            if consolidated:
+                groups = products[-1]["groups"]
+                print(f"Confidence review grid {grid_id} staged {len(groups)} groups "
+                      f"({sum(group['bytes'] for group in groups)} compressed group bytes) "
+                      f"in {time.monotonic() - grid_started:.1f}s.", flush=True)
         write_json_atomic(stage / "manifest.json", {
             "schema":SCHEMA, "status":"complete", "sweep_id":sweep_id, "source_mode":source_mode,
+            **({"source_storage": "grouped", "sweep_status": sweep_status} if consolidated else {}),
             "independent_scalar_configuration_differences":sorted(different_options),
             "cutoffs_cent":sorted(seen), "default_cutoff_cent":min(seen), "grids":products,
             "coverage_semantics":"Count of contributing published direct YOLO prediction layers at the selected cutoff; zero denotes no direct layer. Correlated views can contribute.",
             "generated_only_display":"Accent generated/final foreground where the selected cutoff's current direct layer count is zero. Generated and Global layers contribute no votes.",
             "logical_identity":"A logical ID identifies a model/layer export slot across grids and cutoffs. Independently generated geometry in that slot may differ.",
             "grid_payloads":"A grouped grid has stock .seg.nrrd groups, each holding one cutoff, and per-cutoff direct coverage labelmaps. A reference_only grid lists its segment identities and branch origins but no review payload; open its scalar branch NRRDs directly.",
-            "source_retention":"Scalar branch NRRDs remain in their original directories. Review groups carry the same binary masks, original colors and per-cutoff identities."
+            "source_retention": (
+                "Review groups are the canonical NRRD payloads. Source catalogs retain original layer metadata."
+                if consolidated else
+                "Scalar branch NRRDs remain in their original directories. Review groups carry the same binary masks, original colors and per-cutoff identities."
+            ),
         })
         _copy_index_to_grid_folders(stage, products)
-        stage.rename(review)
+        if consolidated:
+            for directory, _, _ in os.walk(stage, topdown=False):
+                _fsync_parent_directory(Path(directory))
     return review / "manifest.json"

@@ -23,6 +23,11 @@ import numpy as np
 
 from .packet import RegistrationPacket, load_packet
 
+try:
+    from isal.igzip import IGzipFile as _gzip_reader
+except (ImportError, OSError):
+    _gzip_reader = gzip.GzipFile
+
 
 _INTEGER_TYPES = {
     "signed char": "i1",
@@ -240,7 +245,7 @@ def _label_array(path: Path, header: Mapping[str, Any], offset: int, work_dir: P
             remaining = expected_bytes
             with path.open("rb") as source, array_path.open("wb") as target:
                 source.seek(offset)
-                with gzip.GzipFile(fileobj=source, mode="rb") as payload:
+                with _gzip_reader(fileobj=source, mode="rb") as payload:
                     while remaining:
                         chunk = payload.read(min(8 * 1024 * 1024, remaining))
                         if not chunk:
@@ -315,9 +320,21 @@ def _write_header(
     stream.write(("\n".join(fields) + "\n\n").encode("ascii"))
 
 
-def _mask_samples(mask: np.ndarray | None, indices_xyz: np.ndarray) -> np.ndarray:
-    if mask is None:
-        return np.ones(indices_xyz.shape[1:], dtype=bool)
+def _mapped_block_indices(matrix, limits, xx, yy, z):
+    indices = np.empty((3, yy.shape[0], xx.shape[1]), dtype=np.int64)
+    for axis in range(3):
+        coord = (
+            matrix[axis, 0] * xx
+            + matrix[axis, 1] * yy
+            + matrix[axis, 2] * z
+            + matrix[axis, 3]
+        )
+        indices[axis] = np.floor(np.clip(coord + 0.5, -1, limits[axis])).astype(np.int64)
+    valid = np.all((indices >= 0) & (indices < limits[:, None, None]), axis=0)
+    return indices, valid
+
+
+def _mask_samples(mask: np.ndarray, indices_xyz: np.ndarray) -> np.ndarray:
     indexes = indices_xyz[::-1] if mask.ndim == 3 else indices_xyz[1::-1]
     return mask[tuple(np.clip(axis, 0, size - 1) for axis, size in zip(indexes, mask.shape))]
 
@@ -454,6 +471,9 @@ def transfer_nrrd_labelmap(
             )
     target_to_source = np.linalg.inv(packet.matrix(direction))
     target_to_label = native_to_label @ target_to_source
+    shared_source_grid = label_shape == source_shape and np.array_equal(
+        target_to_label, target_to_source
+    )
     source_mask, target_mask = packet.mask(source_role), packet.mask(target_role)
     for role, mask in ((source_role, source_mask), (target_role, target_mask)):
         shape = packet.shape(role)
@@ -503,36 +523,25 @@ def transfer_nrrd_labelmap(
                 for start in range(0, target_shape[1], block_rows):
                     end = min(target_shape[1], start + block_rows)
                     yy = np.arange(start, end, dtype=np.float64)[:, None]
-                    target_index = np.empty((3, end - start, target_shape[2]), dtype=np.int64)
-                    target_index[0], target_index[1], target_index[2] = xx, yy, z
-                    native_index = np.empty_like(target_index)
-                    label_index = np.empty_like(target_index)
-                    for axis in range(3):
-                        for matrix, output, limits in (
-                            (target_to_source, native_index, native_limits),
-                            (target_to_label, label_index, label_limits),
-                        ):
-                            coord = (
-                                matrix[axis, 0] * xx
-                                + matrix[axis, 1] * yy
-                                + matrix[axis, 2] * z
-                                + matrix[axis, 3]
-                            )
-                            output[axis] = np.floor(np.clip(coord + 0.5, -1, limits[axis])).astype(
-                                np.int64
-                            )
-                    valid = np.all(
-                        (native_index >= 0) & (native_index < native_limits[:, None, None]), axis=0
+                    native_index, valid = _mapped_block_indices(
+                        target_to_source, native_limits, xx, yy, z
                     )
-                    valid &= np.all(
-                        (label_index >= 0) & (label_index < label_limits[:, None, None]), axis=0
-                    )
-                    valid &= _mask_samples(source_mask, native_index)
-                    valid &= _mask_samples(target_mask, target_index)
+                    if shared_source_grid:
+                        label_index = native_index
+                    else:
+                        label_index, label_valid = _mapped_block_indices(
+                            target_to_label, label_limits, xx, yy, z
+                        )
+                        valid &= label_valid
+                    if source_mask is not None:
+                        valid &= _mask_samples(source_mask, native_index)
+                    if target_mask is not None:
+                        target_plane = target_mask if target_mask.ndim == 2 else target_mask[z]
+                        valid &= target_plane[start:end]
                     block = np.full(valid.shape, background_value, dtype=dtype)
                     block[valid] = labels[tuple(axis[valid] for axis in label_index[::-1])]
-                    label_stream.write(block.tobytes())
-                    coverage_stream.write(valid.astype(np.uint8).tobytes())
+                    label_stream.write(memoryview(block).cast("B"))
+                    coverage_stream.write(memoryview(valid.astype(np.uint8)).cast("B"))
                     observed += int(np.count_nonzero(valid))
                     foreground += int(np.count_nonzero(block != background_value))
         result = dict(

@@ -83,7 +83,7 @@ def test_known_empty_label_only_keeps_output_check_without_mask_download(tmp_pat
     with mock.patch.object(FakeTensor, 'to', record_to):
         assert publish(tmp_path, np.zeros((8, 8), np.uint8),
             candidate(augmentation_index=1), source_nonempty=False) == (1, {})
-    assert transfers == [(1, 4)]  # Output bounds still cross; no mask window does.
+    assert transfers == [(1,)]  # Output occupancy still crosses.
     assert next((tmp_path / 'labels').glob('*.txt')).read_text() == ''
 
 
@@ -98,7 +98,7 @@ def test_known_empty_binary_still_downloads_and_preserves_exact_mask(tmp_path):
     with mock.patch.object(FakeTensor, 'to', record_to):
         assert publish(tmp_path, np.zeros((8, 8), np.uint8), candidate(),
             source_nonempty=False, save_binary=True) == (1, {})
-    assert transfers == [(1, 4), (1, 8, 8)]
+    assert transfers == [(1,), (1, 8, 8)]
     from XTA.pta_binary import candidate_binary_output_path
     from XTA import pta
     output = candidate_binary_output_path(tmp_path, candidate(), split_active=False)

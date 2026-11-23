@@ -480,7 +480,7 @@ def backproject_spherical_volume_to_volume(
     """
     from .backprojection import (
         SinkOnlyProjectionResult, _emit_projection_block_callback,
-        _abort_projection_block_callback,
+        _abort_projection_block_callback, _emit_projection_empty_range,
         _cancel_main_process_spherical_retirement_request,
     )
 
@@ -516,15 +516,39 @@ def backproject_spherical_volume_to_volume(
             admission_probe_s += time.perf_counter() - probe_started
 
     try:
+        encoded_format = getattr(projection_block_callback, 'encoded_slice_format', None)
+        compact_supported = bool(sink_only and encoded_format in ('raw_u8', 'packbits_little')
+                                 and callable(getattr(projection_block_callback, 'consume_encoded_block', None)))
+        empty_consumer = callable(getattr(projection_block_callback, 'consume_empty_range', None))
+        if (cpu_bounds is not None and cpu_bounds.voxel_count == 0
+                and (not compact_supported or empty_consumer)):
+            runtime_telemetry().gauge('projection.spherical.backend', 'empty_bounds')
+            if not sink_only:
+                output = allocate_workspace_array(
+                    shape=shape, dtype=np.uint8, path=Path(out_path), desc=f'{desc} workspace',
+                    prefer_memory=False, prefer_memfd=False, reserve_bytes=int(reserve_bytes), initialize_zero=False,
+                )
+                output.fill(0)
+                flush = getattr(output, 'flush', None)
+                if callable(flush):
+                    flush()
+            if projection_block_callback is not None:
+                block_depth = (shape[0] if empty_consumer else
+                               _spherical_block_schedule(shape[0], shape[1] * shape[2], workers)[0])
+                try:
+                    for first in range(0, shape[0], block_depth):
+                        _emit_projection_empty_range(projection_block_callback, first,
+                            min(block_depth, shape[0] - first), shape[1:], desc=desc, required=sink_only)
+                except Exception:
+                    callback_aborted = True
+                    raise
+            return output if output is not None else SinkOnlyProjectionResult(shape)
         stage = try_stage()
         cpu_setup_started = time.perf_counter()
         cpu_pull = (_select_spherical_cpu_pull(source, spherical_view, radii, rotation, shape, bboxes)
                     if stage is None else None)
         cpu_setup_seconds = time.perf_counter() - cpu_setup_started
         cpu_backend = 'unused' if stage is not None else 'numba_f64_bounded'
-        encoded_format = getattr(projection_block_callback, 'encoded_slice_format', None)
-        compact_supported = bool(sink_only and encoded_format in ('raw_u8', 'packbits_little')
-                                 and callable(getattr(projection_block_callback, 'consume_encoded_block', None)))
         cpu_compact = bool(compact_supported)
         cpu_rectangular = bool(cpu_compact and callable(getattr(cpu_pull, 'rectangle', None)))
         compact = bool(compact_supported and (stage is not None or cpu_compact))

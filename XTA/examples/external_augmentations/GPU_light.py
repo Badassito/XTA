@@ -643,7 +643,7 @@ class GPUAugmentation:
         mask_float = mask_tensor.to(torch.float32)
         if tuple(image_float.shape[-2:]) != (out_h, out_w):
             image_float = F.interpolate(image_float, size=(out_h, out_w), mode="bilinear", align_corners=False)
-            mask_float = F.interpolate(mask_float, size=(out_h, out_w), mode="nearest")
+            mask_float = F.interpolate(mask_float, size=(out_h, out_w), mode="nearest-exact")
 
         if len(images) == 1:
             # grid_sample only reads its inputs; copies can share one source allocation.

@@ -61,6 +61,15 @@ def test_complete_empty_frames_are_valid():
     assert not np.any(union)
 
 
+def test_empty_raw_retina_instances_do_not_count_as_a_contributing_frame():
+    mask = np.zeros((1, 4, 4), dtype=np.uint8)
+    assert inference._process_prediction_frame(
+        0, np.zeros((2, 4, 4), dtype=np.uint8), None, 4, mask, None,
+        np.eye(2, 3, dtype=np.float32), 4, 4,
+    ) == (2, 0)
+    assert not mask.any()
+
+
 def test_duplicate_mapping_cannot_hide_a_missing_logical_frame():
     class DuplicateSource:
         azimuthal_padding_count = 0

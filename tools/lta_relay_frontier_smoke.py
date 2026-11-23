@@ -57,7 +57,7 @@ def _parser():
                         help="Existing JSON fixture list: single-dogfood, multi-dogfood and/or east-relay")
     parser.add_argument("--output", type=Path, required=True, help="New or empty evidence directory")
     parser.add_argument("--device", type=int, default=0, help="One logical CUDA device")
-    parser.add_argument("--profile", choices=("auto", "egpu", "h100"), default="auto")
+    parser.add_argument("--profile", choices=("auto", "egpu", "h100", "a100"), default="auto")
     parser.add_argument("--canonical-frontier", action="store_true",
                         help="Opt into canonical relay frontiers in the selected source's fixed-point driver")
     parser.add_argument("--plan-only", action="store_true", help="Validate source and portable fixtures without starting a GPU worker")

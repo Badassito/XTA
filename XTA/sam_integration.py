@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from bisect import bisect_left
-from collections import deque
+from collections import OrderedDict, deque
 import json
 import os
 import sys
@@ -274,6 +274,7 @@ class SamInterpolationContext:
         self.source_resize_semantics = str(source_resize_semantics)
         self.gray_cache_root = None if gray_cache_root is None else Path(gray_cache_root)
         self.gray_cache_specs = dict(gray_cache_specs or {})
+        self._idle_gray_readers = OrderedDict()
         self.bundle_identity = str(bundle_identity)
         self.detector_identity = str(detector_identity)
         self.source_grid_shape = tuple(int(value) for value in (source_grid_shape or source_volume.shape))
@@ -932,19 +933,26 @@ class SamInterpolationContext:
             with _trace_sam_phase('image_render', scope_id, operation=operation):
                 from .sam_gpu_rendering import (try_gpu_crop_renderer, SamGpuRenderingUnavailable,
                     clear_image_error_frames)
-                gray_reader = self._select_gray_cache(view, shape, prepared_plan)
-                if gray_reader is not None:
+                gray_admission = self._select_gray_cache(view, shape, prepared_plan)
+                if gray_admission is not None:
+                    gray_key, gray_reader = gray_admission
                     runtime_telemetry().add('sam.gray_cache.admissions', 1)
                     previous = getattr(self._resource_local, 'gray_cache_reader', None)
                     previous_renderer = getattr(self._resource_local, 'gpu_image_renderer', None)
+                    rendered = False
                     try:
                         self._resource_local.gray_cache_reader = gray_reader
                         self._resource_local.gpu_image_renderer = None
-                        return self._image_provider(view, shape, prepared_plan=prepared_plan)
+                        reference = self._image_provider(view, shape, prepared_plan=prepared_plan)
+                        rendered = True
+                        return reference
                     finally:
                         self._resource_local.gray_cache_reader = previous
                         self._resource_local.gpu_image_renderer = previous_renderer
-                        gray_reader.close()
+                        if rendered:
+                            self._park_gray_cache_reader(gray_key, gray_reader)
+                        else:
+                            gray_reader.close()
                 if (self._cache_entries and self.detector_retirement_ready
                         and getattr(self._resource_local, 'profile', None) is not None):
                     # An immutable complete CPU cache needs no upload/rerender.
@@ -1041,8 +1049,12 @@ class SamInterpolationContext:
         scratch_cap = max(1, _env_int('YOLO_TTA_SAM_RENDER_MAX_BYTES', 256*1024**2))
         reader = None
         try:
-            reader = GrayCacheReader(gray_cache_path(self.gray_cache_root, spec), expected_spec=spec,
-                max_cache_bytes=min(64*1024**2, scratch_cap//4), max_crop_bytes=scratch_cap)
+            key = gray_cache_path(self.gray_cache_root, spec), scratch_cap
+            with self._idle:
+                reader = self._idle_gray_readers.pop(key, None)
+            if reader is None:
+                reader = GrayCacheReader(key[0], expected_spec=spec,
+                    max_cache_bytes=min(64*1024**2, scratch_cap//4), max_crop_bytes=scratch_cap)
             if not reader.sealed:
                 reader.close()
                 return None
@@ -1061,7 +1073,7 @@ class SamInterpolationContext:
                         assigned['base_other_non_cpu_allowance_bytes']))):
                 reader.close()
                 return None
-            return reader
+            return key, reader
         except GrayCacheUnavailable as error:
             if reader is not None:
                 reader.close()
@@ -1079,6 +1091,18 @@ class SamInterpolationContext:
             if reader is not None:
                 reader.close()
             raise
+
+    def _park_gray_cache_reader(self, key, reader):
+        # Parsed seal state can persist, while decoded chunks need the active cohort's allowance.
+        reader.clear_cache()
+        with self._idle:
+            replaced = self._idle_gray_readers.pop(key, None)
+            self._idle_gray_readers[key] = reader
+            if len(self._idle_gray_readers) > 4:
+                _, evicted = self._idle_gray_readers.popitem(last=False)
+                evicted.close()
+        if replaced is not None:
+            replaced.close()
 
     def _can_prepare_cheap_cpu_images(self, view, shape, prepared_plan):
         if view is None or str(view.family) not in {'orthogonal', 'tilted'}:
@@ -3149,7 +3173,8 @@ class SamInterpolationContext:
                         try:
                             runtime.close()
                         except BaseException as cleanup_error:
-                            error.add_note(f'SAM multi-session startup cleanup: {cleanup_error}')
+                            if callable(getattr(error, 'add_note', None)):
+                                error.add_note(f'SAM multi-session startup cleanup: {cleanup_error}')
                         if getattr(runtime, 'residency_released', False) is not True:
                             raise
                     if self._cancel.is_set():
@@ -3803,6 +3828,9 @@ class SamInterpolationContext:
                 self._idle.wait(timeout=0.25)
             close_error = None
             try:
+                for reader in self._idle_gray_readers.values():
+                    reader.close()
+                self._idle_gray_readers.clear()
                 for renderer in tuple(self._unsettled_image_renderers):
                     renderer.close()
                 self._release_parked_gpu_sources()

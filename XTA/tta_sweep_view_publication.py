@@ -1,8 +1,8 @@
 """Publish one native detector view across cutoff directories before retiring its packet.
 
-The producer owns only sibling publications. Its ordinary scalar pipeline still
-publishes the floor's masks and confidence. Later scalar children restore their
-own published layer refs and execute the normal final-union and output tails.
+The producer owns sibling publications. Its ordinary scalar pipeline publishes
+the floor's masks and any requested scores. Later scalar children restore their
+published layer refs and execute the normal final-union and output tails.
 """
 from __future__ import annotations
 
@@ -21,8 +21,9 @@ import shutil
 import threading
 import time
 from uuid import NAMESPACE_URL, uuid5
+from zipfile import BadZipFile, ZipFile, ZIP_STORED
 
-from .json_publication import write_json_atomic
+from .json_publication import _atomic_file_writer, write_json_atomic
 
 
 def _cent(value):
@@ -44,6 +45,17 @@ def branch_run_id(sweep_id, cutoff):
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _receipt_name(cent):
+    return f"conf_{cent:03d}.json"
+
+
+def _write_view_receipts(path, receipts):
+    """Commit one view's settled cutoff receipts with a single atomic rename."""
+    with _atomic_file_writer(path) as stream, ZipFile(stream, "w", compression=ZIP_STORED) as bundle:
+        for cent, receipt in receipts.items():
+            bundle.writestr(_receipt_name(cent), json.dumps(receipt, separators=(",", ":"), allow_nan=False))
 
 
 def _file_identity(path):
@@ -340,7 +352,8 @@ class ViewMajorPublication:
 
     def __init__(self, *, family_root, workspace, sweep_id, cutoffs_hundredths, current_cutoff,
                  scalar_sink, source_shape_tyx, model_name, task, min_conf,
-                 confidence_floor_by_backend, progress=None, memory_bytes=512*1024**2):
+                 confidence_floor_by_backend, progress=None, memory_bytes=512*1024**2,
+                 retain_confidence=False, nrrd_stage_root=None):
         self.cutoffs = tuple(_cent(c) for c in cutoffs_hundredths)
         if len(self.cutoffs) < 2 or self.cutoffs != tuple(sorted(set(self.cutoffs))):
             raise ValueError("View-major publication needs multiple distinct increasing cutoffs")
@@ -351,13 +364,14 @@ class ViewMajorPublication:
         self.run_id = branch_run_id(sweep_id, self.current)
         self.family_root = Path(family_root).resolve()
         self.workspace = Path(workspace).resolve()
+        self.nrrd_stage_root = Path(nrrd_stage_root).resolve() if nrrd_stage_root else None
         self.work = self.workspace / "view_publication"
         self.model_name = str(model_name)
         self.shape = tuple(map(index, source_shape_tyx))
         self.scalar_sink = scalar_sink
         if scalar_sink.run_id != self.run_id or scalar_sink.output_shape != self.shape:
             raise ValueError("View-major writer and scalar sink disagree on run ID or geometry")
-        if scalar_sink.nrrd_dir.resolve() != self._branch_dir(self.current) / "nrrd":
+        if scalar_sink.nrrd_dir.resolve() != self._nrrd_branch_dir(self.current) / "nrrd":
             raise ValueError("Scalar output directory does not belong to this cutoff")
         from .sweep_view_schedule import sweep_publication_concurrency
         self.publishers, self.projection_lanes = sweep_publication_concurrency()
@@ -366,6 +380,7 @@ class ViewMajorPublication:
         if self.memory_bytes <= 0:
             raise ValueError("Projection memory must be positive")
         self.progress = progress
+        self.retain_confidence = bool(retain_confidence)
         self._lock = threading.Lock()
         self._executor = None
         self._confidence_pool = None
@@ -392,10 +407,11 @@ class ViewMajorPublication:
                          "configured_cap_bytes": self._storage_cap, "live_bytes": 0,
                          "peak_live_bytes": 0, "published_bytes": 0, "retired_bytes": 0,
                          "peak_native_rank_work_bytes": 0, "published_views": 0}
+        self._storage_dirty = False
         # Publishers start concurrently; create shared parents first (on
         # Windows, resolving a path while a sibling creates its parent can
         # return an extended-length path that no longer relates to self.work).
-        for name in ("projected", "published"):
+        for name in ("projected", "published/by_view"):
             (self.work / name).mkdir(parents=True, exist_ok=True)
         self._storage_lock_path = self.workspace / "fanout_storage.json"
         with _StorageFileLock(self._storage_lock_path):
@@ -421,6 +437,12 @@ class ViewMajorPublication:
         Call with self._lock held. Later-cut children run concurrently and each
         retires its own stores, so a cached copy must never overwrite the file.
         """
+        if self._storage_cap is None and self.current == self.cutoffs[0]:
+            # The coordinator starts consumers only after the producer settles.
+            result = mutate(self._storage)
+            self._storage.update(self._capacity_probe)
+            self._storage_dirty = True
+            return result
         with _StorageFileLock(self._storage_lock_path):
             current = self._read_storage()
             result = mutate(current)
@@ -428,6 +450,12 @@ class ViewMajorPublication:
             write_json_atomic(self.storage_path, current)
             self._storage = current
         return result
+
+    def _flush_storage(self):
+        if self._storage_dirty:
+            with _StorageFileLock(self._storage_lock_path):
+                write_json_atomic(self.storage_path, self._storage)
+                self._storage_dirty = False
 
     def _floor_layer_written(self, ref):
         if (ref.source == "fullframe" and ref.mask_kind == "yolo" and ref.stage == "pre_interpolation"):
@@ -442,14 +470,20 @@ class ViewMajorPublication:
             for key in self._floor_views:
                 self.progress.view_projected(key, cutoffs=(self.current,), geometry_passes=0)
                 self.progress.view_published(key, self.current, layers=0)
+        with self._lock:
+            self._flush_storage()
 
     def _branch_dir(self, cutoff):
         return self.family_root / "confidence_cutoffs" / f"conf_{cutoff:03d}"
 
+    def _nrrd_branch_dir(self, cutoff):
+        if self.nrrd_stage_root is not None:
+            return self.nrrd_stage_root / f"conf_{cutoff:03d}"
+        return self._branch_dir(cutoff)
+
     def _start_writers(self, task, min_conf, floor_by_backend):
         from .outputs import NrrdLayerSink
         from .workspace import _cpu_count
-        from .sweep_confidence import SweepObservedConfidenceWriter
         from .tta_sweep_branch_layers import TtaSweepBranchLayers
         # Every sibling cutoff of every concurrently published view shares this
         # encoder pool. Each publication fences its own siblings, so no more
@@ -459,13 +493,15 @@ class ViewMajorPublication:
         fanout = max(siblings_count, min(self.publishers * siblings_count,
                                          max(1, int(_cpu_count()) // 3)))
         self._executor = ThreadPoolExecutor(max_workers=fanout, thread_name_prefix="sweep-nrrd")
-        # Evidence encoding is ~18% GIL-serialized and stops scaling near 16
-        # threads; wider pools only add per-task workspace planes.
-        self._confidence_pool = ThreadPoolExecutor(
-            max_workers=max(1, min(self.publishers * siblings_count, max(4, int(_cpu_count()) // 8))),
-            thread_name_prefix="sweep-confidence")
         siblings = {}
         try:
+            # Evidence encoding stops scaling near 16 threads. Wider pools add
+            # per-task workspace planes.
+            if self.retain_confidence:
+                from .sweep_confidence import SweepObservedConfidenceWriter
+                self._confidence_pool = ThreadPoolExecutor(
+                    max_workers=max(1, min(self.publishers * siblings_count, max(4, int(_cpu_count()) // 8))),
+                    thread_name_prefix="sweep-confidence")
             producing = os.environ.get("XTA_YOLO_SWEEP_NATIVE_ROLE") == "produce"
             if producing:
                 # Sibling layer files leave this process's GIL: each write holds it
@@ -491,25 +527,28 @@ class ViewMajorPublication:
                         f"{nrrd_processes} worker processes, codec {codec[0]} level {codec[1]}")
             for cent in self.cutoffs[1:]:
                 root = self._branch_dir(cent)
+                nrrd_root = self._nrrd_branch_dir(cent)
                 uid = branch_run_id(self.sweep_id, cent)
                 siblings[cent] = NrrdLayerSink(
-                    nrrd_dir=root/"nrrd", stem=self.scalar_sink.stem, run_id=uid,
+                    nrrd_dir=nrrd_root/"nrrd", stem=self.scalar_sink.stem, run_id=uid,
                     output_shape_tyx=self.shape, max_workers=fanout,
                     low_quality_specs=self.scalar_sink.low_quality_specs,
-                    low_quality_root=root/"low_quality", executor=self._executor,
+                    low_quality_root=nrrd_root/"low_quality", executor=self._executor,
+                    relative_artifact_paths=self.nrrd_stage_root is None,
                     layer_file_processes=self._nrrd_processes)
-                floors = {backend: max(cent/100., float(floor))
-                          for backend, floor in floor_by_backend.items()}
-                self._confidence[cent] = SweepObservedConfidenceWriter(
-                    output_dir=root, cutoff_hundredths=cent, source_shape_tyx=self.shape,
-                    run_id=uid, task=task, min_conf=min_conf, confidence_floor_by_backend=floors)
+                if self.retain_confidence:
+                    floors = {backend: max(cent/100., float(floor))
+                              for backend, floor in floor_by_backend.items()}
+                    self._confidence[cent] = SweepObservedConfidenceWriter(
+                        output_dir=root, cutoff_hundredths=cent, source_shape_tyx=self.shape,
+                        run_id=uid, task=task, min_conf=min_conf, confidence_floor_by_backend=floors)
             self._layers = TtaSweepBranchLayers(siblings, primary_cutoff=self.current,
                                                  max_pending_layers=len(siblings))
             # Sibling evidence is GIL-bound beside NRRD encoding and projection
             # in this process; worker processes reopen the sealed native journal
             # instead. Only the inference-owning producer has that journal, and
             # the writers above already compiled the kernels the workers load.
-            if producing:
+            if producing and self.retain_confidence:
                 from .sweep_evidence_processes import (SweepEvidenceProcessPool,
                                                        sweep_evidence_process_count)
                 processes = sweep_evidence_process_count(self.publishers, siblings_count)
@@ -533,11 +572,33 @@ class ViewMajorPublication:
     def _key(self, view):
         return _digest([self.model_name, view.name])
 
-    def _path(self, cent, view):
-        return self.work / "published" / f"conf_{cent:03d}" / (self._key(view)+".json")
+    def _receipt_path(self, view_key):
+        return self.work / "published" / "by_view" / f"{view_key}.zip"
+
+    def _legacy_receipt_path(self, cent, view_key):
+        return self.work / "published" / f"conf_{cent:03d}" / f"{view_key}.json"
 
     def has_published_view(self, view):
-        return self._path(self.current, view).is_file()
+        if self.current == self.cutoffs[0]:
+            return False
+        view_key = self._key(view)
+        return (self._receipt_path(view_key).is_file()
+                or self._legacy_receipt_path(self.current, view_key).is_file())
+
+    def _read_receipt(self, view):
+        view_key = self._key(view)
+        try:
+            with ZipFile(self._receipt_path(view_key)) as bundle:
+                if bundle.namelist() != [_receipt_name(cent) for cent in self.cutoffs[1:]]:
+                    raise ValueError("Projected view receipt bundle cutoff inventory differs")
+                if any(row.compress_type != ZIP_STORED or row.compress_size != row.file_size
+                       for row in bundle.infolist()):
+                    raise ValueError("Projected view receipts must be stored uncompressed")
+                return json.loads(bundle.read(_receipt_name(self.current)))
+        except FileNotFoundError:
+            return json.loads(self._legacy_receipt_path(self.current, view_key).read_text(encoding="utf-8"))
+        except BadZipFile as error:
+            raise ValueError("Invalid projected view receipt bundle") from error
 
     def _available_projection_bytes(self):
         """Call with self._lock held; the allowance is shared by in-flight views."""
@@ -592,7 +653,11 @@ class ViewMajorPublication:
             counts = {cent: index(counts_by_cutoff[cent]) for cent in siblings}
             if any(c<0 for c in counts.values()):
                 raise ValueError("Invalid native detector count")
-            if key in self._inflight_views or any(self._path(cent,view).exists() for cent in siblings):
+            view_key = self._key(view)
+            published_root = self.work / "published"
+            if (key in self._inflight_views or self._receipt_path(view_key).exists()
+                    or any((folder / f"{view_key}.json").exists()
+                           for folder in published_root.glob("conf_*"))):
                 raise RuntimeError(f"Cutoff outputs already exist for {view.name}")
             self._inflight_views.add(key)
             self._floor_views.add(key)
@@ -737,33 +802,36 @@ class ViewMajorPublication:
             published[cent] = records
         layers_started = time.perf_counter()
         try:
-            for cent in siblings:
-                evidence[cent] = start_confidence(cent)
+            if self.retain_confidence:
+                for cent in siblings:
+                    evidence[cent] = start_confidence(cent)
             layers_started = time.perf_counter()
             self._layers.publish_view(key,refs,view_token=view_output_token(view),completed=completed)
         finally:
             # Never leave evidence writers running past this view's outcome;
             # worker layers are adopted (or their reservations released) here.
-            futures_wait(tuple(task.future for task in evidence.values() if task.future is not None))
-            for task in evidence.values():
-                task.settle()
-            # Layers of a broken worker pool are re-written on producer threads.
-            futures_wait(tuple(task.retry for task in evidence.values() if task.retry is not None))
+            if evidence:
+                futures_wait(tuple(task.future for task in evidence.values() if task.future is not None))
+                for task in evidence.values():
+                    task.settle()
+                # Layers of a broken worker pool are re-written on producer threads.
+                futures_wait(tuple(task.retry for task in evidence.values() if task.retry is not None))
             _record_publication_stages(view, metrics, sum(confidence_seconds),
                                        time.perf_counter() - layers_started, sum(process_seconds))
-        for cent in siblings:
-            evidence[cent].result()  # durable evidence precedes every receipt
+        for task in evidence.values():
+            task.result()  # requested evidence must be durable before receipts
+        receipts = {}
         for cent in siblings:
             records = published[cent]
             receipt = self._receipt_identity(cent,view,geometry_digest)
             receipt.update(prediction_count=counts[cent], ref=ref_records[cent],
                            layer=records[0] if records else None,
                            geometry_passes=metrics["geometry_passes"])
-            path = self._path(cent,view)
-            path.parent.mkdir(parents=True,exist_ok=True)
-            write_json_atomic(path,receipt)
-            if self.progress is not None:
-                self.progress.view_published(key,cent,layers=len(records))
+            receipts[cent] = receipt
+        _write_view_receipts(self._receipt_path(self._key(view)), receipts)
+        if self.progress is not None:
+            for cent in siblings:
+                self.progress.view_published(key, cent, layers=len(published[cent]))
         return refs
 
     def adopt_view(self, view):
@@ -771,7 +839,7 @@ class ViewMajorPublication:
         with self._lock:
             if self._closed or self.current == self.cutoffs[0]:
                 raise RuntimeError("View adoption requires a live later-cut scalar writer")
-            receipt = json.loads(self._path(self.current,view).read_text(encoding="utf-8"))
+            receipt = self._read_receipt(view)
             expected = self._receipt_identity(self.current,view,_digest(asdict(view)))
             if any(receipt.get(k)!=v for k,v in expected.items()):
                 raise ValueError("Published view identity differs from this scalar child")
@@ -826,4 +894,5 @@ class ViewMajorPublication:
                         storage["retired_bytes"] += retired
                     self._update_storage(retire)
                 self._adopted_files.clear()
+                self._flush_storage()
 

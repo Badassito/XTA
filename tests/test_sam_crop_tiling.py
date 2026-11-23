@@ -1,12 +1,15 @@
 """Original1008/128 tiling, raw-halo retention, and end-to-end ownership."""
 from dataclasses import replace
+import errno
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from XTA.config import activate_sam_crop_mode
-from XTA.sam_crop_tiling import axis_windows, resolve_sam_crop_mode, tile_grid
+from XTA.sam_crop_tiling import TiledRunAssembly, axis_windows, resolve_sam_crop_mode, tile_grid
 from XTA.sam_evidence import SamEvidenceBundle
 from XTA.sam_interpolation import (SamInterpolationInfrastructureError,
     interpolate_sam_view_volume_pass, prepare_sam_interpolation_pass)
@@ -22,6 +25,29 @@ def _wide():
     source[0, 60:68, 30:1470] = 1
     source[4, 60:68, 30:1470] = 1
     return source
+
+
+def test_failed_second_mapping_releases_first_and_cleans_partial_files(tmp_path, monkeypatch):
+    allocate = np.memmap
+    opened = []
+    failure = OSError(errno.ENOSPC, 'controlled assembly disk exhaustion')
+
+    def map_or_fail(path, **kwargs):
+        if Path(path).name == 'available.bool.dat':
+            Path(path).touch()
+            raise failure
+        mapping = allocate(path, **kwargs)
+        opened.append(mapping)
+        return mapping
+
+    monkeypatch.setattr(np, 'memmap', map_or_fail)
+    directory = tmp_path/'tiles'
+    with pytest.raises(OSError) as raised:
+        TiledRunAssembly(SimpleNamespace(expected_frames=(0, 1)),
+            SimpleNamespace(context_bbox_yx=(0, 0, 3, 4)), (), directory)
+    assert raised.value is failure
+    assert len(opened) == 1 and opened[0]._mmap.closed
+    assert not directory.exists()
 
 
 def test_geometry_matches_original_1008_128_recipe_exactly():

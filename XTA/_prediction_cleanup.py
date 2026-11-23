@@ -46,15 +46,21 @@ def _cv2_connected_components(mask_u8: np.ndarray, connectivity: int = 8) -> Tup
         ltype=cv2.CV_32S,
     )
 
-def _enclosed_background(labels2d: np.ndarray, num_labels: int) -> np.ndarray:
-    """Select nonzero background labels disconnected from all four plane edges."""
-    touches_boundary = np.zeros((int(num_labels),), dtype=bool)
-    touches_boundary[np.unique(labels2d[0, :])] = True
-    touches_boundary[np.unique(labels2d[-1, :])] = True
-    touches_boundary[np.unique(labels2d[:, 0])] = True
-    touches_boundary[np.unique(labels2d[:, -1])] = True
+_PLANE_CONNECTIVITY = np.zeros((3, 3, 3), dtype=bool)
+_PLANE_CONNECTIVITY[1, 1, :] = True
+_PLANE_CONNECTIVITY[1, :, 1] = True
 
-    return (labels2d > 0) & (~touches_boundary[labels2d])
+
+def _device_enclosed_background(cp, cpx_ndi, background):
+    """Find enclosed 4-connected background independently in each device plane."""
+    labels, count = cpx_ndi.label(background, structure=_PLANE_CONNECTIVITY)
+    exterior = cp.zeros((int(count) + 1,), dtype=cp.bool_)
+    exterior[0] = True
+    exterior[labels[:, 0, :]] = True
+    exterior[labels[:, -1, :]] = True
+    exterior[labels[:, :, 0]] = True
+    exterior[labels[:, :, -1]] = True
+    return ~exterior[labels]
 
 
 def _fill_holes_2d_scipy(mask_bool: np.ndarray) -> np.ndarray:
@@ -95,21 +101,33 @@ def _fill_holes_2d_opencv_u8_inplace(
     y1h = min(full_h, int(y0) + int(height) + 1)
     x1h = min(full_w, int(x0) + int(width) + 1)
     sub = arr[y0h:y1h, x0h:x1h]
-    bg = np.ascontiguousarray(sub == 0, dtype=np.uint8)
+    bg = np.equal(sub, 0, order='C').view(np.uint8)
     if not bool(np.any(bg)):
         return
     num_labels, labels2d = _cv2_connected_components(bg, connectivity=4)
     if int(num_labels) <= 1:
         return
-    enclosed_bg = _enclosed_background(labels2d, num_labels)
-    if bool(np.any(enclosed_bg)):
-        sub[enclosed_bg] = np.uint8(1)
+    # With a single background component, an exterior corner proves that
+    # the entire component is open. Otherwise classify component IDs first
+    # and only expand the classification to pixels when a hole exists.
+    if int(num_labels) == 2 and labels2d[0, 0] != 0:
+        return
+    enclosed = np.ones(int(num_labels), dtype=bool)
+    enclosed[0] = False
+    enclosed[labels2d[0, :]] = False
+    enclosed[labels2d[-1, :]] = False
+    enclosed[labels2d[:, 0]] = False
+    enclosed[labels2d[:, -1]] = False
+    if np.any(enclosed):
+        sub[enclosed[labels2d]] = np.uint8(1)
 
 def _filter_connected_components_by_min_radius_scipy(
     mask_bool: np.ndarray,
     structure2: np.ndarray,
     min_radius: float,
 ) -> np.ndarray:
+    if mask_bool.size and bool(mask_bool.all()):
+        return np.full(mask_bool.shape, math.hypot(*mask_bool.shape) >= float(min_radius), dtype=bool)
     labels2d, num = ndi.label(mask_bool, structure=structure2)
     if int(num) <= 0:
         return np.zeros(mask_bool.shape, dtype=bool)
@@ -129,6 +147,8 @@ def _filter_connected_components_by_min_radius_opencv(
     mask_u8 = np.ascontiguousarray(np.asarray(mask_bool, dtype=np.uint8))
     if mask_u8.size == 0 or not np.any(mask_u8):
         return np.zeros(mask_u8.shape, dtype=bool)
+    if bool(mask_u8.all()):
+        return np.full(mask_u8.shape, math.hypot(*mask_u8.shape) >= float(min_radius), dtype=bool)
 
     num_labels, labels2d = _cv2_connected_components(mask_u8, connectivity=8)
     if int(num_labels) <= 1:
@@ -146,19 +166,45 @@ def _filter_connected_components_by_min_conf_opencv(
     conf_slice: np.ndarray,
     min_conf_u8: int,
 ) -> np.ndarray:
-    mask_u8 = np.ascontiguousarray(np.asarray(mask_bool, dtype=np.uint8))
-    if mask_u8.size == 0 or not np.any(mask_u8):
+    mask_u8 = np.ascontiguousarray(mask_bool, dtype=np.uint8)
+    if mask_u8.size == 0:
         return np.zeros(mask_u8.shape, dtype=bool)
 
-    num_labels, labels2d = _cv2_connected_components(mask_u8, connectivity=8)
+    region = None
+    if (
+        mask_u8.ndim == 2 and isinstance(conf_slice, np.ndarray)
+        and conf_slice.dtype == np.uint8 and conf_slice.shape == mask_u8.shape
+    ):
+        x0, y0, width, height = cv2.boundingRect(mask_u8)
+        if width == 0 or height == 0:
+            return np.zeros(mask_u8.shape, dtype=bool)
+        # Every foreground pixel is in this rectangle. Removing exterior zeros
+        # preserves all 8-connected components and their confidence maxima.
+        # Require a material reduction to offset copying strided crop rows.
+        if 2 * width * height <= mask_u8.size:
+            region = np.s_[y0:y0 + height, x0:x0 + width]
+    elif not np.any(mask_u8):
+        return np.zeros(mask_u8.shape, dtype=bool)
+
+    label_input = mask_u8 if region is None else mask_u8[region]
+    num_labels, labels2d = _cv2_connected_components(label_input, connectivity=8)
     if int(num_labels) <= 1:
         return np.zeros(mask_u8.shape, dtype=bool)
 
+    confidence = np.asarray(conf_slice, dtype=np.uint8)
+    if region is not None:
+        confidence = confidence[region]
     maxima = np.zeros((int(num_labels),), dtype=np.uint8)
-    np.maximum.at(maxima, labels2d.ravel(), np.asarray(conf_slice, dtype=np.uint8).ravel())
+    np.maximum.at(maxima, labels2d.ravel(), confidence.ravel())
     keep_lookup = maxima >= int(min_conf_u8)
     keep_lookup[0] = False
-    return keep_lookup[labels2d]
+    kept = keep_lookup[labels2d]
+    if region is None:
+        return kept
+    del labels2d
+    result = np.zeros(mask_u8.shape, dtype=bool)
+    result[region] = kept
+    return result
 
 def _filter_connected_components_by_min_conf_scipy(
     mask_bool: np.ndarray,

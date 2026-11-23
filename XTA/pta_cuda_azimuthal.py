@@ -9,6 +9,7 @@ Intensity images retain their separate interpolation contract.
 from __future__ import annotations
 
 import math
+import threading
 from collections import OrderedDict
 from functools import lru_cache
 from typing import Optional
@@ -205,16 +206,22 @@ def _external_cupy_stream(cp: object, stream: object) -> object:
     return geometry._cupy_external_stream(cp, stream)
 
 
-@lru_cache(maxsize=1)
-def _categorical_kernel() -> object:
+_KERNEL_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=None)
+def _categorical_kernel(device_index) -> object:
     import cupy as cp
 
     # NumPy computes the tilted stack shear as separate float32 multiply and
     # add operations; disabling FMA keeps boundary decisions aligned.
-    return cp.RawKernel(
-        _AZIMUTHAL_CATEGORICAL_CUDA, 'pta_azimuthal_categorical',
-        options=('--fmad=false',),
-    )
+    with cp.cuda.Device(device_index):
+        kernel = cp.RawKernel(
+            _AZIMUTHAL_CATEGORICAL_CUDA, 'pta_azimuthal_categorical',
+            options=('--fmad=false',),
+        )
+        kernel.compile()
+        return kernel
 
 
 def render_azimuthal_categorical_pair(
@@ -277,7 +284,10 @@ def render_azimuthal_categorical_pair(
     import cupy as cp
 
     selected_stream = stream if stream is not None else torch.cuda.current_stream(mask_tyx.device)
-    with torch.cuda.device(mask_tyx.device), torch.cuda.stream(selected_stream):
+    if selected_stream.device != mask_tyx.device:
+        raise ValueError('Azimuthal stream must belong to the mask CUDA device')
+    device_index = mask_tyx.device.index
+    with cp.cuda.Device(device_index), torch.cuda.stream(selected_stream):
         out_mask = torch.empty((height, width), dtype=torch.uint8, device=mask_tyx.device)
         out_coverage = (
             torch.empty((height, width), dtype=torch.uint8, device=mask_tyx.device)
@@ -297,7 +307,8 @@ def render_azimuthal_categorical_pair(
             rows_gpu = table_cache.table(_row_table_key(view, tilted, mask_tyx.device),
                 rows, torch=torch, stream=selected_stream)
         with _external_cupy_stream(cp, selected_stream):
-            kernel = _categorical_kernel()
+            with _KERNEL_LOCK:
+                kernel = _categorical_kernel(device_index)
             args = (
                 cp.from_dlpack(mask_tyx),
                 cp.from_dlpack(coverage_tyx) if coverage_tyx is not None else np.uint64(0),
@@ -312,11 +323,8 @@ def render_azimuthal_categorical_pair(
                 np.float32(view.center_x), np.float32(view.center_y), tangent,
                 *(np.float64(v) for v in inverse.reshape(-1)),
             )
+            for tensor in (mask_tyx, coverage_tyx, out_mask, out_coverage, nearest_gpu, rows_gpu):
+                if tensor is not None:
+                    tensor.record_stream(selected_stream)
             kernel(((height * width + 255) // 256,), (256,), args)
-        # Keep upload buffers and source tensors alive across the async kernel.
-        out_mask._pta_azimuthal_owners = (
-            nearest_gpu, rows_gpu, mask_tyx, coverage_tyx,
-        )
-        if out_coverage is not None:
-            out_coverage._pta_azimuthal_owners = out_mask._pta_azimuthal_owners
     return out_mask, out_coverage

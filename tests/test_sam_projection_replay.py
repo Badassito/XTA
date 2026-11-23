@@ -398,7 +398,8 @@ def test_failure_report_io_cannot_replace_worker_timeout(tmp_path,monkeypatch):
     with pytest.raises(subprocess.TimeoutExpired) as caught:
         tool.main()
     assert caught.value is timeout
-    assert any('report' in note for note in timeout.__notes__)
+    if callable(getattr(timeout, 'add_note', None)):
+        assert any('report' in note for note in timeout.__notes__)
 
 
 def test_late_probe_is_discarded_after_sampling_scope_closes(tmp_path,monkeypatch):

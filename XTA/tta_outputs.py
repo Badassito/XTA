@@ -205,6 +205,7 @@ def measure_sam_final_connections(
             raise ValueError('Final SAM connection audit references missing proposal contributors')
         selection = load_sam_online_selection(bundle, policy_hash=policy_identity,
                                                selected_run_ids=scope['runs'])
+        branch = (selection or {}).get('branch_selection')
         reader_cache_bytes = min(32 * 1024**2, max(0, budget // 8))
         with bundle.reader(max_cache_bytes=reader_cache_bytes) as reader:
             selection_view = {**(selection or {}), 'mask_filter': reader.filter_snapshot(selection)}
@@ -240,7 +241,6 @@ def measure_sam_final_connections(
                 endpoints = {str(value['observation_id']): value for value in group['endpoints']}
                 edges = []
                 for edge in group.get('edges', ()):
-                    branch = (selection or {}).get('branch_selection')
                     if branch is not None and edge['edge_id'] not in branch['edges']:
                         continue
                     source, target = endpoints[str(edge['source_id'])], endpoints[str(edge['target_id'])]

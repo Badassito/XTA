@@ -143,9 +143,10 @@ extern "C" __global__ void semantic_parent_init(
 }
 
 __device__ __forceinline__ int semantic_root(int* parent, int i) {
-    int p = parent[i];
+    const volatile int* observed_parent = parent;
+    int p = observed_parent[i];
     while (p != i) {
-        int grandparent = parent[p];
+        int grandparent = observed_parent[p];
         if (grandparent != p) atomicMin(parent + i, grandparent);
         i = p;
         p = grandparent;
@@ -160,9 +161,8 @@ __device__ __forceinline__ void semantic_join(int* parent, int a, int b) {
         if (ra == rb) return;
         int high = ra > rb ? ra : rb;
         int low = ra < rb ? ra : rb;
-        // Roots only move to lower indices, so this forest cannot cycle.  Retry
-        // if a concurrent edge already changed the candidate root.
-        if (atomicMin(parent + high, low) == high) return;
+        // Only link a current root. Replacing an existing link can split a component.
+        if (atomicCAS(parent + high, high, low) == high) return;
     }
 }
 
@@ -189,7 +189,7 @@ extern "C" __global__ void semantic_component_max(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n || !mask[i]) return;
     int root = semantic_root(parent, i);
-    parent[i] = root;
+    atomicMin(parent + i, root);
     int score = (int)confidence[i];
     // Scores only increase.  A stale low read causes an extra atomic, while a
     // current/higher value lets dense components avoid a hot atomic per pixel.
@@ -382,6 +382,8 @@ def filter_semantic_components_cuda(
         raise ValueError('semantic component filtering requires uint8 mask and confidence')
     if mask_t.ndim != 2 or mask_t.shape != conf_u8_t.shape:
         raise ValueError('semantic mask and confidence must have the same 2-D shape')
+    if not mask_t.is_contiguous() or not conf_u8_t.is_contiguous():
+        raise ValueError('semantic mask and confidence must be contiguous')
     if int(min_conf_u8) <= 0:
         return mask_t, conf_u8_t
     cp, torch_stream, cp_stream = _on_stream(stream, mask_t.device)

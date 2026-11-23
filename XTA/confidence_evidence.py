@@ -27,6 +27,9 @@ SCHEMA = 'xta.confidence_evidence/1'
 SCORE_SEMANTICS = 'maximum_surviving_observed_prediction_score_u8'
 _LEGACY_SCORE_SEMANTICS = 'maximum_surviving_instance_confidence_u8'
 _LOCK = threading.RLock()
+_MANIFEST_WRITE_LOCK = threading.Lock()
+_BATCH_MANIFEST = False
+_MANIFEST_DIRTY = False
 _OUTPUT_DIR: Path | None = None
 _ENABLED = False
 _DEFER_PROJECTION = False
@@ -49,10 +52,13 @@ def configure_confidence_evidence(output_dir=None, *, enabled=False, min_conf=0.
         confidence_floor=confidence_floor, min_conf=min_conf,
         confidence_floor_by_backend=confidence_floor_by_backend)
     global _OUTPUT_DIR, _ENABLED, _DEFER_PROJECTION, _PUBLICATION, _OBSERVED_CONFIDENCE, _RUN_ID
+    global _BATCH_MANIFEST, _MANIFEST_DIRTY
     shutdown_confidence_publication()
-    with _LOCK:
+    with _MANIFEST_WRITE_LOCK, _LOCK:
         _ENABLED = bool(enabled)
         _DEFER_PROJECTION = bool(defer_projection)
+        _BATCH_MANIFEST = bool(background_publication)
+        _MANIFEST_DIRTY = False
         _OUTPUT_DIR = None if output_dir is None else Path(output_dir) / 'reconciliation_evidence'
         _OBSERVED_CONFIDENCE = contract
         _RUN_ID = run_id
@@ -81,7 +87,9 @@ def drain_confidence_publication():
         publisher, captures = _PUBLICATION, _CAPTURE_QUEUE
     if captures is not None:
         captures.drain()
-    return {} if publisher is None else publisher.drain()
+    result = {} if publisher is None else publisher.drain()
+    _flush_confidence_manifest()
+    return result
 
 
 def confidence_publication_reserve_bytes():
@@ -101,20 +109,35 @@ def confidence_publication_snapshot():
 
 
 def shutdown_confidence_publication(*, raise_errors=True):
-    """Settle run-owned publishers before clearing their registry or workspaces."""
-    global _PUBLICATION, _CAPTURE_QUEUE
+    """Settle run-owned publishers and flush the manifest after a strict, clean shutdown."""
+    global _PUBLICATION, _CAPTURE_QUEUE, _MANIFEST_DIRTY
     with _LOCK:
         publisher, captures = _PUBLICATION, _CAPTURE_QUEUE
         _CAPTURE_QUEUE = None
+    error = None
     try:
         if captures is not None:
             captures.close(raise_errors=raise_errors)
+    except BaseException as exc:
+        error = exc
     finally:
         # Readers may still submit compressed stages until their join finishes.
         with _LOCK:
             _PUBLICATION = None
-        if publisher is not None:
-            publisher.close(raise_errors=raise_errors)
+        try:
+            if publisher is not None:
+                publisher.close(raise_errors=raise_errors)
+        except BaseException as exc:
+            if error is None:
+                error = exc
+    if raise_errors and error is None:
+        _flush_confidence_manifest()
+    else:
+        with _LOCK:
+            # A later shutdown during reconfiguration cannot verify this run's queues.
+            _MANIFEST_DIRTY = False
+    if error is not None:
+        raise error
 
 
 def configure_terminal_confidence_capture(*, slots, workspace_bytes, source_bytes):
@@ -729,25 +752,58 @@ def write_block_confidence_evidence(path, shape, slice_reader: Callable, *, laye
     return ConfidenceEvidenceRef.open(path)
 
 
-def _register_confidence_reference(reference, *, metrics=None):
-    started = time.perf_counter()
-    with _LOCK:
-        acquired = time.perf_counter()
-        output = _OUTPUT_DIR
-        if output is None:
-            raise RuntimeError('Confidence evidence has no configured output directory')
-        token = (reference.model_name,reference.layer_key)
-        if token in _REGISTRY:
-            raise RuntimeError(f'Duplicate confidence evidence for {token!r}')
-        updated = {**_REGISTRY, token: reference}
-        _write_json_atomic(output/'manifest.json',dict(schema=SCHEMA, run_id=_RUN_ID,
-            purpose='observed_prediction_confidence', observed_confidence=_OBSERVED_CONFIDENCE, layers=[
+def _write_confidence_manifest(output, run_id, observed_confidence, references):
+    _write_json_atomic(output/'manifest.json',dict(schema=SCHEMA, run_id=run_id,
+        purpose='observed_prediction_confidence', observed_confidence=observed_confidence, layers=[
             dict(model_name=m,layer_key=k,directory=ref.path.name,output_shape_tyx=list(ref.shape),
                  storage_schema=ref.metadata['schema'],coordinate_space=ref.coordinate_space,
                  stored_shape_tyx=list(ref.storage_shape),score_semantics=ref.metadata['score_semantics'],
                  observed_confidence=ref.metadata.get('provenance', {}).get('observed_confidence'),
-                 unknown='score_zero') for (m,k),ref in sorted(updated.items())]))
-        _REGISTRY[token] = reference
+                 unknown='score_zero') for (m,k),ref in sorted(references.items())]))
+
+
+def _flush_confidence_manifest():
+    global _MANIFEST_DIRTY
+    with _MANIFEST_WRITE_LOCK:
+        with _LOCK:
+            if not _MANIFEST_DIRTY:
+                return
+            snapshot = (_OUTPUT_DIR, _RUN_ID, _OBSERVED_CONFIDENCE, dict(_REGISTRY))
+            _MANIFEST_DIRTY = False
+        try:
+            _write_confidence_manifest(*snapshot)
+        except BaseException:
+            with _LOCK:
+                _MANIFEST_DIRTY = True
+            raise
+
+
+def _register_confidence_reference(reference, *, metrics=None):
+    global _MANIFEST_DIRTY
+    started = time.perf_counter()
+    token = (reference.model_name, reference.layer_key)
+    with _LOCK:
+        batched = _BATCH_MANIFEST
+        if batched:
+            acquired = time.perf_counter()
+            if _OUTPUT_DIR is None:
+                raise RuntimeError('Confidence evidence has no configured output directory')
+            if token in _REGISTRY:
+                raise RuntimeError(f'Duplicate confidence evidence for {token!r}')
+            _REGISTRY[token] = reference
+            _MANIFEST_DIRTY = True
+    if not batched:
+        with _MANIFEST_WRITE_LOCK:
+            acquired = time.perf_counter()
+            with _LOCK:
+                if _OUTPUT_DIR is None:
+                    raise RuntimeError('Confidence evidence has no configured output directory')
+                if token in _REGISTRY:
+                    raise RuntimeError(f'Duplicate confidence evidence for {token!r}')
+                snapshot = (_OUTPUT_DIR, _RUN_ID, _OBSERVED_CONFIDENCE, {**_REGISTRY, token: reference})
+            _write_confidence_manifest(*snapshot)
+            with _LOCK:
+                _REGISTRY[token] = reference
     if metrics is not None:
         metrics.update(registry_wait_seconds=acquired-started,
                        registry_write_seconds=time.perf_counter()-acquired)
@@ -768,7 +824,7 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
                                stage='pre_interpolation', layer_key=None, native_reader=None):
     """Project immutable native-view scores and persist one prediction companion."""
     from .assembly import final_source_output_shape
-    from .confidence_projection import score_projection_reader
+    from .confidence_projection import read_score_slice_in_output_shape, score_projection_reader
     from .cuda_d1 import _nrrd_layer_key
     if not confidence_evidence_enabled():
         return None
@@ -837,6 +893,12 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
             # retain closure cells even after traceback frames are cleared; only
             # compressed files and scalar metadata may survive this boundary.
             scores = native_reader = read_native = None
+    elif native_reader is not None:
+        if not _can_stream_eager_planes(view):
+            raise ValueError('Eager confidence plane streaming requires a transverse view')
+        reference = write_block_confidence_evidence(output / identity, shape,
+            lambda z: read_score_slice_in_output_shape(scores, shape, z, read_native=native_reader),
+            layer_key=key, model_name=model_name, provenance=provenance, metrics=metrics)
     elif not any(bool(np.any(scores[index])) for index in range(scores.shape[0])):
         reference = write_block_confidence_evidence(output / identity, shape, lambda _z: None,
             layer_key=key, model_name=model_name, provenance=provenance,metrics=metrics)
@@ -1110,7 +1172,7 @@ def publish_native_confidence_pieces(pieces, *, native_shape, view, model_name, 
 
 
 def publish_confidence_shards(shards, *, view, model_name, temp_dir, output_shape=None):
-    """Join exact disjoint D1 frame leases in one disk-backed native score map."""
+    """Join exact disjoint D1 frame leases before source projection."""
     from .runtime import close_memmap_array_without_flush
     records = sorted(shards, key=lambda item: int(item['slice_start']))
     if not records:
@@ -1142,27 +1204,26 @@ def publish_confidence_shards(shards, *, view, model_name, temp_dir, output_shap
     if metrics:
         print(f'D1 confidence capture {model_name}/{view.name}: leases={len(records)}, '
               f'metrics={json.dumps(metrics,sort_keys=True)}.', flush=True)
+    pieces = []
+    for record in records:
+        ref = ConfidenceEvidenceRef.open(record['path'])
+        if (ref.storage_shape != tuple(map(int, record['shape_tyx']))
+                or ref.model_name != str(model_name) or ref.layer_key != layer_key):
+            raise ValueError('D1 confidence shard descriptor differs from its stored identity or grid')
+        pieces.append(dict(reference=ref, offset_tyx=(int(record['slice_start']), 0, 0)))
     if confidence_projection_deferred():
-        pieces=[]
-        for record in records:
-            ref=ConfidenceEvidenceRef.open(record['path'])
-            if (ref.storage_shape!=tuple(map(int,record['shape_tyx']))
-                    or ref.model_name!=str(model_name) or ref.layer_key!=layer_key):
-                raise ValueError('D1 confidence shard descriptor differs from its stored identity or grid')
-            pieces.append(dict(reference=ref,offset_tyx=(int(record['slice_start']),0,0)))
         return publish_native_confidence_pieces(pieces,native_shape=shape,view=view,model_name=model_name,
             output_shape=output_shape,layer_key=layer_key,disjoint=True)
+    if _can_stream_eager_planes(view):
+        return _publish_eager_transverse_pieces(pieces, shape, view=view, model_name=model_name,
+            temp_dir=temp_dir, output_shape=output_shape, layer_key=layer_key)
     identity = hashlib.sha256((str(model_name) + '\0' + str(view.name)).encode()).hexdigest()
     path = Path(temp_dir) / 'confidence_evidence' / identity / 'native_score_leases.u8.dat'
     path.parent.mkdir(parents=True, exist_ok=True)
     merged = np.memmap(path, dtype=np.uint8, mode='w+', shape=shape)
     try:
-        for record in records:
-            ref = ConfidenceEvidenceRef.open(record['path'])
-            if (ref.storage_shape != tuple(map(int, record['shape_tyx']))
-                    or ref.model_name != str(model_name) or ref.layer_key != layer_key):
-                raise ValueError('D1 confidence shard descriptor differs from its stored identity or grid')
-            start = int(record['slice_start'])
+        for piece in pieces:
+            ref, (start, _, _) = piece['reference'], piece['offset_tyx']
             with ref.native_reader() as reader:
                 for local in range(ref.storage_shape[0]):
                     for y0,y1,x0,x1,crop in reader.iter_crops(local):
@@ -1175,6 +1236,30 @@ def publish_confidence_shards(shards, *, view, model_name, temp_dir, output_shap
             path.unlink(missing_ok=True)
         except PermissionError:
             pass  # The last mapping consumer completes deferred deletion.
+
+
+def _can_stream_eager_planes(view):
+    from .geometry import physical_view_name
+    return view.family == 'orthogonal' and physical_view_name(view) == 'transverse'
+
+
+def _publish_eager_transverse_pieces(pieces, shape, *, mask=None, **kwargs):
+    from contextlib import closing
+    from .confidence_native import NativePieceReader
+
+    inputs = [(piece['reference'], piece['offset_tyx']) for piece in pieces]
+    with closing(NativePieceReader(pieces=inputs, shape=shape)) as reader:
+        def read(z):
+            plane = None
+            for y0, y1, x0, x1, crop in reader.iter_crops(z):
+                if plane is None:
+                    plane = np.zeros(shape[1:], np.uint8)
+                dst = plane[y0:y1, x0:x1]
+                np.maximum(dst, crop, out=dst)
+            if plane is not None and mask is not None:
+                plane[np.asarray(mask[z]) == 0] = np.uint8(0)
+            return plane
+        return publish_confidence_scores(reader, native_reader=read, **kwargs)
 
 
 __all__ = [

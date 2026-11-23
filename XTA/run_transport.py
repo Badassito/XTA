@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import zipfile
@@ -28,6 +29,10 @@ _RECEIPTS = {"selection.json", "initial_selection.json", "generation.json", "cro
 
 class TransportError(ValueError):
     pass
+
+
+class _ExclusiveDirectoryRenameUnavailable(TransportError):
+    """The host or filesystem cannot honor an exclusive directory rename."""
 
 
 def _canonical_path(path) -> Path:
@@ -122,7 +127,7 @@ def _temporary_reason(relative, info, owned_run):
     if (stat.S_ISDIR(info.st_mode) and parts[0] in {"sam_interpolation", "sam_extrapolation"}
             and re.fullmatch(r"\.(?:evidence|final_evidence|initial_evidence)\.(?:stage|export)-[0-9a-f]{32}", name)):
         return "private SAM evidence staging/export directory (producer UUID naming contract)"
-    if stat.S_ISDIR(info.st_mode) and re.fullmatch(r"\.nrrd\.atomic-result-[0-9A-Za-z_]{8}", name):
+    if stat.S_ISDIR(info.st_mode) and re.fullmatch(r"\.[A-Za-z0-9_.-]+\.atomic-result-[0-9A-Za-z_]{8}", name):
         return "private atomic-result publication staging directory (producer naming contract)"
     return None
 
@@ -208,26 +213,38 @@ def _fresh_target(source, destination):
 
 def _publish_fresh(stage, destination, *, directory=False):
     # Windows rename refuses an existing destination. POSIX hard-link publication
-    # is also exclusive for files; directories are checked immediately before rename.
+    # is also exclusive for files; directories require an exclusive rename.
     if os.name == "nt":
         if os.path.lexists(_api_path(destination)):
             raise TransportError(f"Destination appeared during operation: {destination}")
         os.rename(_api_path(stage), _api_path(destination))
     elif directory:
-        # An ordinary POSIX rename can replace an existing empty directory.
-        # Linux's exclusive rename closes that publication race.
         import ctypes
         import errno
         library = ctypes.CDLL(None, use_errno=True)
-        rename = getattr(library, "renameat2", None)
+        source_bytes, destination_bytes = os.fsencode(stage), os.fsencode(destination)
+        if sys.platform == "darwin":
+            rename = getattr(library, "renamex_np", None)
+            signature = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+            args = (source_bytes, destination_bytes, 4)  # RENAME_EXCL
+        else:
+            rename = getattr(library, "renameat2", None)
+            signature = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+            args = (-100, source_bytes, -100, destination_bytes, 1)  # AT_FDCWD, RENAME_NOREPLACE
         if rename is None:
-            raise TransportError("Exclusive directory publication is unavailable on this host")
-        rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+            raise _ExclusiveDirectoryRenameUnavailable(
+                f"Exclusive directory publication is unavailable on this host: {destination}"
+            )
+        rename.argtypes = signature
         rename.restype = ctypes.c_int
-        if rename(-100, os.fsencode(stage), -100, os.fsencode(destination), 1) != 0:
+        if rename(*args) != 0:
             code = ctypes.get_errno()
             if code == errno.EEXIST:
                 raise TransportError(f"Destination appeared during operation: {destination}")
+            if code in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise _ExclusiveDirectoryRenameUnavailable(
+                    f"Exclusive directory publication is unsupported for {destination}: {os.strerror(code)}"
+                )
             raise OSError(code, os.strerror(code), str(destination))
     else:
         os.link(stage, destination)

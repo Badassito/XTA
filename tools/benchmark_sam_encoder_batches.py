@@ -22,7 +22,7 @@ def main():
     parser.add_argument('--frames', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--gpu-lock', type=Path, required=True)
-    parser.add_argument('--profile', choices=('auto', 'egpu', 'h100'), default='auto')
+    parser.add_argument('--profile', choices=('auto', 'egpu', 'h100', 'a100'), default='auto')
     parser.add_argument('--attention-backend', choices=('auto', 'sdpa', 'fa3_fp8'), default='auto')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
