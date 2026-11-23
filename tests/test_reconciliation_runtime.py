@@ -1,5 +1,6 @@
 """Reconciliation consumes immutable component backings in source geometry."""
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,3 +100,53 @@ def test_section_preflight_pools_repeated_spherical_patches():
         processing_shape_tyx=(2911,3064,3022), settings=replace(settings(), memory_mib=4096),
         policy=validate_policy(dict(grouping='sections')))
     assert plan['planned_group_count'] == 1
+
+
+def test_sweep_reconciliation_receipts_share_policy_and_bind_accepted_reports(tmp_path):
+    from XTA.reconciliation_policy import (
+        accept_sweep_reconciliation_policy, load_reconciliation_report, stage_sweep_reconciliation_report,
+    )
+
+    settings_value = settings()
+    source = tmp_path / 'work' / 'policy-records'
+    family = {'schema': 'xta.confidence_sweep/1', 'sweep_id': 'family', 'status': 'failed',
+              'branches': [], 'reconciliation_policies': {}}
+    shape = (2, 3, 4)
+    raw = np.ones(shape, dtype=np.uint8)
+    for cutoff in (50, 60):
+        output = tmp_path / 'confidence_cutoffs' / f'conf_{cutoff:03d}'
+        _, report = reconcile_tta_layers([], views=[], source_shape_tyx=shape, processing_shape_tyx=shape,
+            settings=settings_value, output_dir=output, workspace=tmp_path / 'work',
+            assembled_union=raw if cutoff == 50 else np.zeros_like(raw), publish_report=False)
+        output.mkdir(parents=True)
+        assert not list(output.iterdir())
+        compact = stage_sweep_reconciliation_report(report, source)
+        assert {'policy', 'policy_path', 'policy_sha256'}.isdisjoint(compact)
+        receipt = {'confidence_sweep': {'sweep_id': 'family', 'cutoff_hundredths': cutoff,
+                                        'reconciliation_policy_sha256': settings_value.sha256},
+                   'status': 'complete', 'reconciliation': compact}
+        branch_path = output / 'manifest.json'
+        branch_bytes = json.dumps(receipt).encode()
+        branch_path.write_bytes(branch_bytes)
+        digest, policy_record = accept_sweep_reconciliation_policy(receipt, family['reconciliation_policies'], source)
+        family['reconciliation_policies'][digest] = policy_record
+        family['branches'].append({'cutoff_hundredths': cutoff, 'status': 'complete',
+            'manifest': branch_path.relative_to(tmp_path).as_posix(),
+            'manifest_sha256': hashlib.sha256(branch_bytes).hexdigest()})
+    assert len(list(source.iterdir())) == len(family['reconciliation_policies']) == 1
+    family_path = tmp_path / 'manifest.json'
+    family_path.write_text(json.dumps(family), encoding='utf-8')
+    low = load_reconciliation_report(tmp_path / family['branches'][0]['manifest'])
+    high = load_reconciliation_report(branch_path)
+    assert low['policy'] == high['policy'] == report['policy']
+    assert low['policy_path'] == high['policy_path'] == settings_value.path
+    assert low['counts']['retained_voxels'] == raw.size
+    assert high['counts']['retained_voxels'] == 0
+
+    family['reconciliation_policies'][digest]['policy']['name'] = 'tampered'
+    family_path.write_text(json.dumps(family), encoding='utf-8')
+    with pytest.raises(ValueError, match='differs from the cutoff receipt'):
+        load_reconciliation_report(branch_path)
+    branch_path.write_bytes(branch_bytes + b'\n')
+    with pytest.raises(ValueError, match='differs from its family manifest'):
+        load_reconciliation_report(branch_path)

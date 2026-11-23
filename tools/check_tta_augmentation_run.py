@@ -17,7 +17,7 @@ import sys
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, open_grouped_catalog, run_layer_catalogs
+from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, open_grouped_catalog, read_layer_catalog, run_layer_catalogs
 
 
 def _output_group(row: dict) -> tuple[str, str, str]:
@@ -85,7 +85,7 @@ def check(root: Path, *, require_nrrd: bool = True) -> dict:
     if require_nrrd:
         assert nrrd_manifest is not None, 'expected one primary NRRD manifest; use a fresh output directory and --save nrrd'
     if nrrd_manifest is not None:
-        data=json.loads(nrrd_manifest.read_bytes())
+        data=read_layer_catalog(nrrd_manifest)
         grouped = open_grouped_catalog(nrrd_manifest) if data.get('layout') == GROUPED_CATALOG_LAYOUT else None
         full=defaultdict(set);tiles=defaultdict(set);filenames=[]
         for layer in data['layers']:

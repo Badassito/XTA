@@ -231,6 +231,7 @@ def test_pipeline_tail_updates_all_known_union_owners_and_preserves_reused_buffe
         streaming_final_union_holder={'model': original}, model_name='model',
         nrrd_layer_refs=[], inference_views=[], source_output_shape_tyx=original.shape,
         T=2, H=3, W=4, reconciliation_policy={}, out_dir=tmp_path, temp_dir=tmp_path,
+        sweep_reconciliation_policy_stage=None,
         close_memmap_array=lambda value: closed.append(id(value)), print=lambda *args: None)
     saved = runtime.reconcile_tta_layers
     try:

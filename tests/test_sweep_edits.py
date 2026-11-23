@@ -26,7 +26,7 @@ def toolbar_contract():
     path = Path(__file__).resolve().parents[1]/'tools/slicer/xta_slicerrc.py'
     tree = ast.parse(path.read_text(encoding='utf-8'))
     names = {'_xta_sweep_scalar','_xta_sweep_review','_xta_sweep_binding','_xta_sweep_grid_rows',
-             '_xta_check_review_family'}
+             '_xta_sweep_embedded_catalogue', '_xta_check_review_family'}
     body = [node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in names]
     assert {node.name for node in body} == names
     namespace = dict(vars(edits))
@@ -37,6 +37,16 @@ def toolbar_contract():
 def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
+
+
+def save_review_family_receipt(review):
+    root = review.parent.parent
+    record = edits._xta_sweep_json(review)
+    branches = [dict(cutoff_hundredths=branch['cutoff_cent'], status='complete',
+                     manifest_sha256=branch['run_manifest_sha256']) for branch in record['grids'][0]['branches']]
+    save(root / 'manifest.json', dict(schema='xta.confidence_sweep/1', sweep_id=record['sweep_id'],
+        status=record['sweep_status'], review_manifest=review.relative_to(root).as_posix(),
+        review_manifest_sha256=edits._xta_sweep_digest(review), branches=branches))
 
 
 def sweep_fixture(tmp_path, native_payload='reference_only'):
@@ -576,7 +586,8 @@ def test_published_reference_only_native_binds_each_cutoff_without_native_payloa
         assert all(row['segment_id']==low_rows[row['logical_id']]['segment_id'] for row in binding['logical_segments'])
 
 
-def test_canonical_grouped_sweep_export_and_native_transfer(tmp_path, monkeypatch):
+@pytest.mark.parametrize('embedded', [True, False])
+def test_canonical_grouped_sweep_export_and_native_transfer(tmp_path, monkeypatch, embedded):
     from XTA import sweep_grouped_reader
     from XTA.sweep_publication import publish_sweep_review
 
@@ -604,6 +615,23 @@ def test_canonical_grouped_sweep_export_and_native_transfer(tmp_path, monkeypatc
                                   review_name='canonical-review', nrrd_stage_root=stage,
                                   memory_mib=2)
     assert not list((root / 'confidence_cutoffs').rglob('*.seg.nrrd'))
+    assert not list(review.parent.rglob('*_nrrd_manifest.json'))
+    if not embedded:
+        # Translate the fixture to the v26.1.0 physical grouped catalogue layout.
+        document = edits._xta_sweep_json(review)
+        for grid in document['grids']:
+            for branch in grid['branches']:
+                catalogue = sweep_grouped_reader.embedded_layer_catalog(grid, branch)
+                path = (review.parent / grid['grid_id'] / 'sources' / f"conf_{branch['cutoff_cent']:03d}"
+                        / 'sample_nrrd_manifest.json')
+                catalogue['review_manifest'] = Path(os.path.relpath(review, path.parent)).as_posix()
+                save(path, catalogue)
+                branch['source_manifest'] = path.relative_to(review.parent).as_posix()
+                branch['source_manifest_sha256'] = edits._xta_sweep_digest(path)
+                del branch['source_catalog']
+        document.pop('source_catalog', None)
+        save(review, document)
+    save_review_family_receipt(review)
     namespace, _, _ = export_api(review, arrays)
     exported = tmp_path / 'export'
     namespace['ExportXTAEdits'](review, exported)
@@ -613,6 +641,44 @@ def test_canonical_grouped_sweep_export_and_native_transfer(tmp_path, monkeypatc
     assert binding['source_storage'] == 'grouped'
     low = root / binding['preview_manifest_relative']
     full = root / binding['native_manifest_relative']
+    if embedded:
+        assert low == full == review
+        assert binding['source_catalog'] == 'embedded'
+        ref = sweep_grouped_reader.LayerCatalogueRef(review, binding['grid_id'], 75)
+        assert (child / 'source_manifest.json').read_bytes() == sweep_grouped_reader.layer_catalogue_bytes(ref)
+        assert bundle['source_manifest_name'] == 'sample_nrrd_manifest.json'
+        contract = prep.native_contract(SimpleNamespace(
+            native_filter=str(Path(nf.__file__).resolve()), native_low_template=str(low), native_full_template=str(full),
+            native_union_receipt=None, python=sys.executable), 'sample', child)
+        assert contract['catalogue_selection']['cutoff_cent'] == 75
+        # Two distinct sources can now select different cutoffs in one physical file.
+        from xta_native_union import UnionSources
+        names = [entry['name'] for entry in bundle['segments']]
+        receipt = tmp_path / 'union-receipt.json'
+        save(receipt, dict(format='xta-preview-exact-name-union/1', groups=[
+            dict(exact_name=name, members=[dict(segment_name=name, segment_index=i),
+                                          dict(segment_name=name, segment_index=i+len(names))])
+            for i, name in enumerate(names)]))
+        spec = tmp_path / 'union-source-pairs.json'
+        pairs = [dict(label=str(cent), low_manifest=str(review), full_manifest=str(review),
+                      grid_id=binding['grid_id'], cutoff_cent=cent,
+                      low_manifest_sha256=sweep_grouped_reader.open_grouped_catalog(
+                          review, grid_id=binding['grid_id'], cutoff_cent=cent).sha256,
+                      full_manifest_sha256=sweep_grouped_reader.open_grouped_catalog(
+                          review, grid_id='native', cutoff_cent=cent).sha256,
+                      receipt_member_indices=list(range(i*len(names), (i+1)*len(names))))
+                 for i, cent in enumerate((25, 75))]
+        save(spec, dict(format='xta-native-union-sources-v1', identification_basis='Fixture', pairs=pairs))
+        original_global = next(entry for entry in bundle['segments'] if 'Global' in entry['name'])
+        union = UnionSources(receipt, spec, bundle['preview_shape_tyx'], bundle['full_quality_shape_tyx'],
+                             low, full, bundle['segments'], original_global,
+                             primary_manifest_hashes=(binding['preview_manifest_sha256'],
+                                                      binding['native_manifest_sha256']))
+        assert union.primary_label == '75'
+        np.testing.assert_array_equal(union.low(original_global['name']),
+                                      arrays[binding['grid_id'], 25] | arrays[binding['grid_id'], 75])
+    else:
+        assert low != full and 'source_catalog' not in binding
     arguments = ['--edits', str(child), '--low-manifest', str(low), '--full-manifest', str(full)]
 
     hash_group = sweep_grouped_reader.sha256_file
@@ -631,7 +697,9 @@ def test_canonical_grouped_sweep_export_and_native_transfer(tmp_path, monkeypatc
     assert nf.run(transfer) == 0
     np.testing.assert_array_equal(nf.Nrrd(target / 'sample.nrrd').array(), arrays['native', 75])
 
-    source = sweep_grouped_reader.open_grouped_catalog(low).segment(bundle['segments'][0]['source_filename'])
+    catalogue = (sweep_grouped_reader.open_grouped_catalog(ref) if embedded
+                 else sweep_grouped_reader.open_grouped_catalog(low))
+    source = catalogue.segment(bundle['segments'][0]['source_filename'])
     with source.path.open('r+b') as raw:
         raw.seek(-1, os.SEEK_END)
         original = raw.read(1)

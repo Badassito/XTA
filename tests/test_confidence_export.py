@@ -143,10 +143,14 @@ def test_selected_observed_score_scalar_roundtrip_on_source_and_compact_grid(tmp
 
 
 def test_compact_export_from_grouped_review_retains_exact_masks_and_scores(tmp_path):
+    from XTA.reconciliation_policy import load_reconciliation_report, stage_sweep_reconciliation_report
     from XTA.reconciliation_io import read_layer_manifest
-    from XTA.sweep_grouped_reader import locate_run_layer_catalog, open_grouped_catalog
+    from XTA.sweep_grouped_reader import LayerCatalogueRef, locate_run_layer_catalog, open_grouped_catalog
     from XTA.sweep_publication import publish_sweep_review
+    from XTA.unification.tta_manifest import TTA_RUN_MANIFEST_SCHEMA, compact_sweep_run_manifest, load_tta_run_manifest
     from tools.compare_reconciliation import discover_geometry_context
+    from tools.export_reconciliation_evidence import main as export_main
+    from tools.nrrd_reference_grid import open_manifest_layers, resolve_layer_catalogue
 
     original, compact, scores, masks = make_run(tmp_path)
     evidence = original.parent / "reconciliation_evidence" / "manifest.json"
@@ -164,15 +168,37 @@ def test_compact_export_from_grouped_review_retains_exact_masks_and_scores(tmp_p
     staged_branch.mkdir(parents=True)
     original.parent.rename(branch)
     (branch / "low_quality").rename(staged_branch / "low_quality")
+    run = branch / "manifest.json"
+    receipt = json.loads(run.read_bytes())
+    receipt.update(schema=TTA_RUN_MANIFEST_SCHEMA, forward_sampling={"test": "preserved"})
+    policy_sha256 = "a" * 64
+    receipt["confidence_sweep"]["reconciliation_policy_sha256"] = policy_sha256
+    source_report = {"schema": "xta.reconciliation/1", "counts": {"retained_voxels": 123},
+                     "policy": {"mode": "union"}, "policy_path": "union.py", "policy_sha256": policy_sha256}
+    policy_stage = stage / "policy"
+    receipt["reconciliation"] = stage_sweep_reconciliation_report(source_report, policy_stage)
+    policy_ref = receipt["reconciliation"]["policy_record_sha256"]
+    compact_sweep_run_manifest(run, receipt, None)
+    run.write_text(json.dumps(receipt), encoding="utf-8")
     review = publish_sweep_review(root, [(50, branch)], sweep_id="export-test", nrrd_stage_root=stage)
     (root / "manifest.json").write_text(json.dumps({
         "schema": "xta.confidence_sweep/1",
+        "status": "complete", "sweep_id": "export-test",
         "review_manifest": "review/manifest.json",
         "review_manifest_sha256": hashlib.sha256(review.read_bytes()).hexdigest(),
+        "branches": [{"cutoff_hundredths": 50, "status": "complete",
+                      "manifest": run.relative_to(root).as_posix(),
+                      "manifest_sha256": hashlib.sha256(run.read_bytes()).hexdigest()}],
+        "reconciliation_policies": {policy_ref: json.loads((policy_stage / f"{policy_ref}.json").read_bytes())},
     }), encoding="utf-8")
 
-    run = branch / "manifest.json"
     catalogue = locate_run_layer_catalog(run, "low_quality/0p50")
+    assert isinstance(catalogue, LayerCatalogueRef) and catalogue.path == review
+    assert resolve_layer_catalogue(review, grid_id="low_quality/0p50", cutoff_cent=50) == catalogue
+    assert resolve_layer_catalogue(run, grid_id="low_quality/0p50") == catalogue
+    with open_manifest_layers(catalogue, filenames=["prediction_1.seg.nrrd"], workspace=tmp_path) as layers:
+        assert len(layers) == 1
+        np.testing.assert_array_equal(layers[0].read_slab(0, 4), masks[1])
     context, linked_run, _ = discover_geometry_context(catalogue)
     assert linked_run == run and context["source_shape_tyx"] == list(scores[0].shape)
     grouped = open_grouped_catalog(catalogue)
@@ -182,7 +208,17 @@ def test_compact_export_from_grouped_review_retains_exact_masks_and_scores(tmp_p
             np.testing.assert_array_equal(layer.read_slab(1, 3), masks[index][1:3])
             np.testing.assert_array_equal(layer.read_slab(0, 4), masks[index])
     output = tmp_path / "portable"
-    result = export_compact_evidence(run, catalogue, output, memory_mib=8)
+    assert export_main(["--run_manifest", str(run), "--grid", "low_quality/0p50",
+                        "--output", str(output), "--memory_mib", "8"]) == 0
+    result = json.loads((output / "export_manifest.json").read_bytes())
+    assert result["source_catalogue"]["grid_id"] == "low_quality/0p50"
+    portable_run = load_tta_run_manifest(output / "manifest.json")
+    assert "shared_run_geometry" not in portable_run
+    assert portable_run["forward_sampling"] == {"test": "preserved"}
+    assert portable_run["geometry"] == load_tta_run_manifest(run)["geometry"]
+    assert load_reconciliation_report(output / "manifest.json") is None
+    original_report = output / portable_run["compact_evidence_export"]["original_reconciliation"]
+    assert json.loads(original_report.read_bytes()) == load_reconciliation_report(run)
     assert locate_run_layer_catalog(output / "manifest.json") == output / result["paths"]["nrrd_manifest"]
     with read_layer_manifest(output / result["paths"]["nrrd_manifest"], workspace=tmp_path) as layers:
         assert layers.grouped_catalog is None

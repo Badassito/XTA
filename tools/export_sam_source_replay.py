@@ -29,7 +29,9 @@ from XTA.sam_evidence import SamEvidenceBundle, iter_selected_native_crops, nati
 from XTA.artifact_archive import read_artifact
 from XTA.file_hashing import source_sha256
 from XTA.reconciliation_io import write_seg_nrrd
-from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, locate_run_layer_catalog, run_layer_catalogs
+from XTA.sweep_grouped_reader import (
+    GROUPED_CATALOG_LAYOUT, LayerCatalogueRef, locate_run_layer_catalog, read_layer_catalog, run_layer_catalogs,
+)
 from tools.nrrd_reference_grid import open_manifest_layers
 
 
@@ -126,7 +128,7 @@ def write_native_direction(crops, destination, shape, *, memory_bytes):
 def reference_scope(reference_run, bundle):
     reference_run = Path(reference_run)
     manifest_path = locate_run_layer_catalog(reference_run/'manifest.json')
-    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest = read_layer_catalog(manifest_path)
     matches = [layer for layer in manifest['layers'] if layer.get('interpolation_backend') == 'sam'
         and layer['view_name'] == bundle.scope['view_name'] and layer['source'] == 'fullframe']
     if not matches:
@@ -158,7 +160,7 @@ def append_reference_detector(manifest_path, source_catalog, detector, *, memory
     row = dict(detector, replay_reference=True)
     source = source_catalog.parent/detector['filename']
     destination = manifest_path.parent/detector['filename']
-    if json.loads(source_catalog.read_bytes()).get('layout') == GROUPED_CATALOG_LAYOUT:
+    if read_layer_catalog(source_catalog).get('layout') == GROUPED_CATALOG_LAYOUT:
         with open_manifest_layers(source_catalog, filenames=[detector['filename']],
                                   memory_mib=memory_mib, workspace=destination.parent) as collection:
             layer = collection[0]
@@ -241,7 +243,10 @@ def export_source_replay(evidence, selection_path, reference_run, output, *, dow
     try:
         (staging/'selection.json').write_bytes(selection_bytes)
         with cpu_export_environment():
-            stem = manifest_path.name.removesuffix('_nrrd_manifest.json')
+            if isinstance(manifest_path, LayerCatalogueRef):
+                stem = Path(generation_manifest['inputs']['source']['path']).stem
+            else:
+                stem = manifest_path.name.removesuffix('_nrrd_manifest.json')
             sink = outputs.NrrdLayerSink(nrrd_dir=staging/'nrrd', stem=stem,
                 output_shape_tyx=source_shape, max_workers=1, low_quality_specs=specs,
                 low_quality_root=staging/'low_quality')
@@ -283,10 +288,11 @@ def export_source_replay(evidence, selection_path, reference_run, output, *, dow
         reference_catalogs = run_layer_catalogs(Path(reference_run)/'manifest.json')
         for spec in specs:
             candidates = [path for grid, path in reference_catalogs.items() if grid.startswith('low_quality/')]
-            match = next((path for path in candidates if tuple(json.loads(path.read_text(encoding='utf-8'))['output_shape_tyx']) == tuple(spec.output_shape_t_y_x)), None)
+            match = next((path for path in candidates
+                          if tuple(read_layer_catalog(path)['output_shape_tyx']) == tuple(spec.output_shape_t_y_x)), None)
             if match is None:
                 raise ValueError('Reference run lacks the requested low-quality detector geometry')
-            low_manifest = json.loads(match.read_text(encoding='utf-8'))
+            low_manifest = read_layer_catalog(match)
             low_detector = next(item for item in low_manifest['layers'] if item['layer_key'] == detector['layer_key'])
             low_detector = dict(low_detector, downbin_value=str(spec.raw_value), downbin_token=str(spec.token),
                 downbin_scale=float(spec.scale))

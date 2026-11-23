@@ -16,6 +16,58 @@ from .run_transport import _stamp
 
 
 GROUPED_CATALOG_LAYOUT = "grouped_sweep_segments"
+_SOURCE_FIELDS = (
+    "view_name", "physical_view_name", "view_family", "source", "mask_kind", "stage",
+    "layer_role", "recomposition_op", "tile_config_id", "tta_aug_id", "model_name",
+    "layer_key", "segment_name", "empty_segment",
+)
+
+
+@dataclass(frozen=True)
+class LayerCatalogueRef(os.PathLike):
+    """Select one catalogue from the authoritative review manifest."""
+
+    path: Path
+    grid_id: str
+    cutoff_cent: int
+
+    def __fspath__(self):
+        return os.fspath(self.path)
+
+    @property
+    def parent(self):
+        return self.path.parent
+
+    @property
+    def name(self):
+        return self.path.name
+
+
+def embedded_layer_metadata(segment, shape):
+    metadata = {key: segment[key] for key in _SOURCE_FIELDS if key in segment}
+    metadata.update(filename=segment["source_filename"], segment_color_rgb=segment["color_rgb"],
+                    output_shape_tyx=shape, exported_axes="(X, Y, t)")
+    metadata.update(segment.get("source_metadata", {}))
+    return metadata
+
+
+def embedded_layer_catalog(grid, branch):
+    """Build the scalar-compatible catalogue for one embedded grid and cutoff."""
+    cutoff = branch["cutoff_cent"]
+    layers = [embedded_layer_metadata(segment, grid["shape_tyx"])
+              for group in grid["groups"] if group["cutoff_cent"] == cutoff
+              for segment in group["segments"]]
+    record = dict(branch.get("source_catalog_metadata", {}))
+    record.update(layout=GROUPED_CATALOG_LAYOUT, run_id=branch["run_id"],
+                  exported_axes="(X, Y, t)", output_shape_tyx=grid["shape_tyx"],
+                  layer_count=len(layers), layers=layers, source_storage="grouped",
+                  review_manifest="manifest.json", grid_id=grid["grid_id"], cutoff_cent=cutoff)
+    return record
+
+
+def embedded_catalogue_bytes(grid, branch):
+    return json.dumps(embedded_layer_catalog(grid, branch), sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode()
 
 
 def group_stamp(info):
@@ -42,24 +94,70 @@ def _family(study):
     path = study / "manifest.json"
     if path.is_file():
         record = json.loads(path.read_bytes())
-        if record.get("schema") == "xta.confidence_sweep/1":
+        if isinstance(record, dict) and record.get("schema") == "xta.confidence_sweep/1":
             return record
     return {}
 
 
-def _review(path, family=None):
+def _review(path, family=None, *, require_family=False):
     data = path.read_bytes()
     record = json.loads(data)
-    if record.get("schema") != "xta.sweep_review/1" or record.get("status") != "complete":
+    if (not isinstance(record, dict) or record.get("schema") != "xta.sweep_review/1"
+            or record.get("status") != "complete"):
         raise ValueError("Expected a published XTA sweep review manifest")
     study = path.parent.parent
     if family is None:
         family = _family(study)
     digest = family.get("review_manifest_sha256")
+    if require_family or record.get("source_catalog") == "embedded" or any(
+        branch.get("source_catalog") == "embedded"
+        for grid in record.get("grids", ()) for branch in grid.get("branches", ())
+    ):
+        status = family.get("status")
+        sweep_id = record.get("sweep_id")
+        if (status not in {"complete", "incomplete", "failed", "cancelled"}
+                or status != record.get("sweep_status")
+                or not isinstance(sweep_id, str) or not sweep_id
+                or family.get("sweep_id") != sweep_id
+                or not isinstance(digest, str) or not digest):
+            raise ValueError("Embedded sweep review requires a matching terminal family receipt")
     if digest is not None and (_relative_file(study, family.get("review_manifest"), study) != path
                                or hashlib.sha256(data).hexdigest() != digest):
         raise ValueError("Sweep review manifest differs from the family receipt")
     return record
+
+
+def _catalogue_slot(review, grid_id, cutoff):
+    if type(cutoff) is not int or not 0 <= cutoff <= 100:
+        raise ValueError("Invalid grouped cutoff value")
+    grid = _one((item for item in review["grids"] if item["grid_id"] == grid_id), f"{grid_id} grid")
+    branch = _one((item for item in grid["branches"] if item["cutoff_cent"] == cutoff),
+                  f"{grid_id} catalogue for cutoff {cutoff}")
+    return grid, branch
+
+
+def _embedded_bytes(ref, review):
+    grid, branch = _catalogue_slot(review, ref.grid_id, ref.cutoff_cent)
+    if (grid.get("payload") != "grouped" or branch.get("source_storage") != "grouped"
+            or branch.get("source_catalog") != "embedded"
+            or branch.get("source_manifest") != ref.path.name):
+        raise ValueError("Expected an embedded grouped sweep layer catalogue")
+    data = embedded_catalogue_bytes(grid, branch)
+    if hashlib.sha256(data).hexdigest() != branch["source_manifest_sha256"]:
+        raise ValueError("Embedded catalogue checksum differs from the review")
+    return data
+
+
+def layer_catalogue_bytes(path):
+    """Return a physical catalogue or project a selected catalogue out of a review."""
+    if isinstance(path, LayerCatalogueRef):
+        ref = LayerCatalogueRef(path.path.resolve(), path.grid_id, path.cutoff_cent)
+        return _embedded_bytes(ref, _review(ref.path, require_family=True))
+    return Path(path).read_bytes()
+
+
+def read_layer_catalog(path):
+    return json.loads(layer_catalogue_bytes(path))
 
 
 def run_layer_catalogs(run_manifest):
@@ -98,7 +196,12 @@ def run_layer_catalogs(run_manifest):
                     or metadata.get("run_id") != run.get("run_id")):
                 raise ValueError("Review catalogue belongs to a different cutoff run")
             path = _relative_file(review_path.parent, metadata["source_manifest"], review_path.parent)
-            if sha256_file(path) != metadata["source_manifest_sha256"]:
+            if metadata.get("source_catalog") == "embedded":
+                if path != review_path:
+                    raise ValueError("Embedded catalogue must be in the review manifest")
+                path = LayerCatalogueRef(path, grid_id, cent)
+                _embedded_bytes(path, review)
+            elif sha256_file(path) != metadata["source_manifest_sha256"]:
                 raise ValueError(f"Grouped catalogue checksum differs from the review: {path}")
             result[grid_id] = path
         return result
@@ -141,27 +244,27 @@ class GroupedSegmentReference:
 
 
 class GroupedCatalogue:
-    def __init__(self, path, catalogue, data_sha256):
+    def __init__(self, path, catalogue, data_sha256, *, embedded_review=None):
         self.path = path
         # The review is an ancestor of its per-grid source catalogues.
         self.review_path = _relative_file(path.parent, catalogue["review_manifest"], path.parents[-1])
         root = self.review_path.parent
-        if self.review_path.name != "manifest.json" or root == path.parent or not path.is_relative_to(root):
+        if (self.review_path.name != "manifest.json" or not path.is_relative_to(root)
+                or (embedded_review is None and root == path.parent)
+                or (embedded_review is not None and path != self.review_path)):
             raise ValueError("Grouped catalogue does not identify its enclosing review")
-        review = _review(self.review_path)
+        review = _review(self.review_path) if embedded_review is None else embedded_review
         self.grid_id = catalogue["grid_id"]
         self.cutoff_cent = catalogue["cutoff_cent"]
-        if type(self.cutoff_cent) is not int or not 0 <= self.cutoff_cent <= 100:
-            raise ValueError("Invalid grouped cutoff value")
-        grid = _one((item for item in review["grids"] if item["grid_id"] == self.grid_id),
-                    f"{self.grid_id} grid")
-        branch = _one((item for item in grid["branches"] if item["cutoff_cent"] == self.cutoff_cent),
-                      f"{self.grid_id} catalogue for cutoff {self.cutoff_cent}")
+        grid, branch = _catalogue_slot(review, self.grid_id, self.cutoff_cent)
         if (grid["payload"] != "grouped" or branch.get("source_storage") != "grouped"
                 or _relative_file(root, branch["source_manifest"], root) != path
                 or branch["source_manifest_sha256"] != data_sha256
+                or (branch.get("source_catalog") == "embedded") != (embedded_review is not None)
                 or branch["run_id"] != catalogue.get("run_id")):
             raise ValueError("Grouped layer catalogue identity does not match the review")
+        self.catalogue = catalogue
+        self.sha256 = data_sha256
         self.run_manifest = _relative_file(root, branch["run_manifest"], root.parent)
         self.run_manifest_sha256 = branch["run_manifest_sha256"]
         run_data = self.run_manifest.read_bytes()
@@ -261,11 +364,22 @@ class GroupedCatalogue:
         return header, payload_offset, stored, offset_xyz, stamp
 
 
-def open_grouped_catalog(path):
+def open_grouped_catalog(path, *, grid_id=None, cutoff_cent=None):
     """Resolve an exact cutoff layer catalogue to its canonical indexed groups."""
+    if isinstance(path, LayerCatalogueRef):
+        if grid_id is not None or cutoff_cent is not None:
+            raise ValueError("A catalogue reference already selects its grid and cutoff")
+        grid_id, cutoff_cent = path.grid_id, path.cutoff_cent
     path = Path(path).resolve()
-    data = path.read_bytes()
+    review = None
+    if grid_id is not None or cutoff_cent is not None:
+        if grid_id is None or cutoff_cent is None:
+            raise ValueError("Select both a grid and cutoff for an embedded catalogue")
+        review = _review(path, require_family=True)
+        data = _embedded_bytes(LayerCatalogueRef(path, grid_id, cutoff_cent), review)
+    else:
+        data = path.read_bytes()
     record = json.loads(data)
     if record.get("layout") != GROUPED_CATALOG_LAYOUT or record.get("source_storage") != "grouped":
         raise ValueError("Expected a canonical grouped sweep layer catalogue")
-    return GroupedCatalogue(path, record, hashlib.sha256(data).hexdigest())
+    return GroupedCatalogue(path, record, hashlib.sha256(data).hexdigest(), embedded_review=review)

@@ -207,6 +207,14 @@ if media_root := os.environ.get('XTA_YOLO_SWEEP_MEDIA_ROOT'):
     stage.parent.mkdir(parents=True, exist_ok=True)
     stage.write_bytes(bytes((1, 0, 1, 0)))
     identity['heatmap_inputs'] = {'grids': {'native': [2, 3, 4]}, 'streaming_decode': False}
+if share_geometry := os.environ.get('SWEEP_TEST_SHARE_GEOMETRY'):
+    from XTA.unification.tta_manifest import SWEEP_SHARED_GEOMETRY_ENV, compact_sweep_run_manifest
+    receipt['forward_sampling'] = {
+        'renderer': 'different' if cent == 75 and share_geometry == 'sampling' else 'reference',
+    }
+    if cent == 75 and share_geometry == 'geometry':
+        receipt['geometry']['physical_views'].append('unexpected')
+    compact_sweep_run_manifest(out / 'manifest.json', receipt, json.loads(os.environ[SWEEP_SHARED_GEOMETRY_ENV]))
 (out / 'manifest.json').write_text(json.dumps(receipt))
 if mode == 'strict_omission':
     raise SystemExit(1)
@@ -228,6 +236,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setenv('XTA_YOLO_SWEEP_CONSUMER_PARALLEL', '1')
     monkeypatch.delenv('SWEEP_TEST_MODE', raising=False)
     monkeypatch.delenv('SWEEP_TEST_FANOUT', raising=False)
+    monkeypatch.delenv('SWEEP_TEST_SHARE_GEOMETRY', raising=False)
     monkeypatch.delenv('XTA_YOLO_SWEEP_VIEW_MAJOR', raising=False)
     monkeypatch.delenv('XTA_YOLO_SWEEP_QUOTA_DIR', raising=False)
     monkeypatch.delenv('XTA_YOLO_SWEEP_CACHE_GIB', raising=False)
@@ -261,6 +270,9 @@ def harness(tmp_path, monkeypatch):
         'entries':len(list(Path(root).glob('child-*'))),
         'raw_disk_bytes':sum(path.stat().st_size for path in Path(root).glob('child-*')),
         'by_backend':{'fixture':len(list(Path(root).glob('child-*')))}}
+    # A staged-output test temporarily imports the real publisher. Restore its
+    # package attribute as well as sys.modules when the harness is torn down.
+    monkeypatch.setattr(sys.modules['XTA'], 'sweep_publication', publisher, raising=False)
     monkeypatch.setitem(sys.modules, 'XTA.sweep_publication', publisher)
     monkeypatch.setitem(sys.modules, 'XTA.forward_replay', cache_module)
     return types.SimpleNamespace(root=tmp_path, source=source, model=model,
@@ -393,6 +405,48 @@ def test_sweep_summary_uses_one_public_file_and_keeps_validated_sections(harness
     assert summary.read_text(encoding='utf-8') == '\n'.join(sections)
     assert list(output.rglob('*.txt')) == [summary]
     assert manifest['work_cleanup_complete']
+
+
+@pytest.mark.parametrize('different', ['none', 'sampling', 'geometry'])
+def test_shared_geometry_is_written_once_and_authenticated(harness, monkeypatch, different):
+    from XTA.unification.tta_manifest import load_tta_run_manifest
+
+    monkeypatch.setenv('SWEEP_TEST_SHARE_GEOMETRY', different)
+    output = harness.root / 'shared-geometry'
+    arguments = dict(cutoffs_hundredths=(50, 75), output_root=output)
+    if different == 'geometry':
+        with pytest.raises(subprocess.CalledProcessError):
+            sweep.run_confidence_sweep(harness.arguments, **arguments)
+    else:
+        sweep.run_confidence_sweep(harness.arguments, **arguments)
+    family = _read(output / 'manifest.json')
+    descriptor = family['shared_run_geometry']
+    shared = output / descriptor['path']
+    assert [p for p in output.rglob(shared.name)] == [shared]
+    assert hashlib.sha256(shared.read_bytes()).hexdigest() == descriptor['sha256']
+    receipt_path = output / 'confidence_cutoffs/conf_050/manifest.json'
+    raw = _read(receipt_path)
+    assert raw['shared_run_geometry'] == descriptor
+    assert 'geometry' not in raw and 'forward_sampling' not in raw
+    restored = load_tta_run_manifest(receipt_path)
+    assert restored['geometry'] == {'physical_views': []}
+    assert restored['forward_sampling'] == {'renderer': 'reference'}
+    if different == 'geometry':
+        assert family['status'] == 'failed'
+        assert not (output / 'confidence_cutoffs/conf_075/manifest.json').exists()
+        return
+    sibling = output / 'confidence_cutoffs/conf_075/manifest.json'
+    sibling_raw = _read(sibling)
+    assert sibling_raw['shared_run_geometry'] == descriptor
+    assert 'geometry' not in sibling_raw
+    sibling_sampling = sibling_raw.get('forward_sampling')
+    assert sibling_sampling == ({'renderer': 'different'} if different == 'sampling' else None)
+    assert load_tta_run_manifest(sibling)['geometry'] == restored['geometry']
+    assert load_tta_run_manifest(sibling)['forward_sampling'] == (sibling_sampling or restored['forward_sampling'])
+    # The raw branch receipt continues to authenticate the shared file.
+    shared.write_bytes(shared.read_bytes().replace(b'reference', b'changed!!'))
+    with pytest.raises(ValueError, match='Shared sweep geometry SHA-256'):
+        load_tta_run_manifest(sibling)
 
 
 @pytest.mark.parametrize('child_fails', [False, True])

@@ -27,6 +27,11 @@ weights, retained and rejected voxel counts, and working-memory plan. Keep the
 original policy source and any dependencies if you plan to rerun a custom
 callback. Use the recorded SHA-256 to verify the policy source.
 
+In a managed confidence sweep, each cutoff's run manifest embeds the
+reconciliation result and references its resolved policy in the family
+`manifest.json`. Read the full report for either layout with
+`XTA.reconciliation_policy.load_reconciliation_report(path_to_run_manifest)`.
+
 ## Included policies
 
 | File | Decision |

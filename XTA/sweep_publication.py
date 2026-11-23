@@ -7,7 +7,7 @@ grid exists.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -26,13 +26,19 @@ from .artifact_archive import split_reference
 from .grouped_seg_nrrd import GroupedSegment, write_grouped_seg_nrrd
 from .json_publication import _fsync_parent_directory, _staged_sweep_directory, write_json_atomic
 from .reconciliation_io import FileLayer, _budget, _same_geometry, read_layer_manifest
+from .review_compression import review_gzip_pool
 from .sweep_coverage import DirectCoverage, write_coverage_colors
+from .sweep_grouped_reader import embedded_catalogue_bytes, embedded_layer_metadata
 
 
 SCHEMA = "xta.sweep_review/1"
 GROUPED = "grouped"
 REFERENCE_ONLY = "reference_only"
 _MAX_CHANNELS = 64
+_EMBEDDED_CATALOGUE_DERIVED_FIELDS = frozenset({
+    "layout", "run_id", "exported_axes", "output_shape_tyx", "layer_count", "layers",
+    "notes", "stored_layout", "source_storage", "review_manifest", "grid_id", "cutoff_cent",
+})
 # Bound the padded volume created by bundling multiple otherwise sparse masks.
 _MAX_GROUP_BYTES = 2 * 1024**3
 _MAX_WORKERS = 8
@@ -117,11 +123,8 @@ class _Member:
         _, y, x = self.source.offset_tyx
         _, height, width = self.source.stored_shape_tyx
 
-        def read(z0, z1):
-            slab = self.source.read_slab(z0, z1, stored_xy=True)
-            if self.info["role"] == "direct":
-                coverage.observe(z0, slab, self.extent, origin_yx=(y, x))
-            return slab
+        def observe(z0, slab):
+            coverage.observe(z0, slab, self.extent, origin_yx=(y, x))
 
         tags = {}
         for entry in self.source.header.get("Segment0_Tags", "").split("|"):
@@ -134,8 +137,10 @@ class _Member:
                 "XTA.Model": quote(self.info["model_name"], safe="._-/"),
                 "XTA.LayerKey": quote(self.info["layer_key"], safe="._-/")})
         return GroupedSegment(self.info["segment_id"], self.info["display_name"],
-                              tuple(self.info["color_rgb"]), read, tags, self.extent,
-                              source_window_yx=(y, x, y + height, x + width))
+                              tuple(self.info["color_rgb"]), None, tags, self.extent,
+                              source_window_yx=(y, x, y + height, x + width),
+                              source_layer=self.source,
+                              observe_slab=observe if self.info["role"] == "direct" else None)
 
 
 def _member(cutoff, layer, sweep_id, grid_id):
@@ -196,33 +201,23 @@ def _rebase_source_reference(metadata, field, old_directory, new_directory):
     metadata[field + "_base"] = "manifest_directory"
 
 
-def _write_grouped_source_manifest(path, collection, *, grid_id, cutoff, review, stage):
-    """Preserve scalar metadata while locating payloads through the group index."""
-    catalog = Path(grid_id) / "sources" / f"conf_{cutoff:03d}" / path.name
-    destination = review / catalog
-    document = dict(collection.manifest)
-    document.pop("stored_layout", None)
-    rows = []
-    for source in document["layers"]:
-        row = dict(source)
-        for field in ("stored_layout", "stored_shape_tyx", "stored_offset_tyx"):
-            row.pop(field, None)
-
-        _rebase_source_reference(row, "proposal_evidence_path", path.parent, destination.parent)
-        if isinstance(row.get("extrapolation"), dict):
-            row["extrapolation"] = dict(row["extrapolation"])
-            _rebase_source_reference(row["extrapolation"], "evidence_path", path.parent, destination.parent)
-        rows.append(row)
-    document.update(layout="grouped_sweep_segments", source_storage="grouped",
-                    review_manifest=_relative(review / "manifest.json", destination.parent),
-                    grid_id=grid_id, cutoff_cent=cutoff, layers=rows,
-                    notes=["Layer filenames are stable identifiers. The review index locates each grouped segment."])
-    published = write_json_atomic(stage / catalog, document)
-    return destination, _read_identity(published)[1]
+def _embed_source_metadata(member, shape, old_directory, review):
+    """Keep provenance fields the review's own segment row does not already carry."""
+    row = dict(member.source.metadata)
+    for field in ("stored_layout", "stored_shape_tyx", "stored_offset_tyx"):
+        row.pop(field, None)
+    _rebase_source_reference(row, "proposal_evidence_path", old_directory, review)
+    if isinstance(row.get("extrapolation"), dict):
+        row["extrapolation"] = dict(row["extrapolation"])
+        _rebase_source_reference(row["extrapolation"], "evidence_path", old_directory, review)
+    defaults = embedded_layer_metadata({**member.info, "empty_segment": member.extent == _EMPTY}, list(shape))
+    extra = {key: value for key, value in row.items() if key not in defaults or defaults[key] != value}
+    if extra:
+        member.info["source_metadata"] = extra
 
 
 def _grid_sources(grid_id, branches, review, scratch, sweep_id, memory_mib, source_mode, resources,
-                  catalog_stage=None):
+                  *, embedded=False):
     """Read each cutoff's manifest and NRRD headers; payloads stay unopened."""
     origins, members = [], []
     geometry = None
@@ -240,21 +235,25 @@ def _grid_sources(grid_id, branches, review, scratch, sweep_id, memory_mib, sour
         elif not _same_geometry(geometry, collection.geometry):
             raise ValueError(f"Physical geometry changed at cutoff {cutoff} on {grid_id}")
         evidence_manifest = branch / "reconciliation_evidence" / "manifest.json"
-        if catalog_stage is not None:
-            path, manifest_digest = _write_grouped_source_manifest(
-                path, collection, grid_id=grid_id, cutoff=cutoff, review=review, stage=catalog_stage,
-            )
         origin = {"cutoff_cent":cutoff, "source_mode":source_mode, "run_id":run_id,
                         "branch_dir":_relative(branch, review),
                         "run_manifest":_relative(branch / "manifest.json", review),
-                        "run_manifest_sha256":run_digest, "source_manifest":_relative(path, review),
-                        "source_manifest_sha256":manifest_digest,
+                        "run_manifest_sha256":run_digest,
                         "observed_confidence_manifest":(_relative(evidence_manifest, review)
                             if evidence_manifest.is_file() else None)}
-        if catalog_stage is not None:
-            origin["source_storage"] = "grouped"
+        cutoff_members = [_member(cutoff, layer, sweep_id, grid_id) for layer in collection]
+        if embedded:
+            for member in cutoff_members:
+                _embed_source_metadata(member, collection.shape_tyx, path.parent, review)
+            origin.update(source_storage="grouped", source_catalog="embedded", source_manifest="manifest.json")
+            extra = {key: value for key, value in collection.manifest.items()
+                     if key not in _EMBEDDED_CATALOGUE_DERIVED_FIELDS}
+            extra["source_manifest_name"] = path.name
+            origin["source_catalog_metadata"] = extra
+        else:
+            origin.update(source_manifest=_relative(path, review), source_manifest_sha256=manifest_digest)
         origins.append(origin)
-        members.extend(_member(cutoff, layer, sweep_id, grid_id) for layer in collection)
+        members.extend(cutoff_members)
     ids = [m.info["segment_id"] for m in members]
     if len(set(ids)) != len(ids):
         raise ValueError(f"Duplicate source layer identity on {grid_id}")
@@ -286,13 +285,12 @@ class _Cancelled(Exception):
 
 
 def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mib, source_mode,
-                  workers=1, *, consolidated=False):
+                  workers=1, *, member_pool, consolidated=False):
     destination = stage / grid_id
     destination.mkdir(parents=True)
     with ExitStack() as resources:
         geometry, origins, members = _grid_sources(grid_id, branches, review, scratch, sweep_id,
-                                                   memory_mib, source_mode, resources,
-                                                   catalog_stage=stage if consolidated else None)
+                                                   memory_mib, source_mode, resources, embedded=consolidated)
         by_cut = defaultdict(list)
         for member in members:
             by_cut[member.cutoff].append(member)
@@ -316,6 +314,7 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
             counter = DirectCoverage(scratch, geometry, len(direct_by_cut[cutoff]))
             try:
                 groups, votes = [], 0
+                group_spans = Counter()
                 for index, pack in packs:
                     if failed.is_set():
                         raise _Cancelled()
@@ -325,7 +324,7 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
                         options = {"index_segments": True} if consolidated else {}
                         stats = write_grouped_seg_nrrd(path, shape_tyx=geometry.shape_tyx, segments=descriptors,
                                                         geometry=geometry, memory_mib=memory_mib, temp_dir=scratch,
-                                                        **options)
+                                                        member_pool=member_pool, **options)
                     finally:
                         for m in pack:
                             m.source.close()
@@ -344,15 +343,18 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
                                    "offset_xyz":stats["offset_xyz"]})
                     if consolidated:
                         groups[-1]["sha256"] = stats["sha256"]
+                    spans = stats["gzip_spans"]
+                    group_spans.update({k: spans[k] for k in (
+                        "reused_spans", "reused_bytes", "reused_compressed_bytes", "data_bytes", "zero_bytes")})
                 path = destination / f"conf_{cutoff:03d}_coverage.label.nrrd"
                 info = counter.write(path, sweep_id=sweep_id, grid_id=grid_id, cutoff_cent=cutoff,
-                                     memory_mib=memory_mib, durable=consolidated)
+                                     memory_mib=memory_mib, durable=consolidated, member_pool=member_pool)
                 if info["voxel_votes"] != votes:
                     raise RuntimeError(f"Direct coverage count conservation failed for {grid_id}, cutoff {cutoff}")
                 overlay = {"cutoff_cent":cutoff, "path":_relative(path, stage),
                            "color_table":_relative(table, stage), "role":"direct_layer_count",
                            "source_segment_ids":direct_by_cut[cutoff], **info}
-                return groups, overlay
+                return groups, overlay, group_spans
             except BaseException:
                 failed.set()
                 raise
@@ -377,9 +379,18 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
             if errors:
                 raise (real or errors)[0]
             results = [f.result() for f in futures]
-    groups = [group for cut_groups, _ in results for group in cut_groups]
-    overlays = [overlay for _, overlay in results]
-    return _grid_record(grid_id, geometry, GROUPED, origins, groups, overlays)
+    groups = [group for cut_groups, _, _ in results for group in cut_groups]
+    overlays = [overlay for _, overlay, _ in results]
+    grid = _grid_record(grid_id, geometry, GROUPED, origins, groups, overlays)
+    totals = Counter()
+    for _, _, spans in results:
+        totals.update(spans)
+    grid["group_compression"] = dict(totals, data_codec=member_pool.backend,
+                                     worker_limit=member_pool.max_workers)
+    if consolidated:
+        for origin in origins:
+            origin["source_manifest_sha256"] = hashlib.sha256(embedded_catalogue_bytes(grid, origin)).hexdigest()
+    return grid
 
 
 def _copy_index_to_grid_folders(stage, products):
@@ -446,9 +457,8 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
 
     Each (hundredth, branch output directory) must designate a completed scalar
     run below output_dir. With no requested scalar NRRDs there is nothing to package.
-    Paths in review/manifest.json are relative to that manifest. Each grouped
-    grid folder also holds a byte-identical copy of it, so that folder can be
-    dropped into Slicer on its own.
+    Paths in review/manifest.json are relative to that manifest. For independent
+    scalar packaging, each grouped grid folder still includes a copy of the index.
     Seek-heavy coverage spools and intermediate compression use temp_dir or the
     system temporary filesystem. Complete review assets stage beside their destination.
 
@@ -459,7 +469,8 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
     exists, because its original scalar NRRDs remain available.
     A grouped grid publishes its cutoffs concurrently
     on up to ``workers`` threads (default: one per cutoff, at most 8, bounded by
-    the CPU count). Each worker uses its own ``memory_mib`` slab budget.
+    the CPU count). Each worker uses its own ``memory_mib`` slab and queued
+    member budget. All cutoffs and grids share the review's CPU compression pool.
     """
     _budget(memory_mib)
     if workers is None:
@@ -546,7 +557,8 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
             raise ValueError("The temporary directory must be outside the review being published")
         temp_dir.mkdir(parents=True, exist_ok=True)
     with (tempfile.TemporaryDirectory(prefix="xta-review-work-", dir=temp_dir) as workspace,
-          _staged_sweep_directory(review, prefix=".review.atomic-result-") as stage):
+          _staged_sweep_directory(review, prefix=".review.atomic-result-") as stage,
+          review_gzip_pool() as member_pool):
         scratch = Path(workspace)
         reference_native = not consolidated and any(g != "native" for g in grids)
         products = []
@@ -559,7 +571,8 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
                                                 memory_mib, source_mode))
             else:
                 products.append(_publish_grid(grid_id, resolved, stage, review, scratch, sweep_id,
-                                              memory_mib, source_mode, workers, consolidated=consolidated))
+                                              memory_mib, source_mode, workers, member_pool=member_pool,
+                                              consolidated=consolidated))
             if consolidated:
                 groups = products[-1]["groups"]
                 print(f"Confidence review grid {grid_id} staged {len(groups)} groups "
@@ -567,7 +580,8 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
                       f"in {time.monotonic() - grid_started:.1f}s.", flush=True)
         write_json_atomic(stage / "manifest.json", {
             "schema":SCHEMA, "status":"complete", "sweep_id":sweep_id, "source_mode":source_mode,
-            **({"source_storage": "grouped", "sweep_status": sweep_status} if consolidated else {}),
+            **({"source_storage": "grouped", "source_catalog": "embedded",
+                "sweep_status": sweep_status} if consolidated else {}),
             "independent_scalar_configuration_differences":sorted(different_options),
             "cutoffs_cent":sorted(seen), "default_cutoff_cent":min(seen), "grids":products,
             "coverage_semantics":"Count of contributing published direct YOLO prediction layers at the selected cutoff; zero denotes no direct layer. Correlated views can contribute.",
@@ -575,12 +589,13 @@ def publish_sweep_review(output_dir, branches, *, sweep_id, memory_mib=128,
             "logical_identity":"A logical ID identifies a model/layer export slot across grids and cutoffs. Independently generated geometry in that slot may differ.",
             "grid_payloads":"A grouped grid has stock .seg.nrrd groups, each holding one cutoff, and per-cutoff direct coverage labelmaps. A reference_only grid lists its segment identities and branch origins but no review payload; open its scalar branch NRRDs directly.",
             "source_retention": (
-                "Review groups are the canonical NRRD payloads. Source catalogs retain original layer metadata."
+                "Review groups are the canonical NRRD payloads. Layer provenance is embedded in the index."
                 if consolidated else
                 "Scalar branch NRRDs remain in their original directories. Review groups carry the same binary masks, original colors and per-cutoff identities."
             ),
         })
-        _copy_index_to_grid_folders(stage, products)
+        if not consolidated:
+            _copy_index_to_grid_folders(stage, products)
         if consolidated:
             for directory, _, _ in os.walk(stage, topdown=False):
                 _fsync_parent_directory(Path(directory))

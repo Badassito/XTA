@@ -152,10 +152,12 @@ def decode_manifest_layers(manifest):
 def inspect_case(output, name):
     import numpy as np
     from XTA.confidence_evidence import ConfidenceEvidenceRef
+    from XTA.reconciliation_policy import load_reconciliation_report
+    from XTA.sweep_grouped_reader import locate_run_layer_catalog
     run = json.loads((output / 'manifest.json').read_text())
     if run['status'] != 'complete':
         raise AssertionError('Pipeline did not publish a complete run manifest')
-    manifest = next((output / 'nrrd').glob('*_nrrd_manifest.json'))
+    manifest = locate_run_layer_catalog(output / 'manifest.json')
     decoded = decode_manifest_layers(manifest)
     layers = [layer for layer, _values in decoded]
     components, final = {}, None
@@ -183,7 +185,9 @@ def inspect_case(output, name):
         component_hashes={key: hashlib.sha256(value.tobytes()).hexdigest() for key, value in components.items()},
         final_is_candidate_subset=True)
     if not name.endswith('_off'):
-        report = json.loads((output / 'reconciliation/manifest.json').read_text())
+        report = load_reconciliation_report(output / 'manifest.json')
+        if report is None:
+            raise AssertionError('Reconciliation did not publish its report')
         score_manifest = json.loads((output / 'reconciliation_evidence/manifest.json').read_text())
         saved = {(entry['model_name'], entry['layer_key']): entry for entry in score_manifest['layers']}
         values_present, known_total, prediction_layers = set(), 0, 0
@@ -196,7 +200,10 @@ def inspect_case(output, name):
             ref = ConfidenceEvidenceRef.open(output / 'reconciliation_evidence' / entry['directory'])
             if ref.shape != final.shape:
                 raise AssertionError('Retained confidence has the wrong source grid')
-            if Path(metadata['confidence_evidence']).resolve() != ref.path.resolve():
+            reported_evidence = Path(metadata['confidence_evidence'])
+            if metadata.get('confidence_evidence_path_base') == 'manifest_directory':
+                reported_evidence = output / reported_evidence
+            if reported_evidence.resolve() != ref.path.resolve():
                 raise AssertionError('Runtime layer confidence descriptor does not match saved sidecar')
             work = output.parent / 'score_verification' / entry['directory']
             with ref.source_reader(work) as reader:
@@ -248,7 +255,9 @@ def inspect_case(output, name):
 def verify_bridge_evidence(output):
     import numpy as np
     from XTA.confidence_evidence import ConfidenceEvidenceRef
-    manifest = next((output / 'nrrd').glob('*_nrrd_manifest.json'))
+    from XTA.reconciliation_policy import load_reconciliation_report
+    from XTA.sweep_grouped_reader import locate_run_layer_catalog
+    manifest = locate_run_layer_catalog(output / 'manifest.json')
     predictions = bridges = None
     bridge_count = 0
     for layer, mask in decode_manifest_layers(manifest):
@@ -268,9 +277,8 @@ def verify_bridge_evidence(output):
         raise AssertionError('Bridge layers add no foreground beyond predictions')
     result = dict(nonempty_bridge_layers=bridge_count, bridge_voxels=int(bridges.sum()),
                   bridge_only_voxels=int(bridge_only.sum()))
-    report_path = output / 'reconciliation/manifest.json'
-    if report_path.exists():
-        report = json.loads(report_path.read_text())
+    report = load_reconciliation_report(output / 'manifest.json')
+    if report is not None:
         known_any = np.zeros_like(bridge_only)
         prediction_count = bridge_roles = 0
         for record in report['layers'].values():
@@ -281,7 +289,10 @@ def verify_bridge_evidence(output):
                     raise AssertionError('Bridge received prediction confidence/provenance')
             elif metadata['mask_kind'] == 'yolo':
                 prediction_count += 1
-                ref = ConfidenceEvidenceRef.open(metadata['confidence_evidence'])
+                evidence_path = Path(metadata['confidence_evidence'])
+                if metadata.get('confidence_evidence_path_base') == 'manifest_directory':
+                    evidence_path = output / evidence_path
+                ref = ConfidenceEvidenceRef.open(evidence_path)
                 work = output.parent / 'bridge_score_verification' / ref.path.name
                 with ref.source_reader(work) as reader:
                     for z in range(ref.shape[0]):

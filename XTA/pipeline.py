@@ -360,11 +360,13 @@ from .unification.sampling import (
     raster_plan_spawn_spec,
 )
 from .unification.tta_manifest import (
+    SWEEP_SHARED_GEOMETRY_ENV,
     TTA_RUN_MANIFEST_SCHEMA,
     TTA_VOXEL_COUNT_SCHEMA,
     assert_tta_artifacts_unchanged,
     build_tta_run_manifest,
     capture_tta_artifact_identities,
+    compact_sweep_run_manifest,
 )
 from .startup_io import capture_and_probe_tta_startup
 from .tta_prepare_planning import (
@@ -955,7 +957,12 @@ def _main_impl() -> None:
             cpu_model_path = resolved_path
 
     from .tta_augmentation_config import resolve_tta_augmentation
-    from .reconciliation_policy import resolve_reconciliation, load_reconciliation_policy
+    from .reconciliation_policy import (
+        SWEEP_RECONCILIATION_POLICY_STAGE, load_reconciliation_policy, resolve_reconciliation,
+    )
+    sweep_reconciliation_policy_stage = (
+        os.environ.get(SWEEP_RECONCILIATION_POLICY_STAGE) if sweep_branch is not None else None
+    )
     try:
         policy_settings = resolve_tta_augmentation(
             args, gpu_devices=backend_devices.gpu_devices, cpu_enabled=backend_devices.cpu,
@@ -1923,7 +1930,10 @@ def _main_impl() -> None:
             processing_shape_tyx=(int(T), int(H), int(W)), settings=reconciliation_settings,
             policy=reconciliation_policy,
             include_extrapolation=interpolation_settings.extrapolation_enabled)
-        write_json_manifest(out_dir / 'reconciliation' / 'preflight.json', reconciliation_preflight)
+        if sweep_reconciliation_policy_stage is not None:
+            runtime_telemetry().gauge('reconciliation.preflight', reconciliation_preflight)
+        else:
+            write_json_manifest(out_dir / 'reconciliation' / 'preflight.json', reconciliation_preflight)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolation_distance))]
 
     # A tilted_* Azimuthal token expands to every concrete signed/directional Tilted variant.
@@ -7360,8 +7370,9 @@ def _main_impl() -> None:
                 nrrd_layer_refs, views=inference_views,
                 source_shape_tyx=source_output_shape_tyx, processing_shape_tyx=(int(T), int(H), int(W)),
                 settings=reconciliation_settings, policy=reconciliation_policy,
-                output_dir=out_dir / 'reconciliation', workspace=temp_dir / 'reconciliation',
-                assembled_union=original_union)
+                output_dir=out_dir if sweep_reconciliation_policy_stage is not None else out_dir / 'reconciliation',
+                workspace=temp_dir / 'reconciliation', assembled_union=original_union,
+                publish_report=sweep_reconciliation_policy_stage is None)
         if final_union_mm is not original_union:
             if streaming_final_union_holder.get(str(model_name)) is original_union:
                 streaming_final_union_holder[str(model_name)] = final_union_mm
@@ -7524,7 +7535,7 @@ def _main_impl() -> None:
 
     final_output_volume_for_low_quality = output_volume_rgb
     final_paths: Dict[str, Path] = {}
-    if reconciliation_report is not None:
+    if reconciliation_report is not None and sweep_reconciliation_policy_stage is None:
         final_paths['reconciliation_manifest'] = out_dir / 'reconciliation' / 'manifest.json'
     from .confidence_retention import published_confidence_manifest
     confidence_manifest = (published_confidence_manifest(out_dir)
@@ -7595,6 +7606,7 @@ def _main_impl() -> None:
             show_progress=False,
             save_overlay=sweep_heatmap_root is None,
             stage_mask=stage_low_quality_heatmap,
+            flat_output=sweep_branch is not None,
         )
         final_paths.update(low_quality_paths)
         output_manager.submit(BackgroundOutputSubmission(
@@ -7992,6 +8004,14 @@ def _main_impl() -> None:
         run_manifest['run_id'] = scalar_run_id
         if sweep_branch is not None:
             run_manifest['confidence_sweep'] = sweep_branch
+        if reconciliation_report is not None and sweep_reconciliation_policy_stage is not None:
+            from .reconciliation_policy import stage_sweep_reconciliation_report
+            report = stage_sweep_reconciliation_report(reconciliation_report, sweep_reconciliation_policy_stage)
+            run_manifest['reconciliation'] = report
+            identity = run_manifest['prediction_processing']['reconciliation']
+            identity.pop('policy_path')
+            identity.pop('policy_sha256')
+            identity['policy_record_sha256'] = report['policy_record_sha256']
         run_manifest['status'] = 'incomplete' if sam_planning_omissions else 'complete'
         run_manifest['sam_requested_work_complete'] = not bool(sam_planning_omissions)
         run_manifest['sam_planning_omissions'] = sam_planning_omissions
@@ -8043,6 +8063,9 @@ def _main_impl() -> None:
                 raise RuntimeError('TTA run manifest was not constructed')
             if tta_artifact_identities is None:  # pragma: no cover - launch invariant
                 raise RuntimeError('TTA artifact identities were not captured')
+            shared_geometry = os.environ.get(SWEEP_SHARED_GEOMETRY_ENV)
+            if sweep_branch is not None and shared_geometry is not None:
+                compact_sweep_run_manifest(run_manifest_path, run_manifest, json.loads(shared_geometry))
             _finalize_tta_selected_run_and_publish(
                 temp_dir=temp_dir,
                 out_dir=out_dir,

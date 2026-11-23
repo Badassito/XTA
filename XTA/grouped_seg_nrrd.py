@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from .reconciliation_io import ReferenceGeometry, _budget, _shape
+from .reconciliation_io import FileLayer, ReferenceGeometry, _budget, _shape
 from .gzip_spans import GzipSpanWriter
 
 
@@ -31,16 +31,19 @@ class GroupedSegment:
 
     extent_xyz is an optional trusted inclusive upper bound in reference IJK.
     An empty extent declares an empty segment without calling read_slab.
-    The callback must not allocate a larger source slab than requested.
+    Provide either a callback or a FileLayer. A callback must not allocate a
+    larger source slab than requested. The observer receives validated slabs.
     """
     segment_id: str
     name: str
     color_rgb: tuple[float, float, float]
-    read_slab: Callable[[int, int], np.ndarray]
+    read_slab: Callable[[int, int], np.ndarray] | None
     tags: Mapping[str, str] = field(default_factory=dict)
     extent_xyz: tuple[int, int, int, int, int, int] | None = None
     # Optional reference coordinates (y0, x0, y1, x1), upper bounds exclusive.
     source_window_yx: tuple[int, int, int, int] | None = None
+    source_layer: FileLayer | None = None
+    observe_slab: Callable[[int, np.ndarray], None] | None = None
 
 
 def _text(value: Any, name: str) -> str:
@@ -78,8 +81,19 @@ def _validated_segments(segments, shape):
         if sid in ids:
             raise ValueError(f"Duplicate segment_id: {sid}")
         ids.add(sid)
-        if not callable(segment.read_slab):
-            raise ValueError("read_slab must be callable")
+        source = segment.source_layer
+        if source is None:
+            if not callable(segment.read_slab):
+                raise ValueError("read_slab must be callable")
+            source_window = (0, 0, *shape[1:])
+        else:
+            if not isinstance(source, FileLayer) or segment.read_slab is not None or source.shape_tyx != shape:
+                raise ValueError("source_layer must be a FileLayer on the reference grid with no read_slab")
+            _, y, x = source.offset_tyx
+            _, height, width = source.stored_shape_tyx
+            source_window = (y, x, y + height, x + width)
+        if segment.observe_slab is not None and not callable(segment.observe_slab):
+            raise ValueError("observe_slab must be callable")
         color = tuple(segment.color_rgb)
         if len(color) != 3 or any(isinstance(v, bool) or not math.isfinite(float(v))
                                    or not 0 <= float(v) <= 1 for v in color):
@@ -96,11 +110,13 @@ def _validated_segments(segments, shape):
             tags[key] = value
         window = segment.source_window_yx
         if window is None:
-            window = (0, 0, *shape[1:])
+            window = source_window
         if (not isinstance(window, (tuple, list)) or len(window) != 4
                 or any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) for v in window)
                 or not 0 <= window[0] < window[2] <= shape[1] or not 0 <= window[1] < window[3] <= shape[2]):
             raise ValueError("source_window_yx must be a nonempty crop inside the reference plane")
+        if source is not None and tuple(window) != source_window:
+            raise ValueError("source_window_yx disagrees with source_layer")
         result.append((segment, _extent(segment.extent_xyz, shape), color, tags, tuple(map(int, window))))
     return result
 
@@ -159,6 +175,61 @@ def _group_slab(slab, window, crop_y, crop_x, height, width):
     return payload
 
 
+def _reusable_source(segment, bound, window, stored_shape, offset_xyz):
+    source = segment.source_layer
+    if source is None or bound == _EMPTY_EXTENT or not source.can_copy_gzip_payload:
+        return None
+    crop_x, crop_y, crop_z = offset_xyz
+    depth, height, width = stored_shape
+    if window != (crop_y, crop_x, crop_y + height, crop_x + width):
+        return None
+    source_z = source.offset_tyx[0]
+    source_stop = source_z + source.stored_shape_tyx[0]
+    # A source with extra stored Z planes must still obey the original
+    # trusted-extent contract. Reuse only planes the callback would read.
+    if (source_z != bound[4] or source_stop != bound[5] + 1
+            or not crop_z <= source_z < source_stop <= crop_z + depth):
+        return None
+    return source
+
+
+def _scan_segment(segment, bound, window, first, stop, depth, stored_shape, offset_xyz, compressed):
+    """Validate source slabs and optionally write their materialized group bytes."""
+    y0, x0, y1, x1 = window
+    crop_x, crop_y, _ = offset_xyz
+    _, height, width = stored_shape
+    source = segment.source_layer
+    foreground, exact = 0, _EMPTY_EXTENT
+    for z0 in range(first, stop, depth):
+        z1 = min(stop, z0 + depth)
+        slab = (source.read_slab(z0, z1, stored_xy=True)
+                if source is not None else np.asarray(segment.read_slab(z0, z1)))
+        if slab.shape != (z1-z0, y1-y0, x1-x0) or slab.dtype not in (np.dtype(np.uint8), np.dtype(bool)):
+            raise ValueError("read_slab must return the requested uint8 or bool TYX slab")
+        if source is None and slab.dtype == np.uint8 and slab.max() > 1:
+            raise ValueError("Grouped segments require binary values 0/1")
+        count = int(np.count_nonzero(slab))
+        extent = _slab_extent(slab, (z0, y0, x0), count)
+        if count and any(extent[2*i] < bound[2*i] or extent[2*i+1] > bound[2*i+1] for i in range(3)):
+            raise ValueError(f"Source data exceeds extent_xyz for {segment.segment_id}")
+        exact = _merge_extent(exact, extent)
+        foreground += count
+        if compressed is not None:
+            if count:
+                payload = _group_slab(slab, window, crop_y, crop_x, height, width)
+                compressed.write(memoryview(payload).cast("B"))
+                del payload
+            else:
+                compressed.write_zeros((z1-z0) * height * width)
+        if segment.observe_slab is not None:
+            observed = slab.view()
+            observed.flags.writeable = False
+            segment.observe_slab(z0, observed)
+            del observed
+        del slab
+    return foreground, exact
+
+
 def _vector(values):
     return "(" + ",".join(format(float(value), ".17g") for value in values) + ")"
 
@@ -197,12 +268,14 @@ def write_grouped_seg_nrrd(
     segments: Sequence[GroupedSegment], geometry: ReferenceGeometry | None = None,
     memory_mib: float = 64, chunk_slices: int = 16, overwrite: bool = False,
     temp_dir: str | Path | None = None, index_segments: bool = False,
+    member_pool=None,
 ) -> dict[str, Any]:
     """Write overlapping ordinary segments with one source pass and bounded slabs.
 
     The numeric buffer budget admits a source slab, normalization/validation
-    workspace, and bounded canonical-zero construction/write buffers. Codec control state and O(K) metadata
-    are separate fixed overhead. Callbacks may borrow pre-existing source arrays
+    workspace, queued compression members, and bounded canonical-zero
+    construction/write buffers. Codec control state and O(K) metadata are
+    separate fixed overhead. Callbacks may borrow pre-existing source arrays
     but must not create a larger new slab than requested.
 
     Trusted extent bounds permit cropping and omission of known-empty source
@@ -211,6 +284,8 @@ def write_grouped_seg_nrrd(
     The compressed spool uses temp_dir (system temporary storage by default);
     only the final assembled temporary file is placed beside its destination.
     Indexed segments have complete gzip member ranges for direct channel reads.
+    Aligned scalar payloads can be reused during validation. A supplied pool
+    encodes materialized data in independently decodable members.
     """
     shape = _shape(shape_tyx, "shape_tyx")
     budget = _budget(memory_mib)
@@ -223,12 +298,24 @@ def write_grouped_seg_nrrd(
         raise ValueError("overwrite and index_segments must be bool")
     descriptors = _validated_segments(segments, shape)
     stored_shape, offset_xyz = _union_crop([row[1] for row in descriptors], shape)
+    reusable_sources = [_reusable_source(segment, bound, window, stored_shape, offset_xyz)
+                        for segment, bound, _, _, window in descriptors]
+    plane_bytes = math.prod(stored_shape[1:])
     largest_input = max(((y1-y0)*(x1-x0) for _, bound, _, _, (y0,x0,y1,x1) in descriptors
                          if bound != _EMPTY_EXTENT), default=1)
-    per_slice = max(largest_input, math.prod(stored_shape[1:]))
+    per_slice = max(largest_input, plane_bytes)
     zero_bytes = min(64 * 1024, per_slice)
     minimum = 3 * per_slice + zero_bytes
-    depth = min(chunk_slices, shape[0], (budget - zero_bytes) // max(1, 3 * per_slice))
+    pending = reserved = 0
+    if member_pool is not None and budget >= minimum:
+        channel_bytes = ((bound[5] - bound[4] + 1) * plane_bytes
+                         for (_, bound, _, _, _), source in zip(descriptors, reusable_sources)
+                         if bound != _EMPTY_EXTENT and source is None)
+        # Indexed channels drain separately. An unindexed stream can coalesce
+        # materialized bytes from consecutive channels into the same member.
+        materialized_bytes = max(channel_bytes, default=0) if index_segments else sum(channel_bytes)
+        pending, reserved = member_pool.plan(budget - minimum, materialized_bytes)
+    depth = min(chunk_slices, shape[0], (budget - reserved - zero_bytes) // max(1, 3 * per_slice))
     if depth < 1:
         raise ValueError(f"memory_mib must admit at least {minimum} numeric buffer bytes for one reference slice")
     path = Path(path).resolve()
@@ -243,9 +330,8 @@ def write_grouped_seg_nrrd(
     payload_dir = None
     zero_member_bytes = 1 << (min(1024*1024, max(1, budget//8)).bit_length()-1)
     zero_write_buffer_bytes = min(64*1024, max(1, budget//16))
-    crop_x, crop_y, crop_z = offset_xyz
-    stored_z, stored_y, stored_x = stored_shape
-    plane_bytes = stored_y * stored_x
+    crop_z = offset_xyz[2]
+    stored_z = stored_shape[0]
     records = []
 
     try:
@@ -254,36 +340,23 @@ def write_grouped_seg_nrrd(
         with payload_path.open("wb") as raw, GzipSpanWriter(
             raw, compresslevel=3, zero_member_bytes=zero_member_bytes,
             write_buffer_bytes=zero_write_buffer_bytes,
+            member_pool=member_pool, max_pending_members=pending,
         ) as compressed:
-            for segment, bound, color, tags, window in descriptors:
-                y0, x0, y1, x1 = window
+            for (segment, bound, color, tags, window), source in zip(descriptors, reusable_sources):
                 start = raw.tell() if index_segments else None
-                foreground, exact = 0, _EMPTY_EXTENT
                 if bound == _EMPTY_EXTENT:
                     first = stop = crop_z
                 else:
                     first, stop = max(crop_z, bound[4]), min(crop_z+stored_z, bound[5]+1)
                 compressed.write_zeros((first-crop_z) * plane_bytes)
-                for z0 in range(first, stop, depth):
-                    z1 = min(stop, z0+depth)
-                    slab = np.asarray(segment.read_slab(z0, z1))
-                    if slab.shape != (z1-z0, y1-y0, x1-x0) or slab.dtype not in (np.dtype(np.uint8), np.dtype(bool)):
-                        raise ValueError("read_slab must return the requested uint8 or bool TYX slab")
-                    if slab.dtype == np.uint8 and slab.max() > 1:
-                        raise ValueError("Grouped segments require binary values 0/1")
-                    count = int(np.count_nonzero(slab))
-                    extent = _slab_extent(slab, (z0, y0, x0), count)
-                    if count and any(extent[2*i] < bound[2*i] or extent[2*i+1] > bound[2*i+1] for i in range(3)):
-                        raise ValueError(f"Source data exceeds extent_xyz for {segment.segment_id}")
-                    exact = _merge_extent(exact, extent)
-                    foreground += count
-                    if count:
-                        payload = _group_slab(slab, window, crop_y, crop_x, stored_y, stored_x)
-                        compressed.write(memoryview(payload).cast("B"))
-                        del payload
-                    else:
-                        compressed.write_zeros((z1-z0) * plane_bytes)
-                    del slab
+                if source is None:
+                    foreground, exact = _scan_segment(
+                        segment, bound, window, first, stop, depth, stored_shape, offset_xyz, compressed)
+                else:
+                    with compressed.gzip_payload_sink((stop-first) * plane_bytes) as sink:
+                        with source.copy_gzip_payload_to(sink, read_bytes=zero_write_buffer_bytes):
+                            foreground, exact = _scan_segment(
+                                segment, bound, window, first, stop, depth, stored_shape, offset_xyz, None)
                 compressed.write_zeros((crop_z+stored_z-stop) * plane_bytes)
                 local_extent = (_EMPTY_EXTENT if exact == _EMPTY_EXTENT else
                                 tuple(v-offset_xyz[i] for i in range(3) for v in exact[2*i:2*i+2]))

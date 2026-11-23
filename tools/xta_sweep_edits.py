@@ -21,7 +21,7 @@ def _xta_sweep_digest(path):
     return digest.hexdigest()
 
 
-def _xta_sweep_json(path, *, exact_numbers=False):
+def _xta_sweep_json(path, *, exact_numbers=False, data=None):
     def pairs(items):
         result = {}
         for key, value in items:
@@ -35,7 +35,7 @@ def _xta_sweep_json(path, *, exact_numbers=False):
     if exact_numbers:
         from decimal import Decimal
         options['parse_float'] = Decimal
-    return json.loads(Path(path).read_text(encoding='utf-8'), object_pairs_hook=pairs,
+    return json.loads(Path(path).read_text(encoding='utf-8') if data is None else data, object_pairs_hook=pairs,
                       parse_constant=invalid, **options)
 
 
@@ -96,6 +96,18 @@ def _xta_sweep_run(path, expected_hash, cent, sweep_id, source_mode):
     return run
 
 
+def _embedded_catalogue_digest(index, grid_id, cutoff_cent):
+    # Support direct CLI use from the checkout as well as an installed XTA.
+    import sys
+    repository = Path(__file__).resolve().parents[1]
+    if (repository / 'XTA').is_dir() and str(repository) not in sys.path:
+        sys.path.insert(0, str(repository))
+    from XTA.sweep_grouped_reader import LayerCatalogueRef, layer_catalogue_bytes
+
+    ref = LayerCatalogueRef(Path(index), grid_id, cutoff_cent)
+    return hashlib.sha256(layer_catalogue_bytes(ref)).hexdigest()
+
+
 def validate_sweep_source_pair(bundle_dir, bundle, low_manifest, full_manifest, *, verify_original_paths=True):
     """Accept one bound legacy child before any native image payload is read.
 
@@ -129,8 +141,15 @@ def validate_sweep_source_pair(bundle_dir, bundle, low_manifest, full_manifest, 
     storage = binding.get('source_storage', 'scalar')
     if storage not in {'scalar', 'grouped'}:
         raise ValueError('Unsupported sweep edit source storage.')
+    source_catalog = binding.get('source_catalog')
+    embedded = source_catalog == 'embedded'
+    if source_catalog is not None and (not embedded or storage != 'grouped'):
+        raise ValueError('Unsupported sweep edit catalogue format.')
     if storage == 'grouped':
         _xta_sweep_child(root, binding['review_manifest_relative'])
+        if embedded and any(binding[key] != binding['review_manifest_relative']
+                            for key in ('preview_manifest_relative', 'native_manifest_relative')):
+            raise ValueError('Embedded preview and native sources must select the bound review index.')
     if verify_original_paths:
         relative_low = Path(binding['preview_manifest_relative'])
         # Relocation preserves the declared branch tree, not a particular machine path.
@@ -160,11 +179,16 @@ def validate_sweep_source_pair(bundle_dir, bundle, low_manifest, full_manifest, 
         if _xta_sweep_digest(expected_run) != run_sha:
             raise ValueError('Original sweep cutoff run manifest changed since export.')
     low_sha, full_sha = binding.get('preview_manifest_sha256'), binding.get('native_manifest_sha256')
+    if embedded and verify_original_paths:
+        actual_low = _embedded_catalogue_digest(low_manifest, grid_id, cent)
+        actual_full = _embedded_catalogue_digest(full_manifest, 'native', cent)
+    else:
+        actual_low, actual_full = _xta_sweep_digest(low_manifest), _xta_sweep_digest(full_manifest)
     if (bundle.get('source_manifest_sha256') != low_sha
             or _xta_sweep_digest(original_low) != low_sha
-            or _xta_sweep_digest(low_manifest) != low_sha):
+            or actual_low != low_sha):
         raise ValueError('Sweep cutoff preview source-manifest mismatch.')
-    if _xta_sweep_digest(original_full) != full_sha or _xta_sweep_digest(full_manifest) != full_sha:
+    if _xta_sweep_digest(original_full) != full_sha or actual_full != full_sha:
         raise ValueError('Sweep cutoff native source-manifest mismatch.')
     low, full = _xta_sweep_json(original_low), _xta_sweep_json(original_full)
     if any((record.get('layout') == 'grouped_sweep_segments') != (storage == 'grouped')
@@ -209,6 +233,8 @@ def validate_sweep_source_pair(bundle_dir, bundle, low_manifest, full_manifest, 
                 status='source_pair_metadata_verified_before_native_payload')
     if storage == 'grouped':
         report.update(source_storage='grouped', review_manifest_sha256=binding['review_manifest_sha256'])
+        if embedded:
+            report['source_catalog'] = 'embedded'
     return report
 
 

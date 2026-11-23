@@ -2198,13 +2198,17 @@ def _xta_check_review_family(manifest_path, manifest, data):
     import hashlib
 
     family_path = manifest_path.parent.parent / "manifest.json"
+    problem = "The parent sweep has no matching published cutoff review."
     if not family_path.is_file():
+        if manifest.get("source_catalog") == "embedded":
+            raise RuntimeError(problem)
         return
     family = json.loads(family_path.read_text(encoding="utf-8"))
     if family.get("schema") != "xta.confidence_sweep/1":
+        if manifest.get("source_catalog") == "embedded":
+            raise RuntimeError(problem)
         return
     status = family.get("status")
-    problem = "The parent sweep has no matching published cutoff review."
     if (family.get("sweep_id") != manifest["sweep_id"]
             or _xta_sweep_child(family_path.parent, family.get("review_manifest", "")) != manifest_path):
         raise RuntimeError(problem)
@@ -2252,8 +2256,8 @@ def _xta_load_review(manifest_path, grid_id, intensity, existing, max_working_mi
     (independent_scalar, native-resolution grid, a store that does not fit in memory).
     """
     global _xta_active_review
-    # A grid folder's manifest.json is a copy of review/manifest.json. Beside its
-    # review it resolves to that manifest; a folder moved on its own is detached.
+    # Attached grid folders resolve to the shared review index. A folder moved
+    # with a copied index on its own is detached.
     try:
         manifest_path, folder_grid, detached = _xta_sweep_review_location(manifest_path)
     except ValueError as exc:
@@ -6943,13 +6947,13 @@ def _xta_store_export_cut_bundle(store, rx, k, cut_dir, *, created_utc=None):
     native = review["grids"]["native"]["branches"][cent]
     child = _XTAStorePath(cut_dir)
     child.mkdir(parents=True)
-    _xta_store_shutil.copyfile(branch["path"], child / "source_manifest.json")
-    _xta_store_shutil.copyfile(native["path"], child / "source_native_manifest.json")
+    _xta_sweep_copy_catalogue(branch, child / "source_manifest.json")
+    _xta_sweep_copy_catalogue(native, child / "source_native_manifest.json")
     _xta_store_shutil.copyfile(branch["run_path"], child / "source_run_manifest.json")
     bundle = dict(
         format="xta-slicer-edits-v1",
         created_utc=created_utc or _XTAStoreDatetime.now(_XTAStoreTimezone.utc).isoformat(),
-        source_manifest_name=branch["path"].name,
+        source_manifest_name=branch["manifest"].get("source_manifest_name", branch["path"].name),
         source_manifest_sha256=branch["sha256"],
         preview_shape_tyx=branch["manifest"]["output_shape_tyx"],
         full_quality_shape_tyx=branch["manifest"]["full_quality_output_shape_tyx"],
@@ -6980,12 +6984,7 @@ def _xta_store_export_cut_bundle(store, rx, k, cut_dir, *, created_utc=None):
             )
         )
         del mask
-    if (
-        digest(branch["path"]) != branch["sha256"]
-        or digest(native["path"]) != native["sha256"]
-        or digest(branch["run_path"]) != branch["run_sha256"]
-    ):
-        raise RuntimeError("A scalar source manifest changed during sweep export.")
+    _xta_sweep_check_source_pair(branch, native)
     with (child / "edits.json").open("w", encoding="utf-8") as stream:
         _xta_store_json.dump(bundle, stream, indent=2, ensure_ascii=False, allow_nan=False)
         stream.write("\n")
@@ -12812,7 +12811,7 @@ def _xta_sweep_digest(path):
     return digest.hexdigest()
 
 
-def _xta_sweep_json(path, *, exact_numbers=False):
+def _xta_sweep_json(path, *, exact_numbers=False, data=None):
     def pairs(items):
         result = {}
         for key, value in items:
@@ -12826,7 +12825,7 @@ def _xta_sweep_json(path, *, exact_numbers=False):
     if exact_numbers:
         from decimal import Decimal
         options['parse_float'] = Decimal
-    return json.loads(Path(path).read_text(encoding='utf-8'), object_pairs_hook=pairs,
+    return json.loads(Path(path).read_text(encoding='utf-8') if data is None else data, object_pairs_hook=pairs,
                       parse_constant=invalid, **options)
 
 
@@ -12895,14 +12894,10 @@ def _xta_sweep_review_relative(base, grid, relative):
 
 
 def _xta_sweep_review_location(path):
-    """Return (review manifest, grid ID, detached) for a review manifest.json.
+    """Resolve an index or attached grid folder to (review manifest, grid ID, detached).
 
-    Publication copies review/manifest.json, byte for byte, into each grouped
-    grid folder so that folder can be opened on its own. A copy inside its
-    review resolves to the review's own manifest, so receipts, export and
-    every other grid keep their review-relative paths. A grid folder moved on
-    its own is detached: only that grid's files are available, by name.
-    The review manifest itself returns (path, None, False).
+    A copied review index allows its detached grid to display files by name.
+    Inside the study, grid folders use the common review index and its receipts.
 
     Every grouped grid numbers its files from group_0001, so with several
     low-quality grids the file names alone match every grid. The folder's
@@ -12910,6 +12905,28 @@ def _xta_sweep_review_location(path):
     XTA.GridID tags in its group headers, then by its path and folder name.
     """
     path = Path(path).resolve()
+    if path.is_dir() or (path.name == 'manifest.json' and not path.exists() and path.parent.is_dir()):
+        folder = path if path.is_dir() else path.parent
+        for parent in (folder, *folder.parents):
+            candidate = parent / 'manifest.json'
+            if not candidate.is_file():
+                continue
+            try:
+                manifest = json.loads(candidate.read_bytes())
+            except ValueError:
+                continue
+            if not isinstance(manifest, dict) or manifest.get('schema') != 'xta.sweep_review/1':
+                continue
+            if parent == folder:
+                return _xta_sweep_review_location(candidate)
+            relative = os.path.normcase(folder.relative_to(parent).as_posix())
+            matches = [grid['grid_id'] for grid in manifest.get('grids') or []
+                       if os.path.normcase('/'.join(_xta_sweep_grid_folder(grid) or ())) == relative]
+            if len(matches) == 1:
+                return candidate, matches[0], False
+            if matches:
+                raise ValueError(f'{folder} belongs to several review grids. Open {candidate}.')
+        raise ValueError(f'No XTA review index for {folder}. Keep the grid in its study or copy the review index beside it.')
     data = path.read_bytes()
     try:
         manifest = json.loads(data)
@@ -13062,14 +13079,61 @@ def _xta_sweep_grid_rows(grid):
     raise ValueError('Unsupported review grid payload.')
 
 
+def _xta_sweep_embedded_catalogue(grid, branch):
+    """Build the catalogue bytes shared with XTA's grouped reader in standalone Slicer."""
+    inherited = ('view_name', 'physical_view_name', 'view_family', 'source', 'mask_kind',
+                 'stage', 'layer_role', 'recomposition_op', 'tile_config_id', 'tta_aug_id',
+                 'model_name', 'layer_key', 'segment_name', 'empty_segment')
+    cutoff, shape = branch['cutoff_cent'], grid['shape_tyx']
+    layers = []
+    for group in grid['groups']:
+        if group['cutoff_cent'] != cutoff:
+            continue
+        for segment in group['segments']:
+            metadata = {key: segment[key] for key in inherited if key in segment}
+            metadata.update(filename=segment['source_filename'], segment_color_rgb=segment['color_rgb'],
+                            output_shape_tyx=shape, exported_axes='(X, Y, t)')
+            metadata.update(segment.get('source_metadata', {}))
+            layers.append(metadata)
+    catalogue = dict(branch.get('source_catalog_metadata', {}))
+    catalogue.update(layout='grouped_sweep_segments', run_id=branch['run_id'], exported_axes='(X, Y, t)',
+                     output_shape_tyx=shape, layer_count=len(layers), layers=layers, source_storage='grouped',
+                     review_manifest='manifest.json', grid_id=grid['grid_id'], cutoff_cent=cutoff)
+    data = json.dumps(catalogue, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True, allow_nan=False).encode()
+    if hashlib.sha256(data).hexdigest() != branch['source_manifest_sha256']:
+        raise ValueError('Embedded sweep source catalogue checksum mismatch.')
+    return catalogue, data
+
+
+def _xta_sweep_copy_catalogue(branch, destination):
+    if branch['catalogue_bytes'] is None:
+        from shutil import copyfile
+        copyfile(branch['path'], destination)
+    else:
+        destination.write_bytes(branch['catalogue_bytes'])
+    if _xta_sweep_digest(destination) != branch['sha256']:
+        raise RuntimeError('A scalar source manifest changed during sweep export.')
+
+
+def _xta_sweep_check_source_pair(preview, native):
+    # The export verifies the common review index once before committing all cuts.
+    for source in (preview, native):
+        if source['catalogue_bytes'] is None and _xta_sweep_digest(source['path']) != source['sha256']:
+            raise RuntimeError('A scalar source manifest changed during sweep export.')
+    if _xta_sweep_digest(preview['run_path']) != preview['run_sha256']:
+        raise RuntimeError('A scalar source manifest changed during sweep export.')
+
+
 def _xta_sweep_review(path):
-    """Read the review index; only its declared scalar manifests are opened."""
+    """Read the shared index and resolve its declared source catalogues."""
     path = Path(path).resolve()
-    manifest = _xta_sweep_json(path)
+    data = path.read_bytes()
+    manifest = _xta_sweep_json(path, data=data)
     if manifest.get('schema') != 'xta.sweep_review/1':
         raise ValueError('Select a cutoff sweep review manifest.')
     if manifest.get('source_storage') == 'grouped':
-        _xta_check_review_family(path, manifest, path.read_bytes())
+        _xta_check_review_family(path, manifest, data)
     sweep_id = _xta_sweep_text(manifest.get('sweep_id'), 'sweep_id')
     source_mode = manifest.get('source_mode','confidence_sweep')
     if source_mode not in {'confidence_sweep','independent_scalar'}:
@@ -13103,11 +13167,23 @@ def _xta_sweep_review(path):
             run_key = (run_path,run_hash,cent,source_mode,sweep_id)
             if run_key not in run_cache:
                 run_cache[run_key] = _xta_sweep_run(run_path,run_hash,cent,sweep_id,source_mode)
-            scalar = _xta_sweep_scalar(source, branch['source_manifest_sha256'], grid, source_storage=storage)
+            catalogue_bytes = None
+            source_catalog = branch.get('source_catalog')
+            if source_catalog is None:
+                scalar = _xta_sweep_scalar(source, branch['source_manifest_sha256'], grid, source_storage=storage)
+            elif source_catalog == 'embedded' and storage == 'grouped' and source == path:
+                scalar, catalogue_bytes = _xta_sweep_embedded_catalogue(grid, branch)
+                if ((scalar.get('quality') == 'low_quality') != grid_id.startswith('low_quality/')
+                        or not scalar['layers']
+                        or len({row['filename'] for row in scalar['layers']}) != len(scalar['layers'])):
+                    raise ValueError('Invalid embedded sweep source catalogue.')
+            else:
+                raise ValueError('Embedded sweep sources must use their grouped review index.')
             branches[cent] = dict(path=source, manifest=scalar,
                 rows={row['filename']:row for row in scalar['layers']},
                 sha256=branch['source_manifest_sha256'],branch_dir=branch_dir,
-                run_path=run_path,run_sha256=run_hash,source_storage=storage)
+                run_path=run_path,run_sha256=run_hash,source_storage=storage,
+                catalogue_bytes=catalogue_bytes)
         by_cut = {}
         payload, rows = _xta_sweep_grid_rows(grid)
         locations = {}
@@ -13144,7 +13220,7 @@ def _xta_sweep_review(path):
     if 'native' not in grids:
         raise ValueError('Review has no native source grid.')
     return dict(path=path, root=root, manifest=manifest, sweep_id=sweep_id,source_mode=source_mode,
-                sha256=_xta_sweep_digest(path), grids=grids, records=records)
+                sha256=hashlib.sha256(data).hexdigest(), grids=grids, records=records)
 
 
 def _xta_sweep_binding(review, grid_id, cent, logical_ids):
@@ -13191,6 +13267,10 @@ def _xta_sweep_binding(review, grid_id, cent, logical_ids):
             raise ValueError('Preview and native source storage differ.')
         binding.update(source_storage='grouped',
                        review_manifest_relative=review['path'].relative_to(review['root']).as_posix())
+        if (source_low['catalogue_bytes'] is None) != (source_full['catalogue_bytes'] is None):
+            raise ValueError('Preview and native catalogue formats differ.')
+        if source_low['catalogue_bytes'] is not None:
+            binding['source_catalog'] = 'embedded'
     return binding
 
 
@@ -13347,11 +13427,12 @@ def ExportXTASweepEdits(source_manifest=None, output_dir=None, *, cutoff_cents=N
             directory = f'cuts/{token}/cut_{cent:03d}'
             child = stage/directory
             child.mkdir(parents=True)
-            shutil.copyfile(branch['path'],child/'source_manifest.json')
-            shutil.copyfile(native['path'],child/'source_native_manifest.json')
+            _xta_sweep_copy_catalogue(branch, child/'source_manifest.json')
+            _xta_sweep_copy_catalogue(native, child/'source_native_manifest.json')
             shutil.copyfile(branch['run_path'],child/'source_run_manifest.json')
             bundle = dict(format='xta-slicer-edits-v1',created_utc=datetime.now(timezone.utc).isoformat(),
-                source_manifest_name=branch['path'].name,source_manifest_sha256=branch['sha256'],
+                source_manifest_name=branch['manifest'].get('source_manifest_name', branch['path'].name),
+                source_manifest_sha256=branch['sha256'],
                 preview_shape_tyx=branch['manifest']['output_shape_tyx'],
                 full_quality_shape_tyx=branch['manifest']['full_quality_output_shape_tyx'],
                 sweep_context=binding,segments=[])
@@ -13368,10 +13449,7 @@ def ExportXTASweepEdits(source_manifest=None, output_dir=None, *, cutoff_cents=N
                     recomposition_op=original.get('recomposition_op'),node_name=node.GetName(),segment_id=sid,
                     sweep_segment_id=row['segment_id'],logical_id=logical,cutoff_cent=cent))
                 del mask
-            if (_xta_sweep_digest(branch['path']) != branch['sha256']
-                    or _xta_sweep_digest(native['path']) != native['sha256']
-                    or _xta_sweep_digest(branch['run_path']) != branch['run_sha256']):
-                raise RuntimeError('A scalar source manifest changed during sweep export.')
+            _xta_sweep_check_source_pair(branch, native)
             with (child/'edits.json').open('w',encoding='utf-8') as stream:
                 json.dump(bundle,stream,indent=2,ensure_ascii=False,allow_nan=False)
                 stream.write('\n')
@@ -13443,6 +13521,8 @@ def ExportXTAEdits(source_manifest=None, output_dir=None, *, cutoff_cents=None, 
         if not source_manifest:
             return None
     source_manifest = Path(str(source_manifest)).resolve()
+    if source_manifest.is_dir() or source_manifest.name == 'manifest.json' and not source_manifest.exists():
+        source_manifest, _, _ = _xta_sweep_review_location(source_manifest)
     with open(source_manifest, encoding='utf-8') as f:
         manifest = json.load(f)
     if manifest.get('schema') == 'xta.sweep_review/1':
@@ -13725,6 +13805,10 @@ def AlignNativeIntensity(source_manifest=None, volume_node=None, confirm=True, *
         if not source_manifest:
             return None
     manifest_path = Path(str(source_manifest)).resolve()
+    if manifest_path.is_dir() or manifest_path.name == 'manifest.json' and not manifest_path.exists():
+        manifest_path, folder_grid, _ = _xta_sweep_review_location(manifest_path)
+        if grid_id is None:
+            grid_id = folder_grid
     data = manifest_path.read_bytes()
     manifest = json.loads(data)
     review_grid = None

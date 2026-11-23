@@ -159,6 +159,47 @@ def test_importer_loads_group_files_from_the_opened_grid_folder(tmp_path):
         loader([])["_xta_load_review"](detached / "manifest.json", "low_quality/quarter", None, [])
 
 
+def test_managed_grid_resolves_shared_index_and_can_detach_with_explicit_copy(tmp_path):
+    from tests import slicer_cutoff_store_support as support
+    from tests.test_sweep_edits import save_review_family_receipt
+
+    root, scratch = tmp_path / "sweep", tmp_path / "scratch"
+    branches = [scalar(root, cent, stage_root=scratch)[0] for cent in (50, 80)]
+    review = publish_sweep_review(root, branches, sweep_id="sweep-test", memory_mib=2,
+                                  workers=1, nrrd_stage_root=scratch)
+    save_review_family_receipt(review)
+    folder = review.parent / LOW
+    assert not (folder / "manifest.json").exists()
+    api = load(LOCATION)
+    locate = api["_xta_sweep_review_location"]
+    grid = next(g for g in json.loads(review.read_bytes())["grids"] if g["grid_id"] == LOW)
+    first = review.parent / grid["groups"][0]["path"]
+
+    for opened in (folder, folder / "manifest.json"):
+        assert locate(opened) == (review.resolve(), LOW, False)
+        paths = []
+        with pytest.raises(RuntimeError, match="Failed to load cutoff masks"):
+            loader(paths)["_xta_load_review"](opened, None, None, [], review_mode="legacy")
+        assert paths == [first.resolve()]
+    detached = tmp_path / "preview"
+    shutil.copytree(folder, detached)
+    shutil.copyfile(review, detached / "manifest.json")
+    assert locate(detached) == ((detached / "manifest.json").resolve(), LOW, True)
+    with pytest.raises(RuntimeError, match="opened on its own"):
+        api["_xta_sweep_review_source"](detached)
+    paths = []
+    with pytest.raises(RuntimeError, match="Failed to load cutoff masks"):
+        loader(paths)["_xta_load_review"](detached, None, None, [], review_mode="legacy")
+    assert paths == [(detached / first.name).resolve()]
+    builder = support.load_store_module(support.MODULE_NAME + "_managed_folder")
+    try:
+        attached, _ = builder._xta_store_build_from_review(folder)
+        copied, _ = builder._xta_store_build_from_review(detached)
+        assert builder._xta_store_state_digest(attached) == builder._xta_store_state_digest(copied)
+    finally:
+        support.unload_store_module(builder)
+
+
 def test_family_receipt_still_guards_a_copy_opened_inside_its_review(tmp_path):
     review = publish(tmp_path, family_status="in_progress")
     with pytest.raises(RuntimeError, match="parent sweep"):

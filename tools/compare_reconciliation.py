@@ -25,8 +25,10 @@ from XTA.reconciliation import EvidenceLayer, reconcile
 import XTA as _xta_package
 from XTA.reconciliation_components import component_statistics
 from XTA.reconciliation_io import read_layer_manifest, write_seg_nrrd
-from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, open_grouped_catalog
+from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, LayerCatalogueRef, open_grouped_catalog, read_layer_catalog
 from XTA.reconciliation_policy import load_reconciliation_policy, resolve_reconciliation
+from XTA.unification.tta_manifest import load_tta_run_manifest
+from tools.nrrd_reference_grid import resolve_layer_catalogue
 
 _POLICIES = Path(_xta_package.__file__).resolve().parent / "examples" / "external_reconciliation"
 _DEFAULT_POLICIES = ("union", "quorum3", "largest_island", "hybrid_with_fill",
@@ -52,18 +54,18 @@ def _atomic_json(path: Path, value) -> None:
     os.replace(temporary, path)
 
 
-def discover_geometry_context(layer_manifest: str | Path) -> tuple[dict, Path | None, dict | None]:
+def discover_geometry_context(layer_manifest: str | Path | LayerCatalogueRef) -> tuple[dict, Path | None, dict | None]:
     """Find the nearest completed-run manifest and retain both source T scales."""
     manifest = Path(layer_manifest).resolve()
-    catalogue = json.loads(manifest.read_bytes())
+    catalogue = read_layer_catalog(layer_manifest)
     if catalogue.get("layout") == GROUPED_CATALOG_LAYOUT:
-        candidates = (open_grouped_catalog(manifest).run_manifest,)
+        candidates = (open_grouped_catalog(layer_manifest).run_manifest,)
     else:
         candidates = (directory / "manifest.json" for directory in manifest.parents)
     for candidate in candidates:
         if candidate == manifest or not candidate.is_file():
             continue
-        data = json.loads(candidate.read_text(encoding="utf-8"))
+        data = load_tta_run_manifest(candidate)
         geometry = data.get("geometry", {})
         inputs = data.get("inputs", {})
         if not isinstance(geometry, dict) or not any(key in geometry for key in ("physical_views", "inference_view_variants")):
@@ -275,11 +277,12 @@ def _csv_report(output: Path, datasets: list[dict]) -> None:
                 writer.writerow(row)
 
 
-def compare(inputs, policy_paths, output, *, memory_mib=2048, previews=True, progress=_progress):
+def compare(inputs, policy_paths, output, *, memory_mib=2048, previews=True, progress=_progress,
+            grid_id=None, cutoff_cent=None):
     if isinstance(memory_mib, bool) or not math.isfinite(float(memory_mib)) or float(memory_mib) <= 0:
         raise ValueError("memory_mib must be positive and finite")
-    paths = [Path(path).resolve() for path in inputs]
-    if not paths or any(not path.is_file() for path in paths):
+    paths = [resolve_layer_catalogue(path, grid_id=grid_id, cutoff_cent=cutoff_cent) for path in inputs]
+    if not paths or any(not Path(path).is_file() for path in paths):
         raise ValueError("--input requires existing NRRD layer manifests")
     if len(set(paths)) != len(paths):
         raise ValueError("Each input manifest must be listed only once")
@@ -301,16 +304,18 @@ def compare(inputs, policy_paths, output, *, memory_mib=2048, previews=True, pro
     _atomic_json(output / "comparison.json", report)
     for dataset_index, manifest_path in enumerate(paths):
         context, run_manifest_path, run_manifest = discover_geometry_context(manifest_path)
-        dataset_name = run_manifest_path.parent.name if run_manifest_path else manifest_path.stem
+        dataset_name = run_manifest_path.parent.name if run_manifest_path else Path(manifest_path).stem
         directory = output / f"{dataset_index+1:02d}_{_name(dataset_name)}"
         directory.mkdir()
         work = directory / ".working"
         work.mkdir()
-        dataset = {"dataset": dataset_name, "input_manifest": str(manifest_path),
+        dataset = {"dataset": dataset_name, "input_manifest": str(Path(manifest_path)),
                    "run_manifest": str(run_manifest_path) if run_manifest_path else None,
                    "run_confidence_threshold": (run_manifest or {}).get("resolved_configuration", {}).get("conf"),
                    "geometry_context": {k: v for k,v in context.items() if k != "views_by_name"},
                    "methods": [], "input_fingerprints": {}}
+        if isinstance(manifest_path, LayerCatalogueRef):
+            dataset.update(input_grid=manifest_path.grid_id, input_cutoff_hundredths=manifest_path.cutoff_cent)
         report["datasets"].append(dataset)
         with ExitStack() as reader_cleanup, read_layer_manifest(manifest_path, workspace=work, memory_mib=max(1, float(memory_mib)/8), max_open=1024) as collection:
             shape = collection.shape_tyx
@@ -332,7 +337,8 @@ def compare(inputs, policy_paths, output, *, memory_mib=2048, previews=True, pro
                     dataset["input_fingerprints"][str(path)] = {
                         "size_bytes": stamp[2], "modified_time_ns": stamp[3], "sha256": digest,
                     }
-            dataset["input_fingerprints"][str(manifest_path)] = _file_fingerprint(manifest_path)
+            if str(Path(manifest_path)) not in dataset["input_fingerprints"]:
+                dataset["input_fingerprints"][str(Path(manifest_path))] = _file_fingerprint(Path(manifest_path))
             if run_manifest_path:
                 dataset["input_fingerprints"][str(run_manifest_path)] = _file_fingerprint(run_manifest_path)
             for confidence_file in confidence_files:
@@ -411,6 +417,8 @@ def compare(inputs, policy_paths, output, *, memory_mib=2048, previews=True, pro
             for path, original in dataset["input_fingerprints"].items():
                 if _file_fingerprint(Path(path)) != original:
                     raise RuntimeError(f"Input changed during comparison: {path}")
+            if run_manifest_path is not None and load_tta_run_manifest(run_manifest_path) != run_manifest:
+                raise RuntimeError(f"Input run metadata changed during comparison: {run_manifest_path}")
             dataset["inputs_unchanged"] = True
         _atomic_json(output / "comparison.json", report)
         _csv_report(output, report["datasets"])
@@ -490,13 +498,16 @@ def compare_sam_bundles(inputs, output, *, policy_paths=None, policies=None,
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--input", nargs="+", metavar="NRRD_MANIFEST.json")
+    source.add_argument("--input", nargs="+", metavar="MANIFEST.json",
+                        help="Layer catalogue, cutoff run receipt, or managed review manifest")
     source.add_argument('--sam_bundle', nargs='+', metavar='PROPOSAL_DIRECTORY',
                         help='Replay fixed SAM proposals as view-native directional NRRDs without inference')
     parser.add_argument("--policy", nargs="+", metavar="POLICY.py", default=None,
                         help="Defaults: union, quorum3, largest_island, hybrid_with_fill, confidence_anchored, confidence_core_rescue. A raw-union reference is always included.")
     parser.add_argument("--output", required=True, metavar="FRESH_DIRECTORY")
     parser.add_argument("--memory_mib", type=int, default=2048)
+    parser.add_argument("--grid", help="Review grid ID, e.g. native or low_quality/<token>")
+    parser.add_argument("--cutoff", type=int, help="Cutoff in hundredths when opening the review manifest")
     parser.add_argument('--sam_policy', nargs='+', choices=('stock', 'strict', 'permissive'),
                         help='SAM defaults: stock and strict. Permissive raw-candidate ablation is opt-in')
     parser.add_argument('--gate_snapshot', type=Path,
@@ -510,6 +521,8 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.sam_bundle:
+        if args.grid is not None or args.cutoff is not None:
+            parser.error('--grid and --cutoff apply to --input')
         if args.policy and args.sam_policy:
             parser.error('--policy and --sam_policy are alternative SAM policy sources')
         report = compare_sam_bundles(args.sam_bundle, args.output, policy_paths=args.policy,
@@ -519,7 +532,12 @@ def main(argv=None):
     if args.sam_policy or args.gate_snapshot or args.frozen_evidence:
         parser.error('--sam_policy, --gate_snapshot and --frozen_evidence require --sam_bundle')
     paths = args.policy or [_POLICIES / f"{name}.py" for name in _DEFAULT_POLICIES]
-    compare(args.input, paths, args.output, memory_mib=args.memory_mib)
+    selection = {}
+    if args.grid is not None:
+        selection["grid_id"] = args.grid
+    if args.cutoff is not None:
+        selection["cutoff_cent"] = args.cutoff
+    compare(args.input, paths, args.output, memory_mib=args.memory_mib, **selection)
     return 0
 
 

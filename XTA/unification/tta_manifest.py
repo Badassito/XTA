@@ -15,10 +15,13 @@ from .context import UnifiedLaunchContext
 
 TTA_RUN_MANIFEST_SCHEMA = "xta.v21.run_manifest/1"
 TTA_VOXEL_COUNT_SCHEMA = "xta.v18.voxel_count/1"
+SWEEP_SHARED_GEOMETRY_FILENAME = "shared_run_geometry.json"
+SWEEP_SHARED_GEOMETRY_ENV = "XTA_YOLO_SWEEP_SHARED_RUN_GEOMETRY"
 
 _ARTIFACT_DIGESTS: dict[tuple[object, ...], str] = {}
 _ARTIFACT_DIGEST_LOCK = threading.Lock()
 _CHANGE_TIME_FIELD = "change_or_creation_time_ns"
+_SWEEP_GEOMETRY_SCHEMA = "xta.sweep_run_geometry/1"
 
 
 def _content_comparison_identity(identity):
@@ -292,6 +295,126 @@ def _artifact_stat_matches(record, current):
         return False
     verified = _file_identity(record["path"], content_digest=True, use_sweep_cache=False)
     return _content_comparison_identity(verified) == _content_comparison_identity(record)
+
+
+def _sweep_geometry_path(path: Path, manifest: Mapping[str, Any]) -> tuple[Path, str]:
+    branch = manifest.get("confidence_sweep")
+    cutoff = branch.get("cutoff_hundredths") if isinstance(branch, dict) else None
+    sweep_id = branch.get("sweep_id") if isinstance(branch, dict) else None
+    if (manifest.get("schema") != TTA_RUN_MANIFEST_SCHEMA
+            or not isinstance(sweep_id, str) or not sweep_id
+            or type(cutoff) is not int or not 0 <= cutoff <= 100
+            or path.name != "manifest.json"
+            or path.parent.name != f"conf_{cutoff:03d}"
+            or path.parent.parent.name != "confidence_cutoffs"):
+        raise ValueError(f"Shared sweep geometry requires a managed cutoff manifest: {path}")
+    return path.parent.parent.parent / SWEEP_SHARED_GEOMETRY_FILENAME, sweep_id
+
+
+def _sweep_geometry_fields(receipt: Mapping[str, Any]) -> dict[str, str]:
+    from .manifest import json_compatible
+
+    return {
+        field: hashlib.sha256(json.dumps(json_compatible(receipt[field]), sort_keys=True,
+                                        separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        for field in ("geometry", "forward_sampling")
+    }
+
+
+def _validate_sweep_geometry_reference(reference: Any) -> None:
+    def digest(value):
+        return (isinstance(value, str) and len(value) == 64
+                and all(char in "0123456789abcdef" for char in value))
+
+    if (not isinstance(reference, dict)
+            or reference.keys() != {"path", "size_bytes", "sha256", "field_sha256"}
+            or reference["path"] != SWEEP_SHARED_GEOMETRY_FILENAME
+            or type(reference["size_bytes"]) is not int or reference["size_bytes"] <= 0
+            or not digest(reference["sha256"])
+            or not isinstance(reference["field_sha256"], dict)
+            or reference["field_sha256"].keys() != {"geometry", "forward_sampling"}
+            or not all(digest(value) for value in reference["field_sha256"].values())):
+        raise ValueError("Invalid shared run geometry reference")
+
+
+def compact_sweep_run_manifest(path: Path, manifest: dict[str, Any], reference: dict[str, Any] | None) -> None:
+    """Create the first branch's shared plan or reuse its authenticated field digests."""
+    destination, sweep_id = _sweep_geometry_path(path, manifest)
+    field_digests = _sweep_geometry_fields(manifest)
+    if reference is None:
+        from ..json_publication import _fsync_parent_directory
+        from ..run_transport import _publish_fresh
+        from .manifest import json_compatible
+
+        shared = {"schema": _SWEEP_GEOMETRY_SCHEMA, "sweep_id": sweep_id,
+                  "geometry": manifest["geometry"], "forward_sampling": manifest["forward_sampling"]}
+        data = (json.dumps(json_compatible(shared), sort_keys=True, separators=(",", ":"),
+                           allow_nan=False) + "\n").encode("utf-8")
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="wb", dir=destination.parent, delete=False,
+                                             prefix=f".{destination.name}.", suffix=".tmp") as stream:
+                temporary = Path(stream.name)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _publish_fresh(temporary, destination)
+            _fsync_parent_directory(destination.parent)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        reference = {"path": destination.name, "size_bytes": len(data),
+                     "sha256": hashlib.sha256(data).hexdigest(), "field_sha256": field_digests}
+    else:
+        _validate_sweep_geometry_reference(reference)
+        if reference["field_sha256"]["geometry"] != field_digests["geometry"]:
+            raise ValueError("Resolved geometry changed between confidence cutoffs")
+    manifest["shared_run_geometry"] = reference
+    del manifest["geometry"]
+    if reference["field_sha256"]["forward_sampling"] == field_digests["forward_sampling"]:
+        del manifest["forward_sampling"]
+
+
+def load_tta_run_manifest(path: Path | str, *, data: bytes | None = None, _shared_cache=None) -> dict[str, Any]:
+    """Load a TTA receipt, resolving authenticated shared sweep fields when present."""
+    path = Path(path).resolve()
+    manifest = json.loads(path.read_bytes() if data is None else data)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Invalid TTA run manifest: {path}")
+    if "shared_run_geometry" not in manifest:
+        return manifest
+    reference = manifest["shared_run_geometry"]
+    _validate_sweep_geometry_reference(reference)
+    if "geometry" in manifest:
+        raise ValueError(f"Cutoff receipt supplies both shared and inline geometry: {path}")
+    destination, sweep_id = _sweep_geometry_path(path, manifest)
+    if destination.is_symlink() or not destination.is_file():
+        raise ValueError(f"Shared sweep geometry is missing or is not a regular file: {destination}")
+    identity = _file_identity(destination)
+    if _shared_cache is not None and destination in _shared_cache:
+        original, original_reference, shared = _shared_cache[destination]
+        if identity != original or reference != original_reference:
+            raise ValueError(f"Shared sweep geometry changed between confidence cutoffs: {destination}")
+    else:
+        if identity["size_bytes"] != reference["size_bytes"]:
+            raise ValueError(f"Shared sweep geometry size does not match its receipt: {destination}")
+        shared_data = destination.read_bytes()
+        if (len(shared_data) != reference["size_bytes"]
+                or hashlib.sha256(shared_data).hexdigest() != reference["sha256"]
+                or _file_identity(destination) != identity):
+            raise ValueError(f"Shared sweep geometry SHA-256 does not match its receipt: {destination}")
+        shared = json.loads(shared_data)
+        if (not isinstance(shared, dict) or shared.get("schema") != _SWEEP_GEOMETRY_SCHEMA
+                or not all(isinstance(shared.get(field), dict) for field in ("geometry", "forward_sampling"))
+                or _sweep_geometry_fields(shared) != reference["field_sha256"]):
+            raise ValueError(f"Invalid authenticated sweep geometry fields: {destination}")
+        if _shared_cache is not None:
+            _shared_cache[destination] = (identity, reference, shared)
+    if shared.get("sweep_id") != sweep_id:
+        raise ValueError(f"Shared geometry belongs to a different confidence sweep: {destination}")
+    manifest["geometry"] = shared["geometry"]
+    manifest.setdefault("forward_sampling", shared["forward_sampling"])
+    return manifest
 
 
 def _resolve_openvino_artifacts(path: str | Path) -> tuple[Path, ...]:
@@ -669,11 +792,15 @@ def build_tta_run_manifest(
 
 
 __all__ = (
+    "SWEEP_SHARED_GEOMETRY_ENV",
+    "SWEEP_SHARED_GEOMETRY_FILENAME",
     "TTA_RUN_MANIFEST_SCHEMA",
     "TTA_VOXEL_COUNT_SCHEMA",
     "assert_tta_artifacts_unchanged",
     "build_tta_run_manifest",
     "capture_tta_artifact_identities",
+    "compact_sweep_run_manifest",
+    "load_tta_run_manifest",
     "radial_view_manifest_record",
     "radial_view_plan_metadata",
     "spherical_view_manifest_record",

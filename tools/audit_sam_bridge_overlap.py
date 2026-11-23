@@ -87,6 +87,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', type=Path, help='Run directory, low-quality output directory, or layer catalogue.')
     parser.add_argument('output', type=Path, help='JSON report destination outside the source repository.')
+    parser.add_argument('--grid', help='Review grid ID, e.g. native or low_quality/<token>')
+    parser.add_argument('--cutoff', type=int, help='Cutoff in hundredths when opening the review manifest')
     parser.add_argument('--audit-native', action='store_true',
                         help='Also compare retained native masks/confidence and reconstruct detector restoration.')
     parser.add_argument('--new-voxels-output', type=Path,
@@ -94,11 +96,11 @@ def main():
     args = parser.parse_args()
     root, destination = args.run, args.output
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, locate_run_layer_catalog, open_grouped_catalog
-    from tools.nrrd_reference_grid import open_manifest_layers
+    from XTA.sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, open_grouped_catalog, read_layer_catalog
+    from tools.nrrd_reference_grid import open_manifest_layers, resolve_layer_catalogue
 
-    manifest_path = root.resolve() if root.is_file() else locate_run_layer_catalog(root / 'manifest.json')
-    manifest = json.loads(manifest_path.read_bytes())
+    manifest_path = resolve_layer_catalogue(root, grid_id=args.grid, cutoff_cent=args.cutoff)
+    manifest = read_layer_catalog(manifest_path)
     if manifest.get('layout') == GROUPED_CATALOG_LAYOUT:
         root = open_grouped_catalog(manifest_path).run_manifest.parent
     elif args.run.is_file():

@@ -71,6 +71,7 @@ def execute_pipeline_block(tmp_path, sink, array, ref, cfg, policy):
         streaming_final_union_holder={'model': array}, model_name='model',
         nrrd_layer_refs=[ref], inference_views=[], source_output_shape_tyx=array.shape,
         T=array.shape[0], H=array.shape[1], W=array.shape[2], out_dir=tmp_path, temp_dir=tmp_path,
+        sweep_reconciliation_policy_stage=None,
         close_memmap_array=lambda value: None, print=lambda *args: None)
     exec(pipeline_block(), namespace)
     return namespace

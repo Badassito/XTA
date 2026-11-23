@@ -7,6 +7,7 @@ reopens that layer, allowing a statistics pass followed by a voting pass.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import gzip
 import json
@@ -17,6 +18,7 @@ import re
 import shutil
 import tempfile
 from typing import Any
+import zlib
 
 import numpy as np
 
@@ -67,29 +69,33 @@ def _vectors(value: str, count: int, name: str) -> tuple[tuple[float, float, flo
 
 def _read_header(path: Path) -> tuple[dict[str, str], int]:
     """Parse the single embedded-data header without importing inference packages."""
-    fields: dict[str, str] = {}
     with path.open("rb") as stream:
-        magic = stream.readline(64).strip()
-        if not re.fullmatch(rb"NRRD000[1-5]", magic):
-            raise ValueError(f"Not a supported NRRD file: {path}")
-        while True:
-            line = stream.readline(1024 * 1024 + 1)
-            if not line or len(line) > 1024 * 1024 or stream.tell() > 4 * _MIB:
-                raise ValueError(f"Incomplete or excessive NRRD header: {path}")
-            if not line.strip():
-                return fields, stream.tell()
-            if line.startswith(b"#"):
-                continue
-            text = line.decode("utf-8").rstrip("\r\n")
-            if ":" not in text:
-                raise ValueError(f"Invalid NRRD header field: {path}")
-            key, value = text.split(":", 1)
-            if value.startswith("="):
-                value = value[1:]
-            key, value = key.strip(), value.strip()
-            if key in fields:
-                raise ValueError(f"Duplicate NRRD field {key!r}: {path}")
-            fields[key] = value
+        return _read_header_stream(stream, path)
+
+
+def _read_header_stream(stream, path):
+    fields: dict[str, str] = {}
+    magic = stream.readline(64).strip()
+    if not re.fullmatch(rb"NRRD000[1-5]", magic):
+        raise ValueError(f"Not a supported NRRD file: {path}")
+    while True:
+        line = stream.readline(1024 * 1024 + 1)
+        if not line or len(line) > 1024 * 1024 or stream.tell() > 4 * _MIB:
+            raise ValueError(f"Incomplete or excessive NRRD header: {path}")
+        if not line.strip():
+            return fields, stream.tell()
+        if line.startswith(b"#"):
+            continue
+        text = line.decode("utf-8").rstrip("\r\n")
+        if ":" not in text:
+            raise ValueError(f"Invalid NRRD header field: {path}")
+        key, value = text.split(":", 1)
+        if value.startswith("="):
+            value = value[1:]
+        key, value = key.strip(), value.strip()
+        if key in fields:
+            raise ValueError(f"Duplicate NRRD field {key!r}: {path}")
+        fields[key] = value
 
 
 @dataclass(frozen=True)
@@ -144,6 +150,70 @@ def open_gzip_range(raw, offset: int, length: int):
     if offset < 0 or length <= 0:
         raise ValueError("A grouped gzip channel needs a valid offset and byte count")
     return gzip.GzipFile(fileobj=_ReadRange(raw, offset, length), mode="rb")
+
+
+class _VerifiedGzipCopy:
+    """Decode bounded input once and copy only the compressed member bytes."""
+
+    def __init__(self, source, sink, read_bytes, codec):
+        self.source = source
+        self.sink = sink
+        self.read_bytes = read_bytes
+        self.codec = codec
+        self.pending = b""
+        self.decoder = None
+        self.decoder_error = codec.error
+        self.completed_member = False
+
+    def read(self, size):
+        parts = []
+        while size:
+            if not self.pending:
+                self.pending = self.source.read(self.read_bytes)
+            if self.decoder is None:
+                if not self.pending:
+                    break
+                if self.completed_member and self.pending[0] == 0:
+                    # Legacy decoders accept zero padding. Drop it so the
+                    # following group channel starts at a gzip member.
+                    self.pending = self.pending.lstrip(b"\0")
+                    if not self.pending:
+                        continue
+                codec = self.codec
+                if codec is not zlib:
+                    # The ISA-L incremental decoder rejects FHCRC even though
+                    # its file reader accepts it. Inspect the flag across reads.
+                    while len(self.pending) < 4:
+                        extra = self.source.read(min(self.read_bytes, 4 - len(self.pending)))
+                        if not extra:
+                            break
+                        self.pending += extra
+                    if len(self.pending) >= 4 and self.pending[3] & 0x02:
+                        codec = zlib
+                self.decoder = codec.decompressobj(16 + zlib.MAX_WBITS)
+                self.decoder_error = codec.error
+            block = self.pending
+            try:
+                decoded = self.decoder.decompress(block, size)
+            except self.decoder_error as exc:
+                raise gzip.BadGzipFile(f"Invalid gzip member in scalar NRRD: {self.source.name}") from exc
+            eof = self.decoder.eof
+            self.pending = self.decoder.unused_data if eof else self.decoder.unconsumed_tail
+            consumed = len(block) - len(self.pending)
+            if consumed:
+                self.sink.write(block if consumed == len(block) else memoryview(block)[:consumed])
+            if decoded:
+                parts.append(decoded)
+                size -= len(decoded)
+            if eof:
+                self.decoder = None
+                self.completed_member = True
+            elif not consumed and not decoded:
+                raise EOFError(f"Incomplete gzip member in scalar NRRD: {self.source.name}")
+        return b"".join(parts)
+
+    def close(self):
+        """The enclosing FileLayer closes the borrowed input stream."""
 
 
 def _inspect_layer(path: Path, metadata: dict[str, Any], reference_shape: tuple[int, int, int]):
@@ -223,6 +293,8 @@ class FileLayer:
     _payload: Any = field(default=None, init=False, repr=False)
     _position: int = field(default=0, init=False, repr=False)
     _eof_validated: bool = field(default=False, init=False, repr=False)
+    _gzip_copy: tuple[Any, int] | None = field(default=None, init=False, repr=False)
+    _gzip_copy_stamp: tuple[int, ...] | None = field(default=None, init=False, repr=False)
 
     def proposal_bundle(self):
         """Open this SAM layer's exact overlapping ownership evidence lazily.
@@ -254,7 +326,19 @@ class FileLayer:
             raise OSError(f"Reconciliation exceeded max_open={self._owner.max_open}; increase it or close completed layer readers")
         try:
             self._source = self.path.open("rb")
-            if self._gzip_bytes is not None:
+            if self._gzip_copy is not None:
+                from .run_transport import _stamp
+
+                self._gzip_copy_stamp = _stamp(os.fstat(self._source.fileno()))
+                if _read_header_stream(self._source, self.path) != (self.header, self._payload_offset):
+                    raise ValueError(f"Scalar NRRD header changed since inspection: {self.path}")
+                codec = zlib
+                if self._owner._fast_gzip_reader is not None:
+                    from isal import isal_zlib
+
+                    codec = isal_zlib
+                self._payload = _VerifiedGzipCopy(self._source, *self._gzip_copy, codec)
+            elif self._gzip_bytes is not None:
                 self._check_group_stamp()
                 self._payload = open_gzip_range(self._source, self._payload_offset, self._gzip_bytes)
             elif self._encoding in {"gzip", "gz"}:
@@ -307,8 +391,35 @@ class FileLayer:
         if self._payload.read(1):
             raise ValueError(f"NRRD payload exceeds declared shape: {self.path}")
         self._check_group_stamp()
+        if self._gzip_copy_stamp is not None:
+            from .run_transport import _stamp
+
+            if (self._gzip_copy_stamp != _stamp(os.fstat(self._source.fileno()))
+                    or self._gzip_copy_stamp != _stamp(self.path.stat())):
+                raise ValueError(f"Scalar NRRD changed while copying: {self.path}")
         self.close()
         self._eof_validated = True
+
+    @property
+    def can_copy_gzip_payload(self) -> bool:
+        return (self.path is not None and self._encoding in {"gzip", "gz"}
+                and self._gzip_bytes is None and not self._empty)
+
+    @contextmanager
+    def copy_gzip_payload_to(self, sink, *, read_bytes):
+        """Copy complete members while sequential slab reads validate the source."""
+        if not self.can_copy_gzip_payload or self._gzip_copy is not None:
+            raise ValueError("Expected an available scalar gzip payload")
+        self.close()
+        self._eof_validated = False
+        self._gzip_copy = (sink, read_bytes)
+        try:
+            yield
+            if not self._eof_validated:
+                raise ValueError(f"Scalar NRRD was not fully decoded while copying: {self.path}")
+        finally:
+            self.close()
+            self._gzip_copy = self._gzip_copy_stamp = None
 
     def read_slab(self, z0: int, z1: int, *, stored_xy: bool = False) -> np.ndarray:
         """Read reference Z slices, optionally retaining their stored XY crop."""
@@ -418,7 +529,7 @@ class LayerCollection(Sequence[FileLayer]):
             self._closed = True
 
 
-def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: float = 256,
+def read_layer_manifest(path: str | os.PathLike, *, workspace: str | Path, memory_mib: float = 256,
                         max_open: int = 512, include_all_layers: bool = False,
                         manifest_bytes: bytes | None = None, prefer_fast_gzip: bool = True) -> LayerCollection:
     """Read additive union descriptors, or all exported layers for review.
@@ -429,8 +540,16 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
     budget = _budget(memory_mib)
     if isinstance(max_open, bool) or not isinstance(max_open, int) or max_open <= 0:
         raise ValueError("max_open must be a positive integer")
+    from .sweep_grouped_reader import GROUPED_CATALOG_LAYOUT, LayerCatalogueRef, open_grouped_catalog
+
+    grouped = None
+    if isinstance(path, LayerCatalogueRef):
+        grouped = open_grouped_catalog(path)
     path = Path(path).resolve()
-    manifest = json.loads(path.read_bytes() if manifest_bytes is None else manifest_bytes)
+    if grouped is not None and manifest_bytes is None:
+        manifest = grouped.catalogue
+    else:
+        manifest = json.loads(path.read_bytes() if manifest_bytes is None else manifest_bytes)
     if not isinstance(manifest, dict) or not isinstance(manifest.get("layers"), list):
         raise ValueError("Expected a NRRD layer manifest with a layers list")
     reference_shape = _shape(manifest.get("output_shape_tyx"), "output_shape_tyx")
@@ -438,9 +557,11 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
         raise ValueError("Manifest must declare exported_axes (X, Y, t)")
     if manifest.get("layer_count", len(manifest["layers"])) != len(manifest["layers"]):
         raise ValueError("Manifest layer_count disagrees with layers")
-    grouped = None
-    if manifest.get("layout") == "grouped_sweep_segments":
-        from .sweep_grouped_reader import open_grouped_catalog
+    if grouped is not None and manifest_bytes is not None:
+        original = grouped.catalogue
+        if dict(manifest, layers=original["layers"], layer_count=original["layer_count"]) != original:
+            raise ValueError("Embedded layer metadata differs from its authenticated catalogue")
+    if grouped is None and manifest.get("layout") == GROUPED_CATALOG_LAYOUT:
         grouped = open_grouped_catalog(path)
     layers = []
     filenames = set()
@@ -452,6 +573,8 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
         if not isinstance(filename, str) or not filename or filename in filenames:
             raise ValueError("Manifest filenames must be nonempty and unique")
         filenames.add(filename)
+        if grouped is not None and grouped.layers.get(filename) != metadata:
+            raise ValueError(f"Grouped layer metadata differs from its authenticated catalogue: {filename}")
         if not include_all_layers and (
             metadata.get("layer_role") != "additive_component" or metadata.get("recomposition_op") != "union"
         ):
@@ -473,8 +596,6 @@ def read_layer_manifest(path: str | Path, *, workspace: str | Path, memory_mib: 
         if metadata.get("exported_axes") is not None and re.sub(r"\s+", "", str(metadata["exported_axes"])).lower() != "(x,y,t)":
             raise ValueError(f"Layer axes disagree with reference: {filename}")
         if grouped is not None:
-            if grouped.layers.get(filename) != metadata:
-                raise ValueError(f"Grouped layer metadata differs from its authenticated catalogue: {filename}")
             segment = grouped.segment(filename)
             prefix = f"Segment{segment.layer}_"
             header = {key: value for key, value in segment.header.items()

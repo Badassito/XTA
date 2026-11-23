@@ -74,7 +74,8 @@ class DirectCoverage:
             self.row_bounds[z] = (first, stop) if previous is None else (
                 min(first, previous[0]), max(stop, previous[1]))
 
-    def write(self, path, *, sweep_id, grid_id, cutoff_cent, memory_mib=128, durable=False):
+    def write(self, path, *, sweep_id, grid_id, cutoff_cent, memory_mib=128, durable=False,
+              member_pool=None):
         _, height, width = self.geometry.shape_tyx
         nrtype = {"u1":"uint8", "u2":"uint16", "u4":"uint32"}[f"u{self.dtype.itemsize}"]
         def vector(values):
@@ -94,16 +95,23 @@ class DirectCoverage:
         member_bytes = 1 << (min(1024**2, budget//8).bit_length()-1)
         codec_buffer = min(64*1024, budget//16)
         band_height = max((bounds[1]-bounds[0] for bounds in self.row_bounds if bounds), default=0)
-        band_bytes = band_height * width * self.dtype.itemsize
-        decode_budget = budget - band_bytes - member_bytes - codec_buffer
-        if band_height and decode_budget < width + (width+7)//8:
-            raise ValueError("Coverage memory_mib must fit the occupied row band and one decoded input row")
-        buffer = np.empty((band_height, width), self.dtype)
         row_bytes = width * self.dtype.itemsize
+        band_bytes = band_height * row_bytes
+        decode_budget = budget - band_bytes - member_bytes - codec_buffer
+        minimum_decode = width + (width+7)//8 if band_height else 0
+        if band_height and decode_budget < minimum_decode:
+            raise ValueError("Coverage memory_mib must fit the occupied row band and one decoded input row")
+        pending = 0
+        if member_pool is not None and band_height:
+            occupied_bytes = row_bytes * sum(stop - first for first, stop in filter(None, self.row_bounds))
+            pending, reserved = member_pool.plan(decode_budget - minimum_decode, occupied_bytes)
+            decode_budget -= reserved
+        buffer = np.empty((band_height, width), self.dtype)
         self._spool.flush()
         with path.open("xb") as raw:
             raw.write(("\n".join(header) + "\n\n").encode("ascii"))
-            with GzipSpanWriter(raw, zero_member_bytes=member_bytes, write_buffer_bytes=codec_buffer) as encoded:
+            with GzipSpanWriter(raw, zero_member_bytes=member_bytes, write_buffer_bytes=codec_buffer,
+                                member_pool=member_pool, max_pending_members=pending) as encoded:
                 for head, bounds in zip(self.heads, self.row_bounds):
                     if head == -1:
                         encoded.write_zeros(height * row_bytes)

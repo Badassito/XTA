@@ -191,20 +191,48 @@ Eligible scalar fallback uses its separate transient raw-forward cache
 matching device, precision, renderer, batch and available space. Source/model
 fingerprints are reused across cutoffs.
 
-The top-level `manifest.json` records the family status, cutoff receipts and
-forward-cache statistics. Branch receipts and per-cutoff binary media live in
-`confidence_cutoffs/conf_NNN/`, where `NNN` is the integer cutoff in
-hundredths. With `--save nrrd`, the canonical segmentations live in
+The top-level `manifest.json` records family status, accepted cutoff receipts
+and forward-cache statistics. Each `confidence_cutoffs/conf_NNN/manifest.json`
+records the outcome of one cutoff in hundredths. Cutoffs share an authenticated
+`shared_run_geometry.json` for common geometry and forward sampling. A cutoff
+with different sampling records its own sampling data. Use
+`XTA.unification.tta_manifest.load_tta_run_manifest(path)` to read either
+these compact receipts or older inline receipts.
+
+For managed sweeps, reconciliation runs its memory preflight in memory.
+Cutoff-specific reconciliation counts and layer results are stored in the
+cutoff receipt. The family records each distinct resolved policy once. Use
+`XTA.reconciliation_policy.load_reconciliation_report(run_manifest_path)`
+to read the complete reconciliation report. Standalone scalar runs retain
+their reconciliation files.
+
+With `--save nrrd`, the canonical segmentations live in
 `review/`. Open `review/manifest.json` to select the native grid or a requested
 preview grid. Each grouped `.seg.nrrd` holds layers from one cutoff. Groups
 can be split to bound their size and the space occupied by distant crops.
-The catalogue records segment identity, channel and reference geometry for
-edit export and native recovery. Keep the review and branch receipts together.
-A Python reader can pass a `review/<grid>/sources/conf_NNN/*_nrrd_manifest.json`
-catalogue to `XTA.reconciliation_io.read_layer_manifest` and read the selected
-layer by slabs. The group index identifies its gzip byte range. Readers that
+The review index records segment identity, provenance, channel and reference
+geometry for edit export and native recovery. Each grid/cutoff catalogue is
+available from that index. Keep the review and family receipts together.
+In Python, call `XTA.sweep_grouped_reader.locate_run_layer_catalog(cutoff_receipt, grid_id)`
+and pass the result to `XTA.reconciliation_io.read_layer_manifest` to read by
+slabs. This also resolves the physical catalogues in earlier grouped sweeps.
+The group index identifies each channel's gzip byte range. Readers that
 stop after the first gzip member, including `pynrrd` 1.1.3's ordinary
 `nrrd.read`, cannot decode every layer of a multi-member group.
+
+Review publication reuses staged gzip members when the source and group share
+the same stored XY crop and the source covers exactly the requested Z slices.
+It verifies the decoded mask and computes its extent and coverage in the same
+pass. For channels that need encoding and for coverage maps, all cutoffs
+share one CPU compression pool. The target is 1 MiB per member at level 3.
+Zero spans and channel boundaries can end a member early, and small memory
+budgets use smaller members. The pool uses up to 32 workers, bounded by the
+CPU allocation and any lower `YOLO_TTA_NRRD_GZIP_WORKERS` setting. XTA
+uses the `deflate>=0.9.0` binding from its `acceleration` extra when available
+and checks it on a known input. The base installation uses stdlib gzip.
+The review index records the codec, worker limit, and reused, newly encoded
+and zero-fill raster bytes in each grouped grid's `group_compression` entry.
+
 A store-backed Slicer review writes its edit log beside
 the sweep folder, in `<sweep folder>.cutoff_edits/`; keep that folder with the
 sweep.
@@ -216,8 +244,10 @@ writes `heatmaps/low_quality/<token>.mp4` for each preview tier. Each video
 shows how many finalized cutoff masks contain each voxel on that grid.
 Zero support preserves the gray source. The `heatmaps` records in the family
 manifest give the exact cutoffs, colors, frame rate and opacity.
-The separate binary exports preserve eligibility at each cutoff, including
-non-nested results.
+The separate binary exports preserve membership at each cutoff, including
+non-nested results. Each branch writes its low-quality binary MP4s directly
+in `confidence_cutoffs/conf_NNN/`; their filenames include the preview
+scale and dimensions, including when several tiers were requested.
 
 For requested NRRDs or heatmaps the coordinator tests directory publication
 on the output filesystem before it launches a cutoff. On a POSIX filesystem

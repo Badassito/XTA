@@ -35,6 +35,7 @@ SECTION_TODAY_HELPERS = (
     "_xta_sweep_text", "_xta_sweep_grid_folder", "_xta_sweep_review_relative", "_xta_sweep_review_location",
     "_xta_sweep_header_grid_ids", "_xta_sweep_review_source", "_xta_sweep_run", "_xta_sweep_scalar",
     "_xta_sweep_grid_rows", "_xta_sweep_review", "_xta_sweep_binding", "_xta_sweep_source_digest",
+    "_xta_sweep_embedded_catalogue", "_xta_sweep_copy_catalogue", "_xta_sweep_check_source_pair",
     "_xta_check_review_family")
 # Today's per-segment Remove Islands / Remove Slices job (SciPy paths) and its helpers.
 TODAY_JOB_HELPERS = (

@@ -110,13 +110,29 @@ def test_sweep_low_quality_binary_reuses_its_mask_for_heatmap_without_resizing_g
     monkeypatch.setattr(outputs, "write_low_quality_binary_video", write_binary)
     paths = outputs.save_single_low_quality_output(
         volume_gray=mask, mask_u8=mask, spec=spec, out_dir=tmp_path, stem="volume", fps=10,
-        temp_dir=tmp_path, show_progress=False, save_overlay=False, stage_mask=stage_mask,
+        temp_dir=tmp_path / "scratch", show_progress=False, save_overlay=False, stage_mask=stage_mask,
+        flat_output=True,
     )
     assert staged == [(spec, mask)]
     assert len(videos) == 1 and videos[0][0] is mask
     assert videos[0][1] == paths[f"low_quality_{spec.token}_binary_video"]
+    assert videos[0][1] == tmp_path / f"volume_Binary_LowQuality_{spec.token}.mp4"
+    assert not (tmp_path / "low_quality").exists()
     assert videos[0][2] == 10
     assert f"low_quality_{spec.token}_overlay" not in paths
+
+
+def test_cutoff_preview_paths_keep_multiple_resolutions_in_the_cutoff(tmp_path):
+    specs = [
+        outputs.LowQualityDownbinSpec("0.5", "0p5_8x8x4", 0.5, (4, 8, 8)),
+        outputs.LowQualityDownbinSpec("0.25", "0p25_4x4x4", 0.25, (4, 4, 4)),
+    ]
+    options = dict(out_dir=tmp_path, stem="sample", downbin_specs=specs)
+    planned = outputs.planned_low_quality_output_paths(**options, save_overlay=False, flat_output=True)
+    assert set(planned.values()) == {tmp_path / f"sample_Binary_LowQuality_{s.token}.mp4" for s in specs}
+    standalone = outputs.planned_low_quality_output_paths(**options)
+    for spec in specs:
+        assert standalone[f"low_quality_{spec.token}_binary_video"].parent == tmp_path / "low_quality" / spec.token
 
 
 def test_complete_heatmap_stage_survives_directory_promotion_failure(tmp_path, monkeypatch):

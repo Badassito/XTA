@@ -7,7 +7,7 @@ import os
 import numpy as np
 import pytest
 
-from XTA.reconciliation_io import ReferenceGeometry, _read_header, write_seg_nrrd
+from XTA.reconciliation_io import ReferenceGeometry, _read_header, read_layer_manifest, write_seg_nrrd
 from XTA.sweep_coverage import DirectCoverage
 from XTA.sweep_publication import publish_sweep_review
 
@@ -158,6 +158,10 @@ def test_real_scalar_branches_become_color_preserving_grouped_masks_and_direct_c
 
 @pytest.mark.parametrize("incomplete", [False, True])
 def test_staged_sweep_groups_native_and_preview_with_indexed_mask_payloads(tmp_path, incomplete):
+    from XTA.sweep_grouped_reader import (
+        LayerCatalogueRef, layer_catalogue_bytes, locate_run_layer_catalog, open_grouped_catalog,
+    )
+
     root = tmp_path / "output"
     staging = tmp_path / "scratch"
     branches, masks = [], {}
@@ -183,26 +187,61 @@ def test_staged_sweep_groups_native_and_preview_with_indexed_mask_payloads(tmp_p
     assert review["source_storage"] == "grouped"
     assert {grid["grid_id"] for grid in review["grids"]} == {"native", "low_quality/half"}
     assert not list((root / "confidence_cutoffs").rglob("*.nrrd"))
+    assert list(published.parent.rglob("*.json")) == [published]
+    anchor = LayerCatalogueRef(published, "native", 50)
+    branch_manifest = dict(branches)[50] / "manifest.json"
+    for access in (lambda: open_grouped_catalog(anchor), lambda: layer_catalogue_bytes(anchor),
+                   lambda: locate_run_layer_catalog(branch_manifest)):
+        with pytest.raises(ValueError, match="matching terminal family receipt"):
+            access()
+    family_path = root / "manifest.json"
+    family = dict(schema="xta.confidence_sweep/1", sweep_id="sweep-test", status=review["sweep_status"],
+                  review_manifest="review/manifest.json",
+                  review_manifest_sha256=hashlib.sha256(published.read_bytes()).hexdigest())
+    for changes in ({"schema": "unknown"}, {"sweep_id": "different"}, {"status": "in_progress"},
+                    {"review_manifest_sha256": None}):
+        family_path.write_bytes(json.dumps({**family, **changes}).encode())
+        with pytest.raises(ValueError, match="matching terminal family receipt"):
+            open_grouped_catalog(anchor)
+    family_path.write_bytes(json.dumps(family).encode())
+    catalogue_hashes = set()
     for grid in review["grids"]:
         check_grouped_grid(published, grid, masks)
         for origin in grid["branches"]:
             assert origin["source_storage"] == "grouped"
-            catalogue = published.parent / origin["source_manifest"]
-            raw_catalogue = catalogue.read_bytes()
+            assert origin["source_catalog"] == "embedded"
+            assert origin["source_manifest"] == "manifest.json"
+            branch = dict(branches)[origin["cutoff_cent"]]
+            catalogue = locate_run_layer_catalog(branch / "manifest.json", grid["grid_id"])
+            raw_catalogue = layer_catalogue_bytes(catalogue)
             assert hashlib.sha256(raw_catalogue).hexdigest() == origin["source_manifest_sha256"]
+            catalogue_hashes.add(origin["source_manifest_sha256"])
             source = json.loads(raw_catalogue)
             assert source["layout"] == "grouped_sweep_segments"
+            assert source["source_manifest_name"] == "volume_nrrd_manifest.json"
             assert source["grid_id"] == grid["grid_id"]
             assert source["cutoff_cent"] == origin["cutoff_cent"]
             assert (catalogue.parent / source["review_manifest"]).resolve() == published
-            assert catalogue.name == "volume_nrrd_manifest.json"
+            with read_layer_manifest(catalogue, workspace=staging, include_all_layers=True) as layers:
+                for layer in layers:
+                    expected = masks[origin["cutoff_cent"]][grid["grid_id"], layer.metadata["layer_key"]]
+                    np.testing.assert_array_equal(layer.read_slab(0, expected.shape[0]), expected)
+            layer_row = source["layers"][-1]
+            selection = dict(source, layers=[layer_row], layer_count=1)
+            with read_layer_manifest(catalogue, workspace=staging, include_all_layers=True,
+                                     manifest_bytes=json.dumps(selection).encode()) as layers:
+                assert [layer.layer_id for layer in layers] == [layer_row["filename"]]
+            selection["layers"] = [dict(layer_row, description="changed")]
+            with pytest.raises(ValueError, match="metadata differs from its authenticated catalogue"):
+                read_layer_manifest(catalogue, workspace=staging, include_all_layers=True,
+                                    manifest_bytes=json.dumps(selection).encode())
             if grid["grid_id"] == "native":
-                relative, member = source["layers"][2]["proposal_evidence_path"].split("#/")
-                branch = dict(branches)[origin["cutoff_cent"]]
+                bridge = next(layer for layer in source["layers"] if layer["layer_key"] == "b")
+                relative, member = bridge["proposal_evidence_path"].split("#/")
                 assert (catalogue.parent / relative).resolve() == branch / "sam-artifacts.tar"
                 assert member == "sam_interpolation/fixture"
-                assert source["layers"][2]["proposal_evidence_path_base"] == "manifest_directory"
-                tail = source["layers"][2]["extrapolation"]
+                assert bridge["proposal_evidence_path_base"] == "manifest_directory"
+                tail = bridge["extrapolation"]
                 tail_path, tail_member = tail["evidence_path"].split("#/")
                 assert (catalogue.parent / tail_path).resolve() == branch / "sam-artifacts.tar"
                 assert tail_member == "sam_extrapolation/fixture"
@@ -217,22 +256,23 @@ def test_staged_sweep_groups_native_and_preview_with_indexed_mask_payloads(tmp_p
                 stop = start + segment["gzip_bytes"]
                 assert segment["label_value"] == 1
                 assert gzip.decompress(raw_group[start:stop]) == independent[segment["layer"]].tobytes()
+    assert len(catalogue_hashes) == 4
 
 
 def test_grouped_publication_refuses_a_destination_created_during_staging(tmp_path, monkeypatch):
-    from XTA import sweep_publication as writer
+    from XTA import json_publication
     from XTA.run_transport import TransportError
 
     root = tmp_path / "output"
     branch, _ = scalar(root, 50, stage_root=tmp_path / "scratch")
     destination = root / "review"
-    before_publication = writer._copy_index_to_grid_folders
+    before_publication = json_publication._publish_sweep_directory
 
-    def compete(stage, products):
-        before_publication(stage, products)
-        destination.mkdir()
+    def compete(stage, target):
+        target.mkdir()
+        return before_publication(stage, target)
 
-    monkeypatch.setattr(writer, "_copy_index_to_grid_folders", compete)
+    monkeypatch.setattr(json_publication, "_publish_sweep_directory", compete)
     with pytest.raises((FileExistsError, TransportError), match="Destination appeared|already exists"):
         publish_sweep_review(root, [branch], sweep_id="sweep-test", nrrd_stage_root=tmp_path / "scratch")
     assert destination.is_dir() and not list(destination.iterdir())
@@ -338,6 +378,39 @@ def test_parallel_cutoffs_publish_identical_files_and_records(tmp_path):
     groups = next(g for g in first["grids"] if g["grid_id"] == "low_quality/half")["groups"]
     assert [g["cutoff_cent"] for g in groups] == [50, 65, 80]
     assert [g["path"] for g in groups] == [f"low_quality/half/group_{i:04d}.seg.nrrd" for i in (1, 2, 3)]
+
+
+def test_masks_and_coverage_share_one_compression_pool_across_cutoffs_and_grids(tmp_path, monkeypatch):
+    from XTA import sweep_publication as publisher
+
+    pools = []
+    write_group = publisher.write_grouped_seg_nrrd
+    write_coverage = DirectCoverage.write
+
+    def group(*args, member_pool, **kwargs):
+        pools.append(member_pool)
+        return write_group(*args, member_pool=member_pool, **kwargs)
+
+    def coverage(*args, member_pool, **kwargs):
+        pools.append(member_pool)
+        return write_coverage(*args, member_pool=member_pool, **kwargs)
+
+    monkeypatch.setattr(publisher, "write_grouped_seg_nrrd", group)
+    monkeypatch.setattr(DirectCoverage, "write", coverage)
+    stage = tmp_path / "staged-nrrds"
+    branches = [scalar(tmp_path, cent, stage_root=stage)[0] for cent in (50, 80)]
+    index = publish_sweep_review(tmp_path, branches, sweep_id="sweep-test", workers=2, nrrd_stage_root=stage)
+
+    grids = json.loads(index.read_bytes())["grids"]
+    assert len(grids) == 2
+    assert len(pools) == sum(len(g["groups"]) + len(g["coverage"]) for g in grids)
+    assert all(pool is pools[0] for pool in pools)
+    for grid in grids:
+        totals = grid["group_compression"]
+        assert 1 <= totals["worker_limit"] <= 32
+        assert totals["reused_bytes"] + totals["data_bytes"] + totals["zero_bytes"] == sum(
+            int(np.prod(g["stored_shape_tyx"])) * len(g["segments"]) for g in grid["groups"])
+        assert all(c["gzip_spans"]["data_codec"] == totals["data_codec"] for c in grid["coverage"])
 
 
 def test_one_failed_cutoff_worker_publishes_nothing(tmp_path, monkeypatch):

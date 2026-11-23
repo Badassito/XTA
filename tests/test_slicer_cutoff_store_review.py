@@ -844,6 +844,8 @@ def test_built_store_export_equals_today_export(S, tmp_path, consolidated):
                 (branch / directory).rename(staged / directory)
     review = publish_sweep_review(root, branches, sweep_id="sweep-test", memory_mib=2,
                                   workers=1, nrrd_stage_root=nrrd_stage)
+    if consolidated:
+        tse.save_review_family_receipt(review)
     store, _ = S._xta_store_build_from_review(review, LOW)
     namespace, node, _ = tse.export_api(review, {})
     data = namespace["_xta_sweep_review"](review)

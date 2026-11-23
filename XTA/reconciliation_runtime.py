@@ -200,17 +200,19 @@ def _reconciliation_refs(refs, shape, *, needs_confidence):
     return sorted(result, key=lambda item: item[0])
 
 
-def _publish_reconciliation_report(report, records, settings, output_dir):
-    """Publish the report with the selected policy's source identity."""
+def _publish_reconciliation_report(report, records, settings, output_dir, *, publish=True):
+    """Prepare the report, optionally publishing it as a standalone artifact."""
     from .confidence_evidence import confidence_evidence_enabled
     from .confidence_retention import published_confidence_manifest
+    from .outputs import interpolation_layer_provenance
 
     output_dir = Path(output_dir)
-    confidence_manifest = (published_confidence_manifest(output_dir.parent)
+    run_dir = output_dir.parent if publish else output_dir.resolve()
+    confidence_manifest = (published_confidence_manifest(run_dir)
                            if confidence_evidence_enabled() else None)
     report.update(policy_path=settings.path, policy_sha256=settings.sha256,
                   stage='source_grid_before_global_postprocessing',
-                  confidence_evidence=(confidence_manifest.relative_to(output_dir.parent).as_posix()
+                  confidence_evidence=(confidence_manifest.relative_to(run_dir).as_posix()
                                        if confidence_manifest is not None else None),
                   source_layers_preserved=True)
     for identity, _ref, metadata, _confidence in records:
@@ -219,10 +221,17 @@ def _publish_reconciliation_report(report, records, settings, output_dir):
                 'physical_view_name', 'view_family', 'source', 'mask_kind', 'tile_config_id',
                 'tile_acceptance', 'stage', 'confidence_evidence', 'confidence_coordinate_space',
                 'confidence_storage_shape_tyx')}
-        from .outputs import interpolation_layer_provenance
-        report['layers'][identity]['metadata'].update(interpolation_layer_provenance(_ref, relative_to=Path(output_dir)))
+        layer_metadata = report['layers'][identity]['metadata']
+        if not publish and layer_metadata['confidence_evidence'] is not None:
+            confidence_path = Path(layer_metadata['confidence_evidence']).resolve()
+            layer_metadata['confidence_evidence'] = confidence_path.relative_to(run_dir).as_posix()
+            layer_metadata['confidence_evidence_path_base'] = 'manifest_directory'
+        layer_metadata.update(interpolation_layer_provenance(_ref, relative_to=output_dir))
         if metadata.get('interpolation_backend') == 'sam' and metadata.get('mask_kind') == 'bridge':
             report['layers'][identity]['final_connection_survival'] = 'not_assessed_after_global_postprocessing'
+    if not publish:
+        settings.assert_unchanged()
+        return
     output_dir.mkdir(parents=True, exist_ok=True)
     pending = output_dir / 'manifest.json.partial'
     try:
@@ -233,7 +242,7 @@ def _publish_reconciliation_report(report, records, settings, output_dir):
         pending.unlink(missing_ok=True)
 
 
-def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy, output_dir):
+def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy, output_dir, publish_report):
     """Borrow the final additive union, counting it once without rebuilding it."""
     if (not isinstance(assembled_union, np.ndarray) or tuple(assembled_union.shape) != shape
             or assembled_union.dtype not in (np.dtype(np.uint8), np.dtype(np.bool_))):
@@ -273,12 +282,13 @@ def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy,
                            'duplicate_group_support_removed', 'anchored_voxels'],
         evidence_interpretation='reuse of the pipeline-assembled additive union before global postprocessing')
     _record_source_bridge_survival(report, records, assembled_union, settings)
-    _publish_reconciliation_report(report, records, settings, output_dir)
+    _publish_reconciliation_report(report, records, settings, output_dir, publish=publish_report)
     return assembled_union, report
 
 
 def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
-                         settings, output_dir, workspace, policy=None, assembled_union=None):
+                         settings, output_dir, workspace, policy=None, assembled_union=None,
+                         publish_report=True):
     """Produce one source-grid result; component backings remain unmodified."""
     policy = load_reconciliation_policy(settings) if policy is None else validate_policy(policy)
     settings.assert_unchanged()
@@ -287,7 +297,7 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
     records = _reconciliation_refs(refs, shape, needs_confidence=needs_confidence)
     if policy['mode'] == 'union' and policy['decide'] is None and assembled_union is not None:
         return _reuse_assembled_union(assembled_union, records, shape=shape, settings=settings,
-                                     policy=policy, output_dir=output_dir)
+                                     policy=policy, output_dir=output_dir, publish_report=publish_report)
     output_dir, workspace = Path(output_dir), Path(workspace)
     output_dir.mkdir(parents=True, exist_ok=True)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -321,7 +331,7 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
         settings.assert_unchanged()
         output.flush()
         _record_source_bridge_survival(report, records, output, settings)
-        _publish_reconciliation_report(report, records, settings, output_dir)
+        _publish_reconciliation_report(report, records, settings, output_dir, publish=publish_report)
         return output, report
     except BaseException:
         if output is not None:

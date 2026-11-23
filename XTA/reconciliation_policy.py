@@ -5,10 +5,15 @@ import ast
 from dataclasses import dataclass
 import hashlib
 import importlib.util
+import json
 import math
 from pathlib import Path
+import re
 import sys
 from typing import Any
+
+
+SWEEP_RECONCILIATION_POLICY_STAGE = 'XTA_YOLO_SWEEP_RECONCILIATION_POLICY_STAGE'
 
 
 @dataclass(frozen=True)
@@ -139,3 +144,101 @@ def validate_policy(value) -> dict[str, Any]:
     if not isinstance(result['proposal_policy_sha256'], str):
         raise ValueError('proposal_policy_sha256 must be a string')
     return result
+
+
+def _policy_record_sha256(record):
+    return hashlib.sha256(json.dumps(record, sort_keys=True, ensure_ascii=True, allow_nan=False,
+                                     separators=(',', ':')).encode('ascii')).hexdigest()
+
+
+def stage_sweep_reconciliation_report(report, directory):
+    """Stage the resolved policy by content and return the cutoff-specific report."""
+    from .json_publication import write_json_atomic
+
+    result = dict(report)
+    record = {key: result.pop(key) for key in ('policy', 'policy_path', 'policy_sha256')}
+    digest = _policy_record_sha256(record)
+    path = Path(directory) / f'{digest}.json'
+    if not path.is_file():
+        write_json_atomic(path, record, sort_keys=True)
+    result['policy_record_sha256'] = digest
+    return result
+
+
+def _sweep_reconciliation_policy_digest(receipt):
+    report = receipt.get('reconciliation')
+    source_digest = (receipt.get('confidence_sweep') or {}).get('reconciliation_policy_sha256')
+    if report is None and source_digest is None:
+        return None
+    digest = report.get('policy_record_sha256') if isinstance(report, dict) else None
+    if (not isinstance(digest, str) or re.fullmatch('[a-f0-9]{64}', digest) is None
+            or not isinstance(source_digest, str) or re.fullmatch('[a-f0-9]{64}', source_digest) is None
+            or report.get('schema') != 'xta.reconciliation/1'
+            or {'policy', 'policy_path', 'policy_sha256'}.intersection(report)):
+        raise ValueError('Cutoff receipt has an invalid reconciliation report or policy reference')
+    return digest
+
+
+def _verified_sweep_reconciliation_policy(receipt, digest, record):
+    source_digest = receipt['confidence_sweep']['reconciliation_policy_sha256']
+    if (not isinstance(record, dict) or set(record) != {'policy', 'policy_path', 'policy_sha256'}
+            or not isinstance(record['policy'], dict) or not isinstance(record['policy_path'], str)
+            or record['policy_sha256'] != source_digest or _policy_record_sha256(record) != digest):
+        raise ValueError('Resolved reconciliation policy differs from the cutoff receipt')
+    return record
+
+
+def accept_sweep_reconciliation_policy(receipt, policies, directory):
+    """Read a privately staged policy on its first accepted cutoff."""
+    digest = _sweep_reconciliation_policy_digest(receipt)
+    if digest is None:
+        return None
+    if digest in policies:
+        record = policies[digest]
+    else:
+        path = Path(directory) / f'{digest}.json'
+        if path.is_symlink() or not path.is_file():
+            raise ValueError('Cutoff receipt has no privately staged reconciliation policy')
+        record = json.loads(path.read_bytes())
+    return digest, _verified_sweep_reconciliation_policy(receipt, digest, record)
+
+
+def load_reconciliation_report(run_manifest: str | Path) -> dict[str, Any] | None:
+    """Read a standalone, legacy sweep, or accepted embedded cutoff report."""
+    path = Path(run_manifest).resolve()
+    if path.is_dir():
+        path /= 'manifest.json'
+    data = path.read_bytes() if path.is_file() else b'{}'
+    receipt = json.loads(data)
+    if not isinstance(receipt, dict):
+        raise ValueError('Expected a JSON run manifest')
+    if receipt.get('schema') == 'xta.reconciliation/1':
+        return receipt
+    if 'reconciliation' not in receipt:
+        legacy = path.parent / 'reconciliation' / 'manifest.json'
+        return json.loads(legacy.read_bytes()) if legacy.is_file() else None
+    digest = _sweep_reconciliation_policy_digest(receipt)
+    if digest is None:
+        return None
+    ownership = receipt['confidence_sweep']
+    cutoff = ownership.get('cutoff_hundredths')
+    if (type(cutoff) is not int or not 0 <= cutoff <= 100 or path.name != 'manifest.json'
+            or path.parent.name != f'conf_{cutoff:03d}' or path.parent.parent.name != 'confidence_cutoffs'):
+        raise ValueError('Reconciliation cutoff receipt is outside its sweep layout')
+    family = json.loads((path.parents[2] / 'manifest.json').read_bytes())
+    if not isinstance(family, dict) or family.get('schema') != 'xta.confidence_sweep/1':
+        raise ValueError('Expected a JSON confidence sweep family manifest')
+    relative = f'confidence_cutoffs/conf_{cutoff:03d}/manifest.json'
+    status = receipt.get('status')
+    matching = [branch for branch in family.get('branches', ()) if isinstance(branch, dict)
+                and type(branch.get('cutoff_hundredths')) is int and branch['cutoff_hundredths'] == cutoff]
+    if (not ownership.get('sweep_id')
+            or family.get('sweep_id') != ownership['sweep_id'] or status not in ('complete', 'incomplete')
+            or len(matching) != 1 or matching[0].get('status') != status
+            or matching[0].get('manifest') != relative
+            or matching[0].get('manifest_sha256') != hashlib.sha256(data).hexdigest()):
+        raise ValueError('Reconciliation cutoff receipt differs from its family manifest')
+    policies = family.get('reconciliation_policies')
+    record = _verified_sweep_reconciliation_policy(
+        receipt, digest, policies.get(digest) if isinstance(policies, dict) else None)
+    return {**receipt['reconciliation'], **record}

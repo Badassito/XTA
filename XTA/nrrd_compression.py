@@ -12,7 +12,6 @@ from importlib import metadata as importlib_metadata
 import io
 import json
 import os
-import re
 import sys
 import threading
 import time
@@ -25,6 +24,12 @@ from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 from .nrrd_spans import canonical_zero_member
+from .review_compression import (
+    _OldNrrdLibdeflateBindingError,
+    _known_nrrd_libdeflate_version,
+    _old_nrrd_libdeflate_binding_version,
+    load_libdeflate_gzip,
+)
 from .runtime import runtime_telemetry
 from .workspace import _cpu_count, _env_flag, _env_int
 
@@ -359,51 +364,6 @@ def _nrrd_iaa_level(capabilities: Dict[str, object]) -> int:
         )
     return int(level)
 
-class _OldNrrdLibdeflateBindingError(RuntimeError):
-    """A known python-deflate release holds the GIL during compression."""
-
-
-def _known_nrrd_libdeflate_version(module: object) -> Optional[str]:
-    """Use the imported binding's version, never unrelated site metadata."""
-    raw = getattr(module, '__version__', None)
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    module_file = getattr(module, '__file__', None)
-    if not module_file:
-        return None
-    try:
-        selected_path = Path(str(module_file)).resolve()
-    except (OSError, ValueError):
-        return None
-    for distribution_name in ('deflate', 'python-deflate'):
-        try:
-            distribution = importlib_metadata.distribution(distribution_name)
-            files = distribution.files
-            if files is None:
-                continue
-            if any(Path(distribution.locate_file(file)).resolve() == selected_path
-                   for file in files):
-                return str(distribution.version)
-        except Exception:
-            continue
-    return None
-
-
-def _old_nrrd_libdeflate_binding_version(module: object) -> Optional[str]:
-    """Recognize pre-0.9 releases; unknown/custom bindings need separate GIL proof.
-
-    This is a version compatibility check, not an automatic throughput benchmark.
-    Unparseable or unassociated package metadata never proves an old binding.
-    """
-    version = _known_nrrd_libdeflate_version(module)
-    if version is None:
-        return None
-    match = re.match(r'^(\d+)\.(\d+)(?:\.\d+)?(?:$|[.+])', version)
-    if match is None:
-        return None
-    return version if (int(match.group(1)), int(match.group(2))) < (0, 9) else None
-
-
 def _nrrd_member_codec_spec(
     codec_name: str,
 ) -> NrrdMemberCodecSpec:
@@ -425,17 +385,8 @@ def _nrrd_member_codec_spec(
         )
         return str(name), int(level), compressor
     if name == 'libdeflate':
-        import deflate  # type: ignore
-
-        old_version = _old_nrrd_libdeflate_binding_version(deflate)
-        if old_version is not None:
-            raise _OldNrrdLibdeflateBindingError(
-                f'python-deflate {old_version} holds the Python GIL during compression; '
-                'install deflate>=0.9.0 for parallel NRRD compression or select '
-                'YOLO_TTA_NRRD_MEMBER_CODEC=isal/zlib'
-            )
+        gzip_compress = load_libdeflate_gzip()
         level = int(nrrd_libdeflate_level())
-        gzip_compress = getattr(deflate, 'gzip_compress')
 
         def _compress_libdeflate(payload: bytes) -> bytes:
             # Positional level is intentional: this is the python-deflate public API and

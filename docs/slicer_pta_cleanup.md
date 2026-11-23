@@ -35,22 +35,20 @@ existing startup script before choosing to replace it permanently.
 
 Load the matching intensity in Slicer. In a fresh scene click **Importer** and
 select the sweep's `review/manifest.json`. Each grouped grid folder, such as
-`review/low_quality/<bin>/`, also holds a byte-identical copy of that
-`manifest.json` beside its group files, coverage labelmaps and color table.
-Choosing that copy in Importer opens the same grid. Dropping the whole folder
-into Slicer instead loads its group files as
-[per-cutoff segments](#per-cutoff-segments); then click **Importer**. If Add
-Data offers `manifest.json` as some other data type, leave it unchecked:
-Importer reads it. While the folder is still inside its review, the copy
-resolves to `review/manifest.json`, so the sweep receipt check, other grids and
-export are unchanged. A folder copied elsewhere on its own still loads,
-displays and edits, but **Export XTA Edits** then stops with a message: export
-binds each cutoff to its scalar branch manifests in the complete sweep output.
+`review/low_quality/<bin>/`, contains its group files, coverage labelmaps
+and color table. Dropping the folder into Slicer loads its group files as
+[per-cutoff segments](#per-cutoff-segments); then click **Importer**. Leave
+any JSON index unchecked in Add Data so Importer can read it separately. Attached folders use
+the common review index. In the Python console, pass the grid folder to
+`ImportXTASegments` to open it directly.
+
+To detach a grid for display or editing, copy its folder and place a copy of
+`review/manifest.json` beside the copied group files. Independently packed
+studies and older sweeps may already carry a grid-local copy. Edit export
+requires the complete sweep with its original cutoff receipts and review index.
 Every grid numbers its group files from `group_0001`, so with several
 low-quality grids a folder copied on its own is identified by the grid ID in
-its group file headers, even when it was renamed. Reviews published before this
-copy existed work from `review/manifest.json`; copying that file into the grid
-folder by hand has the same effect.
+its group file headers, even when it was renamed.
 
 Importer offers grouped review grids only, smallest low-quality grid first.
 Sweeps from v26.1.0 group both the native and requested low-quality masks by
@@ -471,11 +469,18 @@ together.
 For a consolidated confidence sweep, use the XTA checkout or installed package
 with grouped source catalogue support. Select one cutoff from the Slicer export.
 Its `edits.json` lists `preview_manifest_relative` and
-`native_manifest_relative` under `sweep_context`. These paths are relative to
-the sweep root and identify the catalogues to pass as `--low-manifest` and
-`--full-manifest`. The filter authenticates the review and reads the selected
-segments at their indexed positions. Older scalar studies use the original
-per-layer manifests.
+`native_manifest_relative` under `sweep_context`. Pass each path relative
+to the sweep root as `--low-manifest` and `--full-manifest` respectively.
+With embedded catalogues both arguments point to the same
+`review/manifest.json`. The binding selects the preview grid, native grid,
+and cutoff. The filter authenticates the review and reads the selected
+segments at their indexed positions. Older studies supply their original
+catalogue files.
+
+For an explicit mixed-source union using embedded catalogues, give each
+source pair its preview `grid_id` and `cutoff_cent`. Its low and full manifest
+paths both point to that study's review index. The declared checksums identify
+the two logical catalogues.
 
 Example cluster command, from the XTA source directory (replace example paths):
 

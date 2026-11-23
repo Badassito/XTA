@@ -33,12 +33,16 @@ from uuid import uuid4
 from . import __version__
 from .env_flags import env_flag, env_float, env_int
 from .json_publication import SweepDirectoryPublicationError, write_json_atomic
+from .reconciliation_policy import SWEEP_RECONCILIATION_POLICY_STAGE, accept_sweep_reconciliation_policy
 from .unification.tta_manifest import (
+    SWEEP_SHARED_GEOMETRY_ENV,
+    SWEEP_SHARED_GEOMETRY_FILENAME,
     TTA_RUN_MANIFEST_SCHEMA,
     _artifact_stat_matches,
     _file_identity,
     assert_tta_artifacts_unchanged,
     comparable_artifact_identities,
+    load_tta_run_manifest,
 )
 
 
@@ -860,10 +864,10 @@ def _identity_record(value, *, model=False):
             raise ValueError('Scalar model identity is missing its SHA256')
 
 
-def _receipt(path, *, sweep_id, cent, min_conf):
+def _receipt(path, *, sweep_id, cent, min_conf, shared_geometry_cache=None):
     raw = path.read_bytes()
-    value = json.loads(raw)
-    if not isinstance(value, dict) or value.get('schema') != TTA_RUN_MANIFEST_SCHEMA:
+    value = load_tta_run_manifest(path, data=raw, _shared_cache=shared_geometry_cache)
+    if value.get('schema') != TTA_RUN_MANIFEST_SCHEMA:
         raise ValueError(f'Invalid scalar TTA receipt: {path}')
     omissions = value.get('sam_planning_omissions')
     expected_complete = not omissions
@@ -911,6 +915,7 @@ def _receipt(path, *, sweep_id, cent, min_conf):
         'configuration': {key: item for key, item in config.items()
                           if key not in {'conf', 'output', 'temp', 'capture_component_replay'}},
         'geometry': value.get('geometry'),
+        'shared_run_geometry': value.get('shared_run_geometry'),
         'additional_identities': {key: ownership.get(key) for key in _OPTIONAL_IDENTITIES},
     }
     return value, normalized, hashlib.sha256(raw).hexdigest()
@@ -1155,6 +1160,8 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
     fanout_enabled = len(cents)>1 and view_major=='1'
     requested_parallel = _requested_consumer_parallel() if fanout_enabled else None
     reserved_outputs = _RESERVED_OUTPUTS if fanout_enabled else _SCALAR_OUTPUTS
+    if len(cents) > 1:
+        reserved_outputs = (*reserved_outputs, SWEEP_SHARED_GEOMETRY_FILENAME)
     summary_requested = 'summary' in save_options
     if summary_requested:
         reserved_outputs = (*reserved_outputs, SWEEP_SUMMARY_FILENAME)
@@ -1241,7 +1248,10 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
         if heatmaps_requested:
             env[HEATMAP_STAGING_ENV] = str(work / 'heatmap-input')
         env['XTA_YOLO_SWEEP_NRRD_STAGE_ROOT'] = str(nrrd_stage_root)
+        reconciliation_policy_stage = work / 'reconciliation-policies'
+        env[SWEEP_RECONCILIATION_POLICY_STAGE] = str(reconciliation_policy_stage)
         env.pop(SWEEP_SUMMARY_SECTION_ENV, None)
+        env.pop(SWEEP_SHARED_GEOMETRY_ENV, None)
         env.pop('XTA_YOLO_SWEEP_QUOTA_DATABASE', None)
         if quota_work is not None:
             env['XTA_YOLO_SWEEP_QUOTA_DATABASE'] = str(quota_work / 'quota.sqlite')
@@ -1273,6 +1283,7 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
         env.pop(_DEFER_NATIVE_RETIREMENT_ENV, None)
         reference = None
         receipt_versions = {}
+        shared_geometry_cache = {}
         # Only the coordinator thread changes the family receipt; output readers never do.
         manifest_lock = threading.Lock()
 
@@ -1323,6 +1334,8 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                 arguments.extend(('--capture_component_replay', str(capture_root / f'sweep_{sweep_id}' / f'conf_{cent:03d}')))
             command = _child_command(arguments,package_parent)
             child_env = {**env, 'XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS': str(cent)}
+            if len(cents) > 1 and (index == 0 or 'shared_run_geometry' in manifest):
+                child_env[SWEEP_SHARED_GEOMETRY_ENV] = json.dumps(manifest.get('shared_run_geometry'))
             summary_section = work / 'summary' / f'conf_{cent:03d}.txt' if summary_requested else None
             if summary_section is not None:
                 child_env[SWEEP_SUMMARY_SECTION_ENV] = str(summary_section)
@@ -1368,8 +1381,10 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
             validation_started = time.monotonic()
             version = _file_identity(receipt_path)
             receipt, identity, digest = _receipt(receipt_path,
-                sweep_id=sweep_id, cent=cent, min_conf=min_conf)
+                sweep_id=sweep_id, cent=cent, min_conf=min_conf, shared_geometry_cache=shared_geometry_cache)
             receipt_versions[receipt_path] = {**version, "sha256": digest}
+            for path, (file_identity, descriptor, _) in shared_geometry_cache.items():
+                receipt_versions[path] = {**file_identity, 'sha256': descriptor['sha256']}
             print(f'Validated cutoff {cent / 100:.2f} receipt in {time.monotonic() - validation_started:.1f}s.',
                   flush=True)
             if reference is not None and identity != reference:
@@ -1386,6 +1401,8 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                 heatmap_contract = contract
             with manifest_lock:
                 manifest['inputs'] = receipt['inputs']
+                if 'shared_run_geometry' in receipt:
+                    manifest['shared_run_geometry'] = receipt['shared_run_geometry']
                 if fanout_enabled:
                     row['upstream_fanout'] = _fanout_evidence(receipt,role=branch['role'],target_count=len(cents))
                     _update_fanout_summary(manifest)
@@ -1395,6 +1412,8 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                      f"consumed native views={evidence['consumed_views']}, scalar fallback views={evidence['scalar_views']}.")
                 if evidence['fallback_reasons']:
                     _say('Upstream scalar fallback: '+'; '.join(evidence['fallback_reasons']))
+            accepted_policy = accept_sweep_reconciliation_policy(
+                receipt, manifest.get('reconciliation_policies', {}), reconciliation_policy_stage)
             summary_section = branch['summary_section']
             if summary_section is not None:
                 summary_link = receipt['outputs']['paths'].get('summary')
@@ -1405,6 +1424,9 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                     raise ValueError(f'Scalar cutoff {cent / 100:.2f} did not finish its sweep summary section')
                 summary_sections[cent] = (summary_section, _file_identity(summary_section))
             with manifest_lock:
+                if accepted_policy is not None:
+                    policy_digest, policy_record = accepted_policy
+                    manifest.setdefault('reconciliation_policies', {})[policy_digest] = policy_record
                 row.update(status=receipt['status'], manifest_sha256=digest)
                 if receipt['sam_planning_omissions']:
                     row['sam_planning_omissions'] = receipt['sam_planning_omissions']

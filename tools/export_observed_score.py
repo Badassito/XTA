@@ -107,7 +107,8 @@ def export_score(run_manifest, model, layer, output, *, memory_mib=256, max_stag
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-manifest", type=Path, required=True, help="Completed run or portable compact manifest.json")
+    parser.add_argument("--run-manifest", type=Path, required=True,
+                        help="Completed run, sweep cutoff or portable compact manifest.json")
     parser.add_argument("--model", required=True, help="Exact model_name in the confidence catalog")
     parser.add_argument("--layer", required=True, help="Exact layer_key in the confidence catalog")
     parser.add_argument("--output", type=Path, required=True, help="Fresh scalar .nrrd output")

@@ -15,10 +15,14 @@ import numpy as np
 
 class UnionSources:
     def __init__(self, receipt_path, specification_path, low_shape, full_shape,
-                 primary_low, primary_full, edits, global_edit, *, verify_native=True):
+                 primary_low, primary_full, edits, global_edit, *, verify_native=True,
+                 primary_manifest_hashes=None):
         from xta_native_filter import (digest, grouped_catalog, load_json,
                                        manifest_entries, open_original, shape3)
         self.low_shape, self.full_shape = tuple(low_shape), tuple(full_shape)
+        primary_paths = tuple(Path(path).resolve() for path in (primary_low, primary_full))
+        if primary_manifest_hashes is None:
+            primary_manifest_hashes = tuple(digest(path) for path in primary_paths)
         self.receipt_path = Path(receipt_path).resolve()
         self.specification_path = Path(specification_path).resolve()
         self.receipt = load_json(self.receipt_path)
@@ -55,7 +59,7 @@ class UnionSources:
                 raise ValueError('Union reference edits.json checksum mismatch.')
             baseline = load_json(reference_path)
             if (baseline.get('format') != FORMAT
-                    or baseline.get('source_manifest_sha256') != digest(Path(primary_low))):
+                    or baseline.get('source_manifest_sha256') != primary_manifest_hashes[0]):
                 raise ValueError('Union reference bundle does not identify the original primary preview manifest.')
             reference_entries = baseline.get('segments', [])
             self.reference_entries = {e['name']: e for e in reference_entries}
@@ -83,17 +87,30 @@ class UnionSources:
             if not isinstance(label, str) or not label or label in labels:
                 raise ValueError('Union source labels must be unique nonempty strings.')
             labels.add(label)
-            paths, manifests, entries = {}, {}, {}
+            paths, entries = {}, {}
             grouped_sources = {}
+            selects_catalogue = 'grid_id' in pair or 'cutoff_cent' in pair
+            if selects_catalogue and (not isinstance(pair.get('grid_id'), str)
+                                      or not pair['grid_id'].startswith('low_quality/')
+                                      or type(pair.get('cutoff_cent')) is not int):
+                raise ValueError(f'Union {label} needs an exact preview grid and cutoff for an embedded catalogue.')
             for kind in ('low', 'full'):
                 path = Path(pair[kind + '_manifest'])
                 if not path.is_absolute():
                     path = self.specification_path.parent / path
                 path = path.resolve()
                 expected = pair[kind + '_manifest_sha256']
-                if digest(path) != expected:
-                    raise ValueError(f'Union {label} {kind} manifest checksum mismatch.')
-                manifest = load_json(path)
+                if selects_catalogue:
+                    grid = pair['grid_id'] if kind == 'low' else 'native'
+                    catalog = grouped_catalog(path, {}, grid_id=grid, cutoff_cent=pair['cutoff_cent'])
+                    if catalog.sha256 != expected:
+                        raise ValueError(f'Union {label} {kind} manifest checksum mismatch.')
+                    manifest = catalog.catalogue
+                else:
+                    if digest(path) != expected:
+                        raise ValueError(f'Union {label} {kind} manifest checksum mismatch.')
+                    manifest = load_json(path)
+                    catalog = grouped_catalog(path, manifest)
                 wanted = self.low_shape if kind == 'low' else self.full_shape
                 if shape3(manifest['output_shape_tyx']) != wanted:
                     raise ValueError(f'Union {label} {kind} manifest shape mismatch.')
@@ -107,8 +124,7 @@ class UnionSources:
                     if name in by_name:
                         raise ValueError(f'Union {label} has duplicate exact segment names.')
                     by_name[name] = entry
-                paths[kind], manifests[kind], entries[kind] = path, manifest, by_name
-                catalog = grouped_catalog(path, manifest)
+                paths[kind], entries[kind] = path, by_name
                 grouped_sources[kind] = (None if catalog is None else {
                     entry['filename']: catalog.segment(entry['filename'], verify_payload=kind == 'low' or verify_native)
                     for entry in by_name.values()
@@ -138,17 +154,20 @@ class UnionSources:
                 open_original(paths['low'], entry['filename'], self.low_shape, grouped_sources['low'])
                 open_original(paths['full'], other['filename'], self.full_shape, grouped_sources['full'])
             self.pairs.append(dict(label=label, paths=paths, entries=entries,
+                                   catalogue_selection=({key: pair[key] for key in ('grid_id', 'cutoff_cent')}
+                                                        if selects_catalogue else {}),
                                    grouped_sources=grouped_sources,
                                    global_name=global_edit['name'],
                                    manifest_sha256={k: pair[k + '_manifest_sha256'] for k in paths},
                                    receipt_member_indices=indices))
         if len(self.pairs) < 2 or used != set(members):
             raise ValueError('Union specification must partition all receipt members among at least two sources.')
-        if not any(p['paths']['low'] == Path(primary_low).resolve()
-                   and p['paths']['full'] == Path(primary_full).resolve() for p in self.pairs):
+        primary = [pair for pair in self.pairs if tuple(pair['paths'].values()) == primary_paths
+                   and tuple(pair['manifest_sha256'].values()) == primary_manifest_hashes]
+        if len(primary) != 1:
             raise ValueError('Primary original manifest pair is absent from union sources.')
         self.global_name = global_edit['name']
-        self.primary_low = Path(primary_low).resolve()
+        self.primary_label = primary[0]['label']
         self.identification_basis = basis
         self._global_cache, self._hash_cache = {}, {}
         self._native_global_cache = {}
@@ -248,7 +267,7 @@ class UnionSources:
         if self.reference_entries is not None:
             from xta_native_filter import load_edit
             entry = self.reference_entries[name]
-            primary = next(pair for pair in self.pairs if pair['paths']['low'] == self.primary_low)
+            primary = next(pair for pair in self.pairs if pair['label'] == self.primary_label)
             original = self.source(primary, 'low', name)
             baseline = load_edit(self.reference_dir, entry, original)
         group = self.groups[name]
@@ -320,7 +339,8 @@ class UnionSources:
                     pairs=[dict(label=p['label'], low_manifest=str(p['paths']['low']),
                                 full_manifest=str(p['paths']['full']),
                                 manifest_sha256=p['manifest_sha256'],
-                                receipt_member_indices=p['receipt_member_indices']) for p in self.pairs])
+                                receipt_member_indices=p['receipt_member_indices'],
+                                **p['catalogue_selection']) for p in self.pairs])
         if self.reference_dir is not None:
             report['union_reference_edits'] = str(self.reference_dir)
             report['union_reference_edits_sha256'] = self.reference_sha256

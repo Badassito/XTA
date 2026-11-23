@@ -20,6 +20,8 @@ import numpy as np
 
 from .confidence_evidence import ConfidenceEvidenceRef, write_confidence_evidence
 from .reconciliation_io import read_layer_manifest, write_seg_nrrd
+from .sweep_grouped_reader import LayerCatalogueRef, layer_catalogue_bytes
+from .unification.tta_manifest import load_tta_run_manifest
 
 
 EXPORT_SCHEMA = "xta.compact_confidence_export/1"
@@ -172,16 +174,30 @@ def export_memory_plan(source_shape, target_shape, memory_mib):
 def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mib=256,
                             allow_native_projection=False, max_staging_mib=32768, progress=None):
     """Publish a fresh, portable compact mask/score package without native masks."""
-    run_manifest, compact_manifest, output = (Path(path).expanduser().resolve() for path in (run_manifest, compact_manifest, output))
+    run_manifest = Path(run_manifest).expanduser().resolve()
+    output = Path(output).expanduser().resolve()
+    compact_path = Path(compact_manifest).expanduser().resolve()
+    embedded = isinstance(compact_manifest, LayerCatalogueRef)
+    if not embedded:
+        compact_manifest = compact_path
+    catalogue_name = "layers_nrrd_manifest.json" if embedded else compact_path.name
     if output.exists():
         raise FileExistsError(f"Export output must be fresh: {output}")
     if isinstance(max_staging_mib, bool) or not math.isfinite(float(max_staging_mib)) or max_staging_mib <= 0:
         raise ValueError("max_staging_mib must be positive and finite")
-    run = json.loads(run_manifest.read_text(encoding="utf-8"))
+    run_data = run_manifest.read_bytes()
+    run = load_tta_run_manifest(run_manifest, data=run_data)
     if run.get("status") != "complete":
         raise ValueError("Export requires a completed run manifest")
+    # An embedded report describes the original source-grid result. Preserve
+    # its resolved policy with the provenance, outside the portable replay manifest.
+    source_reconciliation = None
+    if "reconciliation" in run:
+        from .reconciliation_policy import load_reconciliation_report
+        source_reconciliation = load_reconciliation_report(run_manifest)
     source_shape = _shape(run.get("inputs", {}).get("source_shape_t_y_x"), "Run source_shape_t_y_x")
-    compact = json.loads(compact_manifest.read_text(encoding="utf-8"))
+    compact_data = layer_catalogue_bytes(compact_manifest)
+    compact = json.loads(compact_data)
     target_shape = _shape(compact.get("output_shape_tyx"), "Compact output_shape_tyx")
     if _shape(compact.get("full_quality_output_shape_tyx"), "Compact full_quality_output_shape_tyx") != source_shape:
         raise ValueError("Compact mask source grid disagrees with the completed run")
@@ -198,7 +214,7 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
         raise ValueError("The compact masks, confidence evidence and run manifest come from different runs")
     if evidence.get("schema") not in SUPPORTED_EVIDENCE_SCHEMAS or not isinstance(evidence.get("layers"), list):
         raise ValueError("Unsupported confidence evidence manifest")
-    if output.is_relative_to(compact_manifest.parent) or output.is_relative_to(evidence_manifest.parent):
+    if output.is_relative_to(compact_path.parent) or output.is_relative_to(evidence_manifest.parent):
         raise ValueError("Export output must be outside input mask and confidence directories")
     entries = {}
     for entry in evidence["layers"]:
@@ -206,7 +222,11 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
         if not all(isinstance(value, str) and value for value in key) or key in entries:
             raise ValueError("Confidence manifest identities must be nonempty and unique")
         entries[key] = entry
-    watched = {path: _fingerprint(path) for path in (run_manifest, compact_manifest, evidence_manifest)}
+    watched = {path: _fingerprint(path) for path in (run_manifest, compact_path, evidence_manifest)}
+    if watched[run_manifest]["sha256"] != hashlib.sha256(run_data).hexdigest():
+        raise RuntimeError(f"Run manifest changed before compact export: {run_manifest}")
+    if not embedded and watched[compact_path]["sha256"] != hashlib.sha256(compact_data).hexdigest():
+        raise RuntimeError(f"Layer catalogue changed before compact export: {compact_path}")
     output.parent.mkdir(parents=True, exist_ok=True)
     prefix = f".{output.name}.export-"
     stage = Path(tempfile.mkdtemp(prefix=prefix, dir=output.parent))
@@ -222,12 +242,14 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
         provenance_output = stage / "provenance"
         for directory in (mask_output, score_output, provenance_output):
             directory.mkdir()
-        with read_layer_manifest(compact_manifest, workspace=work, memory_mib=memory_mib) as collection:
+        with read_layer_manifest(compact_manifest, workspace=work, memory_mib=memory_mib,
+                                 manifest_bytes=compact_data) as collection:
             grouped = collection.grouped_catalog
             if grouped is not None:
                 if grouped.run_manifest != run_manifest:
                     raise ValueError("Grouped mask catalogue belongs to a different cutoff run")
-                watched[grouped.review_path] = _fingerprint(grouped.review_path)
+                if grouped.review_path not in watched:
+                    watched[grouped.review_path] = _fingerprint(grouped.review_path)
                 for path, (stamp, sha256) in grouped.verified_files.items():
                     watched[path] = {"bytes": stamp[2], "mtime_ns": stamp[3], "sha256": sha256}
             geometry = collection.geometry
@@ -369,19 +391,30 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
                 portable_manifest["layout"] = "one_single_layer_nrrd_per_component"
                 for key in ("source_storage", "review_manifest", "grid_id", "cutoff_cent"):
                     portable_manifest.pop(key, None)
-            (mask_output / compact_manifest.name).write_text(json.dumps(portable_manifest,indent=2)+"\n",encoding="utf-8")
+            (mask_output / catalogue_name).write_text(json.dumps(portable_manifest,indent=2)+"\n",encoding="utf-8")
         score_catalog = {"schema":SOURCE_SCHEMA, "layers":result["confidence_layers"]}
         if "run_id" in run:
             score_catalog["run_id"] = run["run_id"]
         (score_output / "manifest.json").write_text(json.dumps(score_catalog,indent=2)+"\n",encoding="utf-8")
-        shutil.copyfile(run_manifest, provenance_output / "original_run_manifest.json")
-        shutil.copyfile(compact_manifest, provenance_output / "original_compact_manifest.json")
+        (provenance_output / "original_run_manifest.json").write_bytes(run_data)
+        (provenance_output / "original_compact_manifest.json").write_bytes(compact_data)
+        if embedded:
+            result["source_catalogue"] = {"review": str(compact_path), "grid_id": compact_manifest.grid_id,
+                                          "cutoff_cent": compact_manifest.cutoff_cent,
+                                          "sha256": hashlib.sha256(compact_data).hexdigest()}
         portable_run = {**run,"outputs":{"requested":["nrrd","confidence_evidence"],"paths":{
-            "run_manifest":"manifest.json","nrrd_dir":"nrrd","nrrd_manifest":f"nrrd/{compact_manifest.name}",
+            "run_manifest":"manifest.json","nrrd_dir":"nrrd","nrrd_manifest":f"nrrd/{catalogue_name}",
             "confidence_evidence_manifest":"reconciliation_evidence/manifest.json"}},
             "compact_evidence_export":{"schema":EXPORT_SCHEMA,"source_shape_tyx":list(source_shape),
                 "output_shape_tyx":list(target_shape),"original_manifest":"provenance/original_run_manifest.json",
                 "input_paths_role":"historical source identities; replay artifacts use relative output paths"}}
+        portable_run.pop("shared_run_geometry", None)
+        portable_run.pop("reconciliation", None)
+        if source_reconciliation is not None:
+            filename = "original_reconciliation.json"
+            (provenance_output / filename).write_text(
+                json.dumps(source_reconciliation, indent=2) + "\n", encoding="utf-8")
+            portable_run["compact_evidence_export"]["original_reconciliation"] = f"provenance/{filename}"
         if grouped is not None:
             portable_run["confidence_sweep"] = {
                 key: value for key, value in run["confidence_sweep"].items() if key != "nrrd_storage"
@@ -390,7 +423,7 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
         (stage / "README.md").write_text(
             "# Portable compact reconciliation evidence\n\n"
             f"Compact grid (t, y, x): {target_shape}. Original source grid: {source_shape}.\n\n"
-            f"Use `nrrd/{compact_manifest.name}` with `tools/compare_reconciliation.py` for offline policy replay. "
+            f"Use `nrrd/{catalogue_name}` with `tools/compare_reconciliation.py` for offline policy replay. "
             "The package contains additive compact masks, matched source-aligned confidence sidecars, "
             "relative replay paths, and original metadata snapshots under `provenance/`.\n\n"
             "Confidence is the maximum known score over each source-to-compact categorical footprint, "
@@ -401,6 +434,10 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
         for path, fingerprint in watched.items():
             if _fingerprint(path) != fingerprint:
                 raise RuntimeError(f"Input changed during compact export: {path}")
+        if load_tta_run_manifest(run_manifest) != run:
+            raise RuntimeError(f"Input run metadata changed during compact export: {run_manifest}")
+        if source_reconciliation is not None and load_reconciliation_report(run_manifest) != source_reconciliation:
+            raise RuntimeError(f"Input reconciliation changed during compact export: {run_manifest}")
         if work.exists():
             resolved_work = work.resolve()
             if resolved_work.parent != stage.resolve() or resolved_work.name != ".workspace":
@@ -408,7 +445,7 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
             shutil.rmtree(resolved_work)
         result.update(status="complete", inputs_unchanged=True, layer_count=len(portable_layers),
                       confidence_layer_count=len(result["confidence_layers"]), paths={"run_manifest":"manifest.json",
-                        "nrrd_manifest":f"nrrd/{compact_manifest.name}","confidence_manifest":"reconciliation_evidence/manifest.json"},
+                        "nrrd_manifest":f"nrrd/{catalogue_name}","confidence_manifest":"reconciliation_evidence/manifest.json"},
                       source_inputs={str(path): fingerprint for path,fingerprint in watched.items()})
         (stage / "export_manifest.json").write_text(json.dumps(result,indent=2)+"\n",encoding="utf-8")
         if output.exists():

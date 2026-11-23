@@ -665,8 +665,8 @@ def manifest_entries(manifest):
     return by_filename
 
 
-def grouped_catalog(path, manifest):
-    if manifest.get('layout') != 'grouped_sweep_segments':
+def grouped_catalog(path, manifest, *, grid_id=None, cutoff_cent=None):
+    if grid_id is None and cutoff_cent is None and manifest.get('layout') != 'grouped_sweep_segments':
         return None
     # The CLI can be launched directly from its source checkout.
     repository = Path(__file__).resolve().parents[1]
@@ -674,11 +674,16 @@ def grouped_catalog(path, manifest):
         sys.path.insert(0, str(repository))
     from XTA.sweep_grouped_reader import open_grouped_catalog
 
-    return open_grouped_catalog(path)
+    return open_grouped_catalog(path, grid_id=grid_id, cutoff_cent=cutoff_cent)
 
 
 def grouped_edit_sources(low_path, full_path, low, full, binding, *, verify_native):
-    catalogues = (grouped_catalog(low_path, low), grouped_catalog(full_path, full))
+    if binding and binding.get('source_catalog') == 'embedded':
+        cent = binding['cutoff_cent']
+        catalogues = (grouped_catalog(low_path, low, grid_id=binding['grid_id'], cutoff_cent=cent),
+                      grouped_catalog(full_path, full, grid_id='native', cutoff_cent=cent))
+    else:
+        catalogues = (grouped_catalog(low_path, low), grouped_catalog(full_path, full))
     if catalogues == (None, None):
         return None
     if binding is None or binding.get('source_storage') != 'grouped' or any(c is None for c in catalogues):
@@ -687,6 +692,8 @@ def grouped_edit_sources(low_path, full_path, low, full, binding, *, verify_nati
     if (preview.review_path != native.review_path
             or digest(preview.review_path) != binding['review_manifest_sha256']
             or preview.grid_id != binding['grid_id'] or native.grid_id != 'native'
+            or preview.sha256 != binding['preview_manifest_sha256']
+            or native.sha256 != binding['native_manifest_sha256']
             or any(c.cutoff_cent != binding['cutoff_cent']
                    or c.run_manifest_sha256 != binding['run_manifest_sha256'] for c in catalogues)):
         raise ValueError('Grouped catalogue identity differs from the sweep edit binding.')
@@ -733,9 +740,18 @@ def run(args):
     if 'sweep_context' in bundle:
         from xta_sweep_edits import validate_sweep_source_pair
         sweep_binding = validate_sweep_source_pair(bundle_dir, bundle, low_path, full_path)
-    if digest(low_path) != bundle['source_manifest_sha256']:
+    embedded = sweep_binding is not None and sweep_binding.get('source_catalog') == 'embedded'
+    if embedded:
+        low, full = (load_json(bundle_dir / name)
+                     for name in ('source_manifest.json', 'source_native_manifest.json'))
+        low_sha = sweep_binding['preview_manifest_sha256']
+        full_sha = sweep_binding['native_manifest_sha256']
+    else:
+        low, full = load_json(low_path), load_json(full_path)
+        low_sha, full_sha = digest(low_path), digest(full_path)
+    source_catalogue_name = low['source_manifest_name'] if embedded else low_path.name
+    if low_sha != bundle['source_manifest_sha256']:
         raise ValueError('This is not the original preview manifest selected during export.')
-    low, full = load_json(low_path), load_json(full_path)
     if low.get('quality') != 'low_quality' or full.get('quality') == 'low_quality':
         raise ValueError('Supply a low-quality manifest and a full-quality manifest, respectively.')
     low_shape, full_shape = shape3(low['output_shape_tyx']), shape3(full['output_shape_tyx'])
@@ -783,6 +799,7 @@ def run(args):
         from xta_native_union import UnionSources
         union_sources = UnionSources(receipt, pairs, low_shape, full_shape,
                                      low_path, full_path, edits, global_edit,
+                                     primary_manifest_hashes=(low_sha, full_sha),
                                      verify_native=not getattr(args, 'validate_only', False))
     output = Path(args.output).resolve()
     ensure_disjoint(output, [bundle_dir, low_path.parent, full_path.parent])
@@ -810,8 +827,8 @@ def run(args):
     output.mkdir(parents=True)
     report = {'tool_version': VERSION, 'status': 'in_progress',
               'created_utc': datetime.now(timezone.utc).isoformat(),
-              'bundle_sha256': digest(bundle_path), 'preview_manifest_sha256': digest(low_path),
-              'full_manifest_sha256': digest(full_path), 'shape_tyx': list(full_shape),
+              'bundle_sha256': digest(bundle_path), 'preview_manifest_sha256': low_sha,
+              'full_manifest_sha256': full_sha, 'shape_tyx': list(full_shape),
               'preview_shape_tyx': list(low_shape), 'slab_depth': depth,
               'scratch_array_bytes': 2 * size, 'max_provisional_components': args.max_components,
               'native_global_cache_bytes': global_cache_bytes,
@@ -845,6 +862,7 @@ def run(args):
     try:
         result = execute(args, output, scratch_root, report, global_edit, layers, le, fe,
                          low_path, full_path, bundle_dir, full_shape, low_shape, depth, support,
+                         source_catalogue_name=source_catalogue_name,
                          union_sources=union_sources, low_sources=low_sources, full_sources=full_sources)
         return result
     except BaseException as exc:
@@ -1014,7 +1032,7 @@ def process_native_layer(i, entry, *, args, output, tmp, low_path, full_path,
 
 def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
             low_path, full_path, bundle_dir, full_shape, low_shape, depth, support,
-            union_sources=None, low_sources=None, full_sources=None):
+            *, source_catalogue_name, union_sources=None, low_sources=None, full_sources=None):
     key = global_edit['source_filename']
     low_global_source = open_original(low_path, key, low_shape, low_sources)
     low_global = (low_global_source.array() if union_sources is None else
@@ -1176,7 +1194,7 @@ def execute(args, output, scratch_root, report, global_edit, layers, le, fe,
                 labels.merge_into(union, keep_lut)
                 final_voxels = int(counts[kept_roots].sum())
             evict(union)
-            stem = str(low_path.name)
+            stem = source_catalogue_name
             suffix = '_nrrd_manifest.json'
             if not stem.endswith(suffix):
                 raise ValueError('Expected an XTA <source-stem>_nrrd_manifest.json filename.')
@@ -1210,8 +1228,8 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--version', action='version', version=VERSION)
     p.add_argument('--edits', required=True, help='Directory exported by Export XTA Edits in Slicer.')
-    p.add_argument('--low-manifest', required=True, help='Original preview layer manifest or sweep preview source catalogue.')
-    p.add_argument('--full-manifest', required=True, help='Matching native layer manifest or sweep native source catalogue.')
+    p.add_argument('--low-manifest', required=True, help='Original preview catalogue or the shared sweep review index.')
+    p.add_argument('--full-manifest', required=True, help='Matching native catalogue or the same sweep review index.')
     p.add_argument('--union-receipt', help='Explicit exact-name preview union manifest; requires --union-source-pairs.')
     p.add_argument('--union-source-pairs', help='Hashed original source pairs and receipt member assignments JSON.')
     p.add_argument('--validate-only', action='store_true',

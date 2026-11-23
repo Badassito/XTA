@@ -428,13 +428,24 @@ def native_contract(args,stem,bundle):
     low=Path(args.native_low_template.format(stem=stem)).resolve()
     full=Path(args.native_full_template.format(stem=stem)).resolve()
     if any(not p.is_file() for p in (tool,low,full)):raise ValueError('Explicit native tool/manifests must exist.')
-    if tool.is_relative_to(bundle) or low==full:raise ValueError('Invalid native tool/source paths.')
+    edits=read_json(bundle/'edits.json')
+    embedded=edits.get('sweep_context', {}).get('source_catalog') == 'embedded'
+    if tool.is_relative_to(bundle) or (low==full and not embedded):raise ValueError('Invalid native tool/source paths.')
     version=subprocess.check_output([args.python,str(tool),'--version'],text=True).strip()
     if version!='0.3.1':raise ValueError(f'This wrapper is qualified for native_filter 0.3.1, found {version!r}.')
-    if digest(low)!=read_json(bundle/'edits.json')['source_manifest_sha256']:
+    if embedded:
+        if __package__:
+            from .xta_sweep_edits import validate_sweep_source_pair
+        else:
+            from xta_sweep_edits import validate_sweep_source_pair
+        binding=validate_sweep_source_pair(bundle,edits,low,full)
+    elif digest(low)!=edits['source_manifest_sha256']:
         raise ValueError('Native low manifest is not the exact edit-bundle source manifest.')
     contract={'filter':str(tool),'filter_sha256':digest(tool),'filter_version':version,
               'low_manifest':str(low),'low_sha256':digest(low),'full_manifest':str(full),'full_sha256':digest(full)}
+    if embedded:
+        contract['catalogue_selection']={key:binding[key] for key in (
+            'grid_id','cutoff_cent','preview_manifest_sha256','native_manifest_sha256')}
     if args.native_union_receipt:
         for key,value in (('union_receipt',args.native_union_receipt),('union_source_pairs',args.native_union_source_pairs)):
             path=Path(value).resolve()
@@ -454,9 +465,18 @@ def native_contract(args,stem,bundle):
                 if not path.is_absolute():path=pairs_path.parent/path
                 path=path.resolve()
                 actual=digest(path)
+                row={'path':str(path),'sha256':actual}
+                if 'grid_id' in pair or 'cutoff_cent' in pair:
+                    if __package__:
+                        from .xta_sweep_edits import _embedded_catalogue_digest
+                    else:
+                        from xta_sweep_edits import _embedded_catalogue_digest
+                    grid=pair['grid_id'] if kind=='low' else 'native'
+                    actual=_embedded_catalogue_digest(path,grid,pair['cutoff_cent'])
+                    row.update(grid_id=grid,cutoff_cent=pair['cutoff_cent'],catalogue_sha256=actual)
                 if actual!=pair[kind+'_manifest_sha256']:
                     raise ValueError(f'Union {kind} source-manifest checksum mismatch: {path}')
-                source_manifests.append({'path':str(path),'sha256':actual})
+                source_manifests.append(row)
         contract['union_source_manifests']=source_manifests
     return contract
 

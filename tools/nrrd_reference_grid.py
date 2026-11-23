@@ -36,6 +36,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from XTA.reconciliation_io import _read_header, read_layer_manifest  # noqa: E402
+from XTA.sweep_grouped_reader import (  # noqa: E402
+    LayerCatalogueRef, locate_run_layer_catalog, read_layer_catalog,
+)
 
 MIB = 1024 * 1024
 OFFSET_FIELD = 'Segmentation_ReferenceImageExtentOffset'
@@ -394,14 +397,56 @@ def reference_payload_sha256(source, *, chunk_bytes: int = 8 * MIB) -> str:
     return digest.hexdigest()
 
 
-def manifest_volume_memory_mib(manifest_path: str | Path, *, minimum_mib: float = 256.0) -> float:
+def resolve_layer_catalogue(source, *, grid_id=None, cutoff_cent=None):
+    """Select layers from a physical catalogue, cutoff receipt or managed review."""
+    if cutoff_cent is not None and (type(cutoff_cent) is not int or not 0 <= cutoff_cent <= 100):
+        raise ValueError("Cutoff must be an integer from 0 through 100")
+    if isinstance(source, LayerCatalogueRef):
+        if grid_id is not None or cutoff_cent is not None:
+            raise ValueError("The layer catalogue already selects a grid and cutoff")
+        return source
+    path = Path(source).expanduser().resolve()
+    if path.is_dir():
+        if cutoff_cent is not None and not (path / "manifest.json").is_file():
+            raise ValueError("A cutoff selector requires a sweep review manifest")
+        path = path / "manifest.json"
+        if not path.is_file():
+            return locate_run_layer_catalog(path, grid_id or "native")
+    if path.name == "manifest.json":
+        document = json.loads(path.read_bytes())
+        if document.get("schema") == "xta.sweep_review/1":
+            if cutoff_cent is None:
+                raise ValueError("Select a cutoff for a sweep review manifest")
+            selected_grid = grid_id or "native"
+            branches = [branch for grid in document["grids"] if grid["grid_id"] == selected_grid
+                        for branch in grid["branches"] if branch["cutoff_cent"] == cutoff_cent]
+            if len(branches) != 1:
+                raise ValueError(f"Expected one {selected_grid} layer catalogue at cutoff {cutoff_cent}")
+            branch = branches[0]
+            if branch.get("source_catalog") == "embedded":
+                return LayerCatalogueRef(path, selected_grid, cutoff_cent)
+            run_path = (path.parent / branch["run_manifest"]).resolve()
+            if not run_path.is_relative_to(path.parent.parent):
+                raise ValueError("Cutoff receipt escaped the study containing the review")
+            return locate_run_layer_catalog(run_path, selected_grid)
+        if "layers" not in document:
+            if cutoff_cent is not None:
+                raise ValueError("A cutoff selector requires a sweep review manifest")
+            return locate_run_layer_catalog(path, grid_id or "native")
+    if grid_id is not None or cutoff_cent is not None:
+        raise ValueError("Grid and cutoff selectors require a cutoff run or sweep review manifest")
+    return path
+
+
+def manifest_volume_memory_mib(manifest_path: str | Path | LayerCatalogueRef, *,
+                               minimum_mib: float = 256.0) -> float:
     """A read_slab budget large enough for one whole reference volume of a layer manifest."""
-    document = json.loads(Path(manifest_path).read_bytes())
+    document = read_layer_catalog(manifest_path)
     shape = tuple(int(value) for value in document['output_shape_tyx'])
     return max(float(minimum_mib), math.prod(shape) / MIB + 1.0)
 
 
-def open_manifest_layers(manifest_path: str | Path, *, filenames: Sequence[str] | None = None,
+def open_manifest_layers(manifest_path: str | Path | LayerCatalogueRef, *, filenames: Sequence[str] | None = None,
                          memory_mib: float | None = None, workspace: str | Path | None = None,
                          max_open: int = 512):
     """Open manifest layers through the supported offset-aware reconciliation reader.
@@ -413,8 +458,9 @@ def open_manifest_layers(manifest_path: str | Path, *, filenames: Sequence[str] 
     """
     path = Path(manifest_path)
     manifest_bytes = None
+    if filenames is not None or memory_mib is None:
+        document = read_layer_catalog(manifest_path)
     if filenames is not None:
-        document = json.loads(path.read_bytes())
         rows = {row.get('filename'): row for row in document.get('layers', []) if isinstance(row, dict)}
         missing = [name for name in filenames if name not in rows]
         if missing:
@@ -422,8 +468,9 @@ def open_manifest_layers(manifest_path: str | Path, *, filenames: Sequence[str] 
         selected = [rows[name] for name in filenames]
         manifest_bytes = json.dumps(dict(document, layers=selected, layer_count=len(selected))).encode('utf-8')
     if memory_mib is None:
-        memory_mib = manifest_volume_memory_mib(path)
-    return read_layer_manifest(path, workspace=Path(workspace) if workspace is not None else path.parent,
+        shape = tuple(int(value) for value in document['output_shape_tyx'])
+        memory_mib = max(256.0, math.prod(shape) / MIB + 1.0)
+    return read_layer_manifest(manifest_path, workspace=Path(workspace) if workspace is not None else path.parent,
                                memory_mib=float(memory_mib), max_open=int(max_open),
                                include_all_layers=True, manifest_bytes=manifest_bytes)
 
@@ -431,5 +478,5 @@ def open_manifest_layers(manifest_path: str | Path, *, filenames: Sequence[str] 
 __all__ = [
     'ReferenceRaster', 'inspect_reference_raster', 'iter_reference_slabs', 'manifest_volume_memory_mib',
     'open_manifest_layers', 'raster_from_fields', 'read_reference_planes', 'read_reference_volume',
-    'reference_payload_sha256',
+    'reference_payload_sha256', 'resolve_layer_catalogue',
 ]

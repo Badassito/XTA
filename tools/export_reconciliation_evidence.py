@@ -17,9 +17,11 @@ from XTA.confidence_export import export_compact_evidence
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--run_manifest", type=Path, help="Completed source run's manifest.json")
+    source.add_argument("--run_manifest", type=Path, help="Completed source run or sweep cutoff manifest.json")
     source.add_argument("--sam_bundle", type=Path, help="Indexed SAM proposal directory or archive reference to copy without inference")
-    parser.add_argument("--compact_manifest", type=Path, help="Matching low-quality NRRD layer manifest (required with --run_manifest)")
+    compact = parser.add_mutually_exclusive_group()
+    compact.add_argument("--compact_manifest", type=Path, help="Matching low-quality NRRD layer manifest")
+    compact.add_argument("--grid", help="Select the low-quality catalogue by its low_quality/<token> grid ID")
     parser.add_argument("--output", type=Path, required=True, help="Fresh portable-package directory")
     parser.add_argument("--memory_mib", type=int, default=256, help="Crop/plane workspace budget")
     parser.add_argument("--allow_native_projection", action="store_true",
@@ -33,23 +35,29 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.sam_bundle is not None:
-        if args.compact_manifest is not None:
-            parser.error('--compact_manifest does not apply to --sam_bundle')
+        if args.compact_manifest is not None or args.grid is not None:
+            parser.error('--compact_manifest and --grid do not apply to --sam_bundle')
         if args.allow_native_projection:
             parser.error('--allow_native_projection does not apply to --sam_bundle; SAM evidence retains its view-native coordinates')
         from XTA.sam_evidence import export_sam_evidence
         result = export_sam_evidence(args.sam_bundle, args.output)
         print(json.dumps(result, indent=2))
         return 0
-    if args.compact_manifest is None:
-        parser.error('--run_manifest requires --compact_manifest')
+    catalogue = args.compact_manifest
+    if args.grid is not None:
+        if not args.grid.startswith("low_quality/"):
+            parser.error('--grid requires a low_quality/<token> grid ID')
+        from XTA.sweep_grouped_reader import locate_run_layer_catalog
+        catalogue = locate_run_layer_catalog(args.run_manifest, args.grid)
+    if catalogue is None:
+        parser.error('--run_manifest requires --compact_manifest or --grid')
     last = [0.]
     def progress(stage, current, total):
         now = time.monotonic()
         if stage == "layers" or current == total or now-last[0] >= 15:
             print(f"Compact evidence {stage}: {current}/{total}", flush=True)
             last[0] = now
-    result = export_compact_evidence(args.run_manifest, args.compact_manifest, args.output,
+    result = export_compact_evidence(args.run_manifest, catalogue, args.output,
         memory_mib=args.memory_mib, allow_native_projection=args.allow_native_projection,
         max_staging_mib=args.max_staging_mib, progress=progress)
     print(json.dumps({"output": str(args.output.resolve()), "layers": result["layer_count"],

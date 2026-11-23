@@ -4931,18 +4931,21 @@ def save_single_low_quality_output(
     show_progress: bool = True,
     save_overlay: bool = True,
     stage_mask: Optional[Callable[[LowQualityDownbinSpec, np.ndarray], None]] = None,
+    flat_output: bool = False,
 ) -> Dict[str, Path]:
     """Write requested videos and optionally stage the same binary grid for a sweep."""
-    low_root = Path(out_dir) / 'low_quality'
-    low_root.mkdir(parents=True, exist_ok=True)
+    result_paths = planned_low_quality_output_paths(
+        out_dir=Path(out_dir), stem=stem, downbin_specs=(spec,),
+        save_overlay=save_overlay, flat_output=flat_output,
+    )
+    binary_path = result_paths[f'low_quality_{spec.token}_binary_video']
+    binary_path.parent.mkdir(parents=True, exist_ok=True)
     source_t = max(1, int(mask_u8.shape[0]))
     out_t, out_h, out_w = (
         int(spec.output_shape_t_y_x[0]),
         int(spec.output_shape_t_y_x[1]),
         int(spec.output_shape_t_y_x[2]),
     )
-    spec_dir = low_root / spec.token
-    spec_dir.mkdir(parents=True, exist_ok=True)
     fps_lq = max(1e-6, float(fps) * float(out_t) / float(source_t))
     print(
         f'Low-quality downbin {spec.raw_value}: native (t,Y,X)=({source_t},{int(mask_u8.shape[1])},{int(mask_u8.shape[2])}) '
@@ -4959,10 +4962,7 @@ def save_single_low_quality_output(
         prefer_memory=True,
         desc=f'Low-quality mask resize {spec.token}',
     )
-    result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
     try:
-        overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
-        binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
         if save_overlay:
             gray_lq = resize_gray_volume_to_shape(
                 volume_gray,
@@ -4978,7 +4978,7 @@ def save_single_low_quality_output(
         def _write_lq_overlay() -> Path:
             assert gray_lq is not None
             return write_low_quality_overlay_video(
-                gray_lq, mask_lq, overlay_path, fps_lq,
+                gray_lq, mask_lq, result_paths[f'low_quality_{spec.token}_overlay'], fps_lq,
                 show_progress=show_progress,
                 publication_root=out_dir,
             )
@@ -5004,9 +5004,6 @@ def save_single_low_quality_output(
                 for fut in as_completed(futures):
                     fut.result()
 
-        if save_overlay:
-            result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
-        result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
         return result_paths
     finally:
         if gray_lq is not None and gray_lq is not volume_gray:
@@ -5028,6 +5025,7 @@ def collect_low_quality_output_futures(
     show_progress: bool = True,
     save_overlay: bool = True,
     stage_mask: Optional[Callable[[LowQualityDownbinSpec, np.ndarray], None]] = None,
+    flat_output: bool = False,
 ) -> Tuple[Dict[str, Path], List[Future]]:
     """Submit each low-quality downbin as an independent background job."""
     result_paths = planned_low_quality_output_paths(
@@ -5035,6 +5033,7 @@ def collect_low_quality_output_futures(
         stem=stem,
         downbin_specs=downbin_specs,
         save_overlay=save_overlay,
+        flat_output=flat_output,
     )
     futures: List[Future] = []
     for spec in list(downbin_specs):
@@ -5051,6 +5050,7 @@ def collect_low_quality_output_futures(
             show_progress=show_progress,
             save_overlay=save_overlay,
             stage_mask=stage_mask,
+            flat_output=flat_output,
         ))
     return result_paths, futures
 
@@ -5060,12 +5060,13 @@ def planned_low_quality_output_paths(
     stem: str,
     downbin_specs: Sequence[LowQualityDownbinSpec],
     save_overlay: bool = True,
+    flat_output: bool = False,
 ) -> Dict[str, Path]:
     """Return paths for per-bin low-quality video writers."""
     low_root = out_dir / 'low_quality'
-    result_paths: Dict[str, Path] = {'low_quality_dir': low_root}
+    result_paths: Dict[str, Path] = {} if flat_output else {'low_quality_dir': low_root}
     for spec in downbin_specs:
-        spec_dir = low_root / spec.token
+        spec_dir = out_dir if flat_output else low_root / spec.token
         overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
         binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
         if save_overlay:
