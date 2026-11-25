@@ -18,6 +18,21 @@ from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter, RawBBoxMaskStor
 from XTA.runtime import release_memfd_owners_under
 
 
+def test_d1_score_workers_charge_distinct_full_views_within_host_and_scratch_budgets():
+    def task(name, native_bytes):
+        return dict(model_name='m', view=SimpleNamespace(name=name), processing_shape=(1, 1, native_bytes),
+                    d1_output_shape=(7, 11, 13))
+    tasks = [task('large', 130)] * 3 + [task('medium', 60), task('small', 45), {}]
+    def plan(**limits):
+        return memory.d1_score_projection_workers(tasks, workspace_bytes=5, **limits)
+    assert plan(cpu_count=32, ram_bytes=1600, scratch_bytes=2000) == (2, 200)
+    assert plan(cpu_count=32, ram_bytes=2000, scratch_bytes=1600) == (2, 200)
+    assert plan(cpu_count=32, ram_bytes=2000, scratch_bytes=2000, anon_cap=199) == (1, 135)
+    assert plan(cpu_count=32, ram_bytes=2000, scratch_bytes=2000) == (3, 250)
+    assert plan(cpu_count=1, ram_bytes=2000, scratch_bytes=2000) == (1, 135)
+    assert plan(cpu_count=32, ram_bytes=0, scratch_bytes=0) == (1, 135)
+
+
 def _cache_export_volumes():
     a = np.zeros((5,17,43), np.uint8)
     pattern = (np.indices((5,13,33)).sum(axis=0) % 2).astype(np.uint8)

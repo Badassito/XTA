@@ -1,4 +1,4 @@
-"""Disjoint candidate bins for XTA's one-class CUDA prototype-union decoder."""
+"""Disjoint candidate bins for XTA's one-class CUDA retina decoder."""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -27,29 +27,22 @@ def _candidate_bins(head, cutoffs):
     return head.index_select(1, accepted.index_select(0, order)), offsets
 
 
-def consume_tiled_siblings(sink, result_index, head, proto, image, *, allow_tiled):
+def consume_sibling_bins(sink, result_index, head, proto, image):
     """Consume exact sibling masks while this frame's raw prototypes are still resident.
 
-    The native union starts at -6, crops logits with the production boxes, and
-    reduces maxima *before* bilinear expansion. Adding disjoint bins from high
-    to low reproduces each independent union. Observed confidence takes the
-    proto maximum, sampled nearest with the bilinear-tap fallback on foreground
-    (_upsample_proto_confidence). Only two prototype grids and the current
-    decoded mask/score pair are accumulated, independent of the cutoff count.
+    Decode every accepted instance in only one bin. Union and positive-score
+    maxima commute across the independently decoded bins, even at overlapping
+    box edges. Only the accumulated planes and the current bin are resident.
     """
     from . import inference
 
     cutoffs = tuple(sink.cutoffs)
     # At up to four siblings, the original direct decoder was faster than
     # binning the real 1024/2048 heads. Both routes consume the same forward.
-    if (not allow_tiled or len(cutoffs) <= 4 or not getattr(head, 'is_cuda', False)
+    if (len(cutoffs) <= 4 or not getattr(head, 'is_cuda', False)
             or head.ndim != 2 or proto.ndim != 3 or head.shape[0] != 5 + proto.shape[0]):
         return False
     import torch
-
-    if not (inference._tiled_f16_proto_union_applicable(torch, head, proto)
-            or inference._tiled_f32_proto_union_applicable(torch, head, proto)):
-        return False
 
     try:
         packed, offsets = _candidate_bins(head, cutoffs)
@@ -58,8 +51,7 @@ def consume_tiled_siblings(sink, result_index, head, proto, image, *, allow_tile
     total = offsets[-1]
     bins = sum(lo != hi for lo, hi in zip(offsets, offsets[1:]))
     sink.record_proto_work(total, sum(total - lo for lo in offsets[:-1]), bins)
-    image_hw = tuple(image.shape[-2:])
-    logits = scores = None
+    union = scores = None
     payload = inference.GpuFlattenedRetinaPayload(union_gpu=None, conf_gpu=None, instance_count=0)
     proto = proto.contiguous()
     previous_cutoff = None
@@ -67,24 +59,23 @@ def consume_tiled_siblings(sink, result_index, head, proto, image, *, allow_tile
         cent = cutoffs[index]
         lo, hi = offsets[index:index+2]
         if hi > lo:
-            # The caller consumes each output before reusing its live backend
-            # bindings. The exact tiled kernel works on this bin's candidates.
-            reduced = inference._reduce_direct_prototypes(
+            # The caller consumes each output before reusing its live backend bindings.
+            bin_payload = inference._build_direct_device_compacted_payload(
                 packed[:, lo:hi], proto, image, cent / 100,
-                allow_tiled=True, own_inputs=False,
+                own_inputs=False,
             )
-            if reduced is None:
-                sink.disable("CUDA prototype reduction is unavailable for sibling cutoffs")
+            if bin_payload is None:
+                sink.disable("CUDA retina decoding is unavailable for sibling cutoffs")
                 return True
-            bin_logits, bin_scores, _, kernel, _refs = reduced
-            if logits is None:
-                logits, scores = bin_logits, bin_scores
+            bin_union, bin_scores = bin_payload.union_gpu, bin_payload.conf_gpu
+            if union is None:
+                union, scores = bin_union, bin_scores
             else:
-                torch.maximum(logits, bin_logits, out=logits)
+                torch.maximum(union, bin_union, out=union)
                 if scores is not None:
                     torch.maximum(scores, bin_scores, out=scores)
             payload = inference._direct_payload_from_planes(
-                logits, scores, image_hw, count=total-lo, kernel_name=kernel,
+                union, scores, count=total-lo, refs=(bin_payload,),
             )
             sink.record_detector_work(mask_decodes=1)
         elif (previous_cutoff is not None and hasattr(sink, 'consume_same_result')

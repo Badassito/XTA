@@ -199,6 +199,30 @@ with different sampling records its own sampling data. Use
 `XTA.unification.tta_manifest.load_tta_run_manifest(path)` to read either
 these compact receipts or older inline receipts.
 
+The following files can appear under a completed managed TTA cutoff's
+`confidence_cutoffs/conf_NNN/` directory. `<stem>` is the input video's
+filename without its extension. `<token>` identifies the preview scale and
+dimensions.
+
+| Requested output or feature | Cutoff files |
+|---|---|
+| Every cutoff | `manifest.json`, the cutoff receipt |
+| `--save low_quality[:bins]` | `<stem>_Binary_LowQuality_<token>.mp4` for each requested preview tier |
+| `--save binary` | `<stem>_Binary.mkv` (native FFV1 video) and `binary_masks/<stem>_Binary_####.tiff` |
+| `--save labels` | `labels/<stem>_####.txt`, final YOLO segmentation labels |
+| `--save semantic` | `semantic_masks/<stem>_####.png`, native masks with pixel values 0 and 1 |
+| `--save images` | `images/model_input/` with active-view model-input images, including multipage TIFFs for five or more channels |
+| `--save voxel_volume` | `<stem>_VoxelVolume.json`, the native foreground voxel count |
+| `--save confidence` or confidence-mode reconciliation | `reconciliation_evidence/`, the observed-score catalogue and layer payloads |
+| SAM interpolation or extrapolation that produces artifacts | `sam-artifacts.tar` |
+| External augmentation | `augmentation_manifest.json` and `augmentation_support/`, including policy snapshots and any saved validity data |
+
+The `nrrd`, `summary` and `high_quality` (also spelled `overlay`) save
+options publish at the family level. `low_quality` publishes both the binary
+video for each cutoff and a family heatmap per preview tier. Live or
+interrupted cutoffs can also expose a `temp` scratch link or pointer and
+temporary image or SAM checkpoint stages.
+
 For managed sweeps, reconciliation runs its memory preflight in memory.
 Cutoff-specific reconciliation counts and layer results are stored in the
 cutoff receipt. The family records each distinct resolved policy once. Use
@@ -222,8 +246,20 @@ stop after the first gzip member, including `pynrrd` 1.1.3's ordinary
 
 Review publication reuses staged gzip members when the source and group share
 the same stored XY crop and the source covers exactly the requested Z slices.
-It verifies the decoded mask and computes its extent and coverage in the same
-pass. For channels that need encoding and for coverage maps, all cutoffs
+For eligible native layers in a managed sweep, the scalar writer records the
+compressed file identity and retains the cropped source masks on family
+scratch. The review writer verifies the compressed data as it copies the gzip
+members and obtains bounds, counts and coverage from the corresponding source
+crops. Layers without a matching receipt use the decoded mask scan.
+The transient source budget is 64 GiB across the family, set by
+`XTA_YOLO_SWEEP_REVIEW_SOURCE_GIB`. Set it to 0 for the decoded path. The
+writer admits retained masks while at least 8 GiB of scratch headroom remains.
+Matching filesystems can retain the crops with hardlinks. Disk-backed scratch
+can also use bounded copies. The job log gives the number of managed gzip
+spans copied without inflation at each cutoff.
+With sufficient job memory, each cutoff accumulates coverage in occupied row
+bands. Smaller allocations use the scratch spool. For channels that need
+encoding and for coverage maps, all cutoffs
 share one CPU compression pool. The target is 1 MiB per member at level 3.
 Zero spans and channel boundaries can end a member early, and small memory
 budgets use smaller members. The pool uses up to 32 workers, bounded by the
@@ -239,11 +275,15 @@ sweep.
 
 `--save summary` writes one family `summary.txt` with the existing scalar
 summary text under a heading for each validated cutoff in requested order.
-`--save high_quality` writes `heatmaps/native.mkv`; `--save low_quality`
-writes `heatmaps/low_quality/<token>.mp4` for each preview tier. Each video
-shows how many finalized cutoff masks contain each voxel on that grid.
-Zero support preserves the gray source. The `heatmaps` records in the family
-manifest give the exact cutoffs, colors, frame rate and opacity.
+`--save high_quality` writes `heatmaps/native.mkv`.
+`--save low_quality` writes `heatmaps/<input-stem>_Heatmap_LowQuality_<token>.mp4`
+for each preview tier. Each video shows how many finalized cutoff masks
+contain each voxel on that grid.
+Zero support preserves the gray source. Positive support uses a distinct
+color for each count at 75% opacity. The requested cutoffs set the palette,
+so a partially completed sweep preserves the colors for the counts it has.
+The `heatmaps` records in the family manifest give the video paths, exact
+cutoffs, colors, frame rate and opacity.
 The separate binary exports preserve membership at each cutoff, including
 non-nested results. Each branch writes its low-quality binary MP4s directly
 in `confidence_cutoffs/conf_NNN/`; their filenames include the preview
@@ -292,6 +332,17 @@ in `reconciliation_evidence/` identifies the model, layer, task-specific score
 meaning and coordinate space. These bytes describe surviving observed
 predictions before interpolation. Zero includes unknown support. Generated
 bridges, hole fill and manual additions do not gain a measured YOLO score.
+
+When reconciliation needs source-space scores, XTA can reuse a view's lowest
+cutoff projection. It verifies that the stricter native scores retain exactly
+the floor scores above one byte threshold. A threshold on scores commutes
+with the projector's maximum, so the reused evidence has the same numeric
+bytes as an independent projection. Changed score values, a cutoff that
+splits a quantized score, or unavailable cache data use the independent
+projection. Matching orthogonal grids can read directly in source order.
+The reusable files stay in the family workspace and use
+`XTA_YOLO_SWEEP_CACHE_GIB` as a storage ceiling, subject to local capacity.
+
 To inspect one model and layer as an ordinary uint8 scalar NRRD, use the
 exact `model_name` and `layer_key` from that catalog, for example:
 

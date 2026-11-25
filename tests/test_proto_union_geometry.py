@@ -1,8 +1,5 @@
-"""CPU geometry of the proto-scale union and its confidence plane.
-
-The Torch proto path (_build_gpu_flattened_payload_from_proto) is the reference for the
-resident NVRTC unions. It is compared here with the per-instance CPU retina path.
-"""
+"""Independent CPU retina geometry and the device fallback's score plane."""
+import os
 from unittest import mock
 
 import numpy as np
@@ -84,14 +81,40 @@ def test_cpu_retina_mask_only_skips_score_quantization():
     np.testing.assert_array_equal(mask_only, scored)
 
 
+def test_cpu_retina_dot_uses_fused_rounding_at_ambiguous_zero():
+    # The middle product is exactly halfway between adjacent float32 values.
+    # The tiny accumulated value still changes which way the fused step rounds.
+    midpoint = np.float32(1 + 2 ** -12)
+    fields = np.broadcast_to(
+        np.array([1., midpoint, 1.], np.float32)[:, None, None], (3, 2, 2)).copy()
+    coeffs = np.array([[2 ** -60, midpoint, -(1 + 2 ** -11)]], np.float32)
+    payload = inference.CpuRetinaMaskPayload(
+        fields, coeffs, np.array([[0, 0, 8, 8]], np.float32), np.array([.3], np.float32),
+        (8, 8), (8, 8),
+    )
+    mask, scores, count = inference._accumulate_cpu_retina_payload_to_prediction_frame(payload, 8)
+    assert mask.all() and np.all(scores == 77) and count == 1
+
+
+@pytest.mark.parametrize("shape", [(0, 2, 2), (1, 0, 2), (1, 2, 0)])
+def test_cpu_retina_accepts_empty_prototype_geometry(shape):
+    payload = inference.CpuRetinaMaskPayload(
+        np.zeros(shape, np.float32), np.zeros((1, shape[0]), np.float32),
+        np.array([[0, 0, 8, 8]], np.float32), np.array([.3], np.float32),
+        (8, 8), (8, 8),
+    )
+    mask, score, count = inference._accumulate_cpu_retina_payload_to_prediction_frame(payload, 8)
+    assert not mask.any() and not score.any() and count == 0
+
+
 @pytest.mark.parametrize('x1,x2', [(4.4, 7.6), (5.0, 7.0), (9.2, 11.8), (6.4, 7.6), (8.2, 9.8)])
 def test_boxes_narrower_than_one_proto_cell_keep_their_detection(x1, x2):
     # The last two hold no proto cell centre; only the box-centre cell keeps them.
     union = proto_union([[x1, 20.0, x2, 40.0]], [.9], FILLED)
     assert union.any()
     left, right = extent(union, 0)
-    assert 4 <= left and right <= 12
-    assert cpu_retina([[x1, 20.0, x2, 40.0]], [.9], FILLED)[0].any()
+    assert (left, right) == (int(np.ceil(x1)), int(np.ceil(x2)))
+    np.testing.assert_array_equal(union, cpu_retina([[x1, 20.0, x2, 40.0]], [.9], FILLED)[0])
 
 
 def test_wide_box_edges_track_the_per_instance_retina_reference():
@@ -144,7 +167,7 @@ def _worked_example():
     return [[0.0, 0.0, 64.0, 64.0]], [.9], field
 
 
-def test_bilinear_boundary_pixels_take_the_positive_weight_tap_score():
+def test_bilinear_boundary_pixels_carry_only_the_positive_instance_score():
     boxes, confs, field = _worked_example()
     payload = proto_path(boxes, confs, field)
     union, confidence = quantized(payload)
@@ -152,10 +175,63 @@ def test_bilinear_boundary_pixels_take_the_positive_weight_tap_score():
     nearest = F.interpolate(conf_plane[None, None], size=(IMG, IMG), mode='nearest')[0, 0].numpy()
     assert np.count_nonzero(union & (nearest == 0)) > 0, 'fixture must exercise the fallback'
     assert np.count_nonzero(union & (confidence == 0)) == 0
-    np.testing.assert_array_equal(payload.conf_gpu.numpy()[nearest > 0], nearest[nearest > 0])
-    expected_union = F.interpolate(torch.from_numpy(field)[None], size=(IMG, IMG), mode='bilinear',
-                                   align_corners=False)[0, 0].numpy() > 0
+    assert np.count_nonzero(confidence[~union]) == 0
+    expected_union, expected_score = cpu_retina(boxes, confs, field)
     np.testing.assert_array_equal(union, expected_union)
+    np.testing.assert_array_equal(confidence, expected_score)
+
+
+def test_contested_parallel_rois_do_not_merge_coarse_logits():
+    fields = np.full((2, PROTO, PROTO), -7., np.float32)
+    fields[0, :, :8] = 1.
+    fields[1, :, 8:] = 1.
+    boxes = [[0., 1., 48., 64.], [16., 1., 64., 64.]]
+    union, scores = quantized(proto_path(boxes, [.3, .8], fields))
+    expected_mask, expected_score = cpu_retina(boxes, [.3, .8], fields)
+    assert union[20, 29] and union[20, 34]
+    assert not union[20, 31] and not union[20, 32]
+    assert scores[20, 29] == 77
+    np.testing.assert_array_equal(union, expected_mask)
+    np.testing.assert_array_equal(scores, expected_score)
+
+
+@pytest.mark.skipif(os.getenv("XTA_TEST_NATIVE_FANOUT_CUDA") != "1", reason="explicit CUDA qualification")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_cuda_exact_retina_matches_cpu_across_contested_cells_and_thresholds(dtype):
+    pytest.importorskip("cupy")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    size = 8
+    # Different corner owners would exclude the only interior winner.
+    fields = np.array([[[8, 8], [-32, -32]], [[7, -32], [7, -32]],
+                       [[-32, 8], [-32, 8]], [[-32, -32], [7, 7]], [[1, 1], [1, 1]]], np.float32)
+    confs = torch.tensor([.82, .83, .80, .81, .9], dtype=dtype)
+    boxes = np.tile(np.array([0, 0, size, size], np.float32), (len(fields), 1))
+    head = torch.zeros((5 + len(fields), len(fields)), device="cuda", dtype=dtype)
+    head[:2] = size / 2
+    head[2:4] = size
+    head[4] = confs
+    head[5:] = torch.eye(len(fields), device="cuda", dtype=dtype)
+    proto = torch.from_numpy(fields).to("cuda", dtype)
+    image = torch.empty((1, 1, size, size), device="cuda")
+    previous = None
+    for cutoff in (.5, .8, .85, .9, 1.):
+        payload = inference._build_direct_device_compacted_payload(head, proto, image, cutoff)
+        assert payload is not None and payload.compaction_kernel == 'exact_retina'
+        payload.ready_event.synchronize()
+        actual = payload.union_gpu.cpu().numpy()
+        actual_scores = np.rint(payload.conf_gpu.cpu().numpy() * 255).astype(np.uint8)
+        mask = confs.float().numpy() >= np.float32(cutoff)
+        cpu = inference.CpuRetinaMaskPayload(
+            fields, np.eye(len(fields), dtype=np.float32)[mask], boxes[mask],
+            confs.float().numpy()[mask], (size, size), (size, size),
+        )
+        expected, expected_scores, _ = inference._accumulate_cpu_retina_payload_to_prediction_frame(cpu, size)
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(actual_scores, expected_scores)
+        if previous is not None:
+            assert np.all(actual <= previous)
+        previous = actual
 
 
 def test_identity_scale_returns_the_nearest_plane_and_positive_scores_are_kept():

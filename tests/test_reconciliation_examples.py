@@ -125,3 +125,35 @@ def test_hybrid_fill_cannot_bypass_a_failed_small_island_vote():
     kept = hybrid_slice(candidate, score, support, support, satellites=True, rescue=True, fill=True)
     assert kept[5:16, 5:16].all()
     assert not kept[7:10, 23:26].any()
+
+
+def test_custom_presets_match_uncropped_decisions_at_native_scale_radii():
+    sample = block((3, 811, 1003))
+    # A component touches two volume edges, with a hole and a weak appendage.
+    sample['candidate'][0, :17, :21] = True
+    sample['candidate'][0, 9, 21:32] = True
+    sample['candidate'][0, 8, 10] = False
+    # Two disconnected components share one neighborhood at the opposite edge.
+    sample['candidate'][1, -24:-8, -25:] = True
+    sample['candidate'][1, -6:-2, -8:-5] = True
+    candidate = sample['candidate']
+    sample['score'][candidate] = 3.1
+    sample['support'][candidate] = 3
+    sample['prediction_support'][candidate] = 3
+    sample['anchored'][candidate] = True
+    sample['score'][0, 9, 21:32] = .7
+    sample['score'][1, -6:-2, -8:-5] = 1.6
+    # A non-contiguous vote block must preserve indexing and input contents.
+    for name, value in sample.items():
+        if isinstance(value, np.ndarray):
+            sample[name] = value.transpose(0, 2, 1)
+            sample[name].flags.writeable = False
+    for name, expected_slice in (
+        ('confidence_core_rescue', lambda plane: _decide_slice(*plane, core_radius=2, rescue_radius=4)),
+        ('hybrid_with_fill', lambda plane: hybrid_slice(*plane[:4], satellites=True, rescue=True,
+                                                        fill=True, rescue_radius=2, fill_radius=4)),
+    ):
+        expected = [expected_slice(tuple(sample[key][z] for key in
+                    ('candidate', 'score', 'support', 'prediction_support', 'anchored'))) for z in range(3)]
+        actual = load(EXAMPLES / (name + '.py'))['decide'](sample)
+        np.testing.assert_array_equal(actual, np.stack(expected))

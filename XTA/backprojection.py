@@ -8,6 +8,7 @@ import math
 import sys
 import threading
 import time
+from functools import lru_cache
 from collections import (
     Counter,
     OrderedDict,
@@ -88,11 +89,10 @@ from .inference import (
     _cuda_graph_capture_context,
     _get_cached_affine_grid,
     _native_fanout_for_source,
+    _retina_workspace,
     _resident_mask_kernels,
     _split_segmentation_backend_outputs,
     _tiled_f16_proto_union_applicable,
-    _tiled_f32_proto_union_applicable,
-    _upsample_proto_confidence,
     _warp_matrix_is_identity,
     resident_trt_cuda_graphs_enabled,
     resident_trt_native_warp_enabled,
@@ -1717,11 +1717,20 @@ def _trt_binding_layout_for_backend(
         raise RuntimeError('TensorRT engine has auxiliary bindings unsupported by the resident ring')
     return names, input_name, output_names, indices
 
-def _ring_native_cutoff_counts(head, floor_threshold, cutoffs):
-    """Count nested FP32 gate sets with O(anchors + cutoffs) device memory.
+@lru_cache(maxsize=64)
+def _ring_cutoff_gate_tensor(gates, device, _stream_handle):
+    """Keep the fixed gates on the CUDA stream that initialized them."""
+    import torch
 
-    One fixed-size histogram and one K-value host transfer replace repeated
-    count synchronizations. Two-cut runs keep their original scalar schedule.
+    return torch.tensor(gates, dtype=torch.float32, device=device)
+
+
+def _ring_native_cutoff_counts(head, floor_threshold, cutoffs):
+    """Count nested FP32 gate sets with one host transfer.
+
+    Short sweeps use a bounded gate matrix and a parallel reduction. Wider
+    sweeps use a histogram to keep device storage linear in anchors and gates.
+    Two-cut runs keep their original scalar schedule.
     """
     if len(cutoffs) < 2 or getattr(head, 'ndim', 0) != 3 or int(head.shape[0]) != 1:
         return None
@@ -1732,9 +1741,18 @@ def _ring_native_cutoff_counts(head, floor_threshold, cutoffs):
     if not isinstance(head, torch.Tensor) or head.dtype not in (torch.float16, torch.float32):
         return None
     try:
-        scores = head[0, 4].to(torch.float32)
-        boundaries = torch.tensor(gates, dtype=torch.float32, device=scores.device)
-        buckets = torch.bucketize(scores, boundaries, right=True)
+        scores = head[0, 4]
+        if len(cutoffs) <= 4 and scores.is_cuda:
+            stream_handle = torch.cuda.current_stream(scores.device).cuda_stream
+            boundaries = _ring_cutoff_gate_tensor(gates, scores.device, stream_handle)
+        else:
+            boundaries = torch.tensor(gates, dtype=torch.float32, device=scores.device)
+        if len(cutoffs) <= 4:
+            # Broadcasting preserves the FP32 gate for half-valued scores and
+            # avoids scatter contention on the dominant below-floor bucket.
+            counts = (scores[None, :] >= boundaries[:, None]).sum(dim=1, dtype=torch.int32)
+            return tuple(counts.cpu().tolist())
+        buckets = torch.bucketize(scores.to(torch.float32), boundaries, right=True)
         # CUDA's >= rejects NaN. bucketize otherwise places NaN above every gate.
         buckets = torch.where(torch.isnan(scores), 0, buckets)
         histogram = torch.zeros(len(gates) + 1, dtype=torch.int64, device=scores.device)
@@ -2058,9 +2076,8 @@ class _ResidentTensorRTRingExecutor:
         slot.compact_coeff = None
         slot.compact_proto_boxes = None
         slot.compact_confs = None
-        if (_tiled_f16_proto_union_applicable(torch, head, proto)
-                or (getattr(self, 'post_policy', 'legacy_proto') == 'native_mask'
-                    and _tiled_f32_proto_union_applicable(torch, head, proto))):
+        slot.retina_workspace = None
+        if self.proto_hole_treatment_active and _tiled_f16_proto_union_applicable(torch, head, proto):
             masks = int(proto.shape[1])
             # Capacity remains anchors so confidence compaction preserves the existing
             # no-truncation semantics.  At 3K/32 prototypes these add ~16 MiB per ring
@@ -2074,7 +2091,14 @@ class _ResidentTensorRTRingExecutor:
             slot.compact_confs = torch.empty(
                 (anchors,), dtype=torch.float32, device=device,
             )
-        slot.max_logit = torch.empty((ph, pw), dtype=torch.float32, device=device)
+        if not self.proto_hole_treatment_active:
+            slot.retina_workspace = _retina_workspace(
+                head[0], proto[0], slot.compact_indices, slot.compact_count,
+                (int(self.out_size), int(self.out_size)),
+                track_confidence=self.compute_confidence,
+            )
+        slot.max_logit = (torch.empty((ph, pw), dtype=torch.float32, device=device)
+                          if self.proto_hole_treatment_active else None)
         slot.proto_tmp = (
             torch.empty((ph, pw), dtype=torch.float32, device=device)
             if self.proto_hole_treatment_active else None
@@ -2086,7 +2110,8 @@ class _ResidentTensorRTRingExecutor:
             if self.proto_hole_treatment_active else None
         )
         slot.conf_proto = (
-            torch.empty((ph, pw), dtype=torch.float32, device=device) if self.compute_confidence else None
+            torch.empty((ph, pw), dtype=torch.float32, device=device)
+            if self.compute_confidence and self.proto_hole_treatment_active else None
         )
         self._allocate_native_output_buffers(slot)
         cp = self.kernels.cp
@@ -2095,9 +2120,10 @@ class _ResidentTensorRTRingExecutor:
             'proto': cp.asarray(proto[0]),
             'indices': cp.asarray(slot.compact_indices),
             'count': cp.asarray(slot.compact_count),
-            'max_logit': cp.asarray(slot.max_logit),
             'native_union': cp.asarray(slot.native_union),
         }
+        if slot.max_logit is not None:
+            refs['max_logit'] = cp.asarray(slot.max_logit)
         if slot.compact_coeff is not None:
             refs['compact_coeff'] = cp.asarray(slot.compact_coeff)
             refs['compact_proto_boxes'] = cp.asarray(slot.compact_proto_boxes)
@@ -2196,7 +2222,8 @@ class _ResidentTensorRTRingExecutor:
             slot._cupy_refs.clear()
             for name in ('compact_indices', 'compact_count', 'compact_coeff', 'compact_proto_boxes',
                          'compact_confs', 'max_logit', 'proto_tmp', 'proto_dilated', 'conf_proto',
-                         'native_union', 'native_conf', 'native_bbox', 'native_mask_grid'):
+                         'native_union', 'native_conf', 'native_bbox', 'native_mask_grid',
+                         'retina_workspace'):
                 setattr(slot, name, None)
             self._allocate_post_buffers(slot)
             self._set_slot_unit_descriptor(slot, self.default_descriptor)
@@ -2352,6 +2379,20 @@ class _ResidentTensorRTRingExecutor:
                 ),
                 stream=external,
             )
+        if not self.proto_hole_treatment_active:
+            union, scores = slot.retina_workspace.decode(stream=external)
+            if getattr(self, 'post_policy', 'legacy_proto') == 'native_mask' or slot.identity_native_warp:
+                self._launch_native_mask_post(slot, external, bbox_arg, union, scores)
+            else:
+                self.kernels.warp_retina_quantize_affine(
+                    ((int(self.native_w) + 31) // 32, (int(self.native_h) + 7) // 8), (32, 8),
+                    (cp.asarray(union), cp.asarray(scores) if scores is not None else np.uintp(0),
+                     np.int32(self.out_size), np.int32(self.out_size),
+                     np.int32(self.native_h), np.int32(self.native_w), *slot.native_to_out,
+                     refs['native_union'], refs.get('native_conf', np.uintp(0)), bbox_arg),
+                    stream=external,
+                )
+            return
         conf_proto_arg = refs.get('conf_proto', np.uintp(0))
         pixels = ph * pw
         if use_tiled_union:
@@ -2384,9 +2425,6 @@ class _ResidentTensorRTRingExecutor:
                 ),
                 stream=external,
             )
-        if getattr(self, 'post_policy', 'legacy_proto') == 'native_mask':
-            self._launch_native_mask_post(slot, external, bbox_arg)
-            return
         if self.proto_hole_treatment_active:
             self.kernels.proto_threshold_signed(
                 ((pixels + 255) // 256,), (256,),
@@ -2442,29 +2480,14 @@ class _ResidentTensorRTRingExecutor:
             )
 
     def _launch_native_mask_post(self, slot: _ResidentGpuPipelineSlot,
-                                 external: object, bbox_arg: object) -> None:
-        """Preserve generic interpolation -> threshold -> nearest warp exactly.
-
-        The legacy fused affine samples logits before thresholding; doing that
-        for native shells changes mask topology. Keep the same Torch operations
-        as direct prediction while reusing the ring's bindings and device union.
-        """
+                                 external: object, bbox_arg: object, union, scores) -> None:
+        """Warp the exact network-space retina planes and emit byte masks."""
         import torch.nn.functional as F  # type: ignore
         torch, cp = self.torch, self.kernels.cp
-        if slot.unit_descriptor is None or not np.array_equal(
-                slot.unit_descriptor.M_out_to_native,
-                self.default_descriptor.M_out_to_native):
+        if slot.unit_descriptor is None or (slot.native_mask_grid is not None and not np.array_equal(
+                slot.unit_descriptor.M_out_to_native, self.default_descriptor.M_out_to_native)):
             raise RuntimeError('native-mask ring requires the task-wide post affine')
-        ph, pw = int(slot.proto.shape[2]), int(slot.proto.shape[3])
-        network_union = (F.interpolate(
-            slot.max_logit.reshape(1, 1, ph, pw),
-            size=(int(self.out_size), int(self.out_size)), mode='bilinear', align_corners=False,
-        ).reshape(int(self.out_size), int(self.out_size)) > 0.0).to(torch.float32)
-        planes = [network_union]
-        if self.compute_confidence:
-            # Native-mask runs never close, so network_union is the raw union.
-            planes.append(_upsample_proto_confidence(
-                slot.conf_proto, network_union, (int(self.out_size), int(self.out_size))))
+        planes = [union] if scores is None else [union, scores]
         if slot.native_mask_grid is not None:
             warped = F.grid_sample(
                 torch.stack(planes, dim=0).unsqueeze(0), slot.native_mask_grid,
@@ -2859,6 +2882,7 @@ class _ResidentTensorRTRingExecutor:
             slot.native_union = None
             slot.native_conf = None
             slot.native_bbox = None
+            slot.retina_workspace = None
             slot.unit_descriptor = None
             slot.native_to_out = tuple()
             slot._cupy_refs.clear()

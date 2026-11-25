@@ -177,7 +177,12 @@ def replay_for_model(model_files, *, backend, settings):
         if not identities:
             return None
         floor = os.environ.get("XTA_YOLO_SWEEP_FLOOR_HUNDREDTHS")
-        namespace = _digest(["xta.forward_replay/1", backend, settings, identities, floor])
+        # Earlier sparse instance packets may omit taps that exact retina
+        # interpolation needs in a letterboxed prototype raster.
+        packet_schema = "xta.forward_replay/2" if backend in (
+            "gpu-segmentation-direct", "gpu-segmentation-trt-ring",
+        ) else "xta.forward_replay/1"
+        namespace = _digest([packet_schema, backend, settings, identities, floor])
         device = settings.get("runtime", {}).get("device_identity", settings.get("device", "cpu"))
         return _get_cache(root, pid, backend, str(device), namespace, min(int(gib * _GIB), 2**62))
     except _CACHE_ERRORS:

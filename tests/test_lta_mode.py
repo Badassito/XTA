@@ -53,6 +53,19 @@ class LtaModeBoundaryTests(unittest.TestCase):
         self.assertEqual(config.cartesian_views, ("transverse",))
         self.assertEqual(config.save.tokens, ("images", "labels"))
 
+    def test_other_views_and_angles_are_rejected_before_loading_runtime(self) -> None:
+        base = ["--input", "target", "--output", "published", "--model", "sam-bundle", "--device", "0"]
+        for views in (["--enable_cartesian", "coronal"],
+                      ["--enable_cartesian", "transverse,sagittal"],
+                      ["--enable_cartesian", "transverse", "--angle", "15"],
+                      ["--enable_cartesian", "transverse", "--enable_radial", "transverse"]):
+            with self.subTest(views=views), mock.patch.object(self.lta_mode, "_load_runtime_module") as load:
+                with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as raised:
+                    self.lta_mode.run([*base, *views])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("Transverse", error.getvalue())
+                load.assert_not_called()
+
     def test_runtime_failures_propagate_without_being_reclassified(self) -> None:
         runtime = types.SimpleNamespace(run=mock.Mock(side_effect=RuntimeError("failed")))
         arguments = [

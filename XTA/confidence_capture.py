@@ -30,10 +30,11 @@ class NativeConfidenceCapturePlan:
     initialization_peak_bytes: int
     copy_batch_cells: int
     copy_batch_bytes: int
+    source_projection_workspace_bytes: int = 0
 
 
 def plan_confidence_capture(shape, workers, *, workspace_bytes=64 * 1024**2,
-                            block_size=128):
+                            block_size=128, source_projection_workspace_bytes=0):
     """Charge a complete ordered frame window without allocating numeric data.
 
     Source mask/scores remain borrowed. Each worker retains at most one frame's
@@ -50,7 +51,8 @@ def plan_confidence_capture(shape, workers, *, workspace_bytes=64 * 1024**2,
     requested = int(workers)
     block = int(block_size)
     budget = int(workspace_bytes)
-    if requested < 1 or not 1 <= block <= 65535 or budget <= 0:
+    projection_budget = int(source_projection_workspace_bytes)
+    if requested < 1 or not 1 <= block <= 65535 or budget <= 0 or projection_budget < 0:
         raise ValueError('Confidence capture workers/block/workspace must be positive and bounded')
     cells = math.ceil(shape[1] / block) * math.ceil(shape[2] / block)
     cell_bytes = min(block, shape[1]) * min(block, shape[2])
@@ -77,10 +79,12 @@ def plan_confidence_capture(shape, workers, *, workspace_bytes=64 * 1024**2,
     admitted = min(requested, shape[0], max(0, available // worker_bytes))
     if admitted < 1:
         raise MemoryError('Confidence capture cannot admit one worker plus its ordered consumer frame')
-    charged = max(initialization_peak, fixed_bytes + consumer_bytes + admitted * worker_bytes)
+    # A parent runs either immediate source projection or native capture.
+    charged = max(initialization_peak, fixed_bytes + consumer_bytes + admitted * worker_bytes,
+                  projection_budget)
     return NativeConfidenceCapturePlan(shape, block, requested, admitted, charged, budget,
                                         fixed_bytes, worker_bytes, consumer_bytes, admitted, initialization_peak,
-                                        copy_batch_cells, copy_batch_bytes)
+                                        copy_batch_cells, copy_batch_bytes, projection_budget)
 
 
 @contextmanager
@@ -89,7 +93,8 @@ def confidence_capture_resources(plan):
     if plan is not None and not isinstance(plan, NativeConfidenceCapturePlan):
         raise TypeError('Confidence capture resources require an admitted plan')
     if plan is not None and plan != plan_confidence_capture(plan.shape, plan.requested_workers,
-            workspace_bytes=plan.workspace_limit_bytes, block_size=plan.block_size):
+            workspace_bytes=plan.workspace_limit_bytes, block_size=plan.block_size,
+            source_projection_workspace_bytes=plan.source_projection_workspace_bytes):
         raise ValueError('Confidence capture plan differs from its admission proof')
     token = _CAPTURE_PLAN.set(plan)
     try:

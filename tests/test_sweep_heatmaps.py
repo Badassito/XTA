@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from XTA import outputs
-from XTA.sweep_heatmaps import publish_sweep_heatmaps, stage_heatmap_mask
+from XTA.sweep_heatmaps import _heatmap_palette, publish_sweep_heatmaps, stage_heatmap_mask
 from XTA.unification.tta_manifest import _file_identity
 
 
@@ -64,6 +64,9 @@ def test_heatmaps_preserve_nonnested_membership_and_use_preview_geometry(tmp_pat
         root, work, inputs, grids, (40, 70), (), requested_cutoffs=(40, 70), streaming_decode=True,
     )
     native, low = records
+    assert native["path"] == "heatmaps/native.mkv"
+    assert low["path"] == "heatmaps/gray_Heatmap_LowQuality_test.mp4"
+    assert low["grid"] == "low_quality/test"
     assert native["fps"] == 8 and low["fps"] == 4
     assert native["cutoffs_hundredths"] == [40, 70]
     assert low["shape_t_y_x"] == list(preview)
@@ -78,7 +81,8 @@ def test_heatmaps_preserve_nonnested_membership_and_use_preview_geometry(tmp_pat
     expected = np.broadcast_to(gray[..., None], native_video.shape).copy()
     colors = np.array(native["palette_rgb"][1:], dtype=np.uint16)
     active = counts != 0
-    expected[active] = (gray[active, None] + colors[counts[active] - 1]) // 2
+    assert native["overlay_opacity"] == low["overlay_opacity"] == 0.75
+    expected[active] = (gray[active, None] + 3 * colors[counts[active] - 1]) // 4
     np.testing.assert_array_equal(native_video, expected)
 
     low_video = decode(low)
@@ -86,8 +90,47 @@ def test_heatmaps_preserve_nonnested_membership_and_use_preview_geometry(tmp_pat
     assert low_counts[0, 4, 5] == 2 and counts.max() == 1
     color = np.asarray(low["palette_rgb"][2])
     gray_level = (int(gray[0, 0, 0]) + int(gray[1, 0, 0])) / 2
-    np.testing.assert_allclose(low_video[0, 4, 5], (gray_level + color) // 2, atol=10)
+    np.testing.assert_allclose(low_video[0, 4, 5], (gray_level + 3 * color) // 4, atol=10)
     np.testing.assert_allclose(low_video[0, 4, -2], [gray_level] * 3, atol=10)
+
+
+def test_partial_heatmap_previews_keep_the_requested_palette_and_flat_paths(tmp_path, monkeypatch):
+    from XTA import sweep_heatmaps
+
+    def write(path, _packed, _work, _inputs, _shape, _fps, palette, **_kwargs):
+        np.testing.assert_array_equal(palette, _heatmap_palette(3)[:3])
+        path.write_bytes(b"heatmap video")
+
+    monkeypatch.setattr(sweep_heatmaps, "_write_heatmap", write)
+    inputs = {"source": {"path": str(tmp_path / "gray.v2.mkv")}, "source_shape_t_y_x": [4, 16, 16], "fps": 4.0}
+    grids = {"low_quality/half": [2, 8, 8], "low_quality/quarter": [1, 4, 4]}
+    records = publish_sweep_heatmaps(
+        tmp_path, tmp_path, inputs, grids, (40, 70), (85,), requested_cutoffs=(40, 70, 85),
+        streaming_decode=True,
+    )
+    assert {path.name for path in (tmp_path / "heatmaps").iterdir()} == {
+        "gray.v2_Heatmap_LowQuality_half.mp4", "gray.v2_Heatmap_LowQuality_quarter.mp4",
+    }
+    for record in records:
+        assert record["status"] == "incomplete"
+        assert record["cutoffs_hundredths"] == [40, 70]
+        assert record["palette_rgb"] == [None, *_heatmap_palette(3)[1:3].tolist()]
+
+
+def test_palette_assigns_a_distinct_color_to_every_possible_support_count():
+    for count in range(1, 102):
+        palette = _heatmap_palette(count)
+        assert len(np.unique(palette[1:], axis=0)) == count
+
+
+def test_flat_preview_rejects_grid_path_traversal(tmp_path):
+    inputs = {"source": {"path": str(tmp_path / "gray.mkv")}, "source_shape_t_y_x": [4, 16, 16], "fps": 4.0}
+    with pytest.raises(ValueError, match="Invalid heatmap grid name"):
+        publish_sweep_heatmaps(
+            tmp_path, tmp_path, inputs, {"low_quality/../escape": [2, 8, 8]}, (40,), (),
+            requested_cutoffs=(40,), streaming_decode=True,
+        )
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_sweep_low_quality_binary_reuses_its_mask_for_heatmap_without_resizing_gray(tmp_path, monkeypatch):

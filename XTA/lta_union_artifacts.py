@@ -379,7 +379,8 @@ def logical_union_sha256(descriptor, *, frame_start=None):
     return digest.hexdigest()
 
 
-def reduce_union_artifact_into_view(descriptor, *, view_union, tile_xyxy, frame_start, frame_stop=None):
+def reduce_union_artifact_into_view(descriptor, *, view_union, tile_xyxy, frame_start, frame_stop=None,
+                                    observe=None):
     """Verify first, then OR only stored support into the private native view."""
     artifact = validate_union_artifact(descriptor, frame_start=frame_start)
     tile = tuple(_index(v, "tile_xyxy") for v in tile_xyxy)
@@ -395,15 +396,18 @@ def reduce_union_artifact_into_view(descriptor, *, view_union, tile_xyxy, frame_
     if (artifact.shape[1:] != (y1-y0,x1-x0) or not 0<=x0<x1<=view_union.shape[2]
             or not 0<=y0<y1<=view_union.shape[1] or not 0<=artifact.frame_start<stop<=view_union.shape[0]):
         raise ValueError("union geometry lies outside its destination view")
-    if artifact.encoding == "raw-uint8":
+    if artifact.encoding == "raw-uint8" and observe is None:
         from .lta_rendering import union_tile_chunk_into_view
         source = np.memmap(artifact.path,dtype=np.uint8,mode="r",shape=artifact.shape)
         union_tile_chunk_into_view(view_union,source,frame_start=artifact.frame_start,tile_xyxy=tile)
         del source
     else:
         for frame,(top,left),crop in iter_union_crops(artifact):
-            target=view_union[frame,y0+top:y0+top+crop.shape[0],x0+left:x0+left+crop.shape[1]]
-            np.bitwise_or(target,crop,out=target)
+            if observe is None:
+                target=view_union[frame,y0+top:y0+top+crop.shape[0],x0+left:x0+left+crop.shape[1]]
+                np.bitwise_or(target,crop,out=target)
+            else:
+                observe(frame, y0+top, x0+left, crop)
     return {"path":str(artifact.path),"encoding":artifact.encoding,
             "logical_bytes":math.prod(artifact.shape),"stored_bytes":artifact.size_bytes,
             "indexed_frame_count":len(artifact.frames) if artifact.encoding==UNION_ENCODING else None,

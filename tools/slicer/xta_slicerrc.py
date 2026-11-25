@@ -52,6 +52,30 @@ _xta_active_store_review = globals().get("_xta_active_store_review")
 # ── Basic helpers ─────────────────────────────────────────────────────
 
 
+def _xta_native_review_support():
+    """Load native-window code from the trusted toolbar checkout or installed bundle."""
+    import importlib
+    import sys
+
+    # compile(..., toolbar_path, "exec") preserves the checkout location even
+    # when the script executes in Slicer's console namespace.
+    filename = Path(_xta_native_review_support.__code__.co_filename)
+    if filename.is_absolute() and filename.is_file() and len(filename.parents) >= 3:
+        root = filename.parents[2]
+        if (root / "XTA" / "slicer_native_window.py").is_file() and str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+    try:
+        return importlib.import_module("XTA.slicer_native_window")
+    except ModuleNotFoundError as exc:
+        if exc.name not in ("XTA", "XTA.slicer_native_window"):
+            raise
+        raise RuntimeError(
+            "Native-window review requires the XTA toolbar support modules. "
+            "Load the toolbar from the current XTA checkout or use the portable "
+            "Slicer ZIP described in docs/native_window_review.md."
+        ) from exc
+
+
 def _find_mask_id(segmentation):
     for index in range(segmentation.GetNumberOfSegments()):
         segment_id = segmentation.GetNthSegmentID(index)
@@ -2036,7 +2060,8 @@ def _xta_review_path(node):
 
 def _xta_choose_review_manifest():
     filename = qt.QFileDialog.getOpenFileName(
-        slicer.util.mainWindow(), "Open XTA cutoff review", "", "XTA review manifest (manifest.json);;JSON (*.json)")
+        slicer.util.mainWindow(), "Open XTA review", "",
+        "XTA reviews (*.xtareview manifest.json);;Native review (*.xtareview);;JSON (*.json)")
     return Path(str(filename)).resolve() if filename else None
 
 
@@ -2412,6 +2437,26 @@ def SelectReviewCutoff(cutoff_cent=None):
     segments: an unloaded cutoff shows its published direct counts read-only;
     load its masks with Importer to edit or export it.
     """
+    native = _xta_current_native_window()
+    if native is not None:
+        if cutoff_cent is None:
+            labels = {_xta_cutoff_label(c): c for c in (native.cutoff, *native.cutoffs)}
+            option = "Show view colors" if native.coverage.enabled else "Show direct coverage"
+            refresh = "Discard pending strokes and refresh window"
+            chosen = _choose_item("2D review cutoff", "Native window cutoff", [*labels, option, refresh])
+            if chosen is None:
+                return None
+            if chosen == refresh:
+                native.refresh()
+                return native.cutoff
+            if chosen == option:
+                native.sync()
+                native.coverage.set_enabled(not native.coverage.enabled)
+                return native.cutoff
+            cutoff_cent = labels[chosen]
+        actual = native.select_cutoff(cutoff_cent)
+        slicer.util.showStatusMessage(f"Native window cutoff {_xta_cutoff_label(actual)}.", 5000)
+        return actual
     display = _xta_active_review
     if display is None:
         raise RuntimeError("Run Importer on a cutoff review first.")
@@ -2489,6 +2534,9 @@ def _xta_display_store_backed(display):
 def _xta_current_edit_scope():
     """The edit scope in effect: the open review's, as its kind has it; with no review open, the per-cutoff
     segments' remembered scope (the one the Scope button shows and sets then)."""
+    native = _xta_current_native_window()
+    if native is not None:
+        return native.edit_scope
     display = _xta_active_review
     if display is None:
         return _xta_edit_scope_for(_xta_edit_scope, False)
@@ -2519,8 +2567,9 @@ def SelectEditScope(scope=None):
     Ordinary (non-review) segments stay eligible whenever they are visible.
     """
     global _xta_edit_scope, _xta_store_edit_scope
+    native = _xta_current_native_window()
     display = _xta_active_review
-    store = _xta_display_store_backed(display)
+    store = native is not None or _xta_display_store_backed(display)
     labels = _XTA_STORE_EDIT_SCOPE_LABELS if store else _XTA_EDIT_SCOPE_LABELS
     current = _xta_current_edit_scope()
     if scope is None:
@@ -2534,11 +2583,13 @@ def SelectEditScope(scope=None):
                          '(per-cutoff segments keep "displayed"). The edit scope was not changed.')
     if scope not in labels:
         raise ValueError("Edit scope must be one of: " + ", ".join(labels))
-    if display is not None:
+    if native is not None:
+        native.edit_scope = scope
+    elif display is not None:
         display.set_edit_scope(scope)
-    if store:
+    if native is None and store:
         _xta_store_edit_scope = scope
-    else:
+    elif native is None:
         _xta_edit_scope = scope
     _xta_refresh_review_actions()
     slicer.util.showStatusMessage(f"Edit scope: {labels[scope]}.", 5000)
@@ -2547,6 +2598,36 @@ def SelectEditScope(scope=None):
 
 def ToggleReviewSurfaces3D(mode=None):
     """Show 3D surfaces of the displayed cutoff only ("selected"), or of all loaded cutoffs ("all")."""
+    native = _xta_current_native_window()
+    if native is not None:
+        surfaces = {"3D Original Mask Overview": "reference", "3D Edited Window": "window",
+                    "Both 3D Surfaces": "both", "Hide 3D Surfaces": "off"}
+        overview = "Show Native Intensity" if native._use_overview else "Show Intensity Overview"
+        jump = "Center window at last marker"
+        if mode is not None:
+            return native.show_surfaces({"selected": "window", "all": "both"}.get(mode, mode))
+        choices = [*surfaces, jump]
+        if native.intensity_window is not None:
+            choices.append(overview)
+        chosen = _choose_item("Native review view", "Navigation and display", choices)
+        if chosen in surfaces:
+            result = native.show_surfaces(surfaces[chosen])
+        elif chosen == overview:
+            result = native.use_overview(not native._use_overview)
+        elif chosen == jump:
+            points = _defined_world_points(_get_point_nodes_f())
+            lines = _defined_world_line_segments(_get_line_nodes_l())
+            if lines:
+                center = np.mean(np.asarray(lines[-1], dtype=np.float64), axis=0)
+            elif points:
+                center = points[-1]
+            else:
+                raise RuntimeError("Add a point named F or a line named L before centering the native window.")
+            result = native.move(center)
+        else:
+            return None
+        _xta_refresh_review_actions()
+        return result
     display = _xta_active_review
     if display is None:
         raise RuntimeError("Run Importer on a cutoff review first.")
@@ -2573,6 +2654,9 @@ def _xta_edit_scope_button_text():
 
 
 def _xta_surfaces_button_text():
+    native = _xta_current_native_window()
+    if native is not None:
+        return "Native View"
     display = _xta_active_review
     if display is not None and getattr(display, "store_review", None) is not None:
         return "3D: Global Only"
@@ -2622,6 +2706,117 @@ def _xta_restore_review(*_):
     _xta_refresh_review_actions()
 
 
+_xta_active_native_window = globals().get("_xta_active_native_window")
+
+
+def _xta_current_native_window():
+    review = globals().get("_xta_active_native_window")
+    return None if review is None or review.closed else review
+
+
+def OpenXTANativeReview(store_path, *, volume_node=None, window_shape=None,
+                        center_ras=None, cutoff_cent=None, journal_path=None, follow=True,
+                        max_working_mib=128):
+    """Open an indexed native review with a bounded editable window.
+
+    With window_shape omitted, the working area follows the view's zoom.
+    Pass a ZYX shape to request a fixed native window. An explicit volume_node
+    asserts that its displayed world RAS aligns with
+    the review. Without one, use bundled intensity or a matching scene volume.
+    """
+    global _xta_active_native_window
+    if _xta_active_review is not None:
+        raise RuntimeError("Close the current cutoff review before opening a native review.")
+    previous = _xta_current_native_window()
+    if previous is not None:
+        previous.close()
+    _xta_active_native_window = _xta_native_review_support().NativeReviewWindow(
+        store_path, editor=globals(), volume_node=volume_node, window_shape=window_shape,
+        center_ras=center_ras, cutoff_cent=cutoff_cent, journal_path=journal_path, follow=follow,
+        max_working_mib=max_working_mib,
+    )
+    view = _xta_active_native_window
+    _xta_refresh_review_actions()
+    _xta_review_shortcuts_update()
+    size = " × ".join(str(b - a) for a, b in zip(view.start_zyx, view.stop_zyx))
+    slicer.util.showStatusMessage(f"Native review opened with a {size} voxel window.", 8000)
+    return view
+
+
+def SetXTANativeReviewWindow(center_ras):
+    """Move the working window to a world RAS location, committing any strokes first."""
+    review = _xta_current_native_window()
+    if review is None:
+        raise RuntimeError("Open a native review with Importer first.")
+    return review.move(center_ras)
+
+
+def CloseXTANativeReview():
+    """Commit pending native strokes and release the working window."""
+    global _xta_active_native_window
+    review = _xta_current_native_window()
+    if review is not None:
+        review.close()
+    _xta_active_native_window = None
+    _xta_refresh_review_actions()
+    _xta_review_shortcuts_update()
+
+
+def ExportXTANativeReview(output_path=None, *, cutoff_cent=None, if_stale=None):
+    """Export one cleaned native Global NRRD at the displayed or requested cutoff."""
+    review = _xta_current_native_window()
+    if review is None:
+        raise RuntimeError("Open a native review with Importer first.")
+    if output_path is None:
+        source = review.store.source_record or {}
+        filename = str(source.get("path") or "").replace("\\", "/").rsplit("/", 1)[-1]
+        stem = Path(filename).stem if filename else "cleaned"
+        output_path = qt.QFileDialog.getSaveFileName(
+            slicer.util.mainWindow(), "Export XTA Native Mask", stem + ".nrrd", "NRRD (*.nrrd)")
+        if not output_path:
+            return None
+    output = review.export(output_path, cutoff_cent, if_stale=if_stale)
+    if output is not None:
+        slicer.util.showStatusMessage(f"Native mask exported to {output}", 10000)
+    return output
+
+
+def _xta_importer_has_geometry(node):
+    """Check existing geometry without generating representations or reading voxels."""
+    segmentation = node.GetSegmentation()
+    if not segmentation.GetNumberOfSegments():
+        return False
+    converter = slicer.vtkSegmentationConverter
+    reference = segmentation.GetConversionParameter(converter.GetReferenceImageGeometryParameterName())
+    if reference:
+        geometry = slicer.vtkOrientedImageData()
+        try:
+            valid = vtkSegmentationCore.vtkSegmentationConverter.DeserializeImageGeometry(reference, geometry, False)
+        except (TypeError, ValueError, RuntimeError):
+            logging.debug("Importer could not read existing reference geometry.", exc_info=True)
+        else:
+            if valid and _extent_is_valid(geometry.GetExtent()):
+                return True
+    names = [converter.GetSegmentationBinaryLabelmapRepresentationName(),
+             converter.GetSegmentationClosedSurfaceRepresentationName()]
+    get_source_name = getattr(segmentation, "GetSourceRepresentationName", None)
+    source_name = get_source_name() if get_source_name is not None else None
+    if source_name and source_name not in names:
+        names.insert(0, source_name)
+    for sid in _segment_ids(segmentation):
+        segment = segmentation.GetSegment(sid)
+        for name in names:
+            representation = segment.GetRepresentation(name)
+            if representation is None:
+                continue
+            if hasattr(representation, "GetExtent"):
+                if _extent_is_valid(representation.GetExtent()):
+                    return True
+            elif hasattr(representation, "GetNumberOfPoints") and representation.GetNumberOfPoints():
+                return True
+    return False
+
+
 def ImportXTASegments(source_manifest=None, grid_id=None, volume_node=None, *, max_working_mib=None,
                       cutoff_cents=None, review_mode=None, edit_log=None):
     """Load a cutoff review or merge ordinary source segmentations as usual.
@@ -2638,25 +2833,46 @@ def ImportXTASegments(source_manifest=None, grid_id=None, volume_node=None, *, m
     choose legacy when review_mode is None); unloaded cutoffs show published 2D
     counts. Running Importer again on an open store-backed review rebuilds a store
     that is missing (view-only review) and otherwise does nothing.
+
+    An .xtareview native store opens with a bounded editable window. A scene
+    containing only segmentation placeholders without geometry can open a review with Importer.
     """
+    native = _xta_current_native_window()
+    if source_manifest is None and native is not None:
+        return native
     scene_nodes = slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
-    existing = [(node, _xta_review_members(node)) for node in scene_nodes]
-    tagged = [node for node, rows in existing if rows]
-    working = [node for node in scene_nodes if _xta_working_node_kind(node)]
-    if source_manifest is not None or tagged or working or not scene_nodes:
-        if source_manifest is None:
-            reference = tagged or working
-            source_manifest = _xta_review_path(reference[0]) if reference else None
+    existing = None
+    if source_manifest is None:
+        existing = [(node, _xta_review_members(node)) for node in scene_nodes]
+        tagged = [node for node, rows in existing if rows]
+        working = [node for node in scene_nodes if _xta_working_node_kind(node)]
+        reference = tagged or working
+        if reference:
+            source_manifest = _xta_review_path(reference[0])
+            segmentation_nodes = []
+        else:
+            # Segment Editor can create a segmentation and a blank working
+            # segment before the scene has anything to merge.
+            segmentation_nodes = [node for node in scene_nodes if _xta_importer_has_geometry(node)]
+        if source_manifest is None and (reference or not segmentation_nodes):
+            source_manifest = _xta_choose_review_manifest()
             if source_manifest is None:
-                source_manifest = _xta_choose_review_manifest()
-                if source_manifest is None:
-                    return None
+                return None
+    if source_manifest is not None:
+        if Path(str(source_manifest)).suffix.lower() == ".xtareview":
+            if grid_id not in (None, "native"):
+                raise ValueError("An indexed native review has one native grid.")
+            return OpenXTANativeReview(source_manifest, cutoff_cent=cutoff_cents, volume_node=volume_node,
+                                       max_working_mib=128 if max_working_mib is None else max_working_mib)
+        if native is not None:
+            raise RuntimeError("Close the native review before opening another kind of review.")
+        if existing is None:
+            existing = [(node, _xta_review_members(node)) for node in scene_nodes]
         try:
             return _xta_load_review(source_manifest, grid_id, volume_node, existing, max_working_mib,
                                     cutoff_cents, review_mode, edit_log)
         finally:
             _xta_refresh_review_actions()
-    segmentation_nodes = _require_segmentation_nodes()
     target = segmentation_nodes[0]
 
     with slicer.util.RenderBlocker():
@@ -2893,6 +3109,9 @@ def _xta_update_globals(groups):
 def UpdateGlobal():
     """Update Global: a store-backed review at every cutoff through its store (one undo entry), then every other
     segmentation group as before."""
+    native = _xta_current_native_window()
+    if native is not None:
+        return native.update("global")
     review = _xta_review_for_update("Update Global")
     groups = _update_groups(allow_empty=review is not None)
     text = _xta_review_update(review, "global") if review is not None else None
@@ -2962,6 +3181,9 @@ def _xta_update_nonglobals(groups, recomposed=None):
 def UpdateNonGlobal():
     """Update Nonglobal: a store-backed review at every cutoff through its store (one undo entry), then every
     other segmentation group as before."""
+    native = _xta_current_native_window()
+    if native is not None:
+        return native.update("nonglobal")
     review = _xta_review_for_update("Update Nonglobal")
     groups = _update_groups(allow_empty=review is not None)
     text = _xta_review_update(review, "nonglobal") if review is not None else None
@@ -2974,6 +3196,9 @@ def UpdateNonGlobal():
 def UpdateBoth():
     """Update Global, then Update Nonglobal: a store-backed review at every cutoff as one undo entry, then every
     other segmentation group as before."""
+    native = _xta_current_native_window()
+    if native is not None:
+        return native.update("both")
     review = _xta_review_for_update("Update Both")
     display = _xta_active_review
     with display.transaction() if display is not None else nullcontext():
@@ -11034,6 +11259,11 @@ def _xta_review_entry_text(review, entry):
 
 def _xta_review_undo_redo(which):
     action = "Undo" if which == "undo" else "Redo"
+    native = _xta_current_native_window()
+    if native is not None:
+        changed = native.history(which)
+        slicer.util.showStatusMessage(f"{action}: native edits {'replayed' if changed else 'unavailable'}.", 5000)
+        return changed
     review = _xta_current_store_review()
     if review is None:
         raise RuntimeError(f"{action}: no store-backed cutoff review is open. Undo and Redo here act on a "
@@ -11119,7 +11349,7 @@ def _xta_review_shortcuts_update():
     window (the Segment Editor's, whose undo is off for the working segmentations) are disabled so the keys are
     never ambiguous; they are enabled again as soon as ours are off or released."""
     state = _xta_review_shortcut_state
-    review = _xta_active_store_review
+    review = _xta_current_native_window() or _xta_active_store_review
     window = _xta_review_shortcut_window() if review is not None else None
     if review is None or review.closed or not review.editable or window is None:
         _xta_review_shortcuts_release(state)
@@ -12477,6 +12707,10 @@ def _remove_marked_regions(remove_slices=False):
             'and/or a closed curve named "C" or "CC".'
         )
 
+    native = _xta_current_native_window()
+    if native is not None:
+        return native.remove(points_world, line_segments_world, closed_curves_world, slices=remove_slices)
+
     visible_segmentation_nodes = [
         node
         for node in _require_segmentation_nodes()
@@ -13479,6 +13713,8 @@ def ExportDisplayedXTAEdits():
     (every loaded cutoff of per-cutoff segments) and
     ExportXTAEdits(review_manifest, cutoff_cents=[...]) a chosen subset.
     """
+    if _xta_current_native_window() is not None:
+        return ExportXTANativeReview()
     display = _xta_active_review
     if display is None:
         return ExportXTAEdits()
@@ -13510,6 +13746,14 @@ def ExportXTAEdits(source_manifest=None, output_dir=None, *, cutoff_cents=None, 
     cutoff, one undo entry), "warn" exports it as it is, "refuse" stops.
     Native NRRDs are NOT read or loaded by this Slicer-side exporter.
     """
+    native = _xta_current_native_window()
+    if native is not None and (source_manifest is None
+                               or Path(str(source_manifest)).resolve() == native.store.path):
+        if isinstance(cutoff_cents, (list, tuple)) and len(cutoff_cents) == 1:
+            cutoff_cents = cutoff_cents[0]
+        if cutoff_cents is not None and type(cutoff_cents) is not int:
+            raise ValueError("A native NRRD exports one cutoff at a time.")
+        return ExportXTANativeReview(output_dir, cutoff_cent=cutoff_cents, if_stale=if_stale)
     if source_manifest is None:
         nodes = slicer.util.getNodesByClass('vtkMRMLSegmentationNode')
         tagged = [n for n in nodes if _xta_review_members(n) or _xta_working_node_kind(n)]
@@ -14962,7 +15206,8 @@ for index, (label, function) in enumerate(_TOOLBAR_ACTIONS):
         )
     elif function == ExportDisplayedXTAEdits:
         action.setToolTip(
-            "Export edited low-resolution masks for native transfer. A cutoff review "
+            "Export the cleaned native Global from a native window review. For other reviews, "
+            "export edited low-resolution masks for native transfer. A cutoff review "
             "exports only the displayed 2D cutoff (a store-backed review from its store; "
             "a stale Global asks Update Global first?); in the console, "
             "ExportXTAEdits(review_manifest) exports every cutoff of a store-backed review "

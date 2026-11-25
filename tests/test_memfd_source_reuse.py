@@ -197,6 +197,102 @@ class MemfdSourceReuseTests(unittest.TestCase):
             for fd in transient:
                 self.assertClosed(fd)
 
+    def test_output_only_proof_uses_one_normal_transfer_without_retaining_the_output(self):
+        scheduler = _scheduler()
+        scheduler.state.gpu_worker_processes = [SimpleNamespace(name='gpu-worker-0', pid=os.getpid())]
+        with _owner(None, b'old') as output_fd, _owner(None, b'different') as next_fd, \
+             mock.patch.object(runtime.os, 'open', side_effect=_local_proc_open):
+            output = runtime._memfd_proc_path(output_fd).as_posix()
+            first = {'task_id': 1, 'source_volume_path': 'source.gray8', 'result_mask_path': output}
+            scheduler._put_worker_inference_task(first, 'gpu', 0)
+            scheduler.state.gpu_task_queues[0].get_nowait()
+            self.assertIn('result_mask_fd', first)
+            self.assertNotIn('source_volume_fd', first)
+            cache = scheduler._worker_memfd_source_cache('gpu', 0)
+            self.assertFalse(cache.pending)
+            first_fds = runtime._materialize_worker_task_memfd_paths(first, self.persistent)
+            runtime._close_fd_list(first_fds)
+            self.assertClosed(first_fds[0])
+            self.assertFalse(self.persistent)
+            scheduler._record_worker_memfd_completion({'type': 'compute_released', 'gpu_index': 0,
+                'task_id': 1, 'ok': True, 'memfd_parent_proc_capability': first['_memfd_parent_proc_capability']})
+            self.assertFalse(cache.known)
+            self.assertIsNone(cache.pending_output_probe)
+            second = {'task_id': 2, 'source_volume_path': 'source.gray8',
+                      'result_mask_path': runtime._memfd_proc_path(next_fd).as_posix()}
+            scheduler._put_worker_inference_task(second, 'gpu', 0)
+            scheduler.state.gpu_task_queues[0].get_nowait()
+            self.assertNotIn('result_mask_fd', second)
+            self.assertIn('result_mask_fd_proc', second)
+            second_fds = runtime._materialize_worker_task_memfd_paths(second, self.persistent)
+            try:
+                os.lseek(second_fds[0], 0, os.SEEK_SET)
+                os.write(second_fds[0], b'replaced!')
+                os.lseek(next_fd, 0, os.SEEK_SET)
+                self.assertEqual(os.read(next_fd, 9), b'replaced!')
+            finally:
+                runtime._close_fd_list(second_fds)
+            self.assertClosed(second_fds[0])
+            self.assertFalse(self.persistent)
+
+            # A fresh queue must independently qualify, even with the same worker PID.
+            scheduler.state.gpu_task_queues[0] = queue.Queue()
+            third = {'task_id': 3, 'source_volume_path': 'source.gray8', 'result_mask_path': output}
+            scheduler._put_worker_inference_task(third, 'gpu', 0)
+            scheduler.state.gpu_task_queues[0].get_nowait()
+            self.assertIn('result_mask_fd', third)
+            self.assertIn('result_mask_fd_probe', third)
+            self.assertNotIn('result_mask_fd_proc', third)
+            self.materialize(third)
+
+    def test_output_only_proof_fails_closed_without_discarding_the_normal_transfer(self):
+        for denial in ('procfs', 'identity', 'parent_pid', 'worker_pid', 'task_id', 'worker_queue', 'failed'):
+            with self.subTest(denial=denial), _owner(None, b'old') as output_fd, _owner(None, b'bad') as other_fd:
+                scheduler = _scheduler()
+                scheduler.state.gpu_worker_processes = [
+                    SimpleNamespace(name='gpu-worker-0', pid=os.getpid()),
+                    SimpleNamespace(name='gpu-worker-1', pid=os.getpid()),
+                ]
+                output = runtime._memfd_proc_path(output_fd).as_posix()
+                task = {'task_id': 1, 'source_volume_path': 'source.gray8', 'result_mask_path': output}
+                scheduler._put_worker_inference_task(task, 'gpu', 0)
+                scheduler.state.gpu_task_queues[0].get_nowait()
+                if denial == 'procfs':
+                    open_proc = mock.Mock(side_effect=PermissionError('procfs restricted'))
+                elif denial == 'identity':
+                    open_proc = mock.Mock(side_effect=lambda _path, _flags: os.dup(other_fd))
+                else:
+                    open_proc = _local_proc_open
+                with mock.patch.object(runtime.os, 'open', side_effect=open_proc):
+                    transient = runtime._materialize_worker_task_memfd_paths(task, self.persistent)
+                try:
+                    self.assertEqual(len(transient), 1)
+                    self.assertEqual(runtime._memfd_source_identity(transient[0]),
+                                     runtime._memfd_source_identity(output_fd))
+                finally:
+                    runtime._close_fd_list(transient)
+                proof = task.get('_memfd_parent_proc_capability')
+                if denial in ('procfs', 'identity'):
+                    self.assertIsNone(proof)
+                else:
+                    self.assertIsNotNone(proof)
+                    if denial in ('parent_pid', 'worker_pid'):
+                        proof[denial] += 1
+                scheduler._record_worker_memfd_completion({'type': 'result',
+                    'gpu_index': int(denial == 'worker_queue'), 'task_id': 2 if denial == 'task_id' else 1,
+                    'ok': denial != 'failed', 'memfd_parent_proc_capability': proof})
+                cache = scheduler._worker_memfd_source_cache('gpu', 0)
+                self.assertIsNone(cache.direct_output_capability)
+                self.assertFalse(cache.known)
+                self.assertFalse(self.persistent)
+                next_task = {'task_id': 3, 'source_volume_path': 'source.gray8', 'result_mask_path': output}
+                scheduler._put_worker_inference_task(next_task, 'gpu', 0)
+                scheduler.state.gpu_task_queues[0].get_nowait()
+                self.assertIn('result_mask_fd', next_task)
+                self.assertNotIn('result_mask_fd_probe', next_task)
+                self.assertNotIn('result_mask_fd_proc', next_task)
+                self.materialize(next_task)
+
     def test_forged_or_unsuccessful_capability_ack_keeps_legacy_output_transfer(self):
         for invalid in ('parent', 'worker', 'source', 'failed'):
             with self.subTest(invalid=invalid), _owner(None) as source_fd, _owner(None) as output_fd, \
@@ -601,6 +697,56 @@ class LinuxMemfdSourceReuseTests(unittest.TestCase):
                 worker.join(timeout=10)
             for path in paths:
                 runtime._release_memfd_owner_key(path)
+            tasks.close()
+            results.close()
+            tasks.join_thread()
+            results.join_thread()
+
+    def test_spawn_ordinary_source_qualifies_writable_output_for_one_worker(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        source = Path(directory.name) / 'source.gray8'
+        source.write_bytes(b'ordinary')
+        context = mp.get_context('spawn')
+        tasks, results = context.Queue(), context.Queue()
+        worker = context.Process(name='gpu-worker-0', target=_spawn_materializer, args=(tasks, results))
+        output_fd = os.memfd_create('ordinary-source-output', flags=os.MFD_CLOEXEC)
+        os.write(output_fd, b'.')
+        output_path = runtime._memfd_proc_path(output_fd).as_posix()
+        runtime._register_memfd_owner(output_path, output_fd, 'ordinary file source spawn test')
+        worker.start()
+        scheduler = _scheduler(queue_obj=tasks)
+        scheduler.state.gpu_worker_processes = [worker]
+        try:
+            first = {'task_id': 1, 'source_volume_path': str(source), 'result_mask_path': output_path}
+            scheduler._put_worker_inference_task(first, 'gpu', 0)
+            self.assertIn('result_mask_fd', first)
+            self.assertNotIn('source_volume_fd', first)
+            initial = results.get(timeout=20)
+            self.assertEqual((initial['source'], initial['sources'], initial['closed_outputs']),
+                             (b'ordinary', 0, 1))
+            proof = initial['capability']
+            scheduler._record_worker_memfd_completion({'type': 'result', 'gpu_index': 0,
+                'task_id': 1, 'ok': True, 'memfd_parent_proc_capability': proof})
+            second = {'task_id': 2, 'source_volume_path': str(source), 'result_mask_path': output_path}
+            os.pwrite(output_fd, b'.', 0)
+            scheduler._put_worker_inference_task(second, 'gpu', 0)
+            self.assertEqual('result_mask_fd_proc' in second, proof is not None)
+            self.assertEqual('result_mask_fd' in second, proof is None)
+            completed = results.get(timeout=20)
+            self.assertEqual((completed['source'], completed['sources'], completed['closed_outputs']),
+                             (b'ordinary', 0, 1))
+            self.assertEqual(os.pread(output_fd, 1, 0), b'Z')
+            self.assertFalse(scheduler._worker_memfd_source_cache('gpu', 0).known)
+            tasks.put(None)
+            self.assertEqual(results.get(timeout=20)['closed_sources'], 0)
+            worker.join(timeout=20)
+            self.assertEqual(worker.exitcode, 0)
+        finally:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=10)
+            runtime._release_memfd_owner_key(output_path)
             tasks.close()
             results.close()
             tasks.join_thread()

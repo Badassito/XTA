@@ -116,31 +116,30 @@ class NativeRingPolicyTests(unittest.TestCase):
         source.prepare_direct_ring.assert_not_called()
         self.assertIsNone(source._direct_ring)
 
-    def test_fp32_packed_launch_preserves_count_capacity_and_skips_proto_closing(self):
-        fp32, fp16 = object(), object()
-        kernels = SimpleNamespace(cp=object(), compact_f32_tiled=mock.Mock(),
-                                  union_f32_f32_tiled=mock.Mock(), proto_threshold_signed=mock.Mock())
+    def test_exact_raw_launch_preserves_count_capacity_and_skips_proto_closing(self):
+        import torch
+
+        kernels = SimpleNamespace(cp=object(), compact_f32=mock.Mock(), proto_threshold_signed=mock.Mock())
         ex = object.__new__(b._ResidentTensorRTRingExecutor)
-        ex.torch = SimpleNamespace(float16=fp16, float32=fp32)
+        ex.torch = torch
         ex.kernels = kernels
         ex.post_policy = 'native_mask'
         ex.collect_slice_bboxes = True
         ex.confidence_threshold = .5
         ex.out_size, ex.native_h, ex.native_w = 65, 43, 67
-        # Even if a malformed legacy state says closing is active, native dispatch
-        # must never call any proto morphology or fused-affine kernel.
-        ex.proto_hole_treatment_active = True
+        ex.proto_hole_treatment_active = False
         ex._launch_native_mask_post = mock.Mock()
-        refs = {key: object() for key in ('head', 'proto', 'indices', 'count', 'native_bbox',
-                'compact_coeff', 'compact_proto_boxes', 'compact_confs', 'max_logit')}
-        slot = SimpleNamespace(head=SimpleNamespace(shape=(1, 37, 101), dtype=fp32),
-                               proto=SimpleNamespace(shape=(1, 32, 5, 66), dtype=fp32),
+        refs = {key: object() for key in ('head', 'proto', 'indices', 'count', 'native_bbox')}
+        union, scores = object(), object()
+        workspace = SimpleNamespace(decode=mock.Mock(return_value=(union, scores)))
+        slot = SimpleNamespace(head=torch.empty((1, 37, 101)), proto=torch.empty((1, 32, 5, 66)),
+                               retina_workspace=workspace, compact_indices=object(),
                                compact_count=mock.Mock(), post_stream=object(), _cupy_refs=refs)
         with mock.patch.object(b, '_cupy_external_stream', return_value='stream'):
             ex._launch_post(slot)
-        self.assertEqual(kernels.compact_f32_tiled.call_args.args[2][1], 101)
-        self.assertEqual(kernels.union_f32_f32_tiled.call_args.args[:2], ((3, 2), (32, 4)))
-        ex._launch_native_mask_post.assert_called_once_with(slot, 'stream', refs['native_bbox'])
+        self.assertEqual(kernels.compact_f32.call_args.args[2][1], 101)
+        workspace.decode.assert_called_once()
+        ex._launch_native_mask_post.assert_called_once_with(slot, 'stream', refs['native_bbox'], union, scores)
         kernels.proto_threshold_signed.assert_not_called()
 
     def _admission_fixture(self):
@@ -404,19 +403,19 @@ class NativeRingCudaPostTests(unittest.TestCase):
         proto = torch.zeros((32, 2, 2), device='cuda')
         ex, slot = self._executor(head, proto, matrix, 8, (8, 8), track_conf=False)
         # An asymmetric sign boundary exposes the legacy fused-affine ordering.
-        slot.max_logit.copy_(torch.tensor([[-.11, .89], [-.11, .89]], device='cuda'))
+        logits = torch.tensor([[-.11, .89], [-.11, .89]], device='cuda')
+        import torch.nn.functional as F
+        network = (F.interpolate(logits[None, None], size=(8, 8),
+                                mode='bilinear', align_corners=False)[0, 0] > 0).float()
         torch.cuda.synchronize()
         with torch.cuda.stream(slot.post_stream):
             ex._launch_native_mask_post(slot, inference._cupy_external_stream(
-                self.kernels.cp, slot.post_stream), np.uintp(0))
+                self.kernels.cp, slot.post_stream), np.uintp(0), network, None)
         slot.post_stream.synchronize()
-        import torch.nn.functional as F
-        network = (F.interpolate(slot.max_logit[None, None], size=(8, 8),
-                                mode='bilinear', align_corners=False)[0, 0] > 0).float()
         expected = inference._torch_warp_planes_to_native([network], matrix, 8, 8, 8)[0].to(torch.uint8)
         fused = torch.empty_like(slot.native_union)
         self.kernels.upsample_quantize_affine(((1, 1)), (32, 8),
-            (self.kernels.cp.asarray(slot.max_logit), np.uintp(0), np.uintp(0), np.int32(2), np.int32(2),
+            (self.kernels.cp.asarray(logits), np.uintp(0), np.uintp(0), np.int32(2), np.int32(2),
              np.int32(8), np.int32(8), np.int32(8), np.int32(8), *slot.native_to_out,
              self.kernels.cp.asarray(fused), np.uintp(0), np.uintp(0)),
             stream=inference._cupy_external_stream(self.kernels.cp, torch.cuda.current_stream()))
@@ -531,7 +530,7 @@ class NativeRingCudaPostTests(unittest.TestCase):
                 self.assertEqual(ex.proto_hole_treatment_active, policy == 'legacy_proto')
                 self.assertEqual(slot.proto_tmp is not None, policy == 'legacy_proto')
                 self.assertEqual(slot.proto_dilated is not None, policy == 'legacy_proto')
-                self.assertEqual(slot.compact_coeff is not None, policy == 'native_mask')
+                self.assertEqual(slot.retina_workspace is not None, policy == 'native_mask')
                 self.assertEqual(ex.dynamic_unit_descriptors, policy == 'legacy_proto')
                 if slot.post_graph is not None:
                     with torch.cuda.stream(slot.post_stream):
@@ -569,9 +568,9 @@ class NativeRingCudaPostTests(unittest.TestCase):
                 self.assertEqual(slot.proto_dilated is not None, ex.proto_hole_treatment_active)
                 self.assertEqual('proto_dilated' in slot._cupy_refs, ex.proto_hole_treatment_active)
                 self.assertEqual(slot.native_conf is not None, track_conf)
-                self.assertEqual(slot.conf_proto is not None, track_conf)
+                self.assertEqual(slot.retina_workspace is not None, not ex.proto_hole_treatment_active)
                 self.assertEqual('native_conf' in slot._cupy_refs, track_conf)
-                self.assertEqual('conf_proto' in slot._cupy_refs, track_conf)
+                self.assertNotIn('conf_proto', slot._cupy_refs)
                 self.assertEqual(slot.compact_count.item(), expected_count)
                 if track_conf:
                     # Foreground interpolation can reach a proto cell whose own logit

@@ -195,7 +195,7 @@ def crop_blocks(crops, shape, block_size=128):
 
 def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, provenance,
                  coordinate_space='source', source_shape=None, block_size=128,
-                 metrics=None, max_numeric_bytes=None):
+                 metrics=None, max_numeric_bytes=None, track_minimum_score=False):
     """Stream block index and payload; metadata is the atomic completion marker."""
     from .confidence_evidence import SCORE_SEMANTICS, _write_json_atomic, _json_value, _MaskedNativeScoreReader
     directory = Path(directory)
@@ -220,6 +220,7 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
     payload_tmp,index_tmp = directory/'scores.u8.zlib.partial',directory/'index.bin.partial'
     digest,index_digest = hashlib.sha256(),hashlib.sha256()
     blocks,known = 0,0
+    minimum_nonzero_score = 256
     read_seconds = scan_seconds = compression_seconds = storage_seconds = 0.0
     codec_diagnostics, codec_frame_counts = {}, {}
     copy_kernel_calls = copy_batch_peak_bytes = 0
@@ -362,6 +363,9 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                         break
                     if encoded_result is None:
                         y0,y1,x0,x1,crop = item
+                        if track_minimum_score:
+                            minimum_nonzero_score = min(minimum_nonzero_score,
+                                int(crop.min(where=crop != 0, initial=255)))
                         phase_started = time.perf_counter()
                         encoded = zlib.compress(crop.tobytes(),level=3)
                         compression_seconds += time.perf_counter() - phase_started
@@ -424,6 +428,8 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                 storage_batch_reserved_bytes=0 if not batch_limit else 2*batch_limit+128,
                 storage_payload_write_calls=payload_write_calls,
                 storage_index_write_calls=index_write_calls)
+            if track_minimum_score:
+                metrics['minimum_nonzero_score'] = minimum_nonzero_score
             if caller_encoder is not None:
                 metrics.update(frame_encoder='caller_compiled_cells',
                     frame_encoder_codec=getattr(slice_reader, 'codec_backend', None),

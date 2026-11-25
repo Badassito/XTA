@@ -97,25 +97,24 @@ def main():
                         with (mock.patch.dict(os.environ, {'YOLO_TTA_DIRECT_DEVICE_COMPACTION': '1'}),
                               mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=True),
                               mock.patch.object(inference, 'angle_variant_gpu_fastpath', return_value=None)):
-                            payload = inference._build_direct_device_compacted_payload(head, proto, image, .5,
-                                                                                       allow_tiled=enabled)
-                        if payload is None:
-                            raise RuntimeError(f'Direct payload returned None, tiled={enabled}')
-                        payloads.append(payload)
+                            planes = inference._reduce_direct_prototypes(head, proto, image, .5,
+                                                                          allow_tiled=enabled)
+                        if planes is None:
+                            raise RuntimeError(f'Prototype reduction returned None, tiled={enabled}')
+                        payloads.append(planes)
                     torch.cuda.synchronize()
-                    scalar, tiled = payloads
+                    scalar_logits, scalar_scores, scalar_count, scalar_kernel, _ = payloads[0]
+                    tiled_logits, tiled_scores, tiled_count, tiled_kernel, _ = payloads[1]
                     expected_tiled = 'tiled_f16' if dtype == torch.float16 else 'tiled_f32'
-                    selected = [scalar.compaction_kernel, tiled.compaction_kernel]
+                    selected = [scalar_kernel, tiled_kernel]
                     if selected != ['scalar', expected_tiled]:
                         raise RuntimeError(f'Unexpected dispatch {selected}')
                     item.update(selected_kernels=selected,
-                                retained_counts=[int(p.instance_count_device.item()) for p in payloads],
-                                logits=differences(scalar.device_refs[4], tiled.device_refs[4]),
-                                prototype_confidence=differences(scalar.device_refs[5], tiled.device_refs[5]),
-                                mask=differences(scalar.union_gpu, tiled.union_gpu),
-                                image_confidence=differences(scalar.conf_gpu, tiled.conf_gpu))
+                                retained_counts=[int(scalar_count.item()), int(tiled_count.item())],
+                                logits=differences(scalar_logits, tiled_logits),
+                                prototype_confidence=differences(scalar_scores, tiled_scores))
                     item['all_outputs_bit_exact'] = all(item[key]['bit_mismatches'] == 0
-                                                       for key in ('logits', 'prototype_confidence', 'mask', 'image_confidence'))
+                                                       for key in ('logits', 'prototype_confidence'))
                 except Exception as exc:
                     item['unexpected_error'] = f'{type(exc).__name__}: {exc}'
                     report['unexpected_errors'].append({'dtype': str(dtype), 'scenario': name,

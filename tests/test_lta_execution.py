@@ -27,6 +27,7 @@ from XTA.lta_execution import (
     _hard_positive_volume,
     _aligned_known_background_frames,
     _known_background_audit,
+    _restore_authoritative_slices,
     _new_worker_audit,
     _lineage_from_record,
     _materialize_source_volume,
@@ -92,13 +93,14 @@ class LtaVideoMaterializationTests(unittest.TestCase):
 class _FakeWorkerPool:
     instances: list["_FakeWorkerPool"] = []
 
-    def __init__(self, device_ids, _init, *, startup_timeout):
+    def __init__(self, device_ids, _init, *, startup_timeout, directional_difference=False):
         self.device_ids = tuple(device_ids)
         self.pids = {device: 1000 + device for device in self.device_ids}
         self.pending = []
         self.used_devices = []
         self.wait_timeouts = []
         self.closed = False
+        self.directional_difference = directional_difference
         self.instances.append(self)
 
     def submit(self, task, *, execution_device_id):
@@ -117,7 +119,8 @@ class _FakeWorkerPool:
         stop = int(payload["output_frame_stop"])
         generation = int(payload["relay_generation"])
         union = np.zeros((stop - start, size, size), dtype=np.uint8)
-        union[:, 1, 3] = 1
+        column = 2 if self.directional_difference and payload["authoritative_anchor_frame"] == 3 else 3
+        union[:, 1, column] = 1
         union_path = output / "union.uint8.raw"
         union.tofile(union_path)
         source_seeds = read_seed_artifact(
@@ -197,7 +200,12 @@ class _FakeWorkerPool:
             "relays": relays,
             "lineage_coverage": coverage_artifact,
             "task_granularity": "window" if task.kind == "propagation_window" else "chain",
-            "windows": [],
+            "windows": [
+                {
+                    "status": "complete",
+                    "adapter": {"model_visited_frame_ranges": [[start, stop]]},
+                },
+            ],
             "profile": {
                 "name": "fake",
                 "execution_device_id": device,
@@ -323,7 +331,7 @@ class LtaProductionExecutionTests(unittest.TestCase):
         self.assertEqual(audit["ready_worker_count"], 1)
         self.assertEqual(audit["chain_count"], 1)
 
-    def test_known_background_labels_are_audited_without_subtracting_predictions(self) -> None:
+    def test_annotated_slices_restore_positive_and_negative_pixels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             plan = self._plan(Path(temp_dir), (0,))
             source = plan.discovery.target_volumes[0]
@@ -338,15 +346,17 @@ class LtaProductionExecutionTests(unittest.TestCase):
                 source,
                 tuple(item for item in annotations if item.polygons),
             )
-            terminal = np.zeros((4, 4, 6), dtype=np.uint8)
-            terminal[1, 2, 3] = 1
+            terminal = np.ones((4, 4, 6), dtype=np.uint8)
+            manual = np.zeros_like(terminal)
+            manual[0, 1, 1] = 1
+            _restore_authoritative_slices(terminal, manual, (0, *frames))
             audit = _known_background_audit(terminal, frames)
 
         self.assertEqual(frames, (1,))
-        self.assertEqual(audit["policy"], "audit_only_no_subtraction")
-        self.assertEqual(audit["frames_with_predicted_foreground"], 1)
-        self.assertEqual(audit["predicted_foreground_pixels"], 1)
-        self.assertTrue(bool(terminal[1, 2, 3]))
+        self.assertEqual(audit["policy"], "authoritative_empty_slices")
+        self.assertEqual(audit["frames_with_predicted_foreground"], 0)
+        np.testing.assert_array_equal(terminal[:2], manual[:2])
+        self.assertTrue(bool(terminal[2:].all()))
 
     def test_storage_preflight_fails_before_decode_when_scratch_is_too_small(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -721,11 +731,13 @@ class LtaProductionExecutionTests(unittest.TestCase):
         revalidation_failure: bool = False,
         postprocessing_override: dict | None = None,
         finalization_operations: object | None = None,
+        directional_difference: bool = False,
+        background_frame: int | None = None,
     ):
         pools = []
 
         def pool_factory(*args, **kwargs):
-            pool = _FakeWorkerPool(*args, **kwargs)
+            pool = _FakeWorkerPool(*args, **kwargs, directional_difference=directional_difference)
             pools.append(pool)
             return pool
 
@@ -773,6 +785,19 @@ class LtaProductionExecutionTests(unittest.TestCase):
             )
 
         plan = self._plan(root, devices)
+        if background_frame is not None:
+            source = plan.discovery.target_volumes[0]
+            annotations = list(source.annotations)
+            label_path = root / f"source_{background_frame:04d}.txt"
+            label_path.write_text("", encoding="utf-8")
+            annotations[background_frame] = replace(
+                annotations[background_frame],
+                state=AnnotationState.KNOWN_BACKGROUND,
+                label_path=label_path,
+                label_sha256=_sha256(label_path),
+            )
+            source = replace(source, annotations=tuple(annotations))
+            plan = replace(plan, discovery=replace(plan.discovery, target_volumes=(source,)))
         if postprocessing_override is not None:
             plan = replace(plan, postprocessing=postprocessing_override)
         if preserve_temp and cleanup_failure:
@@ -1009,11 +1034,14 @@ class LtaProductionExecutionTests(unittest.TestCase):
         self.assertEqual(
             manifest["execution"]["temporal_propagation"],
             {
-                "policy": "full_view_per_anchor_recall_union",
-                "per_anchor_frame_range": [0, 4],
-                "cross_anchor_identity_reconciliation": False,
-                "output_combination": "union",
-                "missing_at_other_anchors": "does_not_terminate_lineage",
+                "policy": "neighboring_annotated_slice_intervals",
+                "anchor_frame_ranges": [
+                    {"anchor_frame": 0, "frame_start": 0, "frame_stop": 3},
+                    {"anchor_frame": 3, "frame_start": 1, "frame_stop": 4},
+                ],
+                "output_combination": "center_aligned_signed_distance_handoff",
+                "annotated_slice_indices": [0, 3],
+                "known_background_slice_indices": [],
                 "continuation": "nonempty_directional_dogfood_boundaries",
             },
         )
@@ -1064,6 +1092,53 @@ class LtaProductionExecutionTests(unittest.TestCase):
                 "minimum_tracker_probability": 0.5,
             },
         )
+
+    def test_manifest_and_summary_publish_an_unannotated_transverse_slice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result, _pool, _ = self._run(Path(temp_dir), (0,), directional_difference=True)
+            manifest = json.loads(result.manifest_path.read_bytes())
+            record = manifest["execution"]["annotation_suggestions"]
+            selected = record["next_slice"]
+            self.assertEqual(record["metric"], "symmetric_difference_over_union")
+            self.assertEqual(record["comparison_scope"], "jointly_observed_pixels")
+            self.assertEqual(record["slice_index_origin"], 0)
+            self.assertEqual(record["compared_slice_count"], 2)
+            self.assertEqual(selected["axis"], "z")
+            self.assertIn(selected["slice_index"], (1, 2))
+            self.assertEqual(selected["encoded_index"], selected["slice_index"])
+            self.assertEqual(selected["exemplar_encoded_index"], selected["slice_index"] + 1)
+            self.assertGreater(selected["disagreement_fraction"], 0)
+            summary = json.loads(next(result.manifest_path.parent.glob("*_summary.json")).read_bytes())
+            self.assertEqual(summary["annotation_suggestions"], record)
+
+    def test_suggestion_tie_uses_native_index_and_skips_annotations(self):
+        from XTA.lta_suggestions import SliceSuggestions
+
+        suggestions = SliceSuggestions((11, 12, 13, 14, 15, 16), (0, 5), exemplar_index_origin=1)
+        suggestions.observe_counts(0, 1, 1)
+        suggestions.observe_counts(5, 1, 1)
+        suggestions.observe_counts(3, 0, 0)
+        self.assertIsNone(suggestions.manifest_record()["next_slice"])
+        suggestions.observe_counts(4, 6, 10)
+        suggestions.observe_counts(2, 3, 5)
+        suggestions.observe_counts(1, 2, 5)
+        record = suggestions.manifest_record()
+        self.assertEqual(record["compared_slice_count"], 3)
+        self.assertEqual(record["disagreeing_slice_count"], 3)
+        self.assertEqual(record["next_slice"], {
+            "axis": "z", "slice_index": 2, "encoded_index": 13, "exemplar_encoded_index": 3,
+            "disagreement_pixels": 3, "union_pixels": 5, "disagreement_fraction": 0.6,
+        })
+
+    def test_explicitly_empty_slice_limits_tracking_and_is_never_suggested(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result, _pool, raw = self._run(Path(temp_dir), (0,), background_frame=1)
+            manifest = json.loads(result.manifest_path.read_bytes())
+            execution = manifest["execution"]
+            self.assertEqual(execution["temporal_propagation"]["known_background_slice_indices"], [1])
+            self.assertEqual(execution["storage_preflight"]["components"]["packed_backward_interval_reserve"], 0)
+            self.assertIsNone(execution["annotation_suggestions"]["next_slice"])
+            self.assertFalse(np.frombuffer(raw, np.uint8).reshape(4, 4, 6)[1].any())
 
     def test_helper_first_completion_bounds_union_files_and_keeps_all_devices_working(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1618,10 +1693,8 @@ class LtaProductionExecutionTests(unittest.TestCase):
             all(0.0 < value <= 4 * 60 * 60 for value in four_pool.wait_timeouts)
         )
         final = np.frombuffer(four_bytes, dtype=np.uint8).reshape(4, 4, 6)
-        self.assertTrue(
-            final[1:, 1, 5].all(),
-            "relay did not reach the neighbor-only edge after its boundary frame",
-        )
+        self.assertTrue(final[1:3, 1, 5].any(), "relay did not reach the unannotated interval")
+        self.assertFalse(final[3, 1, 5], "relay changed the authoritative boundary plane")
 
 
 if __name__ == "__main__":

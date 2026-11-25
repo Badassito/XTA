@@ -141,6 +141,40 @@ class SphericalCpuCompactTests(unittest.TestCase):
             sp._project_spherical_encoded_block(self.source, self.view, self.radii,
                 self.rotation, self.shape, 0, 1, cancel_event=cancel)
 
+    def test_certified_z_margins_publish_once_and_never_enter_projector(self):
+        cases = [view for view in self.views if view.spherical_face in (4, 5)]
+        for view in cases:
+            source = np.ones((view.num_slices, 7, 11), np.uint8)
+            args = (source, view, np.asarray(view.spherical_radii),
+                    np.asarray(view.spherical_rotation_xyz).reshape(3, 3), self.shape)
+            bounds = sp.spherical_output_bounds(view, self.shape)
+            self.assertLess(bounds.z1 - bounds.z0, self.shape[0])
+            expected = oracle.project_spherical_block(*args, 0, self.shape[0], None)
+            for packed in (False, True):
+                with self.subTest(face=view.spherical_face, packed=packed):
+                    ranges = []
+                    sink = EncodedSink(self.shape, packed=packed)
+                    def record_range(first, count):
+                        ranges.append((first, count))
+                        EncodedSink.consume_empty_range(sink, first, count)
+                    sink.consume_empty_range = record_range
+                    with (mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
+                          mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=False),
+                          mock.patch.object(sp, '_project_spherical_encoded_block',
+                                            wraps=sp._project_spherical_encoded_block) as project,
+                          redirect_stdout(io.StringIO())):
+                        sp.backproject_spherical_volume_to_volume(source, view, Path('unused'), 'margins',
+                            sink_only=True, projection_block_callback=sink, workers=2)
+                    self.assertTrue(project.call_args_list)
+                    self.assertTrue(all(bounds.z0 <= call.args[5] < call.args[5] + call.args[6] <= bounds.z1
+                                        for call in project.call_args_list))
+                    self.assertEqual(sink.seen, list(range(self.shape[0])))
+                    if bounds.z0:
+                        self.assertEqual(ranges[0], (0, bounds.z0))
+                    if bounds.z1 < self.shape[0]:
+                        self.assertEqual(ranges[-1], (bounds.z1, self.shape[0] - bounds.z1))
+                    np.testing.assert_array_equal(sink.result, expected)
+
     def test_compact_depth_caps_wire_metadata_and_accounts_for_transient_storage(self):
         depth, workers = sp._spherical_block_schedule(10_000_000, 1, 32, compact=True)
         self.assertEqual(depth, sp._MAX_ENCODED_SLICES)
@@ -265,6 +299,8 @@ class SphericalCpuCompactTests(unittest.TestCase):
             with (self.subTest(field=field),
                   mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
                   mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=compiled.pull_spherical_chunk_numba),
+                  mock.patch.object(sp, 'spherical_output_bounds', return_value=SphericalOutputBounds(
+                      0, self.shape[0], 0, self.shape[1], 0, self.shape[2])),
                   mock.patch.object(sp, '_project_spherical_encoded_block', return_value=block),
                   redirect_stdout(io.StringIO()),
                   self.assertRaisesRegex(RuntimeError, 'empty block metadata')):

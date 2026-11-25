@@ -1,5 +1,8 @@
 # Slicer cleanup to native-resolution PTA labels
 
+To edit native voxels directly with the same marker tools and export one cleaned
+native Global, see [Native-window cleanup in 3D Slicer](native_window_review.md).
+
 The cleanup tool transfers **deletion evidence** from edited low-quality (LQ)
 segments onto their original full-quality (FQ) components. The original native
 voxels supply the detail. It publishes one cleaned native Global NRRD for PTA;

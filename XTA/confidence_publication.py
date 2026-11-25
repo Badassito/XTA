@@ -135,7 +135,7 @@ def _remove_stage(path, parent):
     shutil.rmtree(path)
 
 
-def copy_staged_blocks(stage, destination, *, metrics=None):
+def copy_staged_blocks(stage, destination, *, metrics=None, provenance=None):
     """Copy a completed numeric stage; expose its completion marker last."""
     from .confidence_evidence import ConfidenceEvidenceRef, _write_json_atomic
     from .confidence_storage import BLOCK_LAYOUT
@@ -157,7 +157,8 @@ def copy_staged_blocks(stage, destination, *, metrics=None):
                     copied += len(chunk)
             if digest.hexdigest() != reference.metadata[field]:
                 raise ValueError('Local confidence stage changed before publication')
-        _write_json_atomic(destination/'metadata.json', reference.metadata)
+        metadata = reference.metadata if provenance is None else dict(reference.metadata, provenance=provenance)
+        _write_json_atomic(destination/'metadata.json', metadata)
         result = ConfidenceEvidenceRef.open(destination)
     except BaseException:
         if resolved.parent != parent or resolved != destination.resolve():

@@ -52,6 +52,15 @@ none is presented as universally accuracy-optimal. Use `union.py` with
 `--save confidence` to collect scores while preserving the additive union. Confidence-based decisions
 require source-grid score projection, which can be expensive on large views.
 
+Both `confidence_core_rescue.py` and `confidence_anchored.py` request those
+source-grid scores. Eligible radial, spherical, tilted and azimuthal views
+project numeric maxima with the bounded geometry used by the sweep. Projection
+can use a GPU lease or the CPU and preserves all 256 possible score values.
+Resident D1 views can publish scores concurrently. The job log reports the
+worker count and host memory reservation, then reports each completed view's
+backend and timing when available. A retained-confidence drain occurs before
+the policy's first voting slab.
+
 The spatial core/rescue and hybrid rules operate independently within each
 source XY plane. Their votes include all projected views; they do not apply
 cross-slice morphology. Core rescue preserves a strong observed anchor with

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
+import threading
 import unittest
 from unittest import mock
 
@@ -156,6 +158,64 @@ class ReconciliationComponentTests(unittest.TestCase):
                 component_statistics(lambda z0, z1: value, (1, 2, 2))
         with self.assertRaisesRegex(OSError, "reader failed"):
             component_statistics(mock.Mock(side_effect=OSError("reader failed")), (1, 2, 2))
+
+    def test_indexed_island_weighting_preserves_groups_and_uses_independent_workers(self):
+        from XTA.reconciliation import EvidenceLayer, reconcile
+
+        shape = (21, 31, 37)
+        barrier = threading.Barrier(2)
+        group_threads = {}
+        prediction = dict(mask_kind='yolo', source='fullframe')
+        arrays = []
+        for index in range(4):
+            mask = np.zeros(shape, np.uint8)
+            mask[3:18, 3:13+2*index, 4:8] = 1
+            mask[17:19, 3:13+2*index, 7:12] = 1
+            mask[6:9, 18:21, 10:14] = 1
+            arrays.append(mask)
+        arrays.append(np.zeros(shape, np.uint8))
+        source = [
+            EvidenceLayer(f'layer{index}', shape, {**prediction, 'view_name': f'view{index//2}'},
+                          lambda a, b, mask=mask: mask[a:b])
+            for index, mask in enumerate(arrays)
+        ]
+        packed = []
+        for index, (entry, mask) in enumerate(zip(source, arrays)):
+            coords = np.argwhere(mask)
+            if coords.size:
+                bounds = tuple(value for column in coords.T for value in (int(column.min()), int(column.max())+1))
+            else:
+                bounds = (0, 0, 0, 0, 0, 0)
+
+            def crop(z, mask=mask, index=index):
+                if z == 3 and index in (0, 2) and index not in group_threads:
+                    group_threads[index] = threading.get_ident()
+                    barrier.wait(timeout=5)
+                ys, xs = np.nonzero(mask[z])
+                if not ys.size:
+                    return None
+                y0, y1, x0, x1 = int(ys.min()), int(ys.max())+1, int(xs.min()), int(xs.max())+1
+                return y0, x0, y1, x1, mask[z, y0:y1, x0:x1]
+
+            packed.append(replace(entry, read_mask_crop=crop, mask_crop_bounds=bounds))
+
+        def run(layers, workers):
+            output = np.empty(shape, np.uint8)
+            report = reconcile(layers, shape_tyx=shape, policy={'grouping': 'views', 'island_weighting': True},
+                               write_slab=lambda a, b, slab: output.__setitem__(slice(a, b), slab),
+                               memory_mib=8, managed_workers=workers)
+            return output, report
+
+        expected, old = run(source, 1)
+        actual, report = run(packed, 3)
+        np.testing.assert_array_equal(expected, actual)
+        self.assertEqual(len(set(group_threads.values())), 2)
+        self.assertEqual(old['counts'], report['counts'])
+        for key, record in report['components'].items():
+            baseline = old['components'][key]
+            for field in ('weight', 'component_count', 'foreground_voxels', 'largest_component_voxels'):
+                self.assertEqual(record[field], baseline[field])
+            self.assertLessEqual(record['estimated_peak_bytes'], record['memory_budget_bytes'])
 
 
 if __name__ == "__main__":

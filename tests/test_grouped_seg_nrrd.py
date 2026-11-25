@@ -342,3 +342,79 @@ def test_concurrent_publications_do_not_share_or_remove_each_others_private_spoo
         assert np.all(data == index)
     assert not list(scratch.iterdir())
     assert not list(destination.glob(".grouped-seg-write-*"))
+
+
+@pytest.mark.parametrize("strided,without_opencv", [(False, False), (True, False), (False, True)])
+def test_plane_and_slab_observers_receive_validated_readonly_crops(tmp_path, monkeypatch, strided, without_opencv):
+    from XTA import grouped_seg_nrrd
+    from XTA.sweep_coverage import DirectCoverage
+
+    if without_opencv:
+        monkeypatch.setattr(grouped_seg_nrrd, "_opencv_bounding_rect", lambda: None)
+    shape = (6, 23, 29)
+    slab = np.zeros((6, 8, 18), dtype=bool)[..., ::2] if strided else np.zeros((6, 8, 9), np.uint8)
+    slab[1, 1:3, 3:5] = True
+    slab[3, 0, 2] = True
+    slab[3, 5, 6] = True
+    origin_yx = (4, 5)
+    # Permit more pixels than the source actually contains.
+    declared = (6, 12, 4, 10, 1, 4)
+    exact = (7, 11, 4, 9, 1, 3)
+    observed_slabs, observed_crops = [], []
+    collector = DirectCoverage(tmp_path, ReferenceGeometry(shape), 1)
+
+    def observe_slab(z, observed):
+        assert not observed.flags.writeable
+        np.testing.assert_array_equal(observed, slab[z:z + len(observed)])
+        observed_slabs.append(z)
+
+    def observe_plane(z, crop, y, x):
+        assert not crop.flags.writeable
+        assert np.shares_memory(slab, crop)
+        observed_crops.append((z, y, x, crop.shape))
+        collector.observe_plane(z, crop, y, x)
+
+    try:
+        descriptor = GroupedSegment(
+            "id", "A mask", (.1, .2, .3), lambda start, stop: slab[start:stop],
+            extent_xyz=declared, source_window_yx=(*origin_yx, 12, 14),
+            observe_slab=observe_slab, observe_plane=observe_plane,
+        )
+        group_path = tmp_path / "group.seg.nrrd"
+        result = write_grouped_seg_nrrd(group_path, shape_tyx=shape,
+                                        segments=[descriptor], chunk_slices=2)
+        assert result["segments"][0]["extent_xyz"] == list(exact)
+        assert result["segments"][0]["foreground_voxels"] == 6
+        assert observed_slabs == [1, 3]
+        assert observed_crops == [(1, 5, 8, (2, 2)), (3, 4, 7, (6, 5))]
+
+        coverage_path = tmp_path / "coverage.nrrd"
+        info = collector.write(coverage_path, sweep_id="test", grid_id="native", cutoff_cent=80)
+        assert (info["voxel_votes"], info["positive_voxels"], info["maximum_count"]) == (6, 6, 1)
+        _, coverage = read_stock(coverage_path)
+        _, group = read_stock(group_path)
+        expected = np.zeros(shape, np.uint8)
+        expected[:, 4:12, 5:14] = slab
+        np.testing.assert_array_equal(coverage, expected)
+        np.testing.assert_array_equal(group[0], expected[1:5, 4:11, 6:13])
+    finally:
+        collector.close()
+
+
+@pytest.mark.parametrize("value", [1, 2])
+def test_invalid_slab_invokes_no_observers_and_preserves_output(tmp_path, value):
+    shape = (2, 5, 7)
+    slab = np.zeros(shape, np.uint8)
+    slab[0, 1, 2] = 1
+    slab[1, 4, 6] = value
+
+    def observe(*_args):
+        pytest.fail("An invalid slab must not be delivered to an observer")
+
+    descriptor = GroupedSegment("id", "A mask", (.1, .2, .3), lambda start, stop: slab[start:stop],
+                                extent_xyz=(0, 3, 0, 2, 0, 1), observe_slab=observe, observe_plane=observe)
+    path = tmp_path / "group.seg.nrrd"
+    path.write_bytes(b"preserved")
+    with pytest.raises(ValueError, match="extent_xyz|binary"):
+        write_grouped_seg_nrrd(path, shape_tyx=shape, segments=[descriptor], overwrite=True)
+    assert path.read_bytes() == b"preserved"

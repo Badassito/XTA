@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import cache
 import hashlib
 import math
 import os
@@ -20,6 +21,7 @@ import numpy as np
 
 from .reconciliation_io import FileLayer, ReferenceGeometry, _budget, _shape
 from .gzip_spans import GzipSpanWriter
+from .managed_review_source import ManagedReviewSource
 
 
 _EMPTY_EXTENT = (0, -1, 0, -1, 0, -1)
@@ -32,7 +34,9 @@ class GroupedSegment:
     extent_xyz is an optional trusted inclusive upper bound in reference IJK.
     An empty extent declares an empty segment without calling read_slab.
     Provide either a callback or a FileLayer. A callback must not allocate a
-    larger source slab than requested. The observer receives validated slabs.
+    larger source slab than requested. Observers receive read-only validated
+    data. The plane observer receives each nonempty crop with its reference
+    Z, Y and X coordinates.
     """
     segment_id: str
     name: str
@@ -44,6 +48,9 @@ class GroupedSegment:
     source_window_yx: tuple[int, int, int, int] | None = None
     source_layer: FileLayer | None = None
     observe_slab: Callable[[int, np.ndarray], None] | None = None
+    observe_plane: Callable[[int, np.ndarray, int, int], None] | None = None
+    managed_source: ManagedReviewSource | None = None
+    observe_packed_plane: Callable[[int, np.ndarray, int, int, int], None] | None = None
 
 
 def _text(value: Any, name: str) -> str:
@@ -94,6 +101,8 @@ def _validated_segments(segments, shape):
             source_window = (y, x, y + height, x + width)
         if segment.observe_slab is not None and not callable(segment.observe_slab):
             raise ValueError("observe_slab must be callable")
+        if segment.observe_plane is not None and not callable(segment.observe_plane):
+            raise ValueError("observe_plane must be callable")
         color = tuple(segment.color_rgb)
         if len(color) != 3 or any(isinstance(v, bool) or not math.isfinite(float(v))
                                    or not 0 <= float(v) <= 1 for v in color):
@@ -153,6 +162,51 @@ def _slab_extent(slab, origin_tyx, foreground):
     return tuple(bounds)
 
 
+@cache
+def _opencv_bounding_rect():
+    try:
+        from cv2 import boundingRect
+    except (ImportError, OSError):
+        return None
+    return boundingRect
+
+
+def _plane_bounds(plane):
+    """Return the occupied XY rectangle with exclusive upper bounds."""
+    if plane.flags.c_contiguous and plane.size and plane.dtype in (np.uint8, np.bool_):
+        bounding_rect = _opencv_bounding_rect()
+        if bounding_rect is not None:
+            x, y, width, height = bounding_rect(plane.view(np.uint8))
+            return (y, y + height, x, x + width) if width else None
+    # The general slab callback can return strided data. Avoid making an
+    # entire contiguous plane just to find where the occupied pixels start.
+    rows = np.flatnonzero(np.any(plane, axis=1))
+    if not rows.size:
+        return None
+    top, bottom = int(rows[0]), int(rows[-1]) + 1
+    columns = np.flatnonzero(np.any(plane[top:bottom], axis=0))
+    return top, bottom, int(columns[0]), int(columns[-1]) + 1
+
+
+def _coverage_bounds(slab, origin_tyx):
+    """Derive the slab extent and reusable coverage rectangles in one scan."""
+    z0, y0, x0 = origin_tyx
+    crops = []
+    left, top = slab.shape[2], slab.shape[1]
+    right = bottom = 0
+    for index, plane in enumerate(slab):
+        bounds = _plane_bounds(plane)
+        if bounds is None:
+            continue
+        plane_top, plane_bottom, plane_left, plane_right = bounds
+        crops.append((index, plane_top, plane_bottom, plane_left, plane_right))
+        left, top = min(left, plane_left), min(top, plane_top)
+        right, bottom = max(right, plane_right), max(bottom, plane_bottom)
+    extent = (x0 + left, x0 + right - 1, y0 + top, y0 + bottom - 1,
+              z0 + crops[0][0], z0 + crops[-1][0])
+    return extent, crops
+
+
 def _merge_extent(first, second):
     if first == _EMPTY_EXTENT:
         return second
@@ -209,7 +263,11 @@ def _scan_segment(segment, bound, window, first, stop, depth, stored_shape, offs
         if source is None and slab.dtype == np.uint8 and slab.max() > 1:
             raise ValueError("Grouped segments require binary values 0/1")
         count = int(np.count_nonzero(slab))
-        extent = _slab_extent(slab, (z0, y0, x0), count)
+        crops = ()
+        if count and segment.observe_plane is not None:
+            extent, crops = _coverage_bounds(slab, (z0, y0, x0))
+        else:
+            extent = _slab_extent(slab, (z0, y0, x0), count)
         if count and any(extent[2*i] < bound[2*i] or extent[2*i+1] > bound[2*i+1] for i in range(3)):
             raise ValueError(f"Source data exceeds extent_xyz for {segment.segment_id}")
         exact = _merge_extent(exact, extent)
@@ -226,6 +284,11 @@ def _scan_segment(segment, bound, window, first, stop, depth, stored_shape, offs
             observed.flags.writeable = False
             segment.observe_slab(z0, observed)
             del observed
+        for index, top, bottom, left, right in crops:
+            crop = slab[index, top:bottom, left:right]
+            crop.flags.writeable = False
+            segment.observe_plane(z0 + index, crop, y0 + top, x0 + left)
+            del crop
         del slab
     return foreground, exact
 
@@ -333,6 +396,7 @@ def write_grouped_seg_nrrd(
     crop_z = offset_xyz[2]
     stored_z = stored_shape[0]
     records = []
+    managed_spans = 0
 
     try:
         payload_dir = Path(tempfile.mkdtemp(prefix=".grouped-seg-payload-", dir=payload_root))
@@ -354,9 +418,16 @@ def write_grouped_seg_nrrd(
                         segment, bound, window, first, stop, depth, stored_shape, offset_xyz, compressed)
                 else:
                     with compressed.gzip_payload_sink((stop-first) * plane_bytes) as sink:
-                        with source.copy_gzip_payload_to(sink, read_bytes=zero_write_buffer_bytes):
-                            foreground, exact = _scan_segment(
-                                segment, bound, window, first, stop, depth, stored_shape, offset_xyz, None)
+                        packed_observer = segment.observe_packed_plane
+                        if (segment.managed_source is not None and segment.observe_slab is None
+                                and (segment.observe_plane is None or packed_observer is not None)):
+                            foreground, exact = segment.managed_source.copy_verified(
+                                source, sink, bound, segment.observe_plane, packed_observer, zero_write_buffer_bytes)
+                            managed_spans += 1
+                        else:
+                            with source.copy_gzip_payload_to(sink, read_bytes=zero_write_buffer_bytes):
+                                foreground, exact = _scan_segment(
+                                    segment, bound, window, first, stop, depth, stored_shape, offset_xyz, None)
                 compressed.write_zeros((crop_z+stored_z-stop) * plane_bytes)
                 local_extent = (_EMPTY_EXTENT if exact == _EMPTY_EXTENT else
                                 tuple(v-offset_xyz[i] for i in range(3) for v in exact[2*i:2*i+2]))
@@ -395,6 +466,7 @@ def write_grouped_seg_nrrd(
             "numeric_buffer_budget_bytes": budget, "minimum_numeric_buffer_bytes": minimum,
             "chunk_slices": depth, "payload_uncompressed_bytes": math.prod(stored_shape)*len(records),
             "gzip_spans": dict(compressed.stats),
+            "managed_gzip_spans": managed_spans,
             "bytes": path.stat().st_size,
             **({"sha256": digest.hexdigest()} if digest is not None else {}),
         }

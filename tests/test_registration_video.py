@@ -74,6 +74,29 @@ class RegistrationVideoTests(unittest.TestCase):
         np.testing.assert_array_equal(mask, expected)
         assert observed_field(stack).all()
 
+    def test_black_exterior_ignores_damaged_prefix(self):
+        stack = np.zeros((9, 30, 32), np.uint8)
+        stack[:3, 8:10, 9:11] = 80
+        stack[3:, 3:27, 4:28] = 80
+        stack[3:, 12:15, 13:17] = 8
+        expected = np.zeros(stack.shape[1:], bool)
+        expected[3:27, 4:28] = True
+        actual = observed_field(stack, black_exterior=True, exclude_first=3)
+        np.testing.assert_array_equal(actual, expected)
+        self.assertEqual(np.count_nonzero(observed_field(stack, black_exterior=True)), 4)
+        with self.assertRaisesRegex(ValueError, "inside the volume"):
+            observed_field(stack, black_exterior=True, exclude_first=9)
+
+    def test_pyramid_excludes_damaged_filter_taps_without_shifting_native_grid(self):
+        volume = np.broadcast_to(np.arange(17, dtype=np.uint8)[:, None, None] * 8, (17, 19, 31)).copy()
+        damaged = volume.copy()
+        damaged[:3] = 255
+        pyramid = prepare_pyramid(volume, 4, exclude_first=3)
+        np.testing.assert_array_equal(prepare_pyramid(damaged, 4, exclude_first=3), pyramid)
+        self.assertFalse(np.any(pyramid[0]))
+        self.assertEqual(pyramid[3, 2, 2], 96)
+        self.assertNotEqual(prepare_pyramid(damaged, 4)[1, 2, 2], pyramid[1, 2, 2])
+
     def native_movie(self):
         tmp_path = self.tmp_path
         if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):

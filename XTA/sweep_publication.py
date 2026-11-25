@@ -27,7 +27,7 @@ from .grouped_seg_nrrd import GroupedSegment, write_grouped_seg_nrrd
 from .json_publication import _fsync_parent_directory, _staged_sweep_directory, write_json_atomic
 from .reconciliation_io import FileLayer, _budget, _same_geometry, read_layer_manifest
 from .review_compression import review_gzip_pool
-from .sweep_coverage import DirectCoverage, write_coverage_colors
+from .sweep_coverage import DirectCoverage, plan_direct_coverage, write_coverage_colors
 from .sweep_grouped_reader import embedded_catalogue_bytes, embedded_layer_metadata
 
 
@@ -119,12 +119,9 @@ class _Member:
     info: dict
     extent: tuple
 
-    def descriptor(self, sweep_id, grid_id, coverage):
+    def descriptor(self, sweep_id, grid_id, coverage, *, consolidated=False):
         _, y, x = self.source.offset_tyx
         _, height, width = self.source.stored_shape_tyx
-
-        def observe(z0, slab):
-            coverage.observe(z0, slab, self.extent, origin_yx=(y, x))
 
         tags = {}
         for entry in self.source.header.get("Segment0_Tags", "").split("|"):
@@ -136,11 +133,19 @@ class _Member:
                 "XTA.CutoffCent": str(self.cutoff), "XTA.Role": self.info["role"],
                 "XTA.Model": quote(self.info["model_name"], safe="._-/"),
                 "XTA.LayerKey": quote(self.info["layer_key"], safe="._-/")})
+        managed_source = None
+        if consolidated and grid_id == "native":
+            from .managed_review_source import read_native_review_source
+
+            managed_source = read_native_review_source(self.source.path)
+        direct = self.info["role"] == "direct"
         return GroupedSegment(self.info["segment_id"], self.info["display_name"],
                               tuple(self.info["color_rgb"]), None, tags, self.extent,
                               source_window_yx=(y, x, y + height, x + width),
-                              source_layer=self.source,
-                              observe_slab=observe if self.info["role"] == "direct" else None)
+                              source_layer=self.source, managed_source=managed_source,
+                              observe_plane=coverage.observe_plane if direct else None,
+                              observe_packed_plane=(coverage.observe_packed_plane
+                                                    if direct and managed_source is not None else None))
 
 
 def _member(cutoff, layer, sweep_id, grid_id):
@@ -284,6 +289,34 @@ class _Cancelled(Exception):
     """Another cutoff failed; stop before starting further group files."""
 
 
+def _native_coverage_plans(geometry, by_cut, memory_mib, workers):
+    from .runtime import workspace_anon_cap_bytes
+    from .sam_resources import physical_sam_headroom
+
+    # This also accounts for SLURM and cgroup memory limits. Every cutoff
+    # shares the same allowance while groups and gzip jobs use their buffers.
+    headroom = physical_sam_headroom()
+    remaining = max(0, headroom - headroom // 4 - _budget(memory_mib) * workers)
+    cap = workspace_anon_cap_bytes()
+    if cap > 0:
+        remaining = min(remaining, cap)
+    plans = {
+        cutoff: plan_direct_coverage(geometry.shape_tyx, (
+            member.extent for member in members if member.info["role"] == "direct"))
+        for cutoff, members in by_cut.items()
+    }
+    admitted = {}
+    for cutoff in sorted(plans, key=lambda cut: -plans[cut].size_bytes):
+        plan = plans[cutoff]
+        if 0 < plan.size_bytes <= remaining:
+            admitted[cutoff] = plan
+            remaining -= plan.size_bytes
+    reserved = sum(plan.size_bytes for plan in admitted.values())
+    print(f"Native review coverage: in-memory count bands for {len(admitted)} cutoff(s), "
+          f"{reserved / 1024**3:.2f} GiB reserved.", flush=True)
+    return admitted
+
+
 def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mib, source_mode,
                   workers=1, *, member_pool, consolidated=False):
     destination = stage / grid_id
@@ -296,6 +329,8 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
             by_cut[member.cutoff].append(member)
         direct_by_cut = {cutoff: [m.info["segment_id"] for m in by_cut[cutoff] if m.info["role"] == "direct"]
                          for cutoff, *_ in branches}
+        coverage_plans = (_native_coverage_plans(geometry, by_cut, memory_mib, workers)
+                          if consolidated and grid_id == "native" else {})
         table = destination / "direct_layer_count.ctbl"
         write_coverage_colors(table, max(map(len, direct_by_cut.values()), default=0), durable=consolidated)
         # File numbers are fixed before any worker starts, so output names are deterministic.
@@ -309,17 +344,17 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
         failed = threading.Event()
 
         def publish_cutoff(cutoff, packs):
-            # Every member of a cutoff shares that cutoff's reader collection and
-            # coverage spool; one worker owns both, so neither needs a lock.
-            counter = DirectCoverage(scratch, geometry, len(direct_by_cut[cutoff]))
+            counter = DirectCoverage(scratch, geometry, len(direct_by_cut[cutoff]),
+                                     dense_plan=coverage_plans.get(cutoff))
             try:
                 groups, votes = [], 0
                 group_spans = Counter()
+                managed_spans = 0
                 for index, pack in packs:
                     if failed.is_set():
                         raise _Cancelled()
                     path = destination / f"group_{index:04d}.seg.nrrd"
-                    descriptors = [m.descriptor(sweep_id, grid_id, counter) for m in pack]
+                    descriptors = [m.descriptor(sweep_id, grid_id, counter, consolidated=consolidated) for m in pack]
                     try:
                         options = {"index_segments": True} if consolidated else {}
                         stats = write_grouped_seg_nrrd(path, shape_tyx=geometry.shape_tyx, segments=descriptors,
@@ -344,6 +379,7 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
                     if consolidated:
                         groups[-1]["sha256"] = stats["sha256"]
                     spans = stats["gzip_spans"]
+                    managed_spans += stats.get("managed_gzip_spans", 0)
                     group_spans.update({k: spans[k] for k in (
                         "reused_spans", "reused_bytes", "reused_compressed_bytes", "data_bytes", "zero_bytes")})
                 path = destination / f"conf_{cutoff:03d}_coverage.label.nrrd"
@@ -354,6 +390,9 @@ def _publish_grid(grid_id, branches, stage, review, scratch, sweep_id, memory_mi
                 overlay = {"cutoff_cent":cutoff, "path":_relative(path, stage),
                            "color_table":_relative(table, stage), "role":"direct_layer_count",
                            "source_segment_ids":direct_by_cut[cutoff], **info}
+                if managed_spans:
+                    print(f"Confidence review cutoff {cutoff / 100:.2f} reused {managed_spans} scalar "
+                          "gzip spans without inflation.", flush=True)
                 return groups, overlay, group_spans
             except BaseException:
                 failed.set()

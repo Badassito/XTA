@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from scipy import ndimage
 from scipy.spatial.transform import Rotation
 
-from XTA.registration.fit import _fit_points, _ncc_peak, fit_registration
+from XTA.registration.fit import (
+    _contrast, _errors, _fit_affine_points, _fit_points, _ncc_peak, _patch_matches,
+    _select_correspondence_model, fit_registration,
+)
 
 
 def textured_phantom(seed=8534):
@@ -26,6 +30,57 @@ def textured_phantom(seed=8534):
 
 
 class RegistrationFitTests(unittest.TestCase):
+    def test_two_sided_contrast_preserves_polarity_and_excludes_artifacts(self):
+        volume = np.full((4, 12, 12), 100, np.uint8)
+        volume[0] = np.arange(144, dtype=np.uint8).reshape(12, 12)
+        volume[1:, 5, 5:7] = [80, 120]
+        field = np.ones((12, 12), bool)
+        field[:, 0] = False
+        bright = _contrast(volume, field, 1, "bright")
+        signed = _contrast(volume, field, 1, "both")
+        np.testing.assert_array_equal(bright[1:, 5, 5:7], [[0, 60]] * 3)
+        np.testing.assert_array_equal(signed[1:, 5, 5:7], [[-60, 60]] * 3)
+        self.assertFalse(np.any(signed[0]))
+        self.assertFalse(np.any(signed[..., 0]))
+
+    def test_damaged_prefix_does_not_influence_native_step_patch_noise_floor(self):
+        clean = np.full((30, 30, 30), 100, np.uint8)
+        damaged = clean.copy()
+        damaged[:6, :, ::2] = 255
+        noise_floors = []
+        with (
+            patch("XTA.registration.fit._candidate_centers", return_value=[(1.0, np.array([15, 15, 15]))]),
+            patch("XTA.registration.fit._ncc_peak", return_value=None) as peak,
+        ):
+            for volume in (clean, damaged):
+                field = np.ones(volume.shape[1:], bool)
+                _patch_matches(volume, clean, field, field, np.eye(4), np.ones(3), np.ones(3),
+                               (6, 0), 2, 3, 20)
+                noise_floors.append(peak.call_args.args[-1])
+        self.assertEqual(noise_floors, [0.1, 0.1])
+
+    def test_affine_fits_shear_and_anisotropic_scale_in_physical_space(self):
+        rng = np.random.default_rng(339)
+        source = rng.uniform(0, 300, (60, 3))
+        sf, sm = np.array([2., 3., 4.]), np.array([1.5, 2.5, 5.])
+        linear = np.array([[1.1, 0.04, 0.05], [-0.03, 0.94, 0.08], [0.01, 0.02, 1.05]])
+        translation = np.array([16., -22., 12.])
+        target = (source * sf @ linear.T + translation) / sm
+        native, physical = _fit_affine_points(source[:40], target[:40], sf, sm)
+        np.testing.assert_allclose(physical[:3, :3], linear, atol=1e-8)
+        np.testing.assert_allclose(physical[:3, 3], translation, atol=1e-8)
+        models = {"affine": native}
+        for name, allow_scale in (("calibrated_rigid", False), ("similarity", True)):
+            models[name] = _fit_points(source[:40], target[:40], sf, sm, allow_scale)[0]
+        metrics = {
+            name: {"heldout_error": _errors(source[40:] @ matrix[:3, :3].T + matrix[:3, 3] - target[40:])}
+            for name, matrix in models.items()
+        }
+        self.assertEqual(_select_correspondence_model(metrics, 0.2, 0.4), "affine")
+        source[:, 2] = 0
+        with self.assertRaisesRegex(ValueError, "span three dimensions"):
+            _fit_affine_points(source, target, sf, sm)
+
     def test_homogeneous_search_has_no_artificial_ncc_peak(self):
         rng = np.random.default_rng(881)
         template = rng.normal(70, 5, (9, 9, 9))

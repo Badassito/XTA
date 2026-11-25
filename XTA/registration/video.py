@@ -245,11 +245,19 @@ def decoded_volume(path, work_dir, *, info=None, threads=4):
             volume._mmap.close()
 
 
-def prepare_pyramid(volume, step):
+def _first_usable_frame(value, depth):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or not 0 <= value < depth:
+        raise ValueError("The first usable frame must be a native frame index inside the volume")
+    return int(value)
+
+
+def prepare_pyramid(volume, step, *, exclude_first=0):
     """Return a low-pass-filtered uint8 ZYX grid sampled at native origin zero.
 
     ``step`` must be a power of two. Only reduced XY planes and one output
     volume are held in memory, so native 18 GB input stacks can remain mapped.
+    Filter taps reflect at the first usable plane without changing the origin
+    of the sampling grid.
     """
     import cv2
 
@@ -257,6 +265,7 @@ def prepare_pyramid(volume, step):
         raise ValueError("Pyramid step must be a positive power of two")
     if volume.ndim != 3 or volume.dtype != np.uint8 or min(volume.shape) < 1:
         raise ValueError("Pyramid input must be a nonempty uint8 ZYX volume")
+    first = _first_usable_frame(exclude_first, volume.shape[0])
     step = int(step)
     if step == 1:
         return np.asarray(volume)
@@ -273,11 +282,15 @@ def prepare_pyramid(volume, step):
     reduced = {}
     for oz in range(shape[0]):
         native_z = oz * step
+        if native_z < first:
+            output[oz] = 0
+            continue
         reduced = {z: a for z, a in reduced.items() if z >= native_z - radius}
         plane = np.zeros(shape[1:], np.float32)
         for offset, weight in enumerate(kernel):
-            z = cv2.borderInterpolate(
-                native_z + offset - radius, volume.shape[0], cv2.BORDER_REFLECT_101
+            z = first + cv2.borderInterpolate(
+                native_z + offset - radius - first, volume.shape[0] - first,
+                cv2.BORDER_REFLECT_101,
             )
             if z not in reduced:
                 small = volume[z]
@@ -291,19 +304,21 @@ def prepare_pyramid(volume, step):
     return output
 
 
-def observed_field(volume, *, black_exterior=False):
+def observed_field(volume, *, black_exterior=False, exclude_first=0):
     """Return a conservative native YX acquisition mask.
 
     With ``black_exterior=True``, several planes locate the gray-to-black
-    acquisition boundary. Internal dark holes are retained as observed. With
-    ordinary imagery the full rectangular array is considered observed.
+    acquisition boundary using only frames at or after ``exclude_first``.
+    Internal dark holes are retained as observed. With ordinary imagery the
+    full rectangular array is considered observed.
     """
     if volume.ndim != 3 or volume.dtype != np.uint8 or min(volume.shape) <= 0:
         raise ValueError("Observed-field input must be a nonempty uint8 ZYX volume")
+    first = _first_usable_frame(exclude_first, volume.shape[0])
     if not black_exterior:
         return np.ones(volume.shape[1:], dtype=bool)
     masks = []
-    for z in sorted({0, volume.shape[0] // 2, volume.shape[0] - 1}):
+    for z in sorted({first, first + (volume.shape[0] - first) // 2, volume.shape[0] - 1}):
         plane = np.asarray(volume[z])
         positive = plane[plane > 0]
         if not positive.size:

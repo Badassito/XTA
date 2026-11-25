@@ -21,7 +21,7 @@ FUNCTIONS = {
     "_remove_marked_regions", "_xta_segment_review_identity", "_xta_edit_scope_includes",
     "_xta_cutoff_label", "_xta_current_edit_scope", "SelectEditScope", "_xta_edit_scope_button_text",
     "_xta_surfaces_button_text", "_xta_refresh_review_actions", "ExportDisplayedXTAEdits",
-    "_xta_edit_scope_for", "_xta_display_store_backed", "_xta_new_review_edit_scope",
+    "_xta_edit_scope_for", "_xta_display_store_backed", "_xta_new_review_edit_scope", "_xta_current_native_window",
 }
 CONSTANTS = {"_XTA_EDIT_SCOPE_LABELS", "_XTA_STORE_EDIT_SCOPE_LABELS", "_XTA_EDIT_SCOPE_BUTTONS",
              "_xta_edit_scope", "_xta_store_edit_scope"}

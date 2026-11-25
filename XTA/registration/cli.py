@@ -46,12 +46,23 @@ def _build_parser():
         nargs="+",
         default=[0],
         metavar="N",
-        help="Exclude the first N native frames from fitting, or supply fixed and moving counts separately",
+        help="Exclude the first N native frames from field detection and fitting, or give two counts",
     )
     fit.add_argument(
         "--black-exterior",
         action="store_true",
         help="Infer each scan's acquisition field from a black exterior",
+    )
+    fit.add_argument(
+        "--contrast",
+        choices=("bright", "both"),
+        default="bright",
+        help="Fit bright features above the local background, or use signed contrast for bright and dark features",
+    )
+    fit.add_argument(
+        "--affine",
+        action="store_true",
+        help="Evaluate a full affine refinement with shear and anisotropic scale on held-out patches",
     )
     fit.add_argument(
         "--broad-search",
@@ -93,7 +104,7 @@ def _build_parser():
         help="Reslice annotated voxel slabs into partial native-target YOLO labels and exact masks",
     )
     nrrd = cmds.add_parser(
-        "nrrd", help="Resample a scalar NRRD labelmap using nearest-neighbor interpolation"
+        "nrrd", help="Resample an integer labelmap or Slicer .seg.nrrd using nearest neighbors"
     )
     pairs = cmds.add_parser(
         "pairs",
@@ -137,7 +148,7 @@ def _build_parser():
     nrrd.add_argument(
         "--source-grid-aligned",
         action="store_true",
-        help="Assert that the full source label array already matches the packet source indices",
+        help="Assert native source index axes, using a Slicer crop offset when present",
     )
     nrrd.add_argument(
         "--target-reference",

@@ -236,19 +236,19 @@ def test_direct_sibling_decode_unavailable_invalidates_fanout_but_keeps_floor(mo
     assert len(sink.disabled) == 1 and not sink.results
     assert cache.stores == cache.lookups == 0
 
-def test_direct_fanout_prefers_qualified_cumulative_proto_consumer(monkeypatch):
+def test_direct_fanout_prefers_cumulative_retina_consumer(monkeypatch):
     from XTA import sweep_proto
     sink = Sink()
     calls = []
     def cumulative(*args, **kwargs):
         calls.append((args, kwargs))
         return True
-    monkeypatch.setattr(sweep_proto, 'consume_tiled_siblings', cumulative)
+    monkeypatch.setattr(sweep_proto, 'consume_sibling_bins', cumulative)
     # A successful cumulative consumer must return before reading the raw head.
-    assert inference._direct_native_fanout_siblings(sink, 4, None, None, None, allow_tiled=True)
+    assert inference._direct_native_fanout_siblings(sink, 4, None, None, None)
     assert len(calls) == 1
     assert calls[0][0][:2] == (sink, 4)
-    assert calls[0][1] == {'allow_tiled': True}
+    assert calls[0][1] == {}
 
 @pytest.mark.skipif(os.environ.get('XTA_TEST_NATIVE_FANOUT_CUDA') != '1',
     reason='explicit coordinated native-fanout CUDA qualification only')
@@ -339,12 +339,12 @@ def test_real_cuda_ring_native_fanout_matches_independent_scalar_post(dtype_name
     assert ex.confidence_threshold == .2 and slot.post_valid and union.written[0]
 
 @pytest.mark.parametrize('dtype_name', ['float16', 'float32'])
-def test_ring_bucket_counts_match_exact_fp32_scalar_gates(dtype_name):
+@pytest.mark.parametrize('cutoffs', [(90, 100), (50, 70, 90, 100), (50, 60, 70, 90, 100)])
+def test_ring_cutoff_counts_match_exact_fp32_scalar_gates(dtype_name, cutoffs):
     torch = pytest.importorskip('torch')
     head = torch.zeros((1, 37, 12), dtype=getattr(torch, dtype_name))
     head[0, 4] = torch.tensor([.2, .5, .6, .7, .9, 1., .4999, .7001,
                              float('nan'), -float('inf'), float('inf'), 0.])
-    cutoffs = (50, 60, 70, 90, 100)
     actual = backprojection._ring_native_cutoff_counts(head, .2, cutoffs)
     expected = tuple(int((head[0, 4].float() >= np.float32(gate)).sum())
                      for gate in (.2, *[cutoff / 100. for cutoff in cutoffs]))

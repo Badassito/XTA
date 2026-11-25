@@ -443,7 +443,7 @@ def _shell_rank_projection_reader(source, view, shape, budget, boxes, output_bbo
             yield None
             return
         try:
-            plan = projection._build_radial_plane_plan(view,
+            plan, plan_reused = projection._radial_plane_plan(view,
                 np.asarray(radial_global_radii(view), np.float64), shape,
                 max_plan_bytes=plan_limit, build_chunk_pixels=strip)
         except projection._RadialPlanePlanTooLarge:
@@ -451,8 +451,10 @@ def _shell_rank_projection_reader(source, view, shape, budget, boxes, output_bbo
             yield None
             return
         meta_chunk = max(int(view.src_w), min(128 * 1024, max(1, available // 256)))
-        build_peak = minimum + max(3 * plan_limit + 256 * strip,
+        build_peak = minimum + max(0 if plan_reused else 3 * plan_limit + 256 * strip,
                                    int(plan.nbytes) + 64 * meta_chunk)
+        update(radial_plan_reused=bool(plan_reused))
+        _telemetry(f'sweep.rank_gpu.radial_plan.{"reused" if plan_reused else "built"}')
         if build_peak > budget:
             update(reason='radial_metadata_credit', host_peak_bytes=build_peak)
             yield None
@@ -469,7 +471,7 @@ def _shell_rank_projection_reader(source, view, shape, budget, boxes, output_bbo
             yield None
             return
         geometry_bytes = geometry_estimate
-        purpose = f'Spherical source projection {view.name}'
+        purpose = f'Spherical source projection {view.name}{_SIBLING_PURPOSE_SUFFIX}'
     available_blocks = (budget - upload - 2 * plane - geometry_bytes - control) // (2 * plane)
     if available_blocks < 1 or build_peak > budget:
         update(reason='shell_host_credit', host_peak_bytes=build_peak)
@@ -505,7 +507,7 @@ def _shell_rank_projection_reader(source, view, shape, budget, boxes, output_bbo
         decline = 'shell_stage_unavailable'
     else:
         stage = projection._try_spherical_cuda_stage(source, view, shape, boxes, quiet=True,
-            scalar_max=True, block_bytes=block_bytes, upload_bytes=upload)
+            scalar_max=True, block_bytes=block_bytes, upload_bytes=upload, purpose=purpose)
         decline = 'shell_stage_unavailable'
     if stage is None:
         from .backprojection import _cancel_main_process_spherical_retirement_request

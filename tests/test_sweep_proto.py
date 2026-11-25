@@ -27,7 +27,7 @@ def test_entirely_empty_frame_has_no_packed_head():
 
 @pytest.mark.skipif(os.getenv("XTA_TEST_NATIVE_FANOUT_CUDA") != "1", reason="explicit CUDA qualification")
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
-def test_cuda_disjoint_maxima_match_scalar_tiled_compaction(dtype, monkeypatch):
+def test_cuda_retina_bins_match_independent_cutoff_decoding(dtype, monkeypatch):
     from XTA import inference
     torch = pytest.importorskip("torch")
     pytest.importorskip("cupy")
@@ -65,5 +65,5 @@ def test_cuda_disjoint_maxima_match_scalar_tiled_compaction(dtype, monkeypatch):
             seen.append(cent)
 
     seen = []
-    assert sweep_proto.consume_tiled_siblings(Check(), 0, head, proto, image, allow_tiled=True)
+    assert sweep_proto.consume_sibling_bins(Check(), 0, head, proto, image)
     assert seen == list(reversed(Check.cutoffs))

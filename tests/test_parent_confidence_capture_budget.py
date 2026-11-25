@@ -27,6 +27,28 @@ def test_capture_planner_receives_real_canvas_and_allocated_parent_workers():
     resolve.assert_called_once_with((1931, 2048, 2048), 32, workspace_bytes=256*1024**2)
 
 
+def test_eager_parent_charges_source_projection_before_dispatch(tmp_path):
+    cutoff_plan = pipeline._parent_confidence_capture_plan(
+        (3, 4, 5), 1, enabled=True, source_projection=True)
+    credit = confidence_evidence.SOURCE_SCORE_PROJECTION_WORKSPACE_BYTES
+    assert cutoff_plan.workspace_bytes == cutoff_plan.source_projection_workspace_bytes == credit
+
+    function, ns, view, _, _, _, executor, _, _ = submission(tmp_path, ready=True, staged=False)
+    ns['defer_score_projection'] = False
+    ns['args'].reconciliation_retain_confidence = True
+    ns['interpolation_settings'].backend = 'sdf'
+    function('model', view)
+    task = executor.submit.call_args.args[0]
+    assert task.prepare.keywords['capture_plan'].workspace_bytes == credit
+    assert task.transient_bytes == 2*60+4*GIB+credit
+
+    native_shape = (3, 4, 5)
+    policy = pipeline._policy_parent_prepare_transient_bytes(
+        [dict(kind='fullframe', processing_shape=native_shape, view=view)], 60, 1,
+        interpolation_distance=0, retain_confidence=True, source_projection=True)
+    assert policy == 2*GIB+credit
+
+
 @pytest.mark.parametrize('failure', [False, True])
 def test_prepare_scope_is_bounded_to_call_and_unwinds_failure(failure):
     plan, calls = object(), []
@@ -108,7 +130,8 @@ def test_submitted_capture_scope_runs_inside_exact_parent_reservation(tmp_path):
     ns['prepare_view_volume_after_fullframe'] = prepare
     function('model', view)
     task = executor.submit.call_args.args[0]
-    ns['_parent_confidence_capture_plan'].assert_called_once_with((3, 4, 5), 32, enabled=True)
+    ns['_parent_confidence_capture_plan'].assert_called_once_with(
+        (3, 4, 5), 32, enabled=True, source_projection=False)
     assert task.transient_bytes == 2*60+4*GIB+plan.workspace_bytes
     with mock.patch.object(confidence_evidence, 'confidence_capture_resources', scope, create=True):
         assert task() is prepared
@@ -146,7 +169,8 @@ def test_disabled_missing_score_or_d1_published_parent_has_zero_capture_charge(
         ns['d1_view_shadow_path_by_parent'][key] = tmp_path/'immutable_shadow.cvol'
     ns['_parent_confidence_capture_plan'] = mock.Mock(return_value=None)
     function('model', view)
-    assert ns['_parent_confidence_capture_plan'].call_args.kwargs == dict(enabled=False)
+    assert ns['_parent_confidence_capture_plan'].call_args.kwargs == dict(
+        enabled=False, source_projection=False)
     task = executor.submit.call_args.args[0]
     assert task.transient_bytes == 2*60+4*GIB
     assert task.prepare.keywords['capture_plan'] is None

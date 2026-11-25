@@ -39,7 +39,7 @@ class LtaConfigTests(unittest.TestCase):
     def test_help_describes_always_saved_union_and_filter_checkpoints(self) -> None:
         help_text = " ".join(build_lta_argparser().format_help().split())
         self.assertIn("a complete NRRD checkpoint after each requested filter", help_text)
-        self.assertIn("Filter checkpoints precede hard-positive restoration", help_text)
+        self.assertIn("preserve the manual foreground and background on annotated slices", help_text)
         # Planning-only geometries parse but are not advertised.
         for option in ("--enable_azimuthal", "--enable_radial", "--radial_min_radius",
                        "--enable_spherical", "--spherical_min_radius", "--enable_tilted",

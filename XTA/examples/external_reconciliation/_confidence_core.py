@@ -4,13 +4,10 @@ from __future__ import annotations
 import numpy as np
 from scipy import ndimage as ndi
 
+from ._morphology import candidate_window, disk
+
 
 CROSS = ndi.generate_binary_structure(2, 1)
-
-
-def _disk(radius):
-    y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
-    return x * x + y * y <= radius * radius
 
 
 def _decide_slice(candidate, score, support, direct, anchored, *, core_radius, rescue_radius):
@@ -18,15 +15,14 @@ def _decide_slice(candidate, score, support, direct, anchored, *, core_radius, r
         if isinstance(radius, bool) or int(radius) != radius or radius < 1:
             raise ValueError('Spatial radii must be positive integers')
     candidate = np.asarray(candidate, dtype=bool)
-    observed = candidate & (direct >= 1) & (support >= 1) & (score > 0)
     trusted = candidate & (
         ((direct >= 2) & (support >= 2) & anchored & (score >= 1.1))
         | ((direct >= 3) & (support >= 3) & (score >= 2.1))
     )
-    cores = ndi.binary_opening(trusted, structure=_disk(core_radius), border_value=0)
+    cores = ndi.binary_opening(trusted, structure=disk(core_radius), border_value=0)
     if not np.any(cores):
-        return np.zeros_like(candidate)
-    eligible = observed & (score >= .65)
+        return cores
+    eligible = candidate & (direct >= 1) & (support >= 1) & (score >= .65)
     keep = ndi.binary_dilation(cores, structure=CROSS, iterations=rescue_radius, mask=eligible)
     return keep & candidate
 
@@ -40,11 +36,15 @@ def build_core_rescue():
         rescue_radius = max(1, int(round(shorter * .005)))
         result = np.zeros_like(candidate, dtype=bool)
         for z in range(candidate.shape[0]):
-            if not np.any(candidate[z]):
+            window = candidate_window(candidate[z])
+            if window is None:
                 continue
-            result[z] = _decide_slice(
-                candidate[z], block['score'][z], block['support'][z],
-                block['prediction_support'][z], block['anchored'][z],
+            # All policy stages treat pixels outside the candidate as false.
+            # Keep the radii from the full grid when restricting the work.
+            plane_window = (z, *window)
+            result[plane_window] = _decide_slice(
+                candidate[plane_window], block['score'][plane_window], block['support'][plane_window],
+                block['prediction_support'][plane_window], block['anchored'][plane_window],
                 core_radius=core_radius, rescue_radius=rescue_radius,
             )
         return result

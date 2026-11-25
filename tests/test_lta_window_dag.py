@@ -93,10 +93,16 @@ class LtaWindowDagTests(unittest.TestCase):
         self.worker_collection_requests = batch_fake_worker_collections(self)
 
     def run_driver(self, root, *, windowed, order="roots_first", empty_backward=False, corrupt_dogfood=False,
-                   devices=(0, 1, 2, 3), workers_per_device=1, backend="reference"):
+                   devices=(0, 1, 2, 3), workers_per_device=1, backend="reference", bounded=False):
+        from contextlib import nullcontext
+
+        from XTA.lta_interval_execution import DirectionalHandoff
+        from XTA.lta_windows import plan_neighbor_anchor_domains
+
         root.mkdir(parents=True)
         count = 120 if empty_backward else 59
         anchors = (50,) if empty_backward else (19, 37)
+        domains = plan_neighbor_anchor_domains(anchors, count) if bounded else None
         tiles = plan_tile_grid(source_width=6, source_height=4, tile_size=4, tile_stride=2)
         grid = LtaTileGridPlan("s4_st2", 4, 2, tiles)
         view = SimpleNamespace(volume_id="volume", physical_view_id="transverse", runtime_view_id="transverse__tta_a0", frame_count=count, frame_height=4, frame_width=6, tile_grids=(grid,))
@@ -111,7 +117,7 @@ class LtaWindowDagTests(unittest.TestCase):
             lineage = LtaLineageId("volume", "transverse", view.runtime_view_id, f"object-{index}", tile_config_id=grid.config_id)
             by_frame[anchor] = (LtaMaskSeed(lineage, anchor, 0, mask, visited_tile_indices=(0,)),)
         with mock.patch("XTA.lta_execution._seeds_for_tile", side_effect=lambda *_args, **_kwargs: by_frame if _args[4] == 0 else {}), mock.patch("XTA.lta_execution.PRODUCTION_LTA_RELAY_MIN_PIXELS", 1):
-            chains, inventory = _plan_initial_chains(SimpleNamespace(volume_id="volume"), (), view, cache, temp_root=root, conf=0.15, empty_frame_limit=30)
+            chains, inventory = _plan_initial_chains(SimpleNamespace(volume_id="volume"), (), view, cache, temp_root=root, conf=0.15, empty_frame_limit=30, anchor_domains=domains)
         tasks = _plan_window_tasks(chains) if windowed else chains
         scheduler = LtaViewAffinityScheduler((task.work for task in tasks), devices, helper_queue_order="head", max_relay_generation=20,
                                               workers_per_device=workers_per_device)
@@ -150,13 +156,37 @@ class LtaWindowDagTests(unittest.TestCase):
 
         # The predictor alone is synthetic. Rendering, seed artifacts, session
         # wrapper, sparse union transport, relays, scheduler and driver are real.
-        with mock.patch("XTA.lta_propagation.run_mask_injected_session", side_effect=propagate), mock.patch("XTA.lta_execution.PRODUCTION_LTA_RELAY_MIN_PIXELS", 1):
+        with (
+            mock.patch("XTA.lta_propagation.run_mask_injected_session", side_effect=propagate),
+            mock.patch("XTA.lta_execution.PRODUCTION_LTA_RELAY_MIN_PIXELS", 1),
+            DirectionalHandoff(root, union, domains) if bounded else nullcontext() as handoff,
+        ):
+            if handoff is not None:
+                handoff.bind_seed_inventory(inventory)
+                options["handoff"] = handoff
             result = driver(
                 scheduler=scheduler, pool=pool, initial=tasks, view_plan=view,
                 cache_ref=cache, view_union=union, **options,
                 temp_root=root, conf=0.15, empty_frame_limit=30, worker_task_timeout=30,
             )
+            if handoff is not None:
+                handoff.compose()
         return union, result, pool, scheduler
+
+    def test_bounded_production_relays_stay_inside_their_anchor_domain(self):
+        with tempfile.TemporaryDirectory() as folder:
+            union, result, pool, _scheduler = self.run_driver(
+                Path(folder) / "neighbor-boundaries", windowed=True, backend="canonical", bounded=True,
+            )
+        schedule = result[2]
+        assert any(packet["frontier_wave"] is not None for packet in pool.packets)
+        assert {row["authoritative_anchor_frame"] for row in schedule} == {19, 37}
+        for row in schedule:
+            first, stop = (19, 37) if row["authoritative_anchor_frame"] == 19 else (20, 38)
+            assert first <= row["frame_start"] < row["frame_stop"] <= stop
+        assert np.count_nonzero(union) == 19
+        assert union[19, 1, 3] and not union[19, 2, 3]
+        assert union[37, 2, 3] and not union[37, 1, 3]
 
     def test_production_canonical_matches_generation_reference_and_expected_union(self):
         with tempfile.TemporaryDirectory() as folder:

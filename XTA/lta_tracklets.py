@@ -25,6 +25,163 @@ def _numpy():
     return np
 
 
+def _component_pairings(left_labels, left_stats, left_centers, right_labels, right_stats, right_centers,
+                        matchable):
+    """Pair nearby, similarly sized components in the same native plane."""
+    from scipy.spatial import cKDTree
+
+    np = _numpy()
+    left_count, right_count = len(left_stats) - 1, len(right_stats) - 1
+    if matchable is None:
+        left_ids = np.arange(1, left_count + 1)
+        right_ids = np.arange(1, right_count + 1)
+    else:
+        boundary = ~matchable
+        left_ids = np.setdiff1d(np.arange(1, left_count + 1), np.unique(left_labels[boundary]))
+        right_ids = np.setdiff1d(np.arange(1, right_count + 1), np.unique(right_labels[boundary]))
+    if not left_ids.size or not right_ids.size:
+        return (), set(range(1, left_count + 1)), set(range(1, right_count + 1))
+    candidates = set()
+    # Both directions can contribute a proposed correspondence when several
+    # nearby branches compete for the same component.
+    for source, source_ids, target, target_ids, reverse in (
+        (left_centers, left_ids, right_centers, right_ids, False),
+        (right_centers, right_ids, left_centers, left_ids, True),
+    ):
+        k = min(4, len(target_ids))
+        nearest = cKDTree(target[target_ids]).query(source[source_ids], k=k)[1].reshape(-1, k)
+        for source_id, candidate_ids in zip(source_ids, nearest):
+            for candidate in candidate_ids:
+                pair = int(source_id), int(target_ids[int(candidate)])
+                candidates.add(pair[::-1] if reverse else pair)
+    scores = []
+    for left_id, right_id in candidates:
+        x0, y0, w0, h0, area0 = map(int, left_stats[left_id])
+        x1, y1, w1, h1, area1 = map(int, right_stats[right_id])
+        x, y = max(x0, x1), max(y0, y1)
+        stop_x, stop_y = min(x0 + w0, x1 + w1), min(y0 + h0, y1 + h1)
+        overlap = 0
+        if x < stop_x and y < stop_y:
+            section = np.s_[y:stop_y, x:stop_x]
+            overlap = int(np.count_nonzero((left_labels[section] == left_id) & (right_labels[section] == right_id)))
+        smaller, larger = min(area0, area1), max(area0, area1)
+        distance = float(np.linalg.norm(left_centers[left_id] - right_centers[right_id]))
+        reach = max(2.0, 2.0 * math.sqrt(smaller / math.pi))
+        if overlap * 2 < smaller and (distance > reach or smaller * 4 < larger):
+            continue
+        iou = overlap / (area0 + area1 - overlap)
+        scores.append((-iou, distance / reach, 1.0 - smaller / larger, left_id, right_id))
+    matched_left, matched_right, pairs = set(), set(), []
+    for _iou, _distance, _size, left_id, right_id in sorted(scores):
+        if left_id not in matched_left and right_id not in matched_right:
+            pairs.append((left_id, right_id))
+            matched_left.add(left_id)
+            matched_right.add(right_id)
+    return pairs, set(range(1, left_count + 1)) - matched_left, set(range(1, right_count + 1)) - matched_right
+
+
+def _centered_component(labels, stats, center_xy, label):
+    np = _numpy()
+    x, y, width, height, _area = map(int, stats[label])
+    component = labels[y:y + height, x:x + width] == label
+    cy, cx = float(center_xy[label, 1]) - y, float(center_xy[label, 0]) - x
+    # Snap the centroid to an interior pixel. Corresponding signed-distance
+    # fields then share at least one foreground point even for hollow shapes.
+    row, column = round(cy), round(cx)
+    if not component[row, column]:
+        # A hollow component can cover most of a native plane. Bound the
+        # temporary coordinate arrays and keep row-major ordering for ties.
+        band_rows = max(1, 65536 // width)
+        best_distance = math.inf
+        for start in range(0, height, band_rows):
+            rows, columns = np.nonzero(component[start:start + band_rows])
+            if rows.size:
+                rows += start
+                distances = (rows - cy) ** 2 + (columns - cx) ** 2
+                nearest = int(np.argmin(distances))
+                if distances[nearest] < best_distance:
+                    best_distance = distances[nearest]
+                    row, column = int(rows[nearest]), int(columns[nearest])
+    center = y + row, x + column
+    return component, (y - center[0], x - center[1]), center
+
+
+def _paste_centered_blend(output, left, right, fraction):
+    import cv2
+
+    np = _numpy()
+    top = min(left[1][0], right[1][0]) - 1
+    left_edge = min(left[1][1], right[1][1]) - 1
+    height = max(item[1][0] + item[0].shape[0] for item in (left, right)) + 1 - top
+    width = max(item[1][1] + item[0].shape[1] for item in (left, right)) + 1 - left_edge
+    canvas = np.zeros((height, width), dtype=np.uint8)
+    blend = None
+    for (component, (y, x), _center), weight in ((left, 1.0 - fraction), (right, fraction)):
+        canvas[y - top:y - top + component.shape[0], x - left_edge:x - left_edge + component.shape[1]] = component
+        field = cv2.distanceTransform(canvas, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        canvas ^= 1
+        field -= cv2.distanceTransform(canvas, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        field *= weight
+        if blend is None:
+            blend = field
+        else:
+            blend += field
+        canvas.fill(0)
+    center_y = round((1.0 - fraction) * left[2][0] + fraction * right[2][0])
+    center_x = round((1.0 - fraction) * left[2][1] + fraction * right[2][1])
+    y, x = top + center_y, left_edge + center_x
+    y0, x0 = max(y, 0), max(x, 0)
+    y1, x1 = min(y + height, output.shape[0]), min(x + width, output.shape[1])
+    output[y0:y1, x0:x1] |= blend[y0 - y:y1 - y, x0 - x:x1 - x] >= 0
+
+
+def blend_directional_masks(forward, backward, fraction, *, matchable=None):
+    """Blend matched components around moving centers, retaining unmatched branches."""
+    import cv2
+
+    np = _numpy()
+    left = np.ascontiguousarray(forward, dtype=np.uint8)
+    right = np.ascontiguousarray(backward, dtype=np.uint8)
+    if left.ndim != 2 or left.shape != right.shape:
+        raise ValueError("opposing LTA masks must be equally sized planes")
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("LTA handoff fraction must be in [0,1]")
+    if fraction == 0.0:
+        return left
+    if fraction == 1.0:
+        return right
+    if np.array_equal(left, right) or not np.any(right):
+        return left
+    if not np.any(left):
+        return right
+    # Limit component labels to the union's occupied rectangle. Distance
+    # fields are further restricted to one matched component pair at a time.
+    x, y, width, height = cv2.boundingRect(left | right)
+    region = np.s_[y:y + height, x:x + width]
+    if matchable is not None:
+        matchable = matchable[region]
+    _, left_labels, left_stats, left_centers = cv2.connectedComponentsWithStats(np.ascontiguousarray(left[region]), connectivity=8)
+    _, right_labels, right_stats, right_centers = cv2.connectedComponentsWithStats(np.ascontiguousarray(right[region]), connectivity=8)
+    pairs, unmatched_left, unmatched_right = _component_pairings(
+        left_labels, left_stats, left_centers, right_labels, right_stats, right_centers, matchable,
+    )
+    output = np.zeros_like(left)
+    destination = output[region]
+    for labels, stats, unmatched in ((left_labels, left_stats, unmatched_left), (right_labels, right_stats, unmatched_right)):
+        if unmatched:
+            keep = np.zeros(len(stats), dtype=np.uint8)
+            keep[list(unmatched)] = 1
+            destination |= keep[labels]
+    for left_id, right_id in pairs:
+        _paste_centered_blend(
+            destination,
+            _centered_component(left_labels, left_stats, left_centers, left_id),
+            _centered_component(right_labels, right_stats, right_centers, right_id),
+            fraction,
+        )
+    return output
+
+
 def _as_nonnegative_int(value: Any, *, name: str) -> int:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be an integer")

@@ -1,6 +1,7 @@
 """TTA adapter for the frontend-independent reconciliation engine."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from contextlib import ExitStack
 import json
@@ -14,6 +15,10 @@ import numpy as np
 from .reconciliation import EvidenceLayer, evidence_role, reconcile
 from .reconciliation_policy import load_reconciliation_policy, validate_policy
 from .runtime import close_memmap_array_without_flush
+from .workspace import _cpu_count
+
+
+_MAX_UNION_COUNT_WORKERS = 2
 
 
 def union_nrrd_exports_can_overlap(layer_sink, assembled_union, *, policy, source_shape_tyx):
@@ -118,6 +123,27 @@ class RuntimeLayer:
         self.ref, self.shape_tyx = ref, tuple(map(int, output_shape))
         self.source = (RawBBoxMaskStore.open(ref.path, mmap_payload=True)
                        if _nrrd_layer_ref_is_raw_bbox_store(ref) else _open_nrrd_layer_ref(ref))
+        self.read_mask_crop = (self.source.decode_slice_crop if isinstance(self.source, RawBBoxMaskStore)
+                               and self.source.shape == self.shape_tyx else None)
+
+    def mask_crop_bounds(self):
+        """Bound foreground using the same slice index as the packed decoder."""
+        if self.read_mask_crop is None:
+            return None
+        index = self.source.index
+        if np.any((index['kind'] != 0) & (index['kind'] != 1)):
+            return None
+        occupied = np.flatnonzero(index['kind'] == 1)
+        if not occupied.size:
+            return (0, 0, 0, 0, 0, 0)
+        bounds = index[occupied]
+        if (np.any(bounds['y0'] < 0) or np.any(bounds['x0'] < 0)
+                or np.any(bounds['y1'] <= bounds['y0']) or np.any(bounds['x1'] <= bounds['x0'])
+                or np.any(bounds['y1'] > self.shape_tyx[1]) or np.any(bounds['x1'] > self.shape_tyx[2])):
+            return None
+        return (int(occupied[0]), int(occupied[-1])+1,
+                int(bounds['y0'].min()), int(bounds['y1'].max()),
+                int(bounds['x0'].min()), int(bounds['x1'].max()))
 
     def read_slab(self, z0, z1):
         from .interpolation import RawBBoxMaskStore
@@ -139,6 +165,7 @@ class RuntimeLayer:
 
     def close(self):
         from .outputs import _close_nrrd_layer_source
+        self.read_mask_crop = None
         if self.source is not None:
             _close_nrrd_layer_source(self.source)
             self.source = None
@@ -153,9 +180,14 @@ def _union_reuse_count_plan(shape_tyx, memory_mib):
     if budget < shape[2]:
         raise ValueError(f'Union counting needs at least {shape[2]} bytes for one row')
     rows = min(shape[1], max(1, budget // shape[2]))
+    window_bytes = rows * shape[2]
+    # Each scan borrows a disjoint Z range. Leave small inputs on the calling
+    # thread, and cap the number of streams competing for memory bandwidth.
+    workers = max(1, min(_MAX_UNION_COUNT_WORKERS, _cpu_count(), shape[0], budget // window_bytes,
+                         math.prod(shape) // (64 * 1024**2)))
     return dict(strategy='reuse_assembled_union', slab_depth=1, count_window_rows=rows,
-                minimum_working_bytes=shape[2], planned_working_bytes=rows * shape[2],
-                bytes_per_voxel=1, new_source_volume_bytes=0)
+                minimum_working_bytes=shape[2], planned_working_bytes=workers * window_bytes,
+                bytes_per_voxel=1, new_source_volume_bytes=0, count_workers=workers)
 
 
 def _reconciliation_refs(refs, shape, *, needs_confidence):
@@ -242,22 +274,46 @@ def _publish_reconciliation_report(report, records, settings, output_dir, *, pub
         pending.unlink(missing_ok=True)
 
 
-def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy, output_dir, publish_report):
+def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy, output_dir,
+                           publish_report, packed_union):
     """Borrow the final additive union, counting it once without rebuilding it."""
     if (not isinstance(assembled_union, np.ndarray) or tuple(assembled_union.shape) != shape
             or assembled_union.dtype not in (np.dtype(np.uint8), np.dtype(np.bool_))):
         raise ValueError('Assembled reconciliation union must be a uint8/bool array on the source grid')
     plan = _union_reuse_count_plan(shape, settings.memory_mib)
-    total, windows = 0, 0
-    # Counting reads borrowed views only. Windows are bounded even when a whole
-    # native XY plane exceeds the requested budget; no dense output is allocated.
-    for z in range(shape[0]):
-        for y in range(0, shape[1], plan['count_window_rows']):
-            window = assembled_union[z, y:y + plan['count_window_rows']]
-            if assembled_union.dtype == np.uint8 and int(window.max(initial=0)) > 1:
-                raise ValueError('Assembled reconciliation union must contain binary 0/1 values')
-            total += int(np.count_nonzero(window))
-            windows += 1
+    if packed_union is not None and packed_union.volume is assembled_union:
+        total = packed_union.foreground_voxels
+        counting = dict(count_source='packed_union_expansion', count_windows=0,
+                        logical_union_count_bytes=0, binary_validation='packed_binary_expansion',
+                        count_window_rows=0, count_workers=0)
+    else:
+        # Windows are bounded even when a native XY plane exceeds the budget.
+        rows = plan['count_window_rows']
+        check_binary = assembled_union.dtype == np.uint8
+        workers = plan['count_workers']
+
+        def count_range(worker):
+            total = 0
+            first = worker * shape[0] // workers
+            stop = (worker + 1) * shape[0] // workers
+            for z in range(first, stop):
+                for y in range(0, shape[1], rows):
+                    window = assembled_union[z, y:y + rows]
+                    if check_binary and int(window.max(initial=0)) > 1:
+                        raise ValueError('Assembled reconciliation union must contain binary 0/1 values')
+                    total += int(np.count_nonzero(window))
+            return total
+
+        if workers == 1:
+            total = count_range(0)
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='xta-union-count') as pool:
+                total = sum(pool.map(count_range, range(workers)))
+        counting = dict(count_source='bounded_assembled_union_count',
+                        count_windows=shape[0] * ((shape[1] + rows - 1) // rows),
+                        logical_union_count_bytes=math.prod(shape) * assembled_union.dtype.itemsize,
+                        binary_validation='maximum_per_count_window' if check_binary else 'boolean_dtype',
+                        count_window_rows=rows, count_workers=workers)
     layers = {identity: dict(group=0, role=evidence_role(metadata), island_weight=1.,
         foreground_voxels=0 if metadata['empty_segment'] else None,
         foreground_count_source='empty_segment_metadata' if metadata['empty_segment'] else 'not_rescanned')
@@ -273,10 +329,7 @@ def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy,
                     confidence_unknown_prediction_voxels=None, anchored_voxels=None),
         execution=dict(strategy='reuse_assembled_union', output_ownership='borrowed',
                        component_payload_reads=0, confidence_payload_reads=0, new_source_volume_bytes=0,
-                       count_source='bounded_assembled_union_count', count_windows=windows,
-                       logical_union_count_bytes=math.prod(shape) * assembled_union.dtype.itemsize,
-                       binary_validation='maximum_per_count_window' if assembled_union.dtype == np.uint8 else 'boolean_dtype',
-                       count_window_rows=plan['count_window_rows']),
+                        **counting),
         unmeasured_counts=['layer_foreground_voxels_without_empty_metadata',
                            'confidence_known_voxels', 'confidence_unknown_prediction_voxels',
                            'duplicate_group_support_removed', 'anchored_voxels'],
@@ -288,8 +341,11 @@ def _reuse_assembled_union(assembled_union, records, *, shape, settings, policy,
 
 def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
                          settings, output_dir, workspace, policy=None, assembled_union=None,
-                         publish_report=True):
+                         packed_union=None, publish_report=True):
     """Produce one source-grid result; component backings remain unmodified."""
+    from .confidence_evidence import ConfidenceEvidenceRef
+    from .confidence_storage import BLOCK_LAYOUT, BLOCK_SCHEMA
+
     policy = load_reconciliation_policy(settings) if policy is None else validate_policy(policy)
     settings.assert_unchanged()
     shape = tuple(map(int, source_shape_tyx))
@@ -297,7 +353,8 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
     records = _reconciliation_refs(refs, shape, needs_confidence=needs_confidence)
     if policy['mode'] == 'union' and policy['decide'] is None and assembled_union is not None:
         return _reuse_assembled_union(assembled_union, records, shape=shape, settings=settings,
-                                     policy=policy, output_dir=output_dir, publish_report=publish_report)
+                                     policy=policy, output_dir=output_dir, publish_report=publish_report,
+                                     packed_union=packed_union)
     output_dir, workspace = Path(output_dir), Path(workspace)
     output_dir.mkdir(parents=True, exist_ok=True)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -307,6 +364,7 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
     context = dict(views_by_name={str(view.name): view for view in views},
                    source_shape_tyx=shape, processing_shape_tyx=tuple(map(int, processing_shape_tyx)))
     owners, confidence_owners, layers = [], [], []
+    parallel_layer_costs = {}
     output = None
     try:
         for identity, ref, metadata, confidence in records:
@@ -315,8 +373,20 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
             confidence_reader = confidence.reader() if needs_confidence and confidence is not None else None
             if confidence_reader is not None:
                 confidence_owners.append(confidence_reader)
+            # Each runtime layer owns an independent directory-backed mask
+            # reader and, in confidence mode, an independent source score reader.
+            private_scores = confidence_reader is None or (
+                type(confidence) is ConfidenceEvidenceRef and confidence.coordinate_space == 'source'
+                and confidence.metadata.get('schema') == BLOCK_SCHEMA
+                and confidence.metadata.get('layout') == BLOCK_LAYOUT)
+            if (owner.read_mask_crop is not None and getattr(ref, 'live_array', None) is None
+                    and Path(ref.path).is_dir() and private_scores):
+                index = owner.source.index
+                decoded_bytes = int(index['payload_nbytes'].sum(dtype=np.uint64))
+                parallel_layer_costs[identity] = max(shape[0] * 64, decoded_bytes) if np.any(index['kind']) else 0
             layers.append(EvidenceLayer(identity, shape, metadata, owner.read_slab,
-                                        confidence_reader))
+                                        confidence_reader, read_mask_crop=owner.read_mask_crop,
+                                        mask_crop_bounds=owner.mask_crop_bounds() if policy['island_weighting'] else None))
         output = np.memmap(path, mode='w+', dtype=np.uint8, shape=shape)
         last = [0.]
         def progress(stage, current, total):
@@ -327,7 +397,8 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
         def write(z0, z1, value):
             output[z0:z1] = value
         report = reconcile(layers, shape_tyx=shape, policy=policy, write_slab=write,
-                           memory_mib=settings.memory_mib, geometry_context=context, progress=progress)
+                           memory_mib=settings.memory_mib, geometry_context=context, progress=progress,
+                           managed_workers=_cpu_count(), parallel_layer_costs=parallel_layer_costs)
         settings.assert_unchanged()
         output.flush()
         _record_source_bridge_survival(report, records, output, settings)

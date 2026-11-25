@@ -4540,10 +4540,8 @@ class RawBBoxMaskStore:
                 # reference lets the mapping close when that final exported view disappears.
                 pass
 
-    def decode_slice_crop(
-        self, idx: int, *, dtype: np.dtype | str | type = np.uint8,
-    ) -> Optional[Tuple[int, int, int, int, np.ndarray]]:
-        """Return only a nonempty slice's decoded bbox crop, or None for an empty slice."""
+    def read_encoded_slice_crop(self, idx: int) -> Optional[Tuple[int, int, int, int, np.ndarray]]:
+        """Read a validated crop in its stored layout, borrowing the payload until close."""
         idx_i = int(idx)
         z_dim, h, w = self.shape
         if idx_i < 0 or idx_i >= int(z_dim):
@@ -4582,29 +4580,24 @@ class RawBBoxMaskStore:
                 f'{self.root}: logical bbox byte count mismatch at slice {idx_i}: '
                 f'{payload_nbytes} != {expected}'
             )
-        if bool(self._packbits_payload):
-            packed_w = int((crop_w + 7) // 8)
-            encoded_expected = int(crop_h * packed_w)
-            if int(payload_size) != int(encoded_expected):
-                raise ValueError(
-                    f'{self.root}: packed payload byte count mismatch at slice {idx_i}: '
-                    f'{payload_size} != {encoded_expected}'
-                )
-            packed = np.frombuffer(
-                payload, dtype=np.uint8, count=int(encoded_expected),
-            ).reshape((crop_h, packed_w))
-            crop = np.unpackbits(
-                packed, axis=1, count=int(crop_w), bitorder='little',
-            )
-        else:
-            if int(payload_size) != int(expected):
-                raise ValueError(
-                    f'{self.root}: raw payload byte count mismatch at slice {idx_i}: '
-                    f'{payload_size} != {expected}'
-                )
-            crop = np.frombuffer(
-                payload, dtype=np.uint8, count=expected,
-            ).reshape((crop_h, crop_w))
+        encoded_width = (crop_w + 7) // 8 if self._packbits_payload else crop_w
+        encoded_expected = crop_h * encoded_width
+        if payload_size != encoded_expected:
+            layout = 'packed' if self._packbits_payload else 'raw'
+            raise ValueError(f'{self.root}: {layout} payload byte count mismatch at slice {idx_i}: '
+                             f'{payload_size} != {encoded_expected}')
+        return y0, x0, y1, x1, np.frombuffer(payload, dtype=np.uint8).reshape(crop_h, encoded_width)
+
+    def decode_slice_crop(
+        self, idx: int, *, dtype: np.dtype | str | type = np.uint8,
+    ) -> Optional[Tuple[int, int, int, int, np.ndarray]]:
+        """Return only a nonempty slice's decoded bbox crop, or None for an empty slice."""
+        encoded = self.read_encoded_slice_crop(idx)
+        if encoded is None:
+            return None
+        y0, x0, y1, x1, crop = encoded
+        if self._packbits_payload:
+            crop = np.unpackbits(crop, axis=1, count=x1 - x0, bitorder='little')
         target_dtype = np.dtype(dtype)
         if crop.dtype != target_dtype:
             crop = crop.astype(target_dtype, copy=False)

@@ -1,4 +1,4 @@
-"""Estimate and validate label-free rigid or similarity volume mappings.
+"""Estimate and validate label-free rigid, similarity or affine volume mappings.
 
 Arrays use ZYX order. Returned matrices map zero-based native XYZ voxel-center
 column vectors from the fixed acquisition to the moving acquisition. A supplied
@@ -35,10 +35,12 @@ def _field(volume, supplied):
     return field
 
 
-def _contrast(volume, field, cut):
+def _contrast(volume, field, cut, mode="bright"):
     result = np.empty(volume.shape, np.float32)
     inside = None
-    for z, plane in enumerate(volume):
+    result[:cut] = 0
+    for z in range(cut, len(volume)):
+        plane = volume[z]
         if inside is None or field.ndim != 2:
             observed = field if field.ndim == 2 else field[z]
             inside = ndimage.binary_erosion(observed, iterations=2)
@@ -46,25 +48,28 @@ def _contrast(volume, field, cut):
             result[z] = 0
             continue
         baseline = float(np.median(plane[inside]))
-        result[z] = np.maximum(plane.astype(np.float32) - baseline, 0)
+        centered = result[z]
+        np.subtract(plane, baseline, out=centered, dtype=np.float32)
+        if mode == "bright":
+            np.maximum(centered, 0, out=centered)
         result[z, ~inside] = 0
-    result[:cut] = 0
-    positive = result[result > 0]
-    if not positive.size:
+    magnitude = result if mode == "bright" else np.abs(result)
+    observed_contrast = magnitude[magnitude > 0]
+    if not observed_contrast.size:
         raise ValueError("Volume has no usable contrast after masking and artifact exclusion")
-    result *= 60.0 / max(float(np.percentile(positive, 90)), 1e-6)
-    np.minimum(result, 150, out=result)
+    result *= 60.0 / max(float(np.percentile(observed_contrast, 90)), 1e-6)
+    np.clip(result, -150.0, 150.0, out=result)
     return result
 
 
 def _geometry(volume, spacing):
     # This receives the globally reduced grid, bounded to 128 samples per axis.
-    indexes = np.column_stack(np.nonzero(volume > 10))
+    indexes = np.column_stack(np.nonzero(np.abs(volume) > 10))
     if len(indexes) < 32:
         raise ValueError("Too little image structure for a 3D initialization")
     if len(indexes) > 80000:
         indexes = indexes[np.linspace(0, len(indexes) - 1, 80000).astype(int)]
-    weights = volume[tuple(indexes.T)].astype(float)
+    weights = np.abs(volume[tuple(indexes.T)]).astype(float)
     points = indexes[:, ::-1] * spacing
     center = np.average(points, weights=weights, axis=0)
     delta = points - center
@@ -90,13 +95,13 @@ def _intensity_score(fixed, moving, matrix, fixed_spacing, moving_spacing, count
     inside = np.all((mapped >= 0) & (mapped < np.asarray(moving.shape[::-1]) - 1), axis=1)
     a = fixed[tuple(indexes.T)]
     b = ndimage.map_coordinates(moving, mapped[:, ::-1].T, order=1, prefilter=False)
-    keep = inside & ((a > 3) | (b > 3))
+    keep = inside & ((np.abs(a) > 3) | (np.abs(b) > 3))
     if keep.sum() < 100 or min(a[keep].std(), b[keep].std()) < 1e-6:
         return -1.0
     return float(np.corrcoef(a[keep], b[keep])[0, 1])
 
 
-def _optimize(fixed, moving, fixed_spacing, moving_spacing, seed, center, similarity, threads):
+def _optimize(fixed, moving, fixed_spacing, moving_spacing, seed, center, model, threads):
     try:
         import SimpleITK as sitk
     except ImportError as error:
@@ -108,11 +113,16 @@ def _optimize(fixed, moving, fixed_spacing, moving_spacing, seed, center, simila
         image = sitk.GetImageFromArray(array)
         image.SetSpacing(tuple(spacing))
         images.append(image)
-    initial = sitk.Similarity3DTransform() if similarity else sitk.VersorRigid3DTransform()
-    scale = float(np.cbrt(np.linalg.det(seed[:3, :3]))) if similarity else 1.0
+    if model == "affine":
+        initial = sitk.AffineTransform(3)
+    elif model == "similarity":
+        initial = sitk.Similarity3DTransform()
+    else:
+        initial = sitk.VersorRigid3DTransform()
+    scale = float(np.cbrt(np.linalg.det(seed[:3, :3]))) if model == "similarity" else 1.0
     initial.SetCenter(tuple(center))
     initial.SetMatrix(tuple((seed[:3, :3] / scale).ravel()))
-    if similarity:
+    if model == "similarity":
         initial.SetScale(scale)
     initial.SetTranslation(tuple(seed[:3, 3] - center + seed[:3, :3] @ center))
     registration = sitk.ImageRegistrationMethod()
@@ -126,7 +136,7 @@ def _optimize(fixed, moving, fixed_spacing, moving_spacing, seed, center, simila
         (registration.SetMetricFixedMask, registration.SetMetricMovingMask),
     ):
         mask = sitk.GetImageFromArray(
-            ndimage.binary_dilation(array > 3, iterations=1).astype(np.uint8)
+            ndimage.binary_dilation(np.abs(array) > 3, iterations=1).astype(np.uint8)
         )
         mask.CopyInformation(image)
         setter(mask)
@@ -185,8 +195,10 @@ def _fft_seeds(fixed, moving, spacing_f, spacing_m, center_f, center_m):
         order=1,
         prefilter=False,
     ).reshape((size,) * 3)
-    f = np.sqrt(np.maximum(f, 0))
-    spectrum = np.fft.rfftn(f, s=(2 * size,) * 3).conj()
+    f = np.copysign(np.sqrt(np.abs(f)), f)
+    fft_shape = (2 * size,) * 3
+    axes = (0, 1, 2)
+    spectrum = np.fft.rfftn(f, s=fft_shape, axes=axes).conj()
     shifts = np.arange(2 * size)
     shifts[shifts >= size] -= 2 * size
     allowed = np.abs(shifts) <= size // 3
@@ -197,14 +209,14 @@ def _fft_seeds(fixed, moving, spacing_f, spacing_m, center_f, center_m):
         a = ndimage.map_coordinates(moving, mapped[::-1], order=1, prefilter=False).reshape(
             (size,) * 3
         )
-        a = np.sqrt(np.maximum(a, 0))
+        a = np.copysign(np.sqrt(np.abs(a)), a)
         norm = np.linalg.norm(a)
         if norm < 1e-8:
             continue
         correlation = np.fft.irfftn(
-            np.fft.rfftn(a, s=(2 * size,) * 3) * spectrum, s=(2 * size,) * 3
+            np.fft.rfftn(a, s=fft_shape, axes=axes) * spectrum, s=fft_shape, axes=axes
         )
-        correlation[~allowed] = -1
+        correlation[~allowed] = -np.inf
         index = np.asarray(np.unravel_index(correlation.argmax(), correlation.shape))
         shift = np.where(index >= size, index - 2 * size, index)[::-1] * step
         matrix = np.eye(4)
@@ -308,8 +320,11 @@ def _patch_matches(
     )[::-1].reshape(3, -1)
     grid_shape = (2 * (radius + search) + 1,) * 3
     candidates = _candidate_centers(fixed, field_f, cuts[0], radius, search, maximum)
+    if not candidates:
+        return [], 0
     rows = []
-    valid_std = max(float(np.std(fixed[:: max(1, len(fixed) // 16)])) * 0.01, 0.1)
+    usable = fixed[cuts[0]:]
+    valid_std = max(float(np.std(usable[:: max(1, len(usable) // 16)])) * 0.01, 0.1)
     for _, center in candidates:
         z, y, x = center[::-1]
         template = fixed[
@@ -406,6 +421,78 @@ def _fit_points(source, target, spacing_f, spacing_m, similarity):
     return native, physical
 
 
+def _proper_linear(linear):
+    return (
+        np.isfinite(linear).all()
+        and np.linalg.det(linear) > 1e-12
+        and np.linalg.cond(linear) < 1e8
+    )
+
+
+def _fit_affine_points(source, target, spacing_f, spacing_m):
+    """Fit all nine linear coefficients and three translations in physical space."""
+    unit = float(spacing_f.mean())
+    source = source * spacing_f / unit
+    target = target * spacing_m / unit
+    ca, cb = source.mean(axis=0), target.mean(axis=0)
+    a, b = source - ca, target - cb
+    if np.linalg.matrix_rank(a) != 3:
+        raise ValueError("Affine training correspondences do not span three dimensions")
+    initial = np.linalg.lstsq(a, b, rcond=None)[0]
+
+    def residual(values):
+        return (a @ values[:9].reshape(3, 3) + values[9:] - b).ravel()
+
+    result = least_squares(
+        residual, np.r_[initial.ravel(), np.zeros(3)], loss="soft_l1", f_scale=3.0, max_nfev=150,
+    )
+    matrix = result.x[:9].reshape(3, 3).T
+    if not result.success or not _proper_linear(matrix):
+        raise ValueError("Affine correspondence fit did not yield an invertible proper mapping")
+    physical = np.eye(4)
+    physical[:3, :3] = matrix
+    physical[:3, 3] = (cb + result.x[9:] - matrix @ ca) * unit
+    native = np.diag([*1 / spacing_m, 1.0]) @ physical @ np.diag([*spacing_f, 1.0])
+    return native, physical
+
+
+def _correspondence_models(source, target, sf, sm, affine):
+    models = {
+        "calibrated_rigid": _fit_points(source, target, sf, sm, False),
+        "similarity": _fit_points(source, target, sf, sm, True),
+    }
+    reason = None
+    if affine:
+        try:
+            models["affine"] = _fit_affine_points(source, target, sf, sm)
+        except (ValueError, np.linalg.LinAlgError) as error:
+            reason = str(error)
+    return models, reason
+
+
+def _select_correspondence_model(models, rigid_rms_margin, rigid_p90_margin):
+    rigid = models["calibrated_rigid"]["heldout_error"]
+    similarity = models["similarity"]["heldout_error"]
+    selected = (
+        "calibrated_rigid"
+        if (
+            rigid["rms"] <= similarity["rms"] + rigid_rms_margin
+            and rigid["p90"] <= similarity["p90"] + rigid_p90_margin
+        )
+        else "similarity"
+    )
+    if "affine" in models:
+        standard = models[selected]["heldout_error"]
+        affine = models["affine"]["heldout_error"]
+        if (
+            affine["rms"] < standard["rms"] - 0.05
+            and affine["p90"] <= standard["p90"]
+            and affine["median"] <= standard["median"]
+        ):
+            return "affine"
+    return selected
+
+
 def _errors(residuals):
     lengths = np.linalg.norm(residuals, axis=1)
     return dict(
@@ -428,6 +515,8 @@ def fit_registration(
     artifact_start_z=(0, 0),
     fixed_mask_yx=None,
     moving_mask_yx=None,
+    contrast="bright",
+    affine=False,
     broad_search=False,
     max_patches=400,
     threads=4,
@@ -435,14 +524,17 @@ def fit_registration(
     minimum_matches=20,
     maximum_median_error_voxels=None,
 ):
-    """Fit a physical rigid or similarity map and withhold unsupported results.
+    """Fit a physical map and withhold unsupported results.
 
     ``artifact_start_z`` gives the first usable original Z index in each scan.
     ``fixed_step_xyz`` and ``moving_step_xyz`` describe origin-zero pyramids in
     original voxel indices. Field masks follow the supplied array grid. Omitted
-    masks treat the complete array as observed, including zero-valued pixels. Global
-    search uses all proper PCA axis permutations. ``broad_search`` also samples
-    768 reproducible proper rotations and optimizes translation by zero-padded
+    masks treat the complete array as observed, including zero-valued pixels.
+    ``contrast="both"`` retains signed deviations from each slice's median.
+    ``affine=True`` evaluates an affine candidate in addition to rigid and
+    similarity models. Global search uses all proper PCA axis permutations.
+    ``broad_search`` also samples 768 reproducible proper rotations and
+    optimizes translation by zero-padded
     FFT correlation on a coarse cube. Spatial blocks withheld from local
     fitting provide patch-resolution validation. Their image intensities were
     also available to global fitting, so they are no substitute for independent
@@ -470,6 +562,8 @@ def fit_registration(
         raise ValueError("artifact_start_z must give two nonnegative native frame indices")
     if not 20 <= max_patches <= 10000 or not 1 <= threads <= 64 or minimum_matches < 12:
         raise ValueError("Invalid patch count, thread count or minimum correspondence count")
+    if contrast not in ("bright", "both"):
+        raise ValueError("contrast must be 'bright' or 'both'")
     if maximum_median_error_voxels is not None and (
         not np.isfinite(maximum_median_error_voxels) or maximum_median_error_voxels <= 0
     ):
@@ -495,12 +589,14 @@ def fit_registration(
         moving_step_xyz=pm.tolist(),
         artifact_start_z=cuts_native.tolist(),
         labels_used=False,
+        contrast=contrast,
+        affine_enabled=bool(affine),
         broad_search=bool(broad_search),
         validation_resolution_native_voxels=pm.tolist(),
     )
     try:
-        f = _contrast(cf_volume, coarse_fields[0], int(np.ceil(cuts[0] / shrink)))
-        m = _contrast(cm_volume, coarse_fields[1], int(np.ceil(cuts[1] / shrink)))
+        f = _contrast(cf_volume, coarse_fields[0], int(np.ceil(cuts[0] / shrink)), contrast)
+        m = _contrast(cm_volume, coarse_fields[1], int(np.ceil(cuts[1] / shrink)), contrast)
         seeds, center = _global_seeds(f, m, spacing_f / unit, spacing_m / unit, broad_search)
     except ValueError as error:
         return dict(result, reason=str(error), elapsed_seconds=time.monotonic() - started)
@@ -529,7 +625,7 @@ def fit_registration(
     for _, seed in seeds[:6]:
         try:
             fitted = _optimize(
-                f, m, spacing_f / unit, spacing_m / unit, seed, center, False, threads
+                f, m, spacing_f / unit, spacing_m / unit, seed, center, "calibrated_rigid", threads
             )
             score = _intensity_score(f, m, fitted, spacing_f / unit, spacing_m / unit)
             candidates.append((score, fitted))
@@ -546,13 +642,17 @@ def fit_registration(
             elapsed_seconds=time.monotonic() - started,
         )
     candidates.sort(key=lambda row: row[0], reverse=True)
-    _, best = candidates[0]
-    try:
-        sim = _optimize(f, m, spacing_f / unit, spacing_m / unit, best, center, True, threads)
-        if _intensity_score(f, m, sim, spacing_f / unit, spacing_m / unit) > candidates[0][0]:
-            best = sim
-    except RuntimeError:
-        pass
+    best_score, best = candidates[0]
+    global_model = "calibrated_rigid"
+    for name in ("similarity", "affine") if affine else ("similarity",):
+        try:
+            fitted = _optimize(f, m, spacing_f / unit, spacing_m / unit, best, center, name, threads)
+            if np.isfinite(fitted).all() and _proper_linear(fitted[:3, :3]):
+                score = _intensity_score(f, m, fitted, spacing_f / unit, spacing_m / unit)
+                if score > best_score:
+                    best_score, best, global_model = score, fitted, name
+        except (RuntimeError, np.linalg.LinAlgError):
+            continue
     native = np.diag([*unit / sm, 1.0]) @ best @ np.diag([*sf / unit, 1.0])
     radius = min(7, max(2, int(min(*fixed.shape, *moving.shape) // 12)))
     search = max(3, radius)
@@ -564,7 +664,8 @@ def fit_registration(
         measured_patches=len(rows),
         candidate_patches=count,
         accepted_patches=len(accepted),
-        global_tissue_ncc=candidates[0][0],
+        global_tissue_ncc=best_score,
+        global_model=global_model,
         patch_matches=rows,
     )
     if len(accepted) < minimum_matches:
@@ -585,8 +686,12 @@ def fit_registration(
             elapsed_seconds=time.monotonic() - started,
         )
     models = {}
-    for name, free_scale in (("calibrated_rigid", False), ("similarity", True)):
-        fitted, physical = _fit_points(source[train], target[train], sf, sm, free_scale)
+    point_models, affine_reason = _correspondence_models(
+        source[train], target[train], sf, sm, affine
+    )
+    if affine_reason is not None:
+        result["affine_fit_reason"] = affine_reason
+    for name, (fitted, physical) in point_models.items():
         errors = source @ fitted[:3, :3].T + fitted[:3, 3] - target
         models[name] = dict(
             fixed_to_moving_xyz=fitted.tolist(),
@@ -595,15 +700,7 @@ def fit_registration(
             heldout_error=_errors(errors[~train]),
             physical_linear_scale=float(np.cbrt(np.linalg.det(physical[:3, :3]))),
         )
-    rigid, similarity = (
-        models["calibrated_rigid"]["heldout_error"],
-        models["similarity"]["heldout_error"],
-    )
-    selected = (
-        "calibrated_rigid"
-        if rigid["rms"] <= similarity["rms"] + 0.2 and rigid["p90"] <= similarity["p90"] + 0.4
-        else "similarity"
-    )
+    selected = _select_correspondence_model(models, 0.2, 0.4)
     chosen = models[selected]
     median_limit = float(
         maximum_median_error_voxels if maximum_median_error_voxels is not None else 1.5 * pm.mean()

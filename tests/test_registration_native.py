@@ -8,7 +8,7 @@ from unittest import mock
 import numpy as np
 from scipy import ndimage
 
-from XTA.registration.fit import _fit_points
+from XTA.registration.fit import _correspondence_models
 from XTA.registration.native import _sample, refine_native_registration
 
 
@@ -165,7 +165,9 @@ class NativeRegistrationTests(unittest.TestCase):
             model="calibrated_rigid",
             validation={"median": 0.1},
         )
-        fitting = mock.patch("XTA.registration.native._fit_points", wraps=_fit_points)
+        fitting = mock.patch(
+            "XTA.registration.native._correspondence_models", wraps=_correspondence_models
+        )
         with (
             mock.patch("XTA.registration.native._texture_candidates", return_value=([], 20.0)),
             mock.patch("XTA.registration.native._select_candidates", return_value=entries),
@@ -175,7 +177,9 @@ class NativeRegistrationTests(unittest.TestCase):
             if fit_shift is not None:
                 wrong = np.eye(4)
                 wrong[:3, 3] = fit_shift
-                fitter.return_value = (wrong, wrong)
+                fitter.return_value = (
+                    {"calibrated_rigid": (wrong, wrong), "similarity": (wrong, wrong)}, None
+                )
             return refine_native_registration(
                 self.fixed,
                 self.fixed,

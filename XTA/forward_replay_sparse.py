@@ -105,10 +105,10 @@ def _pack_torch(head, proto, floor, input_hw, support):
     boxes = rows[:, :4].to(torch.float32)
     if not _all(torch.isfinite(boxes)) or not _all(boxes[:, 2:] >= 0):
         return None
-    if support == 'full':
+    if support == 'full' or ph * input_hw[1] != pw * input_hw[0] or ph > input_hw[0] or pw > input_hw[1]:
         return flat, rows, empty_ids, proto.clone(), 'full'
-    # One-cell halo covers the float32 crop arithmetic's boundary rounding.
-    # Both CUDA and Torch crop on GLOBAL prototype coordinates; no domain resize.
+    # For a same-aspect upsample, this halo retains all four uncropped retina
+    # interpolation taps, as well as the optional coarse morphology footprint.
     scale = boxes.new_tensor((pw / input_hw[1], ph / input_hw[0]))
     low_edge = (boxes[:, :2] - .5 * boxes[:, 2:]) * scale
     high_edge = (boxes[:, :2] + .5 * boxes[:, 2:]) * scale
@@ -155,7 +155,7 @@ def _pack_numpy(head, proto, floor, input_hw, support):
     boxes = rows[:, :4].astype(np.float32)
     if not np.all(np.isfinite(boxes)) or not np.all(boxes[:, 2:] >= 0):
         return None
-    if support == 'full':
+    if support == 'full' or ph * input_hw[1] != pw * input_hw[0] or ph > input_hw[0] or pw > input_hw[1]:
         return flat, rows, np.empty(0, np.int64), proto.copy(), 'full'
     scale = np.asarray((pw / input_hw[1], ph / input_hw[0]), np.float32)
     with np.errstate(over='ignore', invalid='ignore'):

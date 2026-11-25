@@ -30,7 +30,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import cv2, ndi, tqdm
+from ._deps import _numba, cv2, ndi, tqdm
 
 from .config import (
     GIB,
@@ -46,6 +46,7 @@ from .runtime import (
     parallel_for_indices_chunked,
     runtime_telemetry,
     runtime_telemetry_phase,
+    should_use_in_memory_workspace,
 )
 
 # Explicit lower-layer dependencies keep imports one-way.
@@ -63,6 +64,7 @@ from .geometry import (
 from .media import _center_aligned_nearest_source_indices, resize_binary_plane_to_output_xy
 from .interpolation import (
     CVOL_FORMAT,
+    INTERNAL_PACKED_CVOL_FORMAT,
     IncrementalRawBBoxMaskStoreWriter,
     NrrdLayerRef,
     RawBBoxMaskStore,
@@ -102,6 +104,100 @@ from .outputs import (
     nrrd_layer_sink,
 )
 from .assembly import materialize_nrrd_global_layer
+
+
+@dataclass(frozen=True)
+class PackedFinalUnion:
+    """A source-space binary result and the count taken during its expansion."""
+
+    volume: np.ndarray
+    foreground_voxels: int
+
+
+@_numba.njit(nogil=True, cache=False)
+def _or_packed_crop_into_plane(destination, crop, y0, x0, width):
+    first_byte = x0 // 8
+    shift = x0 % 8
+    columns = crop.shape[1]
+    stop_byte = (x0 + width + 7) // 8
+    last_byte_mask = (1 << ((width - 1) % 8 + 1)) - 1
+    for row in range(crop.shape[0]):
+        carry = 0
+        for column in range(columns):
+            value = int(crop[row, column])
+            if column == columns - 1:
+                # Older stores need not guarantee zero-valued row padding.
+                value &= last_byte_mask
+            shifted = (value << shift) | carry
+            destination[y0 + row, first_byte + column] |= shifted & 255
+            carry = shifted >> 8
+        if first_byte + columns < stop_byte:
+            destination[y0 + row, first_byte + columns] |= carry
+
+
+def try_assemble_preprojected_packed_union(
+    refs: Sequence[NrrdLayerRef], destination: np.ndarray, *, workers: int,
+) -> Optional[PackedFinalUnion]:
+    """Merge source-grid projected packed stores without decoding each mask.
+
+    The caller owns a fresh zeroed native destination. A missing memory or
+    geometry requirement returns None before any part of it has been filled.
+    Only one source store is open at a time, including for very wide sweeps.
+    """
+    shape = tuple(destination.shape)
+    if not refs or any(ref.storage_format != INTERNAL_PACKED_CVOL_FORMAT or tuple(ref.shape) != shape
+                       for ref in refs):
+        return None
+    depth, height, width = shape
+    packed_shape = (depth, height, (width + 7) // 8)
+    worker_count = choose_slice_parallel_workers(workers, depth)
+    required = destination.nbytes + int(np.prod(packed_shape, dtype=np.int64)) + worker_count * height * width
+    if not should_use_in_memory_workspace(required):
+        return None
+    try:
+        packed = np.zeros(packed_shape, dtype=np.uint8)
+    except MemoryError:
+        return None
+    occupied = np.zeros(depth, dtype=bool)
+    for ref in refs:
+        store = RawBBoxMaskStore.open(ref.path, mmap_payload=True)
+        try:
+            if (tuple(store.shape) != shape or not store._packbits_payload
+                    or store.meta.get('logical_dtype_in_pipeline') != 'uint8_0_or_1'):
+                return None
+            indices = np.flatnonzero(store.index['kind'] == 1)
+            occupied[indices] = True
+
+            def merge_slice(index: int) -> None:
+                z = int(indices[index])
+                encoded = store.read_encoded_slice_crop(z)
+                if encoded is None:
+                    raise ValueError(f'{ref.path}: projected crop disappeared at slice {z}')
+                y0, x0, _, x1, crop = encoded
+                _or_packed_crop_into_plane(packed[z], crop, y0, x0, x1 - x0)
+
+            parallel_for_indices_chunked(
+                len(indices), merge_slice, max_workers=worker_count, desc='Packed projected union',
+                target_chunks_per_worker=2, show_progress=False,
+            )
+        finally:
+            store.close()
+
+    indices = np.flatnonzero(occupied)
+    counts = np.zeros(len(indices), dtype=np.int64)
+
+    def expand_slice(index: int) -> None:
+        z = int(indices[index])
+        plane = np.unpackbits(packed[z], axis=1, count=width, bitorder='little')
+        destination[z] = plane
+        counts[index] = np.count_nonzero(plane)
+
+    parallel_for_indices_chunked(
+        len(indices), expand_slice, max_workers=worker_count, desc='Expanding packed projected union',
+        target_chunks_per_worker=2, show_progress=False,
+    )
+    return PackedFinalUnion(destination, int(counts.sum()))
+
 
 def _union_projected_layer_ref_into_volume(
     ref: 'NrrdLayerRef',

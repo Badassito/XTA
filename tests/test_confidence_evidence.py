@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 from dataclasses import replace
+import gc
 import io
 import json
 from pathlib import Path
@@ -15,7 +16,7 @@ import numpy as np
 from XTA import assembly, backprojection, geometry
 from XTA.confidence_evidence import (
     ConfidenceEvidenceRef, capture_prediction_confidence, configure_confidence_evidence,
-    lookup_confidence_evidence, write_confidence_evidence,
+    lookup_confidence_evidence, write_block_confidence_evidence, write_confidence_evidence,
     publish_confidence_shards,
 )
 from XTA.confidence_projection import score_projection_reader, resize_score_plane_max
@@ -120,6 +121,75 @@ class ConfidenceEvidenceTests(unittest.TestCase):
         scores, known = ref.read(0, 5)
         np.testing.assert_array_equal(scores, native)
         np.testing.assert_array_equal(known, native > 0)
+
+    def test_radial_d1_shards_publish_exact_source_scores_through_crop_projection(self):
+        if gc.isenabled():
+            self.addCleanup(gc.enable)
+        gc.disable()
+        options = geometry.get_view_infos(9, 30, 32, cartesian_views=(),
+            radial_views=('transverse',), radial_min_radius=.7, radial_patch_size=14)
+        view = max(options, key=lambda item: item.num_slices)
+        shape = (view.num_slices, view.src_h, view.src_w)
+        output_shape = (6, 30, 32)
+        native = np.zeros(shape, np.uint8)
+        rng = np.random.default_rng(76)
+        native[::2, 1:5, 2:7] = rng.integers(1, 256, native[::2, 1:5, 2:7].shape, np.uint8)
+        native[-1, -2:, -3:] = 255
+        cut = shape[0] // 2
+        shards = []
+        for start, stop in ((cut, shape[0]), (0, cut)):
+            local = native[start:stop]
+            ref = write_block_confidence_evidence(
+                self.root / f'shard{start}', local.shape, local.__getitem__,
+                layer_key='radial-key', model_name='m')
+            shards.append(dict(path=str(ref.path), shape_tyx=local.shape,
+                slice_start=start, slice_count=stop-start, view_shape_tyx=shape,
+                view_name=view.name, model_name='m', layer_key='radial-key'))
+
+        with score_projection_reader(native, view, output_shape, self.root / 'oracle') as old_read:
+            expected = write_block_confidence_evidence(self.root / 'expected', output_shape, old_read,
+                layer_key='radial-key', model_name='m')
+        configure_confidence_evidence(self.root / 'out', enabled=True)
+        logs = io.StringIO()
+        with (mock.patch('XTA.sweep_projection._rank_boxes',
+                         side_effect=AssertionError('shard bounds already cover every score')),
+              redirect_stdout(logs)):
+            result = publish_confidence_shards(shards, view=view, model_name='m',
+                temp_dir=self.root, output_shape=output_shape)
+        self.assertGreater(expected.metadata['block_count'], 0)
+        self.assertIn('cpu_radial_rank_rectangle', logs.getvalue())
+        wait_for_retired_memmap_unlinks(under=self.root / 'confidence_evidence')
+        self.assertFalse(list(self.root.glob('confidence_evidence/*/native_score_leases.u8.dat')))
+        for filename in ('index.bin', 'scores.u8.zlib'):
+            self.assertEqual((result.path / filename).read_bytes(), (expected.path / filename).read_bytes())
+
+        from XTA.confidence_capture import confidence_capture_resources, plan_confidence_capture
+        plan = plan_confidence_capture(shape, 1)
+        admitted, reference_credits, native_stages = [], [], []
+        def decline(*args, memory_bytes, **kwargs):
+            admitted.append(memory_bytes)
+            raise MemoryError('test admission decline')
+
+        def bounded_reference(scores, *args, memory_bytes):
+            reference_credits.append(memory_bytes)
+            native_stages.append(Path(scores.filename))
+            return score_projection_reader(scores, *args, memory_bytes=memory_bytes)
+
+        configure_confidence_evidence(self.root / 'bounded-reference', enabled=True)
+        with (confidence_capture_resources(plan),
+              mock.patch('XTA.sweep_projection.sweep_rank_projection_reader', decline),
+              mock.patch('XTA.confidence_projection.score_projection_reader', bounded_reference)):
+            fallback = publish_confidence_shards(shards, view=view, model_name='m',
+                temp_dir=self.root / 'reference-work', output_shape=output_shape)
+        credit, = admitted
+        self.assertGreater(credit, 0)
+        self.assertLess(credit, plan.workspace_bytes)
+        self.assertEqual(reference_credits, [credit])
+        native_stage, = native_stages
+        wait_for_retired_memmap_unlinks(path=native_stage)
+        self.assertFalse(native_stage.exists())
+        for filename in ('index.bin', 'scores.u8.zlib'):
+            self.assertEqual((fallback.path / filename).read_bytes(), (expected.path / filename).read_bytes())
 
     def test_tile_scores_keep_parent_and_bridge_gate_categories(self):
         from XTA.confidence_tiles import capture_consolidated_tile_confidence

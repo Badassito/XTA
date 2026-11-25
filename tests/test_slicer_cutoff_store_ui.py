@@ -47,7 +47,8 @@ TODAY = (
     "_xta_display_coverage_entries", "_xta_display_codes", "_xta_display_count_rgb", "_xta_display_union_bounds",
     "_xta_display_read_coverage", "_xta_sweep_tag", "_xta_sweep_snapshot", "ExportXTASweepEdits",
     "AlignNativeIntensity", "_xta_native_to_preview_matrix", "_xta_choose_review_manifest", "_xta_edit_scope_for",
-    "_xta_display_store_backed", "_xta_new_review_edit_scope", "SelectEditScope")
+    "_xta_display_store_backed", "_xta_new_review_edit_scope", "SelectEditScope", "_xta_current_native_window",
+    "_xta_importer_has_geometry", "_extent_is_valid")
 SCOPE_STATEMENTS = ("_XTA_EDIT_SCOPE_LABELS", "_XTA_STORE_EDIT_SCOPE_LABELS", "_XTA_EDIT_SCOPE_BUTTONS",
                     "_xta_edit_scope", "_xta_store_edit_scope")
 CLOCK = itertools.count(1)
@@ -218,6 +219,9 @@ class Segmentation(Observable):
 
     def SetConversionParameter(self, name, value):
         self.params[name] = value
+
+    def GetConversionParameter(self, name):
+        return self.params.get(name, "")
 
     def IsSharedBinaryLabelmap(self, sid):
         return True  # as Slicer 5.12 answers for a segment alone in its layer too
@@ -538,7 +542,8 @@ def fake_modules(scene, record):
     slicer.vtkSegment, slicer.vtkOrientedImageData = Segment, Image
     slicer.vtkSegmentationConverter = SimpleNamespace(
         GetSegmentationBinaryLabelmapRepresentationName=lambda: BINARY,
-        GetSegmentationClosedSurfaceRepresentationName=lambda: CLOSED)
+        GetSegmentationClosedSurfaceRepresentationName=lambda: CLOSED,
+        GetReferenceImageGeometryParameterName=lambda: "ReferenceImageExtentOffset")
     slicer.app = SimpleNamespace(processEvents=lambda: None, layoutManager=lambda: None)
     core = SimpleNamespace(vtkSegmentationConverter=SimpleNamespace(
         GetReferenceImageGeometryParameterName=lambda: "ReferenceImageExtentOffset",
@@ -654,6 +659,101 @@ def open_review(h, path, **kwargs):
 
 # --------------------------------------------------------------------------------------------
 # Importer
+
+@pytest.mark.parametrize("blank_segment", [False, True])
+def test_importer_chooses_native_review_for_geometryless_placeholder(ui, tmp_path, blank_segment):
+    h = ui
+    placeholder = h.scene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Segmentation")
+    if blank_segment:
+        segment = Segment()
+        segment.AddRepresentation(BINARY, Image())
+        placeholder.GetSegmentation().AddSegment(segment, "Segment_1")
+    archive = tmp_path / "review.xtareview"
+    used = []
+    opened = object()
+    h["_xta_choose_review_manifest"] = lambda: archive
+    volume = h.scene.nodes[0]
+
+    def open_native(path, **options):
+        used.append((path, options))
+        return opened
+
+    h["OpenXTANativeReview"] = open_native
+    assert h["ImportXTASegments"](volume_node=volume, cutoff_cents=90, max_working_mib=64) is opened
+    assert used == [(archive, {"volume_node": volume, "cutoff_cent": 90, "max_working_mib": 64})]
+    assert placeholder in h.scene.nodes
+    assert placeholder.GetSegmentation().GetNumberOfSegments() == int(blank_segment)
+
+
+def test_importer_cancel_preserves_empty_segment_editor_node(ui):
+    h = ui
+    h.scene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Segmentation")
+    initial = tuple(h.scene.nodes)
+    h["_xta_choose_review_manifest"] = lambda: None
+    h["OpenXTANativeReview"] = lambda *a, **k: pytest.fail("Cancel must not open a native review")
+    h["_xta_load_review"] = lambda *a, **k: pytest.fail("Cancel must not open a cutoff review")
+    assert h["ImportXTASegments"]() is None
+    assert tuple(h.scene.nodes) == initial
+
+
+def test_importer_ordinary_merge_uses_populated_node_instead_of_empty_placeholder(ui):
+    h = ui
+    placeholder = h.scene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Segmentation")
+    target = h.scene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Target")
+    source = h.scene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Source")
+    destination = target.GetSegmentation()
+    target_segment = Segment()
+    empty_mask = Image()
+    empty_mask.SetExtent(2, 4, 3, 5, 6, 8)
+    target_segment.AddRepresentation(BINARY, empty_mask)
+    destination.AddSegment(target_segment, "target")
+    source_segment = Segment()
+    source_segment.AddRepresentation(CLOSED, SimpleNamespace(GetNumberOfPoints=lambda: 3))
+    source.GetSegmentation().AddSegment(source_segment, "source")
+    destination.CopySegmentFromSegmentation = lambda other, sid: destination.AddSegment(other.GetSegment(sid), sid)
+    h["_xta_choose_review_manifest"] = lambda: pytest.fail("Ordinary merge must not open the review chooser")
+    h["_ensure_binary_labelmap_representation"] = lambda node: None
+    aligned = []
+    h["_ensure_importer_source_volume"] = aligned.append
+    h["ImportXTASegments"]()
+    assert aligned == [target]
+    assert placeholder in h.scene.nodes and placeholder.GetSegmentation().GetNumberOfSegments() == 0
+    assert source not in h.scene.nodes and destination.GetSegment("source") is not None
+
+
+def test_importer_honors_existing_reference_geometry_of_blank_segment(ui):
+    h = ui
+    node = h.scene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Working label")
+    segmentation = node.GetSegmentation()
+    segmentation.AddSegment(Segment(), "blank")
+    segmentation.SetConversionParameter("ReferenceImageExtentOffset", "reference")
+    converter = h["vtkSegmentationCore"].vtkSegmentationConverter
+
+    def deserialize(value, image, allocate):
+        assert not allocate
+        image.SetExtent(2, 4, 3, 5, 6, 8)
+        return True
+
+    converter.DeserializeImageGeometry = deserialize
+    h["_xta_choose_review_manifest"] = lambda: pytest.fail("Preserve editable empty label geometry")
+    h["_ensure_binary_labelmap_representation"] = lambda node: None
+    attached = []
+    h["_ensure_importer_source_volume"] = attached.append
+    h["ImportXTASegments"]()
+    assert attached == [node]
+
+
+def test_importer_still_finds_existing_review_from_empty_working_node(ui, review_path):
+    h = ui
+    working = h.scene.AddNewNodeByClass("vtkMRMLSegmentationNode", "XTA Review Layers")
+    working.SetAttribute("XTA.StoreReview", "layers")
+    working.SetAttribute("XTA.ReviewManifest", str(review_path))
+    h["_xta_choose_review_manifest"] = lambda: pytest.fail("Existing review path should bypass the chooser")
+    opened = []
+    h["_xta_load_review"] = lambda path, *args: opened.append(path)
+    h["ImportXTASegments"]()
+    assert opened == [review_path.resolve()]
+
 
 def test_importer_order_working_nodes_and_display(ui, review_path):
     h = ui

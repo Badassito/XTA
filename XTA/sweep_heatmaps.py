@@ -19,7 +19,8 @@ from .json_publication import _fsync_parent_directory, _staged_sweep_directory
 HEATMAP_DIRECTORY = "heatmaps"
 HEATMAP_STAGING_ENV = "XTA_YOLO_SWEEP_MEDIA_ROOT"
 _GRID_NAME = re.compile(r"(?:native|low_quality/[A-Za-z0-9_.+\-]+)")
-_PALETTE_STOPS = ((64, 64, 255), (0, 224, 160), (255, 240, 32))
+_PALETTE_STOPS = ((76, 76, 255), (16, 235, 153), (255, 194, 7))
+_OVERLAY_OPACITY = 0.75
 
 
 def _packed_path(root, cutoff, grid):
@@ -186,14 +187,14 @@ def _heatmap_palette(cutoff_count):
     return palette
 
 
-def _render_heatmap(frame, gray, counts, palette):
+def _render_heatmap(frame, gray, counts, color_contributions):
     frame[:] = gray[:, :, None]
     rows = max(1, (128 * 1024) // frame.shape[1])
     for start in range(0, frame.shape[0], rows):
         region = slice(start, start + rows)
         active = counts[region]
         if np.any(active):
-            blended = (np.add(gray[region, :, None], palette[active], dtype=np.uint16) >> 1).astype(np.uint8)
+            blended = (np.add(gray[region, :, None], color_contributions[active]) >> 2).astype(np.uint8)
             np.copyto(frame[region], blended, where=(active != 0)[:, :, None])
 
 
@@ -205,6 +206,8 @@ def _write_heatmap(path, packed_paths, work, inputs, shape, fps, palette, *, nat
     frames, height, width = shape
     plane_size = height * width
     packed_plane_size = (plane_size + 7) // 8
+    # Blend three parts color and one part grayscale for nonzero support.
+    color_contributions = palette.astype(np.uint16) * 3
     with ExitStack() as stack:
         masks = [stack.enter_context(filename.open("rb")) for filename in packed_paths]
         if any(os.fstat(stream.fileno()).st_size != frames * packed_plane_size for stream in masks):
@@ -228,7 +231,7 @@ def _write_heatmap(path, packed_paths, work, inputs, shape, fps, palette, *, nat
                     packed = _read_exact(stream, packed_plane_size)
                     bits = np.unpackbits(packed, bitorder="little", count=plane_size).reshape(height, width)
                     np.add(counts, bits, out=counts)
-                _render_heatmap(frame, gray, counts, palette)
+                _render_heatmap(frame, gray, counts, color_contributions)
                 writer.stdin.write(memoryview(frame).cast("B"))
         except BaseException:
             if writer.poll() is None:
@@ -250,7 +253,10 @@ def publish_sweep_heatmaps(root, work, inputs, grids, cutoffs, incomplete_cutoff
     if not grids:
         return []
     source_shape = tuple(inputs["source_shape_t_y_x"])
-    palette = _heatmap_palette(len(cutoffs))
+    if not cutoffs or not set(cutoffs).issubset(requested_cutoffs):
+        raise ValueError("Confidence heatmaps require at least one accepted cutoff from the request")
+    # Keep the color for a given count when some requested cutoffs are missing.
+    palette = _heatmap_palette(len(requested_cutoffs))[:len(cutoffs) + 1]
     destination = root / HEATMAP_DIRECTORY
     records = []
     with _staged_sweep_directory(destination, prefix=".heatmaps.atomic-result-") as stage:
@@ -264,15 +270,18 @@ def publish_sweep_heatmaps(root, work, inputs, grids, cutoffs, incomplete_cutoff
             if native and shape != source_shape:
                 raise ValueError("The native confidence heatmap differs from the source geometry")
             paths = [_packed_path(work / "heatmap-input", cutoff, grid) for cutoff in cutoffs]
-            name = f"{grid}.{'mkv' if native else 'mp4'}"
+            if native:
+                name = "native.mkv"
+            else:
+                stem = Path(inputs["source"]["path"]).stem
+                token = grid.split("/", 1)[1]
+                name = f"{stem}_Heatmap_LowQuality_{token}.mp4"
             path = stage / name
-            path.parent.mkdir(parents=True, exist_ok=True)
             fps = max(1e-6, float(inputs["fps"]) * shape[0] / source_shape[0])
             _write_heatmap(path, paths, work, inputs, shape, fps, palette,
                            native=native, streaming_decode=streaming_decode)
             with path.open("rb+") as stream:
                 os.fsync(stream.fileno())
-            _fsync_parent_directory(path.parent)
             records.append({
                 "grid": grid, "path": (destination / name).relative_to(root).as_posix(),
                 "shape_t_y_x": list(shape), "fps": fps,
@@ -280,7 +289,7 @@ def publish_sweep_heatmaps(root, work, inputs, grids, cutoffs, incomplete_cutoff
                 "requested_cutoffs_hundredths": list(requested_cutoffs),
                 "status": "complete" if not incomplete_cutoffs and cutoffs == requested_cutoffs else "incomplete",
                 "semantics": "Count of final cutoff masks containing each voxel",
-                "palette_rgb": [None, *palette[1:].tolist()], "overlay_opacity": 0.5,
+                "palette_rgb": [None, *palette[1:].tolist()], "overlay_opacity": _OVERLAY_OPACITY,
             })
         _fsync_parent_directory(stage)
     return records

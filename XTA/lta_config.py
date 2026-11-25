@@ -185,10 +185,7 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         nargs="+",
         default=None,
         metavar="VIEW",
-        help=(
-            "Inference-only Cartesian views: transverse, sagittal, coronal; the "
-            "connected production path currently requires exactly transverse"
-        ),
+        help="Use transverse for native annotated-slice tracking.",
     )
     # Planning-only geometries stay parseable for run planning and manifests,
     # but are hidden from --help: execution rejects them before workers start.
@@ -252,7 +249,7 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         nargs="+",
         default=["0"],
         metavar="DEG",
-        help="TTA in-plane angles; comma-separated and whitespace-separated forms are accepted",
+        help="Use angle 0 for native Transverse tracking (default).",
     )
 
     parser.add_argument(
@@ -274,8 +271,8 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
             "the nrrd token is accepted for compatibility. The native tile union "
             "before postprocessing, a complete NRRD checkpoint after each requested "
             "filter, <input-stem>_Global_final_output.seg.nrrd, and the machine-readable "
-            "manifest are always written. Filter checkpoints precede hard-positive "
-            "restoration; the final output includes all authoritative foreground"
+            "manifest are always written. Each filter checkpoint and the final output "
+            "preserve the manual foreground and background on annotated slices."
         ),
     )
     parser.add_argument(
@@ -347,11 +344,19 @@ def parse_lta_args(
     argv: Optional[Sequence[str]] = None,
     *,
     prog: Optional[str] = None,
+    for_execution: bool = False,
 ) -> LtaConfig:
     parser = build_lta_argparser(prog=prog)
     args = parser.parse_args(None if argv is None else list(argv))
     try:
-        return resolve_lta_config(args)
+        config = resolve_lta_config(args)
+        if for_execution and (
+            config.cartesian_views != ("transverse",) or config.angles != (0.0,)
+            or config.azimuthal_requests or config.radial_requests
+            or config.spherical_requests or config.tilted_groups
+        ):
+            raise ValueError("LTA tracks native Transverse slices only. Use --enable_cartesian transverse --angle 0.")
+        return config
     except ValueError as exc:
         parser.error(str(exc))
         raise AssertionError("argparse.error must terminate") from exc

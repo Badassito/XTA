@@ -144,6 +144,10 @@ class _ReadRange:
         remaining = max(0, self._offset + self._size - self._raw.tell())
         return self._raw.read(remaining if size < 0 else min(size, remaining))
 
+    def readinto(self, buffer) -> int:
+        remaining = max(0, self._offset + self._size - self._raw.tell())
+        return self._raw.readinto(memoryview(buffer).cast("B")[:remaining])
+
 
 def open_gzip_range(raw, offset: int, length: int):
     """Decode concatenated gzip members within a byte range on a borrowed stream."""

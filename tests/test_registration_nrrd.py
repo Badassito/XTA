@@ -1,4 +1,4 @@
-"""Scalar NRRD registration keeps category values, geometry and observation coverage."""
+"""NRRD registration keeps category values, geometry and observation coverage."""
 
 import json
 import warnings
@@ -246,6 +246,133 @@ def test_slicer_semantics_rejected_before_output_publication(tmp_path, metadata)
     assert not output.exists()
     assert not output.with_name("out_coverage.nrrd").exists()
     assert not list(tmp_path.glob("*.partial"))
+
+
+@pytest.mark.parametrize("use_reference", [False, True])
+def test_xta_grouped_segmentation_warp_preserves_overlaps_and_tags(tmp_path, use_reference):
+    from XTA.grouped_seg_nrrd import GroupedSegment, write_grouped_seg_nrrd
+    from XTA.reconciliation_io import ReferenceGeometry
+
+    shape = (7, 13, 16)
+    spacing = (2.0, 3.0, 4.0)
+    origin = [11.0, -7.0, 2.0]
+    geometry = ReferenceGeometry(shape, directions_xyz=np.diag(spacing), origin_xyz=origin)
+    masks = np.zeros((3, *shape), np.uint8)
+    masks[0, 1:4, 3:8, 5:9] = 1
+    masks[1, 2:5, 4:9, 6:11] = 1
+    masks[1, 3, 5, 7] = 0
+    input_path = tmp_path / "group.seg.nrrd"
+    staged = write_grouped_seg_nrrd(
+        input_path, shape_tyx=shape, geometry=geometry, index_segments=True,
+        segments=[
+            GroupedSegment(
+                ("first", "second", "empty")[i], ("Café", "Second", "Empty")[i],
+                (0.3, 0.65, 1.0), lambda start, stop, mask=mask: mask[start:stop],
+                tags={"XTA.LayerKey": f"layer-{i}"},
+                extent_xyz=((5, 8, 3, 7, 1, 3), (6, 10, 4, 8, 2, 4), (0, -1, 0, -1, 0, -1))[i],
+            ) for i, mask in enumerate(masks)
+        ],
+    )
+    assert staged["offset_xyz"] == [5, 3, 1]
+    assert len({row["gzip_offset"] for row in staged["segments"]}) == 3
+    matrix = np.array([[1, 0.17, 0, 0.4], [0, 1, 0, -1.1], [0, 0, 1, 1], [0, 0, 0, 1]])
+    fixed_mask = np.ones(shape[1:], bool)
+    fixed_mask[4, 6] = False
+    target_mask = np.ones(shape[1:], bool)
+    target_mask[4, 8] = False
+    pair = packet(shape, matrix=matrix, spacing=spacing, masks={"fixed": fixed_mask, "moving": target_mask})
+    reference = {
+        "dimension": 3, "sizes": np.asarray(shape[::-1]), "space": geometry.space,
+        "space directions": np.diag(spacing), "space origin": origin,
+    }
+    target_origin = np.array([53.0, 9.0, -21.0])
+    output = tmp_path / "target.seg.nrrd"
+    result = transfer_nrrd_labelmap(
+        pair, input_path, output, source_grid_aligned=not use_reference,
+        source_reference=reference if use_reference else None,
+        target_reference={**reference, "space origin": target_origin}, block_rows=2,
+    )
+    labels, header = load(output)
+    coverage, _ = load(result["coverage_output"])
+    assert len(labels.shape) == 4 and labels.shape[-1] == 3
+    assert list(header["kinds"]) == ["list", "domain", "domain", "domain"]
+    x0, y0, z0 = map(int, header["Segmentation_ReferenceImageExtentOffset"].split())
+    dz, dy, dx, _ = labels.shape
+    assert (dz, dy, dx) != shape
+    np.testing.assert_allclose(header["space origin"], target_origin + np.array([x0, y0, z0]) * spacing)
+    assert b"Segment0_Name:=Caf\xc3\xa9\n" in output.read_bytes().split(b"\n\n", 1)[0]
+    assert header["Segment1_Tags"] == "XTA.LayerKey:layer-1|"
+    assert header["Segment0_ID"] == "first" and header["Segment1_ID"] == "second"
+    restored = np.zeros((*shape, 3), np.uint8)
+    restored[z0:z0+dz, y0:y0+dy, x0:x0+dx] = labels
+    xyz = np.indices(shape)[::-1].reshape(3, -1)
+    inverse = np.linalg.inv(matrix)
+    mapped = np.floor(inverse[:3, :3] @ xyz + inverse[:3, 3, None] + 0.5).astype(int)
+    lim = np.asarray(shape[::-1])[:, None]
+    valid = ((mapped >= 0) & (mapped < lim)).all(axis=0)
+    sx, sy, sz = np.clip(mapped, 0, lim - 1)
+    valid &= fixed_mask[sy, sx] & target_mask[xyz[1], xyz[0]]
+    expected = (masks[:, sz, sy, sx] * valid).T.reshape((*shape, 3))
+    np.testing.assert_array_equal(coverage, valid.reshape(shape))
+    np.testing.assert_array_equal(restored, expected)
+    assert np.count_nonzero(restored[..., 0] & restored[..., 1]) > 0
+    for i, segment in enumerate(result["segments"]):
+        actual = np.argwhere(expected[..., i])
+        assert segment["foreground_voxels"] == len(actual)
+        if len(actual):
+            lo, hi = actual.min(axis=0)[::-1], actual.max(axis=0)[::-1]
+            bounds = [int(value) for pair in zip(lo, hi) for value in pair]
+            assert segment["extent_xyz"] == bounds
+            offset = [x0, y0, z0]
+            assert list(map(int, header[f"Segment{i}_Extent"].split())) == [
+                value - offset[axis // 2] for axis, value in enumerate(bounds)
+            ]
+        else:
+            assert header[f"Segment{i}_Extent"] == "0 -1 0 -1 0 -1"
+
+    # Reuse the conventional list-first output as the next source segmentation.
+    again = tmp_path / "registered-again.seg.nrrd"
+    identity = transfer_nrrd_labelmap(
+        packet(shape, spacing=spacing), output, again, source_grid_aligned=True, encoding="raw"
+    )
+    data, _ = load(again)
+    ox, oy, oz = identity["output_reference_offset_xyz"]
+    sz, sy, sx = data.shape[:3]
+    np.testing.assert_array_equal(data, restored[oz:oz+sz, oy:oy+sy, ox:ox+sx])
+
+
+def test_cropped_scalar_segmentation_retains_multiple_categories_in_layer(tmp_path):
+    volume = np.zeros((2, 3, 4), dtype=np.uint16)
+    volume[0, :2, 2:4] = 3
+    volume[1, 1:, 1:3] = 513
+    shape = (6, 8, 10)
+    offset = np.array([3, 2, 1])
+    metadata = {
+        "Segmentation_MasterRepresentation": "Binary labelmap",
+        "Segmentation_ReferenceImageExtentOffset": "3 2 1",
+        "Segmentation_ReferenceImageExtent": "0 9 0 7 0 5",
+        "Segment0_ID": "first", "Segment0_Layer": "0", "Segment0_LabelValue": "3",
+        "Segment1_ID": "second", "Segment1_Layer": "0", "Segment1_LabelValue": "513",
+    }
+    saved = tmp_path / "source.seg.nrrd"
+    write(saved, volume, header=metadata)
+    transform = np.eye(4)
+    transform[:3, 3] = [2, -1, 0]
+    output = tmp_path / "warped.seg.nrrd"
+    result = transfer_nrrd_labelmap(
+        packet(shape, matrix=transform), saved, output, source_grid_aligned=True,
+        direction="moving-to-fixed", encoding="raw",
+    )
+    actual, header = load(output)
+    assert actual.ndim == 3 and actual.dtype == np.uint16
+    assert header["Segment0_LabelValue"] == "3" and header["Segment1_LabelValue"] == "513"
+    x0, y0, z0 = result["output_reference_offset_xyz"]
+    dx, dy, dz = np.array(actual.shape[::-1])
+    expected = np.zeros(shape, np.uint16)
+    x, y, z = offset - transform[:3, 3].astype(int)
+    expected[z:z+2, y:y+3, x:x+4] = volume
+    np.testing.assert_array_equal(actual, expected[z0:z0+dz, y0:y0+dy, x0:x0+dx])
+    assert result["output_foreground_voxels"] == 8
 
 
 def test_ambiguous_alignment_and_wrong_reference_spacing_rejected(tmp_path):

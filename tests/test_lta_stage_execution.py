@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -48,6 +49,40 @@ def operations(*, fail_keep=False):
 
 
 class LtaStageExecutionTests(unittest.TestCase):
+    def test_every_published_stage_preserves_the_full_annotated_planes(self):
+        helper = fixtures.LtaProductionExecutionTests()
+
+        def fill_every_pixel(volume, *_args, **_kwargs):
+            volume[:] = 1
+            return {"passes": 1}
+
+        def clear_every_pixel(volume, *_args, **_kwargs):
+            volume[:] = 0
+            return {"kept_objects": 1}
+
+        terminal_operations = replace(
+            operations(),
+            apply_gaussian_smoothing=fill_every_pixel,
+            apply_cpu_keep_objects=clear_every_pixel,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result, _pool, raw = helper._run(
+                Path(temporary), (0,),
+                postprocessing_override={"gaussian_smoothing_enabled": True, "keep_objects": 1},
+                finalization_operations=terminal_operations,
+            )
+            manifest = json.loads(result.manifest_path.read_bytes())
+            checkpoints = manifest["postprocessing_checkpoints"]
+            self.assertTrue(all(record["metadata"]["authoritative_slices_restored"] for record in checkpoints))
+            before, after_fill, after_clear = (read_checkpoint(Path(record["path"])) for record in checkpoints)
+            self.assertGreater(int(before[0].sum()), 0)
+            self.assertLess(int(before[0].sum()), before[0].size)
+            self.assertTrue(after_fill[1:3].all())
+            self.assertFalse(after_clear[1:3].any())
+            np.testing.assert_array_equal(after_fill[[0, 3]], before[[0, 3]])
+            np.testing.assert_array_equal(after_clear[[0, 3]], before[[0, 3]])
+            np.testing.assert_array_equal(np.frombuffer(raw, np.uint8).reshape(before.shape), after_clear)
+
     def test_default_saved_union_and_keep_stage_match_exported_masks_and_receipts(self):
         helper = fixtures.LtaProductionExecutionTests()
         with tempfile.TemporaryDirectory() as temporary:

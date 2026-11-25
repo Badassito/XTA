@@ -27,6 +27,35 @@ def publication_ram_headroom():
                       int(available_anon_work_bytes(meminfo=info))))
 
 
+def d1_score_projection_workers(tasks, *, cpu_count, ram_bytes, scratch_bytes,
+                                workspace_bytes, anon_cap=0):
+    """Size concurrent eager score projections before issuing host memory grants."""
+    by_view = {}
+    for task in tasks:
+        if 'd1_output_shape' in task:
+            key = (task['model_name'], task['view'].name)
+            # All leases for a view share one complete native score mmap.
+            by_view[key] = max(by_view.get(key, 0), math.prod(task['processing_shape']))
+    if not by_view:
+        return 0, 0
+    # Reserve most RAM and scratch for in-flight inference and staged outputs.
+    # Charge the largest possible simultaneous set rather than the mean view.
+    budget = min(max(0, int(ram_bytes)), max(0, int(scratch_bytes))) // 8
+    if anon_cap > 0:
+        budget = min(budget, anon_cap)
+    limit = min(16, max(1, cpu_count // 4))
+    reserved = 0
+    workers = 0
+    for native_bytes in sorted(by_view.values(), reverse=True)[:limit]:
+        required = native_bytes + workspace_bytes
+        if workers and reserved + required > budget:
+            break
+        # Keep the existing one-view path even on a small allocation.
+        reserved += required
+        workers += 1
+    return workers, reserved
+
+
 def policy_cpu_worker_buffer_plan(*, worker_count, cache_mib, batch_size, out_size,
                                   channels, prefetch_frames=0, strip_rows=128):
     """Reserve the CPU policy adapter's host buffers before admitting parents.

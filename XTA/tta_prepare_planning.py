@@ -16,11 +16,11 @@ from .interpolation import _view_uses_interpolation
 PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES = 256 * 1024**2
 
 
-def _parent_confidence_capture_plan(shape, workers, *, enabled):
+def _parent_confidence_capture_plan(shape, workers, *, enabled, source_projection=False):
     """Resolve bounded capture scratch before its parent admission is requested."""
     if not enabled:
         return None
-    from .confidence_evidence import plan_confidence_capture
+    from .confidence_evidence import SOURCE_SCORE_PROJECTION_WORKSPACE_BYTES, plan_confidence_capture
     from .native_pull_scheduling import get_native_pull_scheduler
     scheduler = get_native_pull_scheduler()
     if scheduler is not None:
@@ -29,8 +29,10 @@ def _parent_confidence_capture_plan(shape, workers, *, enabled):
         # with native projection. A queued parent must not freeze this to its
         # executor's one-slice cleanup budget, nor upgrade it after admission.
         workers = scheduler.max_workers
+    projection = ({'source_projection_workspace_bytes': SOURCE_SCORE_PROJECTION_WORKSPACE_BYTES}
+                  if source_projection else {})
     return plan_confidence_capture(tuple(int(v) for v in shape), int(workers),
-        workspace_bytes=PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES)
+        workspace_bytes=PARENT_CONFIDENCE_CAPTURE_WORKSPACE_BYTES, **projection)
 
 
 def _prepare_parent_with_confidence_capture(prepare, *, capture_plan, **kwargs):
@@ -95,7 +97,8 @@ def _parent_prepare_transient_bytes(view, processing_bytes, source_bytes, *,
 
 def _policy_parent_prepare_transient_bytes(tasks, source_bytes, workers, *,
                                           interpolation_distance, retain_confidence,
-                                          extrapolation_distance=0, sam_image_phase_bytes=0):
+                                          extrapolation_distance=0, sam_image_phase_bytes=0,
+                                          source_projection=False):
     """Charge the same capture scratch before policy parent dispatch begins."""
     largest = 2 * GIB
     plans = {}
@@ -106,7 +109,8 @@ def _policy_parent_prepare_transient_bytes(tasks, source_bytes, workers, *,
         enabled = bool(retain_confidence) and 'd1_output_shape' not in task
         key = (shape, enabled)
         if key not in plans:
-            plans[key] = _parent_confidence_capture_plan(shape, workers, enabled=enabled)
+            projection = {'source_projection': True} if source_projection else {}
+            plans[key] = _parent_confidence_capture_plan(shape, workers, enabled=enabled, **projection)
         plan = plans[key]
         workspace = 0 if plan is None else int(plan.workspace_bytes)
         interpolates = (int(extrapolation_distance) > 0 or

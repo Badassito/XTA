@@ -453,6 +453,7 @@ def finalize_lta_native_union(
     checkpoint_callback: Optional[
         Callable[[str, np.ndarray, Mapping[str, object]], None]
     ] = None,
+    restore_authoritative_slices: Optional[Callable[[np.ndarray], None]] = None,
 ) -> LtaFinalizationResult:
     """Compose native layers scalably and apply the exact TTA filter order.
 
@@ -463,11 +464,14 @@ def finalize_lta_native_union(
     authoritative labels) is restored after the filter sequence so it remains
     a hard-positive invariant of the published terminal union.  A synchronous
     checkpoint callback receives a read-only view before filtering and after
-    each requested operation, before that final hard-positive restoration.
+    each requested operation. An authoritative-slice restorer can enforce
+    exact planes before every checkpoint and before subsequent filters.
     """
 
     if checkpoint_callback is not None and not callable(checkpoint_callback):
         raise TypeError("checkpoint_callback must be callable or None")
+    if restore_authoritative_slices is not None and not callable(restore_authoritative_slices):
+        raise TypeError("restore_authoritative_slices must be callable or None")
     layer_values = tuple(layers)
     seen_ids: set[str] = set()
     expected_shape: Optional[tuple[int, int, int]] = None
@@ -547,10 +551,13 @@ def finalize_lta_native_union(
             "restore_stage": "after_terminal_filters",
             "applied": bool(protected),
         },
+        "authoritative_slices_restored_at_checkpoints": restore_authoritative_slices is not None,
     }
     active_volume: np.ndarray = terminal_union
 
     def checkpoint(stage: str) -> None:
+        if restore_authoritative_slices is not None:
+            restore_authoritative_slices(active_volume)
         if checkpoint_callback is None:
             return
         # Writing finishes before a later filter mutates or closes this buffer.
@@ -568,6 +575,7 @@ def finalize_lta_native_union(
             "keep_objects": post_stats["keep_objects"],
             "protected_foreground_restore_applied": False,
             "protected_foreground_layer_ids": [layer.layer_id for layer in protected],
+            "authoritative_slices_restored": restore_authoritative_slices is not None,
         }
         checkpoint_callback(stage, snapshot, metadata)
         post_stats["checkpoint_stages"].append({  # type: ignore[union-attr]
@@ -575,6 +583,7 @@ def finalize_lta_native_union(
             "shape_tyx": list(expected_shape),
             "foreground_voxels": foreground,
             "protected_foreground_restore_applied": False,
+            "authoritative_slices_restored": restore_authoritative_slices is not None,
         })
 
     try:
@@ -672,6 +681,8 @@ def finalize_lta_native_union(
             post_stats["execution_order"].append(  # type: ignore[union-attr]
                 "restore_protected_foreground"
             )
+            if restore_authoritative_slices is not None:
+                restore_authoritative_slices(active_volume)
 
         foreground = int(np.count_nonzero(np.asarray(active_volume)))
         return LtaFinalizationResult(
@@ -853,27 +864,26 @@ def write_lta_postprocessing_checkpoint(
 ) -> LtaCheckpointArtifact:
     """Save a complete filter checkpoint with TTA's independent-select semantics.
 
-    Filter results are captured before the final hard-positive restoration.
-    In particular, the keep_objects checkpoint shows the actual kept objects,
-    even when final restoration later adds another disconnected annotation.
+    The caller supplies the settled stage. Production interval tracking has
+    already restored the full annotated planes before saving each stage.
     """
 
     stages = {
         "before_postprocessing": (
             "Global_union_before_postprocessing",
-            "Native LTA tile/view union before optional terminal filters.",
+            "Native LTA mask before optional terminal filters.",
         ),
         "after_3d_void_fill": (
             "Global_after_3d_void_fill",
-            "Complete native union after 3D void fill, before final hard-positive restoration.",
+            "Complete native mask after 3D void fill.",
         ),
         "after_gaussian_smoothing": (
             "Global_after_gaussian_smoothing",
-            "Complete native union after all requested Gaussian passes, before final hard-positive restoration.",
+            "Complete native mask after all requested Gaussian passes.",
         ),
         "after_keep_objects": (
             "Global_after_keep_objects",
-            "Complete native union after keep_objects, before final hard-positive restoration.",
+            "Complete native mask after keep_objects.",
         ),
     }
     resolved_stage = str(stage).strip()

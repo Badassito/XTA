@@ -1999,6 +1999,7 @@ class _MemfdTransferBatch:
 
     handles: List[object]
     source_keys: Tuple[str, ...] = ()
+    output_probe_key: Optional[str] = None
 
     def rollback(self) -> None:
         # Detaching unregisters DupFd from multiprocessing.resource_sharer. Dropping
@@ -2015,6 +2016,7 @@ class _MemfdTransferBatch:
 def _attach_memfd_transfers_to_task(
     task: Dict[str, object], *, known_sources: Optional[Iterable[str]] = None,
     direct_output_capability: Optional[Dict[str, int]] = None,
+    probe_output: bool = False,
 ) -> _MemfdTransferBatch:
     """Attach handles to a dispatch copy, including independent policy result parents.
 
@@ -2061,6 +2063,21 @@ def _attach_memfd_transfers_to_task(
                     return
                 handle = mp_reduction.DupFd(int(fd))
             known.add(key)
+        elif (probe_output and batch.output_probe_key is None and not source_keys
+              and path_field in {'result_mask_path', 'result_conf_path'}
+              and str(raw_path).startswith(f'/proc/{os.getpid()}/fd/')):
+            # A file-backed input never qualifies the worker via a source transfer.
+            # Use one ordinarily transferred output to prove access to the same inode.
+            with _MEMFD_OWNER_LOCK:
+                fd = _memfd_owner_fd_for_path(raw_path)
+                if fd is None:
+                    return
+                handle = mp_reduction.DupFd(int(fd))
+                batch.handles.append(handle)
+                batch.output_probe_key = _memfd_source_identity(fd)
+            holder[handle_field] = handle
+            holder[f'{handle_field}_probe'] = True
+            return
         else:
             handle = _duplicate_memfd_path_for_child(raw_path)
         if handle is not None:
@@ -2236,7 +2253,8 @@ def _materialize_worker_task_memfd_paths(
             fd = int(received_fd)
             transient_fds.append(int(fd))
         holder[path_field] = str(_memfd_proc_path(int(fd), owner_pid=os.getpid()))
-        if persistent:
+        output_probe = holder.pop(f'{handle_field}_probe', False)
+        if persistent or (output_probe and path_field in {'result_mask_path', 'result_conf_path'}):
             capability = _probe_memfd_parent_proc_capability(parent_source_path, int(fd))
             if capability is not None:
                 task['_memfd_parent_proc_capability'] = capability

@@ -535,6 +535,7 @@ class ViewMajorPublication:
                     low_quality_specs=self.scalar_sink.low_quality_specs,
                     low_quality_root=nrrd_root/"low_quality", executor=self._executor,
                     relative_artifact_paths=self.nrrd_stage_root is None,
+                    managed_review_root=self.scalar_sink.managed_review_root,
                     layer_file_processes=self._nrrd_processes)
                 if self.retain_confidence:
                     floors = {backend: max(cent/100., float(floor))

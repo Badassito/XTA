@@ -59,6 +59,7 @@ from .lta_scheduler import (
     LtaViewAffinityScheduler,
     LtaViewKey,
 )
+from .lta_suggestions import SliceSuggestions
 from .lta_tile_tracking import LtaLineageId
 from .lta_tiles import (
     TilePlan,
@@ -75,6 +76,7 @@ from .lta_windows import (
     WindowPlan,
     owned_frame_range,
     plan_domain_windows,
+    plan_neighbor_anchor_domains,
 )
 from .lta_workers import LtaWorkerInit, LtaWorkerPool, LtaWorkerResult, LtaWorkerTask
 
@@ -112,6 +114,8 @@ def _storage_capacity_probe(path: Path) -> tuple[Path, int, int]:
 def _preflight_lta_storage(
     plan: LtaRunPlan,
     view_plan: LtaRuntimeViewPlan,
+    *,
+    directional_overlap_frames: int = 0,
 ) -> dict[str, object]:
     """Reserve scratch and persistent NRRD capacity before source decode."""
 
@@ -141,6 +145,7 @@ def _preflight_lta_storage(
     # Each completed dense union is reduced and removed before its worker slot is
     # reused; only compact manifests wait for ordered logical commits.
     worker_union_reserve = len(plan.device_ids) * plan.workers_per_gpu * largest_worker_union
+    directional_reserve = directional_overlap_frames * view_plan.frame_height * ((view_plan.frame_width + 7) // 8)
     checkpoint_count = (
         1
         + int(bool(plan.postprocessing.get("enable_3d_void_fill", False)))
@@ -156,6 +161,7 @@ def _preflight_lta_storage(
         + filter_workspace
         + keep_replacement
         + worker_union_reserve
+        + directional_reserve
     )
     scratch_probe, scratch_filesystem, scratch_free = _storage_capacity_probe(plan.temp_root)
     output_probe, output_filesystem, output_free = _storage_capacity_probe(plan.output_root)
@@ -208,6 +214,7 @@ def _preflight_lta_storage(
             "largest_selected_dense_filter_workspace": int(filter_workspace),
             "keep_objects_replacement": int(keep_replacement),
             "bounded_worker_union_reserve": int(worker_union_reserve),
+            "packed_backward_interval_reserve": int(directional_reserve),
             "compressed_public_nrrd_upper_bound": int(public_nrrd_reserve),
             "headroom": scratch_reservation["headroom"],
         },
@@ -322,7 +329,7 @@ def _execution_run_plan_manifest_record(plan: LtaRunPlan) -> dict[str, object]:
         "status": "superseded",
         "superseded_by": "execution.device_schedule",
         "reason": (
-            "production execution replans full-view chains for each authoritative anchor "
+            "production execution plans neighboring annotation intervals "
             "and dynamically admitted spatial relays"
         ),
     }
@@ -492,7 +499,7 @@ def _aligned_known_background_frames(
     source: object,
     positive_annotations: Sequence[object],
 ) -> tuple[int, ...]:
-    """Resolve explicit empty labels as audit-only target-frame assertions."""
+    """Resolve explicit empty labels on native transverse slices."""
 
     from .lta_inputs import AnnotationState
 
@@ -535,7 +542,7 @@ def _known_background_audit(
                 }
             )
     return {
-        "policy": "audit_only_no_subtraction",
+        "policy": "authoritative_empty_slices",
         "known_background_frame_count": len(tuple(frame_indices)),
         "frames_with_predicted_foreground": len(per_frame),
         "predicted_foreground_pixels": sum(
@@ -543,6 +550,13 @@ def _known_background_audit(
         ),
         "nonempty_frames": per_frame,
     }
+
+
+def _restore_authoritative_slices(volume, hard_positive, annotated_frames: Sequence[int]) -> None:
+    """Restore complete annotated planes, including their negative pixels."""
+
+    for frame in annotated_frames:
+        volume[frame] = hard_positive[frame]
 
 
 def _prepare_output_roots(plan: LtaRunPlan) -> None:
@@ -844,6 +858,7 @@ def _plan_initial_chains(
     temp_root: Path,
     conf: float,
     empty_frame_limit: int | None,
+    anchor_domains: Mapping[int, AnchorDomain] | None = None,
 ) -> tuple[
     tuple[_PlannedChain, ...],
     dict[tuple[str, int, int], tuple[LtaMaskSeed, ...]],
@@ -867,12 +882,8 @@ def _plan_initial_chains(
             )
             for frame, seeds in by_frame.items():
                 seed_inventory[(grid.config_id, tile_index, frame)] = seeds
-            # An unrelated positive annotation is not evidence that an existing
-            # lineage ended. Until production integrates cross-anchor identity
-            # reconciliation, let every anchor propagate over the full view and
-            # union its evidence with the other independently seeded lineages.
             for anchor_frame in sorted(by_frame):
-                domain = AnchorDomain(
+                domain = anchor_domains[anchor_frame] if anchor_domains is not None else AnchorDomain(
                     anchor_frame=anchor_frame,
                     frame_start=0,
                     frame_stop=view_plan.frame_count,
@@ -938,6 +949,7 @@ def _plan_initial_chains(
                         empty_frame_limit=empty_frame_limit,
                         relay_generation=0,
                     )
+                    payload["authoritative_anchor_frame"] = anchor_frame
                     chains.append(_PlannedChain(work=work, payload=payload))
                     plan_order += 1
     if not chains:
@@ -1044,6 +1056,8 @@ def _consume_chain_manifest(
     manifest: Mapping[str, object],
     *,
     view_union: object,
+    handoff=None,
+    anchor_frame=None,
 ) -> tuple[tuple[dict[str, object], ...], Path]:
     from .lta_union_artifacts import reduce_union_artifact_into_view
 
@@ -1054,10 +1068,16 @@ def _consume_chain_manifest(
         int(tile["top"]) + int(tile["size"]),
     )
     start, stop = (int(value) for value in manifest["output_frame_range"])
-    receipt = reduce_union_artifact_into_view(
-        manifest["union"], view_union=view_union, tile_xyxy=tile_xyxy,
-        frame_start=start, frame_stop=stop,
-    )
+    if handoff is None:
+        receipt = reduce_union_artifact_into_view(
+            manifest["union"], view_union=view_union, tile_xyxy=tile_xyxy,
+            frame_start=start, frame_stop=stop,
+        )
+    else:
+        receipt = handoff.reduce(
+            manifest["union"], tile_xyxy=tile_xyxy, frame_start=start, frame_stop=stop,
+            anchor_frame=anchor_frame, windows=manifest.get("windows", ()),
+        )
     return tuple(dict(item) for item in manifest.get("relays", ())), Path(receipt["path"])
 
 
@@ -1458,6 +1478,7 @@ def _dispatch_available(
                 "volume_id": claim.work.view.volume_id,
                 "physical_view_id": claim.work.view.physical_view_id,
                 "runtime_view_id": claim.work.runtime_view_id,
+                "authoritative_anchor_frame": payload.get("authoritative_anchor_frame"),
                 "relay_generation": task_generation,
                 "plan_order": claim.work.plan_order,
                 "frame_start": claim.work.frame_start,
@@ -1556,6 +1577,7 @@ def _continue_canonical_frontier(execution, settled):
         max_relay_generations=execution.scheduler.max_relay_generation,
         device_ids=execution.scheduler.device_ids,
         workers_per_device=execution.scheduler.workers_per_device,
+        handoff=execution.handoff,
     )
     settled.admission_audit["policy"] = "canonical_temporal_frontier/1"
     return RelayContinuation(generation)
@@ -1575,6 +1597,7 @@ def _drive_workers_to_fixed_point(
     worker_task_timeout: float,
     trace: object | None = None,
     enable_2D_hole_fill: bool = False,
+    handoff=None,
 ):
     """Execute the production bounded-window graph and canonical relay frontier."""
     from .lta_window_execution import WindowExecution, drive_window_generations
@@ -1584,7 +1607,7 @@ def _drive_workers_to_fixed_point(
             scheduler=scheduler, pool=pool, view_plan=view_plan, cache_ref=cache_ref,
             view_union=view_union, temp_root=temp_root, conf=conf,
             empty_frame_limit=empty_frame_limit, worker_task_timeout=worker_task_timeout,
-            trace=trace, enable_2D_hole_fill=enable_2D_hole_fill,
+            trace=trace, enable_2D_hole_fill=enable_2D_hole_fill, handoff=handoff,
         ),
         initial=initial, continue_relays=_continue_canonical_frontier,
         admission_policy="canonical_temporal_frontier/1",
@@ -1720,11 +1743,10 @@ def execute_lta_plan(
 ) -> LtaProductionResult:
     """Execute the qualified mask-injected LTA production path."""
 
-    import numpy as np
-
     if not isinstance(plan, LtaRunPlan):
         raise TypeError("plan must be an LtaRunPlan")
     source, volume_plan, view_plan = _require_supported_runtime(plan)
+    from .lta_interval_execution import DirectionalHandoff
     dynamic_crops = plan.crop_backend == "dynamic"
     if dynamic_crops:
         from .lta_dynamic_crops import DYNAMIC_CROP_POLICY, DynamicCropSettings
@@ -1743,7 +1765,26 @@ def execute_lta_plan(
         raise ValueError("empty_frame_limit must be a positive integer or None")
     if type(plan.workers_per_gpu) is not int or not 1 <= plan.workers_per_gpu <= 4:
         raise ValueError("LTA workers_per_gpu must be an integer in [1,4]")
-    storage_preflight = _preflight_lta_storage(plan, view_plan)
+    aligned_annotations = _aligned_annotations(plan, source)
+    known_background_frames = _aligned_known_background_frames(plan, source, aligned_annotations)
+    positive_frames = {int(annotation.frame_position) for annotation in aligned_annotations}
+    annotated_frames = sorted(positive_frames.union(known_background_frames))
+    domains = plan_neighbor_anchor_domains(
+        positive_frames, view_plan.frame_count, background_frames=known_background_frames,
+    )
+    directional_overlap_frames = sum(
+        right - left - 1
+        for left, right in zip(annotated_frames, annotated_frames[1:])
+        if left in positive_frames and right in positive_frames
+    )
+    encoded_indices = (view_plan.encoded_frame_indices or source.encoded_indices
+                       or (None,) * view_plan.frame_count)
+    suggestions = SliceSuggestions(
+        encoded_indices, annotated_frames, exemplar_index_origin=plan.exemplar_index_origin,
+    )
+    storage_preflight = _preflight_lta_storage(
+        plan, view_plan, directional_overlap_frames=directional_overlap_frames,
+    )
     _prepare_output_roots(plan)
     from . import __version__
     from .lta_telemetry import LtaExecutionTrace, lta_source_fingerprint
@@ -1779,6 +1820,7 @@ def execute_lta_plan(
     source_volume = None
     hard_positive = None
     view_union = None
+    handoff = None
     native_prediction = None
     finalization = None
     completed = False
@@ -1791,12 +1833,6 @@ def execute_lta_plan(
     known_background_audit: Mapping[str, object] = {}
     relay_generation = 0
     try:
-        aligned_annotations = _aligned_annotations(plan, source)
-        known_background_frames = _aligned_known_background_frames(
-            plan,
-            source,
-            aligned_annotations,
-        )
         source_cache_path = plan.temp_root / "source.gray8.dat"
         with trace.phase("decode_source_cache", shape_tyx=list(volume_plan.source_shape_tyx)):
             source_volume = _materialize_source_volume(source, path=source_cache_path)
@@ -1814,15 +1850,22 @@ def execute_lta_plan(
             source_identity=_source_identity(source),
         )
 
+        view_union = _allocate_view_union(
+            view_plan,
+            plan.temp_root / "views" / "transverse_union.uint8.raw",
+        )
+        handoff = DirectionalHandoff(plan.temp_root, view_union, domains)
         with trace.phase("plan_seed_window_graph") as planning:
             if dynamic_crops:
                 initial, seed_inventory = plan_initial_dynamic_tasks(
                     source, aligned_annotations, view_plan, cache_ref, temp_root=plan.temp_root,
-                    conf=plan.conf, empty_frame_limit=empty_frame_limit, settings=crop_settings)
+                    conf=plan.conf, empty_frame_limit=empty_frame_limit, settings=crop_settings,
+                    anchor_domains=domains)
             else:
                 initial, seed_inventory = _plan_initial_chains(
                     source, aligned_annotations, view_plan, cache_ref,
                     temp_root=plan.temp_root, conf=plan.conf, empty_frame_limit=empty_frame_limit,
+                    anchor_domains=domains,
                 )
             planning["chain_count"] = len(initial)
             if not dynamic_crops:
@@ -1830,6 +1873,7 @@ def execute_lta_plan(
                 initial = tuple(_PlannedChain(task.work, {**task.payload, "worker_trace_root": str(trace_dir)}) for task in initial)
             planning["window_count"] = len(initial)
         authoritative_seed_audit = _authoritative_seed_audit(seed_inventory)
+        handoff.bind_seed_inventory(seed_inventory)
         del seed_inventory
         if dynamic_crops:
             scheduler = DynamicViewCompletion(initial[0].work.view, plan.device_ids)
@@ -1840,10 +1884,6 @@ def execute_lta_plan(
                 (chain.work for chain in initial), plan.device_ids, helper_queue_order="head",
                 max_relay_generation=_relay_generation_bound(view_plan),
                 workers_per_device=plan.workers_per_gpu)
-        view_union = _allocate_view_union(
-            view_plan,
-            plan.temp_root / "views" / "transverse_union.uint8.raw",
-        )
         with trace.phase("worker_pool_startup", devices=list(plan.device_ids)):
             pool = LtaWorkerPool(
                 plan.device_ids,
@@ -1868,7 +1908,8 @@ def execute_lta_plan(
                     scheduler=scheduler, pool=pool, initial=initial, view_plan=view_plan,
                     cache_ref=cache_ref, view_union=view_union, temp_root=plan.temp_root,
                     conf=plan.conf, empty_frame_limit=empty_frame_limit,
-                    worker_task_timeout=float(worker_task_timeout), trace=trace, settings=crop_settings)
+                    worker_task_timeout=float(worker_task_timeout), trace=trace, settings=crop_settings,
+                    handoff=handoff)
             else:
                 relay_generation, worker_pids, execution_schedule, worker_audit = _drive_workers_to_fixed_point(
                     enable_2D_hole_fill=plan.enable_2D_hole_fill,
@@ -1883,6 +1924,7 @@ def execute_lta_plan(
                     empty_frame_limit=empty_frame_limit,
                     worker_task_timeout=float(worker_task_timeout),
                     trace=trace,
+                    handoff=handoff,
                 )
             worker_audit = {
                 **worker_audit,
@@ -1921,12 +1963,18 @@ def execute_lta_plan(
                 if callable(add_note):
                     add_note(str(cleanup_error))
 
+        with trace.phase("compose_directional_handoff"):
+            handoff.compose(observe=suggestions.observe_counts)
+        handoff.close()
+        handoff = None
+        suggestion_record = suggestions.manifest_record()
         view_fill = fill_completed_view_holes_2d_inplace(
             view_union,
             enabled=plan.enable_2D_hole_fill,
             runtime_view_id=view_plan.runtime_view_id,
             workers=worker_count,
         )
+        _restore_authoritative_slices(view_union, hard_positive, annotated_frames)
         backprojection_claim = scheduler.claim_backprojection(
             scheduler.owner_for_view(initial[0].work.view)
         )
@@ -2037,16 +2085,19 @@ def execute_lta_plan(
             ))
             write_checkpoint_index(sequence_complete=False)
 
+        def restore_authoritative_slices(volume):
+            _restore_authoritative_slices(volume, hard_positive, annotated_frames)
+
         finalization = finalize_lta_native_union(
             contributor_layers,
             workspace_path=plan.temp_root / "terminal_union.uint8.raw",
             temp_dir=plan.temp_root / "postprocessing",
-            protected_foreground_layers=(hard_positive_layer,),
             postprocessing=plan.postprocessing,
             prefer_memory=False,
             reserve_bytes=0,
             workers=worker_count,
             checkpoint_callback=save_postprocessing_checkpoint,
+            restore_authoritative_slices=restore_authoritative_slices,
         )
         checkpoint_index = write_checkpoint_index(sequence_complete=True)
         known_background_audit = _known_background_audit(
@@ -2107,6 +2158,7 @@ def execute_lta_plan(
                         "authoritative_tile_seeding": dict(authoritative_seed_audit),
                         "storage_preflight": dict(storage_preflight),
                         "known_background_audit": dict(known_background_audit),
+                        "annotation_suggestions": suggestion_record,
                         "worker_audit": dict(worker_audit),
                         "postprocessing": dict(finalization.postprocessing),
                         "postprocessing_checkpoints": [
@@ -2182,13 +2234,14 @@ def execute_lta_plan(
                     "relay_admission_policy": relay_policy,
                     "authoritative_tile_seeding": dict(authoritative_seed_audit),
                     "temporal_propagation": {
-                        "policy": "full_view_per_anchor_recall_union",
-                        "per_anchor_frame_range": [0, view_plan.frame_count],
-                        "cross_anchor_identity_reconciliation": False,
-                        "output_combination": "union",
-                        "missing_at_other_anchors": "does_not_terminate_lineage",
+                        "policy": "neighboring_annotated_slice_intervals",
+                        "anchor_frame_ranges": [asdict(domain) for domain in domains.values()],
+                        "output_combination": "center_aligned_signed_distance_handoff",
+                        "annotated_slice_indices": annotated_frames,
+                        "known_background_slice_indices": list(known_background_frames),
                         "continuation": "nonempty_directional_dogfood_boundaries",
                     },
+                    "annotation_suggestions": suggestion_record,
                     "storage_preflight": dict(storage_preflight),
                     "known_background_audit": dict(known_background_audit),
                     "worker_audit": dict(worker_audit),
@@ -2227,6 +2280,12 @@ def execute_lta_plan(
             relay_generations=relay_generation,
         )
         completed = True
+        if (next_slice := suggestion_record["next_slice"]) is not None:
+            print(
+                f"LTA suggested native transverse slice {next_slice['slice_index']} (0-based) "
+                f"with {next_slice['disagreement_fraction']:.1%} directional disagreement.",
+                flush=True,
+            )
         return result
     finally:
         from .runtime import close_memmap_array
@@ -2238,6 +2297,8 @@ def execute_lta_plan(
 
         if finalization is not None and not finalization.closed:
             finalization.close()
+        if handoff is not None:
+            handoff.close()
         for volume in (native_prediction, view_union, hard_positive, source_volume):
             if volume is not None:
                 try:

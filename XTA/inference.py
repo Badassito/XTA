@@ -891,7 +891,7 @@ def _iter_cpu_retina_payload_rois(
     proto = np.asarray(payload.proto, dtype=np.float32)
     if proto.ndim == 4 and int(proto.shape[0]) == 1:
         proto = proto[0]
-    if proto.ndim != 3:
+    if proto.ndim != 3 or min(proto.shape) <= 0:
         return
 
     coeffs = np.asarray(payload.coeffs, dtype=np.float32)
@@ -912,6 +912,9 @@ def _iter_cpu_retina_payload_rois(
     proto_flat = np.ascontiguousarray(proto.reshape(c, mh * mw), dtype=np.float32)
     block = cpu_retina_block_detections()
     n = int(coeffs.shape[0])
+    from .retina_numeric import retina_roundoff_bounds, threshold_retina_roi
+
+    bounds = retina_roundoff_bounds(proto_flat, coeffs)
 
     for start in range(0, n, block):
         stop = min(n, start + block)
@@ -924,13 +927,17 @@ def _iter_cpu_retina_payload_rois(
             inst_idx = int(start + local_idx)
             if inst_idx >= int(boxes.shape[0]):
                 continue
+            if not np.isfinite(boxes[inst_idx]).all():
+                continue
             roi = _bbox_to_integer_roi(boxes[inst_idx], (target_h, target_w))
             if roi is None:
                 continue
             y1, y2, x1, x2 = roi
             low_logits = np.ascontiguousarray(logits_block[local_idx, mask_crop_y, mask_crop_x], dtype=np.float32)
-            roi_logits = _resize_lowres_logits_roi(low_logits, (target_h, target_w), roi)
-            roi_mask = np.asarray(roi_logits > 0.0, dtype=bool)
+            roi_mask = threshold_retina_roi(
+                low_logits, bounds[inst_idx], proto_flat, coeffs[inst_idx], mw,
+                mask_crop_y.start, mask_crop_x.start, target_h, target_w, y1, y2, x1, x2,
+            )
             if not np.any(roi_mask):
                 continue
             conf_val = float(confs[inst_idx]) if inst_idx < int(confs.shape[0]) else 0.0
@@ -943,14 +950,14 @@ def _accumulate_cpu_retina_payload_to_prediction_frame(
     track_confidence: bool = True,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], int]:
     """Build a prediction-space union and an optional observed-score plane."""
-    target_shape = (int(out_size), int(out_size))
+    return _accumulate_cpu_retina_rois(payload, (int(out_size), int(out_size)), track_confidence)
+
+
+def _accumulate_cpu_retina_rois(payload, target_shape, track_confidence):
     frame_union = np.zeros(target_shape, dtype=np.uint8)
     frame_confmap = np.zeros(target_shape, dtype=np.uint8) if track_confidence else None
     kept_instances = 0
 
-    # The generated inference videos are square --imgsz frames. If a future source ever reports a
-    # different original shape, keep the current --imgsz target because the affine matrices in this
-    # pipeline are defined in that prediction-video coordinate system.
     for _inst_idx, conf_val, y1, y2, x1, x2, roi_mask in _iter_cpu_retina_payload_rois(payload, target_shape):
         roi_u8 = roi_mask.astype(np.uint8, copy=False)
         frame_union[y1:y2, x1:x2] |= roi_u8
@@ -1089,138 +1096,82 @@ def ensure_cpu_retina_mask_predictor_patch() -> bool:
 
 _ULTRALYTICS_GPU_PROTO_UNION_PATCHED = False
 
-def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: object) -> Optional['GpuFlattenedRetinaPayload']:
-    """Build the flattened union payload at PROTO resolution.
+def _exact_retina_torch(torch, pred, proto, image_hw, track_confidence):
+    """Use the canonical bounded CPU decoder if the CUDA kernel cannot run."""
+    host = pred.detach().float().cpu().numpy()
+    payload = CpuRetinaMaskPayload(
+        proto=proto.detach().float().cpu().numpy(), coeffs=host[:, 6:6+int(proto.shape[0])],
+        boxes_xyxy=host[:, :4], confs=host[:, 4], orig_shape=image_hw, img_shape=image_hw,
+    )
+    union, scores, _ = _accumulate_cpu_retina_rois(payload, image_hw, track_confidence)
+    return (torch.as_tensor(union, dtype=torch.float32, device=pred.device),
+            None if scores is None else (
+                torch.as_tensor(scores, dtype=torch.float32, device=pred.device) / CONF_U8_MAX))
 
- Instead of letting Ultralytics materialize the (n, imgsz, imgsz) float retina stack that the
- pipeline immediately reduces to one plane, the per-instance mask logits are combined from
- the protos, box-cropped at proto scale, reduced with a single max-logit plane, and ONE plane
- is bilinearly upsampled to the network raster and thresholded at 0. This is an approximation:
- interpolation and instance maximum do not commute. Neighboring instance logits can create
- foreground bridges that per-instance retina interpolation would leave empty, including away
- from box edges. Native-grid scaling can magnify these differences.
- Instance-level --min_conf (angle-variant fast path) and the optional per-pixel max-confidence
- plane are applied at proto resolution; that plane is upsampled by _upsample_proto_confidence,
- so bilinear mask boundaries keep a score. Returns None on any unexpected condition so the
- caller falls back to the unpatched Ultralytics path."""
+
+def _retina_workspace(head, proto, indices, count, image_hw, *, track_confidence):
+    from .retina_cuda import RetinaWorkspace
+
+    crop = _scale_masks_crop_slices_np(tuple(proto.shape[-2:]), image_hw)
+    return RetinaWorkspace(head, proto, indices, count, image_hw, crop, track_confidence=track_confidence)
+
+
+def _selected_retina_cuda(torch, pred, proto, image_hw, track_confidence):
+    head = pred.transpose(0, 1).contiguous()
+    proto = proto.contiguous()
+    indices = torch.arange(head.shape[1], dtype=torch.int32, device=head.device)
+    count = torch.full((1,), head.shape[1], dtype=torch.int32, device=head.device)
+    workspace = _retina_workspace(head, proto, indices, count, image_hw, track_confidence=track_confidence)
+    stream = _cupy_external_stream(workspace._cp, torch.cuda.current_stream(head.device))
+    union, scores = workspace.decode(xyxy=True, stream=stream)
+    return union, scores, (head, proto, indices, count, workspace)
+
+
+def _build_gpu_flattened_payload_from_proto(pred: object, img: object, proto: object) -> Optional['GpuFlattenedRetinaPayload']:
+    """Decode exact per-instance retina support without a full-resolution mask stack."""
     try:
-        import torch  # type: ignore
-        import torch.nn.functional as F  # type: ignore
-    except Exception:
-        return None
-    if not isinstance(pred, torch.Tensor) or not isinstance(proto, torch.Tensor):
-        return None
-    try:
-        proto_t = proto
-        if proto_t.ndim == 4 and int(proto_t.shape[0]) == 1:
-            proto_t = proto_t[0]
-        if proto_t.ndim != 3 or pred.ndim != 2:
+        import torch
+
+        if not isinstance(pred, torch.Tensor) or not isinstance(proto, torch.Tensor):
             return None
-        img_h = int(img.shape[2])
-        img_w = int(img.shape[3])
-        if img_h <= 0 or img_w <= 0:
+        if proto.ndim == 4 and int(proto.shape[0]) == 1:
+            proto = proto[0]
+        image_hw = tuple(map(int, img.shape[-2:]))
+        if proto.ndim != 3 or pred.ndim != 2 or min(image_hw) <= 0 or min(proto.shape) <= 0:
             return None
-        c, mh, mw = (int(proto_t.shape[0]), int(proto_t.shape[1]), int(proto_t.shape[2]))
-        if c <= 0 or mh <= 0 or mw <= 0 or int(pred.shape[1]) < 6 + c:
+        if int(pred.shape[1]) < 6 + int(proto.shape[0]):
             return None
 
         fastpath = angle_variant_gpu_fastpath()
-        fastpath_min_conf = None if fastpath is None else float(fastpath[0])
-        fastpath_min_radius = 0.0 if fastpath is None else float(fastpath[1])
-        run_gpu_cleanup = bool(
-            fastpath is not None and gpu_retina_cleanup_enabled() and float(fastpath_min_radius) > 0.0
-        )
-
-        pred_t = pred
-        n = int(pred_t.shape[0])
-        confs_t = pred_t[:, 4].to(torch.float32).reshape(-1) if n > 0 else None
-
-        # Angle-variant fast path: drop low-confidence instances before the union (exact
-        # instance-level --min_conf, mirroring _try_flatten_gpu_retina_result).
-        min_conf_applied = False
-        if (
-            fastpath_min_conf is not None
-            and float(fastpath_min_conf) > 0.0
-            and confs_t is not None
-            and n > 0
-        ):
-            keep = confs_t >= float(fastpath_min_conf)
-            pred_t = pred_t[keep]
-            confs_t = confs_t[keep]
-            n = int(pred_t.shape[0])
-            min_conf_applied = True
-
-        if n <= 0:
-            return GpuFlattenedRetinaPayload(
-                union_gpu=None, conf_gpu=None, instance_count=0,
-                min_conf_applied=min_conf_applied, run_gpu_cleanup=run_gpu_cleanup,
-                gpu_min_radius=float(fastpath_min_radius),
-            )
-
-        coeffs = pred_t[:, 6:6 + c].to(torch.float32)
-        logits = (coeffs @ proto_t.to(torch.float32).view(c, -1)).view(n, mh, mw)
-
-        # Box crop at proto scale. Proto cell c spans [c, c+1) and is sampled at its centre
-        # c+0.5 by the align_corners=False upsample, so the crop tests that centre against
-        # the half-open box. The cell holding a non-empty box's centre is always kept, so a
-        # box narrower than one cell still contributes, as in the per-instance retina path.
-        # The resident NVRTC unions use the same predicate (proto_cell_accepted/_rejected).
-        boxes = pred_t[:, :4].to(torch.float32)
-        sx = float(mw) / float(img_w)
-        sy = float(mh) / float(img_h)
-        x1 = (boxes[:, 0] * sx).view(-1, 1, 1)
-        y1 = (boxes[:, 1] * sy).view(-1, 1, 1)
-        x2 = (boxes[:, 2] * sx).view(-1, 1, 1)
-        y2 = (boxes[:, 3] * sy).view(-1, 1, 1)
-        cols = torch.arange(mw, device=logits.device, dtype=torch.float32).view(1, 1, -1)
-        rows = torch.arange(mh, device=logits.device, dtype=torch.float32).view(1, -1, 1)
-        inside_x = ((cols + 0.5 >= x1) & (cols + 0.5 < x2)) | ((x2 > x1) & (cols == torch.floor(0.5 * (x1 + x2))))
-        inside_y = ((rows + 0.5 >= y1) & (rows + 0.5 < y2)) | ((y2 > y1) & (rows == torch.floor(0.5 * (y1 + y2))))
-        inside = inside_x & inside_y
-
-        # Crop fill: a bounded "confident background" logit rather than -inf. An extreme fill
-        # bleeds through the bilinear upsample and erodes up to a full proto cell of box
-        # interior; -6 (sigmoid ~0.0025) keeps real logit zero-crossings exact while limiting
-        # crop-edge bleed to ~1 px at the network raster. Ultralytics' own non-retina path
-        # (ops.process_mask) also crops at proto resolution, with a multiplicative zero fill.
-        neg_fill = logits.new_full((), -6.0)
-        max_logit = torch.where(inside, logits, neg_fill).amax(dim=0)  # (mh, mw)
-        union_gpu = (
-            F.interpolate(
-                max_logit.reshape(1, 1, mh, mw), size=(img_h, img_w),
-                mode='bilinear', align_corners=False,
-            ).reshape(img_h, img_w) > 0.0
-        ).to(torch.float32)
-
-        conf_gpu = None
-        if confs_t is not None and gpu_flatten_conf_tracking_enabled():
-            inst_proto = (logits > 0.0) & inside
-            conf_plane = (confs_t.clamp(0.0, 1.0).view(-1, 1, 1) * inst_proto).amax(dim=0)
-            conf_gpu = _upsample_proto_confidence(conf_plane, union_gpu, (img_h, img_w))
-
-        ready_event = None
-        try:
-            if union_gpu.is_cuda:
-                ready_event = torch.cuda.Event()
-                ready_event.record(torch.cuda.current_stream(union_gpu.device))
-        except Exception:
-            ready_event = None
+        min_conf = None if fastpath is None else float(fastpath[0])
+        radius = 0.0 if fastpath is None else float(fastpath[1])
+        run_gpu_cleanup = bool(fastpath is not None and gpu_retina_cleanup_enabled() and radius > 0.0)
+        min_conf_applied = bool(min_conf is not None and min_conf > 0.0)
+        if min_conf_applied:
+            pred = pred[pred[:, 4].float() >= min_conf]
+        count = int(pred.shape[0])
+        union = scores = event = refs = None
+        if count:
+            want_scores = gpu_flatten_conf_tracking_enabled()
+            if pred.is_cuda:
+                try:
+                    union, scores, refs = _selected_retina_cuda(torch, pred, proto, image_hw, want_scores)
+                except Exception:
+                    union, scores = _exact_retina_torch(torch, pred, proto, image_hw, want_scores)
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(pred.device))
+            else:
+                union, scores = _exact_retina_torch(torch, pred, proto, image_hw, want_scores)
         return GpuFlattenedRetinaPayload(
-            union_gpu=union_gpu, conf_gpu=conf_gpu, instance_count=int(n),
-            min_conf_applied=min_conf_applied, run_gpu_cleanup=run_gpu_cleanup,
-            gpu_min_radius=float(fastpath_min_radius),
-            ready_event=ready_event,
+            union_gpu=union, conf_gpu=scores, instance_count=count, min_conf_applied=min_conf_applied,
+            run_gpu_cleanup=run_gpu_cleanup, gpu_min_radius=radius, ready_event=event, device_refs=refs,
         )
     except Exception:
         return None
 
-def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
-    """Patch Ultralytics segmentation postprocess for GPU retina mode.
 
- Mirrors ensure_cpu_retina_mask_predictor_patch: construct_result returns a lightweight
- Results carrying a prebuilt GpuFlattenedRetinaPayload (union computed at proto resolution)
- instead of an (n, imgsz, imgsz) retina-mask stack. Any failure falls back per-frame to the
- original Ultralytics construct_result."""
+def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
+    """Return exact device retina planes from Ultralytics segmentation postprocess."""
     global _ULTRALYTICS_GPU_PROTO_UNION_PATCHED
 
     if cpu_retina_masks_enabled():
@@ -1257,8 +1208,8 @@ def ensure_gpu_retina_proto_union_predictor_patch() -> bool:
     SegmentationPredictor.construct_result = _tta_gpu_proto_union_construct_result
     _ULTRALYTICS_GPU_PROTO_UNION_PATCHED = True
     print(
-        'GPU proto-resolution retina union enabled: per-frame unions are reduced at '
-        'proto scale and one plane is upsampled, bypassing the (n, imgsz, imgsz) retina stack.'
+        'GPU retina union enabled: exact per-instance masks accumulate directly into '
+        'the final raster without a full-resolution instance stack.'
     )
     return True
 
@@ -3013,6 +2964,7 @@ class _ResidentGpuPipelineSlot:
         self.native_union = None
         self.native_conf = None
         self.native_bbox = None
+        self.retina_workspace = None
         self.unit_descriptor: Optional[ResidentRingUnitDescriptor] = None
         self.identity_native_warp = False
         self.native_to_out: Tuple[np.float32, ...] = tuple()
@@ -3640,6 +3592,31 @@ def _resident_mask_kernels() -> Optional[object]:
           }
           merge_quantize_block_bbox(fg != 0, oh, ow, out_bbox, row_masks);
         }
+
+        extern "C" __global__ void warp_retina_quantize_affine(
+            const float* mask, const float* scores, int ih, int iw, int oh, int ow,
+            float m00, float m01, float m02,
+            float m10, float m11, float m12,
+            unsigned char* out_mask, unsigned char* out_scores, int* out_bbox) {
+          __shared__ unsigned int row_masks[8];
+          const int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+          const int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+          bool foreground = false;
+          if (ox < ow && oy < oh) {
+            // The retina result is already categorical. Warp its nearest
+            // network pixel, so the native affine cannot introduce a bridge.
+            const int x = __float2int_rn(m00 * ox + m01 * oy + m02);
+            const int y = __float2int_rn(m10 * ox + m11 * oy + m12);
+            const int pixel = oy * ow + ox;
+            const int source = y * iw + x;
+            foreground = x >= 0 && x < iw && y >= 0 && y < ih && mask[source] > 0.f;
+            out_mask[pixel] = foreground ? 1 : 0;
+            if (out_scores != nullptr) {
+              out_scores[pixel] = foreground ? __float2uint_rn(scores[source] * 255.0f) : 0;
+            }
+          }
+          merge_quantize_block_bbox(foreground, oh, ow, out_bbox, row_masks);
+        }
         '''
         names = (
             'compact_f32', 'compact_f16', 'compact_f16_tiled', 'compact_f32_tiled',
@@ -3647,6 +3624,7 @@ def _resident_mask_kernels() -> Optional[object]:
             'union_f16_f16_tiled', 'union_f32_f32_tiled',
             'proto_threshold_signed', 'proto_dilate_signed', 'proto_erode_signed',
             'upsample_quantize', 'upsample_quantize_affine', 'upsample_proto_confidence',
+            'warp_retina_quantize_affine',
         )
         module = cp.RawModule(code=src, options=('--std=c++11',), name_expressions=names)
         _RESIDENT_MASK_KERNELS = argparse.Namespace(
@@ -3938,7 +3916,7 @@ def _announce_direct_compaction_layout(torch_mod, head, proto, *, allow_tiled, k
           f'reason={";".join(reasons) if reasons else "eligible"}', flush=True)
 
 def direct_device_compaction_enabled() -> bool:
-    """Fuse the generic direct loop's confidence gate + proto union without host counts."""
+    """Fuse the generic direct loop's confidence gate and retina decoding without host counts."""
     return _env_flag('YOLO_TTA_DIRECT_DEVICE_COMPACTION', True)
 
 def _reduce_direct_prototypes(
@@ -4120,17 +4098,12 @@ def _upsample_proto_confidence(conf_proto, union, image_hw):
     return torch.where((union.reshape(oh, ow) > 0) & ~(nearest > 0), taps, nearest)
 
 
-def _direct_payload_from_planes(max_logit, conf_proto, image_hw, *, count, count_device=None,
-                                kernel_name, min_conf_applied=False, refs=()):
+def _direct_payload_from_planes(union, confidence, *, count, count_device=None,
+                                kernel_name='exact_retina', min_conf_applied=False, refs=()):
     import torch
-    import torch.nn.functional as F
 
-    union = F.interpolate(max_logit[None, None], size=image_hw, mode='bilinear',
-                          align_corners=False)[0, 0].gt(0).to(torch.float32)
-    confidence = (None if conf_proto is None else
-                  _upsample_proto_confidence(conf_proto, union, image_hw))
     event = torch.cuda.Event()
-    event.record(torch.cuda.current_stream(max_logit.device))
+    event.record(torch.cuda.current_stream(union.device))
     fastpath = angle_variant_gpu_fastpath()
     radius = 0.0 if fastpath is None else float(fastpath[1])
     return GpuFlattenedRetinaPayload(
@@ -4143,15 +4116,39 @@ def _direct_payload_from_planes(max_logit, conf_proto, image_hw, *, count, count
 
 def _build_direct_device_compacted_payload(
     head_frame: object, proto_frame: object, im: object, confidence_threshold: float,
-    min_conf_applied: bool = False, *, allow_tiled: bool = True,
+    min_conf_applied: bool = False, *, own_inputs: bool = True,
 ) -> Optional[GpuFlattenedRetinaPayload]:
-    planes = _reduce_direct_prototypes(head_frame, proto_frame, im, confidence_threshold, allow_tiled=allow_tiled)
-    if planes is None:
-        return None
-    logits, scores, count, name, refs = planes
     try:
-        return _direct_payload_from_planes(logits, scores, tuple(im.shape[-2:]), count=-1,
-            count_device=count, kernel_name=name, min_conf_applied=min_conf_applied, refs=refs)
+        import torch
+
+        kernels = _resident_mask_kernels()
+        if kernels is None or not head_frame.is_cuda or head_frame.ndim != 2 or proto_frame.ndim != 3:
+            return None
+        head, proto = head_frame.contiguous(), proto_frame.contiguous()
+        if own_inputs:
+            head, proto = head.clone(), proto.clone()
+        anchors = int(head.shape[1])
+        if not anchors or head.shape[0] != 5 + proto.shape[0]:
+            return None
+        image_hw = tuple(map(int, im.shape[-2:]))
+        indices = torch.empty((anchors,), dtype=torch.int32, device=head.device)
+        count = torch.zeros((1,), dtype=torch.int32, device=head.device)
+        workspace = _retina_workspace(head, proto, indices, count, image_hw,
+                                      track_confidence=gpu_flatten_conf_tracking_enabled())
+        cp = kernels.cp
+        stream = _cupy_external_stream(cp, torch.cuda.current_stream(head.device))
+        compact = kernels.compact_f16 if head.dtype == torch.float16 else kernels.compact_f32
+        head_ptr, _, index_ptr, count_ptr = workspace._input_ptrs
+        with cp.cuda.Device(workspace.device_id):
+            compact(
+                ((anchors + 255) // 256,), (256,),
+                (head_ptr, np.int32(anchors), np.float32(confidence_threshold), index_ptr, count_ptr,
+                 np.int32(image_hw[0]), np.int32(image_hw[1]), np.uintp(0)), stream=stream,
+            )
+        union, scores = workspace.decode(stream=stream)
+        return _direct_payload_from_planes(union, scores, count=-1, count_device=count,
+            min_conf_applied=min_conf_applied,
+            refs=(head, proto, indices, count, workspace, workspace._boxes, workspace._owners))
     except Exception:
         return None
 
@@ -4175,13 +4172,13 @@ def _mark_native_fanout_consumed(source):
         source = getattr(source, 'base_source', None)
 
 
-def _direct_native_fanout_siblings(sink, result_index, head, proto, image, *, allow_tiled):
+def _direct_native_fanout_siblings(sink, result_index, head, proto, image):
     """Decode sibling cutoffs from one live raw frame, retaining one extra plane."""
     cutoffs = tuple(sink.cutoffs)
     if not cutoffs:
         return True
-    from .sweep_proto import consume_tiled_siblings
-    if consume_tiled_siblings(sink, result_index, head, proto, image, allow_tiled=allow_tiled):
+    from .sweep_proto import consume_sibling_bins
+    if consume_sibling_bins(sink, result_index, head, proto, image):
         return True
     # One bounded scalar read can eliminate every higher-cut decode on blank frames.
     # CUDA compaction compares fp32 scores/gates, including heads stored in fp16.
@@ -4195,7 +4192,7 @@ def _direct_native_fanout_siblings(sink, result_index, head, proto, image, *, al
                 payload = GpuFlattenedRetinaPayload(union_gpu=None, conf_gpu=None, instance_count=0)
             else:
                 payload = _build_direct_device_compacted_payload(
-                    head, proto, image, threshold, min_conf_applied=False, allow_tiled=allow_tiled)
+                    head, proto, image, threshold, min_conf_applied=False, own_inputs=False)
                 if payload is None:
                     unavailable.append(cutoff)
                     return
@@ -4223,7 +4220,7 @@ def _direct_predict_stream(
     cfg: 'PredictConfig',
     source_label: str,
 ) -> Iterator[_DirectPredictResult]:
-    """Run the direct preprocess, backend-forward, confidence-gate, and proto-union loop.
+    """Run direct preprocess, backend forward, confidence gate, and retina decoding.
     
     The loop preserves padded-frame accounting while avoiding per-frame Results and avoidable host count reads."""
     import torch  # type: ignore
@@ -4243,8 +4240,7 @@ def _direct_predict_stream(
     replay_cache = (None if native_fanout is not None else
                     torch_replay_for_predictor(predictor, cfg, 'gpu-segmentation-direct'))
     result_ordinal = 0
-    tiled_compaction_active = True
-    kernel_counts = {'tiled_f16': 0, 'tiled_f32': 0, 'scalar': 0, 'scalar_workspace_fallback': 0, 'synchronized': 0}
+    kernel_counts = {'exact_retina': 0, 'synchronized': 0}
     failed_probes = 0
 
     global _DIRECT_PREDICT_ANNOUNCED, _DIRECT_DEVICE_COMPACTION_ANNOUNCED, _DIRECT_DEVICE_COMPACTION_FALLBACK_WARNED
@@ -4253,7 +4249,7 @@ def _direct_predict_stream(
         print(
             'Direct backend predict loop active: stream_inference, NMS and '
             'per-frame Results are bypassed; confidence-gated instances feed the '
-            'proto-resolution union directly (YOLO_TTA_DIRECT_PREDICT=0 restores model.predict).'
+            'retina union directly (YOLO_TTA_DIRECT_PREDICT=0 restores model.predict).'
         )
 
     start_fn = getattr(source, 'start', None)
@@ -4309,7 +4305,6 @@ def _direct_predict_stream(
                         min_conf_applied=bool(
                             _direct_fastpath is not None and float(_direct_fastpath[0]) > 0.0
                         ),
-                        allow_tiled=tiled_compaction_active,
                     )
                     for i in range(int(bsz))
                 ]
@@ -4320,7 +4315,7 @@ def _direct_predict_stream(
                         _DIRECT_DEVICE_COMPACTION_ANNOUNCED = True
                         print(
                             'Direct device compaction active: confidence filtering, '
-                            'proto dot/crop union, and instance counts remain on device; '
+                            'exact retina union, and instance counts remain on device; '
                             'YOLO_TTA_DIRECT_DEVICE_COMPACTION=0 restores the synchronized fallback.'
                         )
                     for frame_index, payload in enumerate(compacted_payloads):
@@ -4328,13 +4323,10 @@ def _direct_predict_stream(
                         result_ordinal += 1
                         if native_fanout is not None:
                             payload.sweep_fanout_capture = (native_fanout, ordinal)
-                        if payload.compaction_kernel == 'scalar_workspace_fallback':
-                            tiled_compaction_active = False
-                        kernel_counts[payload.compaction_kernel or 'scalar'] += 1
+                        kernel_counts['exact_retina'] += 1
                         yield _DirectPredictResult(payload)  # type: ignore[arg-type]
                         if native_fanout is not None and not _direct_native_fanout_siblings(
-                                native_fanout, ordinal, head[frame_index], protos[frame_index],
-                                im, allow_tiled=tiled_compaction_active):
+                                native_fanout, ordinal, head[frame_index], protos[frame_index], im):
                             native_fanout = None
                             if replay_key is not None and replayed is None:
                                 replay_cache.store_instance(replay_key, (head, protos),
@@ -4398,8 +4390,7 @@ def _direct_predict_stream(
                     )
                 result_ordinal += 1
                 yield _DirectPredictResult(payload)
-    if (getattr(source, '_tta_announce_prediction', True) or failed_probes
-            or kernel_counts['synchronized'] or kernel_counts['scalar_workspace_fallback']):
+    if getattr(source, '_tta_announce_prediction', True) or failed_probes or kernel_counts['synchronized']:
         print(f'Direct compaction {source_label}: '
               + ', '.join(f'{name}={count}' for name, count in kernel_counts.items())
               + f', failed_probes={failed_probes}', flush=True)
@@ -4517,14 +4508,13 @@ def predict_source_and_accumulate(
             if not use_custom_cpu_retina:
                 print('Warning: CPU retina predictor patch unavailable; using Ultralytics native retina_masks=True for this source.')
         else:
-            # GPU retina mode — reduce unions at proto resolution inside
-            # construct_result instead of materializing (n, imgsz, imgsz) retina stacks.
+            # GPU retina builds a union without materializing an instance stack.
             ensure_gpu_retina_proto_union_predictor_patch()
 
         prediction_count = 0
         frames_with_predictions = 0
 
-        # drive the backend directly on the proto-union fast path; fall back
+        # Drive the backend directly on the retina path. Fall back
         # to Ultralytics stream_inference when the direct loop's preconditions do not hold.
         results = None
         predictor_direct = None

@@ -48,12 +48,12 @@ def update_leases(root, updates):
     _update_database(path, updates, create=path == root / 'quota.sqlite')
 
 
-def _update_database(path, updates, *, create):
-    limit = _quota_bytes()
+def _update_database(path, updates, *, create, limit=None, timeout=30):
+    limit = _quota_bytes() if limit is None else limit
     # The coordinator initializes a separately placed ledger. Losing it must
     # not give active workers a second capacity budget.
     target = path if create else path.as_uri() + '?mode=rw'
-    with closing(sqlite3.connect(target, timeout=30, uri=not create)) as db, db:
+    with closing(sqlite3.connect(target, timeout=timeout, uri=not create)) as db, db:
         db.execute('PRAGMA journal_mode=TRUNCATE').fetchone()
         db.execute('PRAGMA synchronous=NORMAL')
         db.execute('BEGIN IMMEDIATE')

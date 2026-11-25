@@ -94,16 +94,17 @@ class DirectTiledDispatchTests(unittest.TestCase):
                     stack.enter_context(mock.patch.object(torch.cuda, 'current_stream', return_value=None))
                     stack.enter_context(mock.patch.object(torch.cuda, 'Event', return_value=SimpleNamespace(record=lambda _: None)))
                     stack.enter_context(mock.patch.object(torch, 'empty', side_effect=empty))
-                    payload = inference._build_direct_device_compacted_payload(head, proto, image, .5)
-                self.assertIsNotNone(payload)
-                self.assertEqual(payload.compaction_kernel, expected)
-                self.assertEqual(int(payload.instance_count_device[0]), 5)
-                self.assertTrue(bool(payload.union_gpu.all()))
+                    reduced = inference._reduce_direct_prototypes(head, proto, image, .5)
+                self.assertIsNotNone(reduced)
+                logits, _, count, kernel_name, refs = reduced
+                self.assertEqual(kernel_name, expected)
+                self.assertEqual(int(count[0]), 5)
+                self.assertTrue(bool((logits > 0).all()))
                 if expected in ('tiled_f16', 'tiled_f32'):
                     compact.assert_not_called(); union.assert_not_called()
                     tiled_compact.assert_called_once(); tiled_union.assert_called_once()
                     self.assertEqual(tiled_union.call_args.args[:2], (((2 if dtype == torch.float16 else 3), 2), (32, 4)))
-                    owners = payload.device_refs[-6:-3]
+                    owners = refs[-6:-3]
                     self.assertEqual([tuple(owner.shape) for owner in owners], [(5, 32), (5, 4), (5,)])
                     self.assertEqual([owner.dtype for owner in owners], [dtype, torch.float32, torch.float32])
                 else:
@@ -119,8 +120,8 @@ class DirectTiledDispatchTests(unittest.TestCase):
         backend.names = {0: 'foreground'}
         predictor = SimpleNamespace(model=backend, preprocess=lambda value: value)
         source = [([], image, []) for _ in range(4)]
-        payloads = [inference.GpuFlattenedRetinaPayload(None, None, compaction_kernel=name)
-                    for name in ('tiled_f16', 'tiled_f32', 'scalar_workspace_fallback', 'scalar')]
+        payloads = [inference.GpuFlattenedRetinaPayload(None, None, compaction_kernel='exact_retina')
+                    for _ in range(4)]
         output = io.StringIO()
         with mock.patch.object(inference, '_build_direct_device_compacted_payload', side_effect=payloads) as build, \
                 mock.patch.object(inference, 'angle_variant_gpu_fastpath', return_value=None), \
@@ -129,8 +130,8 @@ class DirectTiledDispatchTests(unittest.TestCase):
         self.assertEqual(len(actual), 4)
         lines = [line for line in output.getvalue().splitlines() if line.startswith('Direct compaction summary-test:')]
         self.assertEqual(len(lines), 1)
-        self.assertIn('tiled_f16=1, tiled_f32=1, scalar=1, scalar_workspace_fallback=1, synchronized=0, failed_probes=0', lines[0])
-        self.assertEqual([call.kwargs['allow_tiled'] for call in build.call_args_list], [True, True, True, False])
+        self.assertIn('exact_retina=4, synchronized=0, failed_probes=0', lines[0])
+        self.assertEqual(build.call_count, 4)
 
     def test_fp32_guard_preserves_precision_and_qualified_shapes(self):
         torch_mod = SimpleNamespace(float16='f16', float32='f32')
@@ -177,25 +178,23 @@ class DirectTiledCudaParityTests(unittest.TestCase):
     def _assert_payload_parity(self, head, proto, image_shape, retained, want_conf=True):
         import torch
         image = torch.empty((1, 1, *image_shape), device='cuda', dtype=head.dtype)
-        payloads = []
+        returned = []
         for enabled in (False, True):
             with mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=want_conf), \
                     mock.patch.object(inference, 'angle_variant_gpu_fastpath', return_value=None):
-                payload = inference._build_direct_device_compacted_payload(head, proto, image, .5, allow_tiled=enabled)
-            self.assertIsNotNone(payload)
-            payloads.append(payload)
+                reduced = inference._reduce_direct_prototypes(head, proto, image, .5, allow_tiled=enabled)
+            self.assertIsNotNone(reduced)
+            returned.append(reduced)
         torch.cuda.synchronize()
-        scalar, tiled = payloads
+        scalar_logits, scalar_scores, scalar_count, scalar_name, _ = returned[0]
+        tiled_logits, tiled_scores, tiled_count, tiled_name, _ = returned[1]
         tag = 'f16' if head.dtype == torch.float16 else 'f32'
-        self.assertEqual((scalar.compaction_kernel, tiled.compaction_kernel), ('scalar', f'tiled_{tag}'))
-        for left, right in ((scalar.device_refs[4], tiled.device_refs[4]),
-                            (scalar.union_gpu, tiled.union_gpu),
-                            (scalar.instance_count_device, tiled.instance_count_device)):
+        self.assertEqual((scalar_name, tiled_name), ('scalar', f'tiled_{tag}'))
+        for left, right in ((scalar_logits, tiled_logits), (scalar_count, tiled_count)):
             self.assertTrue(torch.equal(left.view(torch.uint8), right.view(torch.uint8)))
-        self.assertEqual(int(tiled.instance_count_device.item()), retained)
+        self.assertEqual(int(tiled_count.item()), retained)
         if want_conf:
-            self.assertTrue(torch.equal(scalar.device_refs[5].view(torch.uint8), tiled.device_refs[5].view(torch.uint8)))
-            self.assertTrue(torch.equal(scalar.conf_gpu.view(torch.uint8), tiled.conf_gpu.view(torch.uint8)))
+            self.assertTrue(torch.equal(scalar_scores.view(torch.uint8), tiled_scores.view(torch.uint8)))
 
     def test_fp32_scalar_parity_at_thresholds_invalid_boxes_and_nonfinite_inputs(self):
         import torch

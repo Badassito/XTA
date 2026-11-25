@@ -42,6 +42,7 @@ def _drive_canonical_relay_frontier(
     dispatched, first_plan_order, max_relay_generations,
     device_ids=None, workers_per_device=None,
     enable_2D_hole_fill=False,
+    handoff=None,
 ):
     """Advance merged relay masks one canonical slab at a time.
 
@@ -128,6 +129,10 @@ def _drive_canonical_relay_frontier(
                             or seeds[0].frame_index != frame
                             or tuple(seeds[0].mask.shape) != (grid.tile_size, grid.tile_size)):
                         raise RuntimeError("relay seed metadata does not match its frontier destination")
+                    if handoff is not None:
+                        domain = handoff.domain_for_lineage(lineage)
+                        if not domain.frame_start <= frame < domain.frame_stop:
+                            raise RuntimeError("relay seed crossed an annotated interval boundary")
                     grouped[(lineage, tile_index, frame, direction)].append(record)
                 def spatial_offers():
                     for (_lineage, tile_index, _frame, direction), group in sorted(grouped.items()):
@@ -167,11 +172,17 @@ def _drive_canonical_relay_frontier(
                     if enable_2D_hole_fill:
                         seed = replace(seed, mask=fill_binary_mask_holes_2d(seed.mask))
                     window = entry.window
+                    anchor = None
+                    if handoff is not None:
+                        domain = handoff.domain_for_lineage(seed.lineage)
+                        anchor = domain.anchor_frame
+                        window = replace(window, frame_start=max(window.frame_start, domain.frame_start),
+                                         frame_stop=min(window.frame_stop, domain.frame_stop))
                     group_key = (seed.lineage.tile_config_id, entry.tile_index, entry.direction,
-                                 window.frame_start, window.frame_stop, window.prompt_frame)
-                    seed_groups[group_key].append((entry, seed))
+                                 window.frame_start, window.frame_stop, window.prompt_frame, anchor)
+                    seed_groups[group_key].append((replace(entry, window=window), seed))
                 tasks = []
-                for (config_id, tile_index, direction, _start, _stop, _prompt), values in sorted(seed_groups.items()):
+                for (config_id, tile_index, direction, _start, _stop, _prompt, anchor), values in sorted(seed_groups.items()):
                     grid = grids[config_id]
                     window = values[0][0].window
                     seed_keys = {id(seed): entry for entry, seed in values}
@@ -193,7 +204,8 @@ def _drive_canonical_relay_frontier(
                             empty_frame_limit=empty_frame_limit, relay_generation=generation)
                         payload.update(chain_work_id=work_id, chain_window_count=1, window_index=0,
                                        window=asdict(window), predecessor_work_id=None,
-                                       frontier_wave=wave_index, frontier_revision=revision)
+                                       frontier_wave=wave_index, frontier_revision=revision,
+                                       authoritative_anchor_frame=anchor)
                         if getattr(trace, "path", None) is not None:
                             payload["worker_trace_root"] = str(Path(trace.path).parent)
                         # A scheduler owns only this sealed wave. Spatial-generation
@@ -271,7 +283,10 @@ def _drive_canonical_relay_frontier(
                             legacy_paths = execution._verified_relay_artifact_paths(tuple(manifest.get("relays", ())))
                             for path in legacy_paths:
                                 contained(path)
-                            _unused_relays, union_path = execution._consume_chain_manifest(manifest, view_union=view_union)
+                            _unused_relays, union_path = execution._consume_chain_manifest(
+                                manifest, view_union=view_union, handoff=handoff,
+                                anchor_frame=payload["authoritative_anchor_frame"],
+                            )
                         with phase("lineage_coverage_ingest", work_id=result.work_id, generation=generation):
                             execution._ingest_lineage_coverage(
                                 manifest, payload, coverage, temp_root=temp_root, input_lineages=input_lineages,
@@ -295,7 +310,11 @@ def _drive_canonical_relay_frontier(
                     window = payload["window"]
                     direction = window["direction"]
                     boundary = int(window["frame_stop"]) - 1 if direction == "forward" else int(window["frame_start"])
-                    terminal = boundary == (view_plan.frame_count - 1 if direction == "forward" else 0)
+                    first, stop = 0, view_plan.frame_count
+                    if handoff is not None:
+                        domain = handoff.domains[payload["authoritative_anchor_frame"]]
+                        first, stop = domain.frame_start, domain.frame_stop
+                    terminal = boundary == (stop - 1 if direction == "forward" else first)
                     if not terminal and boundary in outgoing:
                         record = outgoing[boundary]
                         seeds = read_seed_artifact(record["path"], expected_sha256=record["sha256"])

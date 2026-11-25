@@ -16,7 +16,7 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from .fit import _errors, _fit_points, _ncc_peak, _triple
+from .fit import _correspondence_models, _errors, _ncc_peak, _select_correspondence_model, _triple
 
 
 @lru_cache(maxsize=12)
@@ -213,7 +213,8 @@ def refine_native_registration(
     ``capture_radius`` is in two-voxel search samples. ``exclude_first`` is one
     native Z cutoff or a fixed/moving pair. Optional field masks are native YX
     boolean acquisition masks. Zero-valued intensities remain valid unless a
-    mask explicitly marks them unavailable. Failure to validate a refinement
+    mask explicitly marks them unavailable. Affine refinement is enabled when
+    requested in the supplied estimate. Failure to validate a refinement
     preserves the supplied mapping and records the failed check. A correction
     is used only when it improves the same test sites or repairs a seed that
     fails the error limits. Sufficient contradictory native evidence invalidates
@@ -363,8 +364,12 @@ def refine_native_registration(
         )
         return result
     models = {"coarse": (matrix, np.diag([*sm, 1.0]) @ matrix @ np.diag([*1 / sf, 1.0]))}
-    for name, similarity in (("calibrated_rigid", False), ("similarity", True)):
-        models[name] = _fit_points(source[train], target[train], sf, sm, similarity)
+    candidates, affine_reason = _correspondence_models(
+        source[train], target[train], sf, sm, fitted.get("affine_enabled", False)
+    )
+    models.update(candidates)
+    if affine_reason is not None:
+        report["affine_fit_reason"] = affine_reason
     report["models"] = {}
     for name, (transform, physical) in models.items():
         residual = source @ transform[:3, :3].T + transform[:3, 3] - target
@@ -383,13 +388,7 @@ def refine_native_registration(
             heldout_native_ncc_median=float(np.median(correlations)) if correlations else None,
             native_ncc_samples=len(correlations),
         )
-    rigid = report["models"]["calibrated_rigid"]["heldout_error"]
-    similarity = report["models"]["similarity"]["heldout_error"]
-    selected_model = (
-        "calibrated_rigid"
-        if rigid["rms"] <= similarity["rms"] + 0.15 and rigid["p90"] <= similarity["p90"] + 0.25
-        else "similarity"
-    )
+    selected_model = _select_correspondence_model(report["models"], 0.15, 0.25)
     candidate = report["models"][selected_model]
     error = candidate["heldout_error"]
     baseline = report["models"]["coarse"]["heldout_error"]

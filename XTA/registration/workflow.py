@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import math
+from numbers import Integral
 from pathlib import Path
 import tempfile
 
@@ -36,6 +37,8 @@ def fit_movies(
     step=None,
     exclude_first=(0, 0),
     black_exterior=False,
+    contrast="bright",
+    affine=False,
     broad_search=False,
     pyramid_only=False,
     threads=4,
@@ -54,11 +57,14 @@ def fit_movies(
         raise FileExistsError(f"Output already exists: {output}")
     if not 1 <= threads <= 64 or (step is not None and (step < 1 or step & (step - 1))):
         raise ValueError("Use 1 to 64 threads and a positive power of two for the pyramid step")
-    cuts = (exclude_first,) if isinstance(exclude_first, int) else tuple(exclude_first)
+    cuts = (exclude_first,) if isinstance(exclude_first, Integral) else tuple(exclude_first)
     if len(cuts) == 1:
         cuts *= 2
-    if len(cuts) != 2 or min(cuts) < 0:
+    if len(cuts) != 2 or any(
+        not isinstance(cut, Integral) or isinstance(cut, bool) or cut < 0 for cut in cuts
+    ):
         raise ValueError("Supply one nonnegative first usable frame index, or one for each scan")
+    cuts = tuple(map(int, cuts))
     scans = [
         probe_video(path, header_path=header, spacing_xyz=spacing)
         for path, header, spacing in [
@@ -91,16 +97,17 @@ def fit_movies(
     refine_native = step > 1 and not pyramid_only
     with ExitStack() as contexts:
         native_volumes = []
-        for path, scan in zip([fixed, moving], scans):
+        for path, scan, cut in zip([fixed, moving], scans, cuts):
             with ExitStack() as temporary:
                 owner = contexts if refine_native or step == 1 else temporary
                 volume = owner.enter_context(decoded_volume(path, work, info=scan, threads=threads))
                 if refine_native:
                     native_volumes.append(volume)
                 masks.append(
-                    observed_field(volume, black_exterior=True) if black_exterior else None
+                    observed_field(volume, black_exterior=True, exclude_first=cut)
+                    if black_exterior else None
                 )
-                grids.append(prepare_pyramid(volume, step))
+                grids.append(prepare_pyramid(volume, step, exclude_first=cut))
         reduced_masks = [mask[::step, ::step] if mask is not None else None for mask in masks]
         result = fit_registration(
             *grids,
@@ -111,6 +118,8 @@ def fit_movies(
             artifact_start_z=cuts,
             fixed_mask_yx=reduced_masks[0],
             moving_mask_yx=reduced_masks[1],
+            contrast=contrast,
+            affine=affine,
             broad_search=broad_search,
             threads=threads,
         )
@@ -154,6 +163,8 @@ def fit_movies(
             "global_candidate_seeds",
             "proper_rotation_hypotheses",
             "global_tissue_ncc",
+            "global_model",
+            "affine_fit_reason",
         )
         if key in result
     }
@@ -161,9 +172,19 @@ def fit_movies(
         pyramid_step_xyz=[step] * 3,
         first_usable_native_z=list(cuts),
         observed_field="measured black exterior" if black_exterior else "full array",
+        contrast=contrast,
+        affine_enabled=bool(affine),
         error_units="Euclidean distance in moving native voxel indices",
     )
     native = result.get("native_validation")
+    if affine and "models" in result:
+        evidence["pyramid_models"] = {
+            name: {
+                key: candidate[key]
+                for key in ("train_error", "heldout_error", "physical_fixed_to_moving_xyz")
+            }
+            for name, candidate in result["models"].items()
+        }
     if native:
         evidence["native_validation"] = {
             key: value for key, value in native.items() if key not in ("models", "observations")

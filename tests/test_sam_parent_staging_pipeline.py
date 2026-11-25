@@ -46,6 +46,7 @@ def submission(tmp_path, *, ready=False, staged=True, dispatch_error=False):
             extrapolation_walk_back=1, extrapolation_min_radius=3.),
         sam_context=SimpleNamespace(detector_retirement_ready=ready,shared_detector_devices=('cuda:0',)),sam_parent_staging=stager,
         parent_slice_postprocess_workers=1,parent_interpolation_task_workers=1,
+        defer_score_projection=True,
         component_layers_needed=True,angle_variant_streaming_cleanup_active=False,
         angle_variant_gpu_fastpath_active=False,
         _publish_parent_mask_ready=mock.Mock(),_submit_component_projection=mock.Mock(),

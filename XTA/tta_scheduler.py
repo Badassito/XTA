@@ -142,6 +142,15 @@ class _WorkerMemfdSourceCache:
     known: Dict[str, None] = field(default_factory=dict)
     pending: Dict[int, Tuple[str, ...]] = field(default_factory=dict)
     direct_output_capability: Optional[Dict[str, int]] = None
+    output_probe_sent: bool = False
+    pending_output_probe: Optional[Tuple[int, str]] = None
+
+    def reset(self) -> None:
+        self.known.clear()
+        self.pending.clear()
+        self.direct_output_capability = None
+        self.pending_output_probe = None
+        self.output_probe_sent = False
 
     def completed(self, task_id: int, *, ok: bool) -> None:
         keys = self.pending.pop(int(task_id), ())
@@ -522,9 +531,7 @@ class TtaScheduler:
         pid = self._worker_process_pid(worker_kind, worker_id)
         if pid is not None:
             if cache.pid is not None and cache.pid != pid:
-                cache.known.clear()
-                cache.pending.clear()
-                cache.direct_output_capability = None
+                cache.reset()
             cache.pid = pid
         return cache
 
@@ -551,6 +558,7 @@ class TtaScheduler:
                 batch = self.operations._attach_memfd_transfers_to_task(
                     dispatch_task, known_sources=tuple(cache.known),
                     direct_output_capability=capability,
+                    probe_output=actual_pid is not None and capability is None and not cache.output_probe_sent,
                 )
             with scheduler_step('payload_serialize', worker_id=worker_id,
                                 task_id=int(dispatch_task['task_id'])):
@@ -568,6 +576,9 @@ class TtaScheduler:
         # final-result handling may make these identities available to later dispatch.
         if isinstance(batch, _MemfdTransferBatch) and batch.source_keys:
             cache.pending[int(dispatch_task['task_id'])] = batch.source_keys[-64:]
+        if isinstance(batch, _MemfdTransferBatch) and batch.output_probe_key is not None:
+            cache.pending_output_probe = (int(dispatch_task['task_id']), batch.output_probe_key)
+            cache.output_probe_sent = True
 
     def _record_worker_memfd_completion(self, msg: Dict[str, object]) -> None:
         worker_kind = 'cpu' if str(msg.get('worker_kind', 'gpu')).lower() == 'cpu' else 'gpu'
@@ -584,15 +595,16 @@ class TtaScheduler:
                 if actual_pid is not None and int(pid) != actual_pid:
                     return
                 if cache.pid is not None and cache.pid != int(pid):
-                    cache.known.clear()
-                    cache.pending.clear()
-                    cache.direct_output_capability = None
+                    cache.reset()
                 cache.pid = int(pid)
         elif mtype in {'compute_released', 'result'}:
             # The result's worker identity must match the queue which received this
             # task. A different worker has no pending entry and cannot authorize it.
             task_id = int(msg.get('task_id', -1))
-            sources = cache.pending.get(task_id, ())
+            proof_keys = cache.pending.get(task_id, ())
+            if cache.pending_output_probe is not None and cache.pending_output_probe[0] == task_id:
+                proof_keys = (*proof_keys, cache.pending_output_probe[1])
+                cache.pending_output_probe = None
             cache.completed(task_id, ok=bool(msg.get('ok')))
             capability = msg.get('memfd_parent_proc_capability')
             actual_pid = self._worker_process_pid(worker_kind, worker_id)
@@ -601,7 +613,7 @@ class TtaScheduler:
                     and type(capability['parent_pid']) is int and type(capability['worker_pid']) is int
                     and capability['parent_pid'] == os.getpid()
                     and actual_pid is not None and actual_pid == cache.pid == capability['worker_pid']
-                    and capability['source_key'] in sources):
+                    and capability['source_key'] in proof_keys):
                 cache.direct_output_capability = {'parent_pid': os.getpid(), 'worker_pid': actual_pid}
 
     def bind_result_callbacks(self, callbacks: TtaSchedulerCallbacks) -> None:

@@ -227,37 +227,54 @@ def _build_radial_plane_plan(view, radii, output_shape, *, max_plan_bytes=None,
     return RadialPlanePlan(base, tuple(plane), shells, offsets, columns)
 
 
-def _radial_plane_plan(view, radii, output_shape):
+def _radial_plane_plan(view, radii, output_shape, *, max_plan_bytes=None, build_chunk_pixels=None):
     global _PLANE_PLAN_CACHE_SIZE
     base, work_plane, plane = _plane_geometry(view, output_shape)
     key = (base, work_plane, plane, float(view.center_x), float(view.center_y),
            float(view.radial_min_radius), float(view.radial_max_radius), tuple(radii),
            int(view.radial_shell_start), int(view.num_slices), int(view.src_w), float(view.radial_arc_origin))
+    limit = _PLANE_PLAN_MAX_BYTES if max_plan_bytes is None else min(_PLANE_PLAN_MAX_BYTES, int(max_plan_bytes))
+    if limit <= 0 or (build_chunk_pixels is not None and int(build_chunk_pixels) <= 0):
+        raise ValueError('Radial plan and build-strip budgets must be positive')
+    if math.prod(plane) * 12 > limit:
+        raise _RadialPlanePlanTooLarge('Radial plane ownership exceeds the bounded plan budget')
+    # Build strips do not change the immutable geometry. A smaller plan
+    # credit can decline a valid plan, so only equal limits share a build.
+    flight_key = (key, limit)
     flight = None
     owner = False
     try:
         with _PLANE_PLAN_LOCK:
-            cached = _PLANE_PLAN_CACHE.pop(key, None)
+            cached = _PLANE_PLAN_CACHE.get(key)
             if cached is not None:
-                _PLANE_PLAN_CACHE[key] = cached
+                if cached.nbytes > limit:
+                    raise _RadialPlanePlanTooLarge('Radial periodic occurrences exceed the bounded plan budget')
+                _PLANE_PLAN_CACHE.move_to_end(key)
                 return cached, True
-            flight = _PLANE_PLAN_INFLIGHT.get(key)
+            flight = _PLANE_PLAN_INFLIGHT.get(flight_key)
             if flight is None:
                 flight = Future()
                 # A caller abandoning its wait must not cancel shared work.
                 flight.set_running_or_notify_cancel()
                 generation = _PLANE_PLAN_CACHE_GENERATION
                 owner = True
-                _PLANE_PLAN_INFLIGHT[key] = flight
+                _PLANE_PLAN_INFLIGHT[flight_key] = flight
         if not owner:
             return flight.result(), True
 
         # Build and wait outside the cache lock: unrelated keys remain parallel.
-        built = _build_radial_plane_plan(view, radii, output_shape)
+        if max_plan_bytes is None and build_chunk_pixels is None:
+            built = _build_radial_plane_plan(view, radii, output_shape)
+        else:
+            built = _build_radial_plane_plan(view, radii, output_shape,
+                max_plan_bytes=limit, build_chunk_pixels=build_chunk_pixels)
         with _PLANE_PLAN_LOCK:
             if (generation == _PLANE_PLAN_CACHE_GENERATION
-                    and _PLANE_PLAN_INFLIGHT.get(key) is flight
+                    and _PLANE_PLAN_INFLIGHT.get(flight_key) is flight
                     and built.nbytes <= _PLANE_PLAN_CACHE_BYTES):
+                prior = _PLANE_PLAN_CACHE.pop(key, None)
+                if prior is not None:
+                    _PLANE_PLAN_CACHE_SIZE -= prior.nbytes
                 while _PLANE_PLAN_CACHE and _PLANE_PLAN_CACHE_SIZE + built.nbytes > _PLANE_PLAN_CACHE_BYTES:
                     _, evicted = _PLANE_PLAN_CACHE.popitem(last=False)
                     _PLANE_PLAN_CACHE_SIZE -= evicted.nbytes
@@ -274,8 +291,8 @@ def _radial_plane_plan(view, radii, output_shape):
     finally:
         if owner and flight is not None:
             with _PLANE_PLAN_LOCK:
-                if _PLANE_PLAN_INFLIGHT.get(key) is flight:
-                    _PLANE_PLAN_INFLIGHT.pop(key)
+                if _PLANE_PLAN_INFLIGHT.get(flight_key) is flight:
+                    _PLANE_PLAN_INFLIGHT.pop(flight_key)
 
 
 def _radial_projection_metadata(view, source_shape, output_shape, plan, *, chunk_values=None):

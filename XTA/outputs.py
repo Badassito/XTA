@@ -3059,10 +3059,12 @@ class NrrdLayerSink:
         layer_file_processes: Optional[object] = None,
         layer_layout: str = NRRD_LAYER_LAYOUT_CROPPED,
         relative_artifact_paths: bool = True,
+        managed_review_root: Optional[Path] = None,
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
         self.run_id = run_id
         self.relative_artifact_paths = bool(relative_artifact_paths)
+        self.managed_review_root = managed_review_root
         # Optional sweep_nrrd_processes.SweepNrrdProcessPool owned by the caller: it
         # writes eligible layer files outside this process's GIL. This sink keeps every
         # name, colour, manifest row and publication record either way.
@@ -3326,6 +3328,11 @@ class NrrdLayerSink:
                     segment_color=segment_color, z_shards=int(executed_z_shards),
                     layout=layout, raster_plan=full_plan, mirror_raster_plans=lq_plans,
                 )
+                review_identity = None
+                if self.managed_review_root is not None and layout == NRRD_LAYER_LAYOUT_CROPPED:
+                    from .managed_review_source import capture_native_review_source, review_source_identity
+
+                    review_identity = review_source_identity(resolved_ref, self.output_shape)
                 # A worker process writes eligible files with identical bytes and returns
                 # the plans it wrote; None (pool absent, broken, or layer ineligible)
                 # writes them here.
@@ -3340,19 +3347,24 @@ class NrrdLayerSink:
                     result = out_path
                 else:
                     result = write_sink_layer_files(**write_args, plan_receipt=written_plans)
+                actual = written_plans.get(str(out_path))
                 if layout == NRRD_LAYER_LAYOUT_CROPPED:
                     # An extent-violation fallback republished the full raster; the rows must
                     # describe the files actually on disk.
                     with self._lock:
-                        actual = written_plans.get(str(out_path))
                         if actual is not None:
                             _record_nrrd_stored_plan(manifest_entry, actual, layout)
                         for (_lq_shape, lq_entry), (_mirror_shape, lq_path) in zip(
                             lq_manifest_entries, lq_mirror_args,
                         ):
-                            actual = written_plans.get(str(lq_path))
-                            if actual is not None:
-                                _record_nrrd_stored_plan(lq_entry, actual, layout)
+                            mirror_actual = written_plans.get(str(lq_path))
+                            if mirror_actual is not None:
+                                _record_nrrd_stored_plan(lq_entry, mirror_actual, layout)
+                if review_identity is not None and actual is not None:
+                    capture_native_review_source(
+                        resolved_ref, self.output_shape, out_path, actual, self.managed_review_root,
+                        expected_identity=review_identity,
+                    )
                 self.observe_published_layer(ref)
                 return result
 

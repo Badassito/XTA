@@ -2616,9 +2616,9 @@ def _gpu_inference_worker_main(
             if not ensure_cpu_retina_mask_predictor_patch():
                 raise RuntimeError('CPU retina-mask predictor patch was not installed')
         else:
-            # GPU retina mode — reduce per-frame unions at proto resolution.
+            # GPU retina composes exact per-instance masks without an instance stack.
             if not ensure_gpu_retina_proto_union_predictor_patch():
-                raise RuntimeError('GPU proto-union predictor patch was not installed')
+                raise RuntimeError('GPU retina predictor patch was not installed')
         if (Path(model_path).suffix.lower() == '.engine'
                 and str(cfg.task) == 'segment'
                 and _direct_predict_applicable(cfg)):

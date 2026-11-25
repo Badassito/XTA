@@ -1469,6 +1469,11 @@ def _main_impl() -> None:
     if gpu_worker_process_active:
         confidence_floor_by_backend['gpu'] = max(float(args.conf),
             float(angle_variant_gpu_fastpath_min_conf_value or 0.0))
+    defer_score_projection = not (reconciliation_settings.enabled and reconciliation_policy['mode'] == 'confidence')
+    sweep_score_projection = None
+    if sweep_branch is not None and not defer_score_projection:
+        from .sweep_score_reuse import SweepScoreProjection
+        sweep_score_projection = SweepScoreProjection.from_environment(sweep_branch['sweep_id'], sweep_cutoff)
     configure_confidence_evidence(out_dir, enabled=args.reconciliation_retain_confidence,
                                   run_id=scalar_run_id,
                                   adopt_existing=os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') == 'consume',
@@ -1476,8 +1481,8 @@ def _main_impl() -> None:
                                   prediction_task=str(args.task), confidence_floor=float(args.conf),
                                   confidence_floor_by_backend=confidence_floor_by_backend,
                                   background_publication=True,
-                                  defer_projection=not (reconciliation_settings.enabled
-                                      and reconciliation_policy['mode'] == 'confidence'))
+                                   defer_projection=defer_score_projection,
+                                   sweep_score_projection=sweep_score_projection)
 
     unified_launch_at_start = current_unified_launch()
     tta_artifact_identities: Optional[Dict[str, object]] = None
@@ -1619,6 +1624,7 @@ def _main_impl() -> None:
             low_quality_specs=sink_low_quality_specs,
             low_quality_root=(nrrd_root / 'low_quality'),
             relative_artifact_paths=not sweep_nrrd_root,
+            managed_review_root=Path(sweep_nrrd_root) if sweep_nrrd_root and save_nrrd_enabled else None,
         )
         _run_resources().track_sink(layer_sink_for_run)
         set_nrrd_layer_sink(layer_sink_for_run)
@@ -2883,6 +2889,9 @@ def _main_impl() -> None:
     physical_view_union_submitted: set[Tuple[str, str]] = set()
     physical_view_union_completed: set[Tuple[str, str]] = set()
     streaming_final_union_holder: Dict[str, np.ndarray] = {}
+    adopted_union_layers: Dict[Tuple[str, str], Tuple[NrrdLayerRef, ...]] = {}
+    collect_adopted_union = fully_preprojected and len(yolo_models) == 1
+    packed_final_union = None
     tile_cleanup_futures: Dict[Future, Tuple[str, str, str, str]] = {}
     # P (cleaned parent YOLO) is published before parent interpolation through this queue.
     # B (parent-only interpolation delta) becomes ready when the parent future completes.
@@ -3269,6 +3278,7 @@ def _main_impl() -> None:
                          else tuple(baseline_union_by_model_view[key].shape))
         capture_plan = _parent_confidence_capture_plan(capture_shape,
             parent_slice_postprocess_workers,
+            source_projection=not defer_score_projection,
             enabled=bool(getattr(args, 'reconciliation_retain_confidence', False))
                 and not has_shadow and baseline_confmap_by_model_view.get(key) is not None)
         view_processing_submitted.add(key)
@@ -3548,6 +3558,18 @@ def _main_impl() -> None:
             return tilted_native_output_by_model[str(model_name)][str(view_name)]
         return view_volumes_by_model[str(model_name)][str(view_name)]
 
+    def _allocate_streaming_final_union() -> np.ndarray:
+        # Keep the long-lived accumulator path-backed while other stages hold
+        # their canvases. The operating system can reclaim its cached pages.
+        return allocate_workspace_array(
+            shape=(int(input_T), int(input_H), int(input_W)),
+            dtype=np.uint8,
+            path=temp_dir / 'final_union_volume.u8.dat',
+            desc='Streaming final single-model view-union volume',
+            prefer_memory=False,
+            reserve_bytes=16 * GIB,
+        )
+
     def _submit_physical_view_union_reduction(
         physical_key: Tuple[str, str],
         *,
@@ -3562,25 +3584,16 @@ def _main_impl() -> None:
         if physical_volume is None and not refs:
             physical_view_union_completed.add(physical_key)
             return
+        if collect_adopted_union and physical_volume is None:
+            adopted_union_layers[physical_key] = refs
+            return
 
         def _reduce_physical_view() -> Tuple[str, str]:
             model_name_local, physical_name_local = physical_key
             try:
                 final_union = streaming_final_union_holder.get(str(model_name_local))
                 if final_union is None:
-                    # The accumulator persists until global postprocessing, so keep it
-                    # path-backed while inference canvases are still live. The OS page cache
-                    # remains reclaimable; this avoids an uncharged source-sized anonymous
-                    # array. Allocation is inside the ownership guard so failure still retires
-                    # the dense handoff and returns its credit.
-                    final_union = allocate_workspace_array(
-                        shape=(int(input_T), int(input_H), int(input_W)),
-                        dtype=np.uint8,
-                        path=temp_dir / 'final_union_volume.u8.dat',
-                        desc='Streaming final single-model view-union volume',
-                        prefer_memory=False,
-                        reserve_bytes=16 * GIB,
-                    )
+                    final_union = _allocate_streaming_final_union()
                     streaming_final_union_holder[str(model_name_local)] = final_union
                 if physical_volume is not None:
                     assemble_view_volumes_into_native_union(
@@ -3616,6 +3629,48 @@ def _main_impl() -> None:
                 physical_view_dense_handoff_credit.release()
             raise
         physical_view_union_futures[fut] = physical_key
+
+    def _assemble_adopted_union() -> None:
+        nonlocal collect_adopted_union, packed_final_union
+        from .finalization import try_assemble_preprojected_packed_union
+
+        collect_adopted_union = False
+        expected = {(str(model_name), str(name)) for name in physical_view_infos_by_name}
+        if (physical_view_union_submitted != expected or physical_view_finalization_futures
+                or physical_view_union_futures or streaming_final_union_holder):
+            # Any dense or delayed contribution belongs to the original single
+            # reducer, which owns its current accumulator and all further ORs.
+            pending = tuple(adopted_union_layers.items())
+            adopted_union_layers.clear()
+            for key, group in pending:
+                physical_view_union_submitted.remove(key)
+                _submit_physical_view_union_reduction(key, physical_volume=None, layer_refs=group)
+            return
+        if not adopted_union_layers:
+            return
+        refs = tuple(ref for group in adopted_union_layers.values() for ref in group)
+        destination = _allocate_streaming_final_union()
+        try:
+            with runtime_telemetry().span('tta.preprojected_union.assemble'):
+                packed_final_union = try_assemble_preprojected_packed_union(
+                    refs, destination, workers=int(streaming_view_finalization_slice_workers),
+                )
+                if packed_final_union is None:
+                    for group in adopted_union_layers.values():
+                        _union_projected_layer_refs_grouped_into_volume(
+                            group, destination,
+                            workers=int(streaming_view_finalization_slice_workers),
+                            desc='Adopted projected view union',
+                        )
+        except BaseException:
+            close_memmap_array_without_flush(destination)
+            raise
+        runtime_telemetry().gauge('tta.preprojected_union.packed', packed_final_union is not None)
+        streaming_final_union_holder[str(model_name)] = destination
+        physical_view_union_completed.update(adopted_union_layers)
+        print(f'Adopted projected view union committed {len(adopted_union_layers)} physical groups '
+              f'from {len(refs)} component layers.')
+        adopted_union_layers.clear()
 
     def _detach_terminal_physical_group_inputs(
         model_name: str,
@@ -3712,9 +3767,11 @@ def _main_impl() -> None:
             _submit_physical_view_union_reduction(
                 physical_key, physical_volume=None, layer_refs=group_refs,
             )
+            handoff = ('collected for shared projection fusion' if collect_adopted_union
+                       else 'queued for early global fusion')
             print(
                 f'Streaming physical-view finalization {model_name}/{physical_name}: '
-                f'{len(group_refs)} immutable component ref(s) queued for early global fusion.'
+                f'{len(group_refs)} immutable component ref(s) {handoff}.'
             )
             return
 
@@ -4999,6 +5056,7 @@ def _main_impl() -> None:
         return str(shared_backing), shape, str(np.asarray(shared_mm).dtype)
 
     _configure_main_process_gpu_stage_workers(gpu_logical_indices)
+    d1_score_workers = 1
     if not gpu_worker_process_active or not scheduled_inference_views:
         # Fanout-only and SAM stages need the selected devices without detector priority.
         _set_main_process_gpu_inference_priority_active(False)
@@ -5657,6 +5715,25 @@ def _main_impl() -> None:
             if bool(getattr(args, 'reconciliation_retain_confidence', False)) and any(
                 'd1_output_shape' in task for task in gpu_worker_tasks_by_id.values()) else 0)
         confidence_stage_reserve = confidence_publication_reserve_bytes()
+        if confidence_worker_reserve and not defer_score_projection:
+            from .confidence_evidence import SOURCE_SCORE_PROJECTION_WORKSPACE_BYTES
+            from .publication_memory import d1_score_projection_workers
+            from .sam_resources import physical_sam_headroom
+            try:
+                score_scratch_bytes = shutil.disk_usage(temp_dir).free
+            except OSError:
+                score_scratch_bytes = 0
+            d1_score_workers, score_working_bytes = d1_score_projection_workers(
+                gpu_worker_tasks_by_id.values(), cpu_count=_cpu_count(),
+                ram_bytes=physical_sam_headroom(), scratch_bytes=score_scratch_bytes,
+                workspace_bytes=SOURCE_SCORE_PROJECTION_WORKSPACE_BYTES,
+                anon_cap=workspace_anon_cap_bytes())
+            confidence_worker_reserve += score_working_bytes
+            runtime_telemetry().gauge('confidence.d1_projection_plan', dict(
+                workers=d1_score_workers, working_bytes=score_working_bytes))
+            print(f'D1 source confidence projection: {d1_score_workers} concurrent views, '
+                  f'{score_working_bytes / GIB:.2f} GiB planned for native scores and projection.',
+                  flush=True)
         if bounded_policy_parent_keys:
             # File results and packed coverage coexist with the admitted parents.
             # Charge those commitments before dispatch, even on disk-backed scratch.
@@ -5674,6 +5751,7 @@ def _main_impl() -> None:
                 interpolation_distance=int(args.interpolation_distance),
                 sam_image_phase_bytes=(sam_context.mandatory_image_phase_bytes()
                     if sam_context is not None else 0),
+                source_projection=not defer_score_projection,
                 retain_confidence=bool(getattr(args, 'reconciliation_retain_confidence', False)))
             parent_reserve = max(parent_working, min(
                 parent_transient_admission.capacity,
@@ -6102,7 +6180,7 @@ def _main_impl() -> None:
     pending_d1_confidence_by_parent: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
     d1_confidence_futures: List[Future] = []
     d1_confidence_executor = (
-        _create_tracked_thread_pool(max_workers=1, thread_name_prefix='confidence-evidence')
+        _create_tracked_thread_pool(max_workers=d1_score_workers, thread_name_prefix='confidence-evidence')
         if bool(getattr(args, 'reconciliation_retain_confidence', False)) else None)
 
     def _merge_pending_azimuthal_padding_for_parent(model_name_s: str, view: ViewInfo) -> None:
@@ -6811,6 +6889,8 @@ def _main_impl() -> None:
                     fanout_consumers.popleft()
                     view_prediction_stats[str(view.summary_family)] += int(predictions)
                     sweep_fanout_plan.consumed += 1
+                    if not fanout_consumers and collect_adopted_union:
+                        _assemble_adopted_union()
                     continue
 
             # Recheck arrivals after the cooperative background pass as well.
@@ -7070,7 +7150,6 @@ def _main_impl() -> None:
 
         _set_main_process_gpu_pending_inference(False)
         _set_main_process_gpu_stage_wake_callback(None)
-        _reset_gpu_stage_coordinator_if_sam_settled()
 
     _drain_completed_background_futures()
 
@@ -7085,9 +7164,13 @@ def _main_impl() -> None:
         while confidence_pending:
             confidence_now = time.perf_counter()
             if confidence_now >= confidence_next_progress:
+                runtime_telemetry().gauge('confidence.d1_drain', dict(
+                    submitted=len(d1_confidence_futures), pending=len(confidence_pending),
+                    workers=d1_score_workers, elapsed_seconds=confidence_now-confidence_started))
                 print(f'Retained confidence publication drain: '
                       f'completed={len(d1_confidence_futures)-len(confidence_pending)}/'
                       f'{len(d1_confidence_futures)}, pending={len(confidence_pending)}, '
+                      f'workers={d1_score_workers}, '
                       f'elapsed_s={confidence_now-confidence_started:.1f}.', flush=True)
                 confidence_next_progress = confidence_now + 30.0
             confidence_done, confidence_pending = wait(
@@ -7096,6 +7179,9 @@ def _main_impl() -> None:
                 confidence_future.result()
         print(f'Retained confidence publication complete: views={len(d1_confidence_futures)}, '
               f'elapsed_s={time.perf_counter()-confidence_started:.3f}.', flush=True)
+        runtime_telemetry().gauge('confidence.d1_drain', dict(
+            submitted=len(d1_confidence_futures), pending=0, workers=d1_score_workers,
+            elapsed_seconds=time.perf_counter()-confidence_started))
     if pending_d1_confidence_by_parent:
         raise RuntimeError('D1 confidence evidence contains unfinished view leases')
     if d1_confidence_executor is not None:
@@ -7107,6 +7193,8 @@ def _main_impl() -> None:
     if sweep_view_publication is not None:
         sweep_view_publication.finish_floor()
         sweep_fanout_plan.failures.update(sweep_view_publication.geometry_fallbacks)
+    # Confidence projections and sweep writers may hold a GPU lease after inference drains.
+    _reset_gpu_stage_coordinator_if_sam_settled()
     if sweep_fanout_plan.role is not None:
         sweep_branch['upstream_fanout'] = sweep_fanout_plan.summary(len(inference_views))
         if sweep_view_publication is not None and sweep_view_publication.geometry_fallbacks:
@@ -7345,9 +7433,10 @@ def _main_impl() -> None:
         )
     else:
         final_union_mm = streamed_final_union_mm
-        print(
-            '\n=== Final view union was assembled incrementally while inference was active ==='
-        )
+        if fully_preprojected:
+            print('\n=== Final view union used shared source-space projections ===')
+        else:
+            print('\n=== Final view union was assembled incrementally while inference was active ===')
 
     reconciliation_report = None
     if reconciliation_settings.enabled:
@@ -7372,6 +7461,7 @@ def _main_impl() -> None:
                 settings=reconciliation_settings, policy=reconciliation_policy,
                 output_dir=out_dir if sweep_reconciliation_policy_stage is not None else out_dir / 'reconciliation',
                 workspace=temp_dir / 'reconciliation', assembled_union=original_union,
+                packed_union=packed_final_union,
                 publish_report=sweep_reconciliation_policy_stage is None)
         if final_union_mm is not original_union:
             if streaming_final_union_holder.get(str(model_name)) is original_union:
@@ -7380,6 +7470,7 @@ def _main_impl() -> None:
                 streamed_final_union_mm = final_union_mm
             close_memmap_array(original_union)
         original_union = None
+        packed_final_union = None
 
     if bool(args.enable_3d_void_fill) and (streamed_final_union_mm is not None or reconciliation_settings.enabled):
         print('\n=== Optional 3D void fill after final global union ===')

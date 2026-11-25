@@ -44,6 +44,69 @@ def test_raw_layer_union_and_metadata_preserve_sources(tmp_path):
     assert [ref.path.read_bytes() for ref in refs] == before
 
 
+def test_same_grid_packed_confidence_reconciliation_matches_dense_vote(tmp_path, monkeypatch):
+    from XTA import confidence_evidence
+    from XTA.interpolation import INTERNAL_PACKED_CVOL_FORMAT, write_raw_bbox_mask_store
+    from XTA.reconciliation_runtime import RuntimeLayer
+
+    shape = (3, 16, 145)
+    dense, packed, scores_by_key = [], [], {}
+    for index, view in enumerate(('transverse', 'tilted_transverse_horizontal_p0p1', 'sagittal')):
+        values = np.zeros(shape, np.uint8)
+        values[index % 2:, 4+index:11+index, 119+index:139-index] = 1
+        values[:, 6, 132] = 0
+        scores = np.zeros(shape, np.uint8)
+        scores[:, 3:14, 117:135+index] = 210 - 4*index
+        scores[0, 7, 130] = 0
+        scores_by_key[view] = confidence_evidence.write_block_confidence_evidence(
+            tmp_path / f'{view}.scores', shape, scores.__getitem__, model_name='m', layer_key=view)
+        raw_path = tmp_path / f'{view}.dat'
+        values.tofile(raw_path)
+        ref = NrrdLayerRef(key=view, name=view, path=raw_path, shape=shape, model_name='m',
+                           view_name=view, physical_view_name=view, view_family='orthogonal',
+                           source='fullframe', mask_kind='yolo')
+        dense.append(ref)
+        packed_path = tmp_path / f'{view}.cvol'
+        write_raw_bbox_mask_store(values, packed_path, format_name=INTERNAL_PACKED_CVOL_FORMAT)
+        packed.append(replace(ref, path=packed_path, storage_format=INTERNAL_PACKED_CVOL_FORMAT))
+    monkeypatch.setattr(confidence_evidence, 'lookup_confidence_evidence',
+                        lambda ref: scores_by_key[ref.key])
+
+    calls = []
+
+    def decide(block):
+        calls.append({k: v.copy() if isinstance(v, np.ndarray) else v for k, v in block.items()})
+        return block['anchored'] & (block['score'] >= 1.5)
+
+    def execute(refs, directory):
+        output, report = reconcile_tta_layers(
+            refs, views=[], source_shape_tyx=shape, processing_shape_tyx=shape, settings=settings(),
+            policy=dict(mode='confidence', decide=decide), output_dir=tmp_path / directory,
+            workspace=tmp_path / (directory + '-workspace'))
+        try:
+            return output.copy(), report['counts']
+        finally:
+            output._mmap.close()
+
+    expected_mask, expected_counts = execute(dense, 'dense')
+    dense_calls = calls.copy()
+    calls.clear()
+
+    def unexpected_slab(owner, z0, z1):
+        pytest.fail('Same-grid packed voting expanded a complete dense mask slab')
+
+    monkeypatch.setattr(RuntimeLayer, 'read_slab', unexpected_slab)
+    actual_mask, actual_counts = execute(packed, 'packed')
+    assert expected_counts['duplicate_group_support_removed'] > 0
+    assert expected_counts['confidence_unknown_prediction_voxels'] > 0
+    assert actual_counts == expected_counts
+    np.testing.assert_array_equal(actual_mask, expected_mask)
+    for actual, expected in zip(calls, dense_calls, strict=True):
+        assert actual.keys() == expected.keys()
+        for name in actual:
+            np.testing.assert_array_equal(actual[name], expected[name])
+
+
 def test_conflicting_layer_identity_is_rejected(tmp_path):
     path = tmp_path / 'a.dat'
     np.zeros((2, 3, 4), np.uint8).tofile(path)
@@ -100,6 +163,33 @@ def test_section_preflight_pools_repeated_spherical_patches():
         processing_shape_tyx=(2911,3064,3022), settings=replace(settings(), memory_mib=4096),
         policy=validate_policy(dict(grouping='sections')))
     assert plan['planned_group_count'] == 1
+
+
+def test_largest_island_uses_indexed_bounds_on_the_managed_entrypoint(tmp_path):
+    from XTA.interpolation import INTERNAL_PACKED_CVOL_FORMAT, write_raw_bbox_mask_store
+    cfg = resolve_reconciliation(SimpleNamespace(
+        reconciliation=Path('XTA/examples/external_reconciliation/largest_island.py'),
+        reconciliation_memory_mib=8))
+    values = np.zeros((6, 9, 13), np.uint8)
+    values[2:5, 3:6, 4:8] = 1
+    refs = []
+    for view in ('transverse', 'sagittal'):
+        path = tmp_path / f'{view}.cvol'
+        write_raw_bbox_mask_store(values, path, format_name=INTERNAL_PACKED_CVOL_FORMAT)
+        refs.append(NrrdLayerRef(key=view, name=view, path=path, shape=values.shape,
+            model_name='m', view_name=view, physical_view_name=view, view_family='orthogonal',
+            source='fullframe', mask_kind='yolo', storage_format=INTERNAL_PACKED_CVOL_FORMAT))
+    output, report = reconcile_tta_layers(refs, views=[], source_shape_tyx=values.shape,
+        processing_shape_tyx=values.shape, settings=cfg,
+        output_dir=tmp_path / 'published', workspace=tmp_path / 'workspace')
+    try:
+        np.testing.assert_array_equal(output, values)
+        for record in report['components'].values():
+            assert record['component_working_bounds_tyx'] == (2, 5, 3, 6, 4, 8)
+            assert record['component_count'] == 1
+            assert record['largest_component_voxels'] == 36
+    finally:
+        output._mmap.close()
 
 
 def test_sweep_reconciliation_receipts_share_policy_and_bind_accepted_reports(tmp_path):

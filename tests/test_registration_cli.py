@@ -26,6 +26,9 @@ class RegistrationCommandTests(unittest.TestCase):
 
     def test_unsupported_fit_has_distinct_exit_and_machine_readable_result(self):
         def unavailable(**options):
+            self.assertEqual(options["exclude_first"], [3, 5])
+            self.assertEqual(options["contrast"], "both")
+            self.assertTrue(options["affine"])
             print("progress")
             return {"packet": str(options["output"]), "status": "unavailable"}
 
@@ -37,7 +40,10 @@ class RegistrationCommandTests(unittest.TestCase):
             self.assertRaises(SystemExit) as caught,
         ):
             run(
-                ["register", "fit", "--fixed", "a.mkv", "--moving", "b.mkv", "--output", "pair.zip"]
+                [
+                    "register", "fit", "--fixed", "a.mkv", "--moving", "b.mkv", "--output", "pair.zip",
+                    "--exclude-first", "3", "5", "--contrast", "both", "--affine",
+                ]
             )
         self.assertEqual(caught.exception.code, 3)
         self.assertEqual(

@@ -25,6 +25,14 @@ _FRONTIER_BYTES_PER_VOXEL = 64
 _MAX_LABEL_ID = int(np.iinfo(np.int32).max)
 
 
+def component_lane_count(shapes, memory_mib, workers):
+    """Share the component-statistics budget across independent cropped unions."""
+    minimum_bytes = _FIXED_WORKSPACE_BYTES + (
+        _FRONTIER_BYTES_PER_VOXEL + _SLAB_BYTES_PER_VOXEL
+    ) * max(y * x for _, y, x in shapes)
+    return min(len(shapes), max(1, workers), max(1, int(memory_mib * _MIB) // minimum_bytes))
+
+
 def _plan_slabs(shape_tyx: Sequence[int], memory_mib: float) -> dict:
     try:
         dimensions = tuple(shape_tyx)
@@ -128,8 +136,11 @@ def _advance_frontier(
     del merged_ids
     last_face = label_to_merged[labels[-1]]
     del label_to_merged
-    active_ids = np.unique(last_face)
-    active_ids = active_ids[active_ids != 0]
+    active = np.zeros(merged_count + 1, dtype=bool)
+    active[last_face] = True
+    active[0] = False
+    active_ids = np.flatnonzero(active)
+    del active
 
     retired = np.ones(merged_count, dtype=np.bool_)
     retired[active_ids - 1] = False

@@ -26,15 +26,22 @@ voxels on both grids. Playback FPS is recorded separately.
 For a scan with a black acquisition exterior and gray interior, add
 `--black-exterior`. XTA measures a native XY observation mask for each scan,
 including interior dark structures. The default treats the rectangular images
-as observed. To exclude early artifacts from fitting, use `--exclude-first 400`
-or give separate counts for the fixed and moving acquisitions. The registered
-movie still includes every reference frame.
+as observed. To exclude early artifacts, use `--exclude-first 400` or give
+separate counts for the fixed and moving acquisitions. The acquisition field,
+pyramid filter, and registration all use the usable part of each scan. Native
+voxel indices still refer to the original grid, and the registered movie
+includes every reference frame.
 
 The estimator combines candidate 3D orientations, intensity-based refinement
 and local patch correspondences. It compares a rigid motion in physical space
 with a fit that adds uniform scale. Patch errors are reported in moving native
 voxels. On downsampled fitting grids, the default also checks native-resolution
 patches. The packet records the level of validation actually obtained.
+`--contrast both` uses signed deviations from each slice's background median,
+so dark lumens and bright structures both contribute. The default uses bright
+contrast for the initial fit. `--affine` also evaluates a 12-parameter physical
+mapping with shear and anisotropic scale. The affine model is selected when it
+improves the spatially held-out correspondence errors over the simpler fit.
 `--broad-search` adds a CPU orientation and translation search for acquisitions
 that may have settled very differently. `--step` overrides the power-of-two
 pyramid step. `--pyramid-only` skips the additional native refinement.
@@ -110,7 +117,7 @@ holes per component). The transfer manifest quantifies residual loss.
 would cover an unobserved pixel. Use the resliced-movie workflow above for
 ordinary whole-slice supervision.
 
-## Transfer a scalar NRRD labelmap
+## Transfer a NRRD labelmap or Slicer segmentation
 
 ```sh
 xta register nrrd --packet sample01_mapping.zip --input earlier_labels.nrrd --source-reference earlier_scan.nrrd --target-reference later_scan.nrrd --output later_labels.nrrd
@@ -124,14 +131,24 @@ XTA warns when a reference's stored axes do not follow +X, +Y, +Z, still uses
 it, and records each reference's path, header and axis alignment in the
 provenance JSON. Source labelmaps can be cropped or reoriented when this
 geometry is available.
-For a full-sized label array already in the source movie's exact XYZ index
-order, use `--source-grid-aligned` in place of `--source-reference`. Without
-a target reference, output coordinates are scan-local, with packet spacing and
-origin at target index zero. XTA uses nearest-neighbor sampling for integer
-classes and writes a companion coverage NRRD and provenance JSON. Supported
-inputs are embedded, scalar, three-dimensional integer NRRDs with raw or gzip
-encoding. Slicer segmentation files that carry segment-specific metadata
-require a scalar labelmap export.
+Use `--source-grid-aligned` in place of `--source-reference` when the input
+uses the source movie's exact XYZ index axes. XTA uses a Slicer segmentation's
+reference offset to place a stored crop on that grid. Without a target
+reference, output coordinates are scan-local, with packet spacing and
+origin at target index zero.
+
+The command accepts embedded raw or gzip integer labels and XTA's scalar or
+grouped `.seg.nrrd` files directly. Use a `.seg.nrrd` output name to open
+the result as a segmentation in Slicer. The output preserves IDs, names,
+colors, tags and overlapping layers, resamples by nearest neighbor, and
+recomputes the extent of each segment. It stores the warped crop with its
+origin and offset in the target grid. The companion
+coverage NRRD distinguishes observed background from missing data. Outside a
+stored segmentation crop, observed voxels have label zero.
+
+```sh
+xta register nrrd --packet sample01_mapping.zip --input group_0001.seg.nrrd --source-grid-aligned --target-reference later_scan.nrrd --output later_labels.seg.nrrd
+```
 
 ## Packet conventions
 

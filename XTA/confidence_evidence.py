@@ -6,6 +6,7 @@ negative evidence. These sidecars never modify the prediction or bridge masks.
 """
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import json
@@ -13,6 +14,7 @@ import os
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 from typing import Callable
 import zlib
 
@@ -39,20 +41,22 @@ _CAPTURE_QUEUE = None
 _OBSERVED_CONFIDENCE = None
 _RUN_ID = None
 _ADOPTED_KEYS: set[tuple[str, str]] = set()
+_SWEEP_SCORE_PROJECTION = None
+SOURCE_SCORE_PROJECTION_WORKSPACE_BYTES = 512 * 1024**2
 
 
 def configure_confidence_evidence(output_dir=None, *, enabled=False, min_conf=0.0,
                                   defer_projection=False, background_publication=False,
                                   prediction_task=None, confidence_floor=None,
                                   confidence_floor_by_backend=None, run_id=None,
-                                  adopt_existing=False):
+                                   adopt_existing=False, sweep_score_projection=None):
     """Start a run-owned collection; output_dir is the run's output directory."""
     from .confidence_retention import observed_confidence_contract
     contract = observed_confidence_contract(prediction_task=prediction_task,
         confidence_floor=confidence_floor, min_conf=min_conf,
         confidence_floor_by_backend=confidence_floor_by_backend)
     global _OUTPUT_DIR, _ENABLED, _DEFER_PROJECTION, _PUBLICATION, _OBSERVED_CONFIDENCE, _RUN_ID
-    global _BATCH_MANIFEST, _MANIFEST_DIRTY
+    global _BATCH_MANIFEST, _MANIFEST_DIRTY, _SWEEP_SCORE_PROJECTION
     shutdown_confidence_publication()
     with _MANIFEST_WRITE_LOCK, _LOCK:
         _ENABLED = bool(enabled)
@@ -62,6 +66,7 @@ def configure_confidence_evidence(output_dir=None, *, enabled=False, min_conf=0.
         _OUTPUT_DIR = None if output_dir is None else Path(output_dir) / 'reconciliation_evidence'
         _OBSERVED_CONFIDENCE = contract
         _RUN_ID = run_id
+        _SWEEP_SCORE_PROJECTION = sweep_score_projection if enabled and not defer_projection else None
         _REGISTRY.clear()
         _ADOPTED_KEYS.clear()
         if enabled and _OUTPUT_DIR is not None:
@@ -739,7 +744,8 @@ def write_confidence_evidence(path, shape, slice_reader: Callable, *, layer_key,
 
 def write_block_confidence_evidence(path, shape, slice_reader: Callable, *, layer_key, model_name,
                                     provenance=None, coordinate_space=None, source_shape_tyx=None,
-                                    block_size=128, metrics=None, max_numeric_bytes=None):
+                                    block_size=128, metrics=None, max_numeric_bytes=None,
+                                    track_minimum_score=False):
     """Write schema2 numeric blocks without a whole-plane bounding rectangle."""
     from .confidence_storage import write_blocks
     provenance = _confidence_provenance(provenance)
@@ -748,7 +754,7 @@ def write_block_confidence_evidence(path, shape, slice_reader: Callable, *, laye
         space = 'native_view_processing'
     write_blocks(path,shape,slice_reader,layer_key=layer_key,model_name=model_name,
         provenance=provenance,coordinate_space=space,source_shape=source_shape_tyx,block_size=block_size,
-        metrics=metrics,max_numeric_bytes=max_numeric_bytes)
+        metrics=metrics,max_numeric_bytes=max_numeric_bytes,track_minimum_score=track_minimum_score)
     return ConfidenceEvidenceRef.open(path)
 
 
@@ -819,12 +825,68 @@ def _confidence_destination(model_name,layer_key):
     return output/identity
 
 
+@contextmanager
+def _source_score_projection(scores, view, shape, work, *, native_boxes=None):
+    """Project all uint8 values, reusing the sweep's exact bounded geometry."""
+    from .confidence_projection import score_projection_reader
+    from .confidence_storage import _CROP_OCCUPANCY_BAND_BYTES
+    from .geometry import is_tilted_view
+    capture_plan = current_confidence_capture_plan()
+    host_credit = (SOURCE_SCORE_PROJECTION_WORKSPACE_BYTES if capture_plan is None
+                   else min(SOURCE_SCORE_PROJECTION_WORKSPACE_BYTES, capture_plan.workspace_bytes))
+    # Keep the writer's largest occupancy band, row indices, one cropped cell,
+    # and zlib buffers inside the same promise as the projector.
+    writer_credit = (min(_CROP_OCCUPANCY_BAND_BYTES, min(128, shape[1]) * shape[2])
+                     + 4 * shape[2] + 1024**2)
+    projection_credit = host_credit - writer_credit
+    if str(view.family) == 'orthogonal' and not is_tilted_view(view):
+        from .d1_orthogonal_coverage import orthogonal_coverage_supported
+        eligible = native_boxes is not None and orthogonal_coverage_supported(view, scores.shape, shape)
+    else:
+        eligible = (scores.shape[0] == int(view.num_slices)
+                    and (str(view.family) in ('radial', 'spherical', 'azimuthal') or is_tilted_view(view)))
+    if not eligible:
+        kwargs = ({} if capture_plan is None and native_boxes is None
+                  else {'memory_bytes': projection_credit})
+        with score_projection_reader(scores, view, shape, work, **kwargs) as read:
+            yield read, read
+        return
+
+    from .sweep_projection import sweep_rank_projection_reader
+    with ExitStack() as stack:
+        try:
+            read = stack.enter_context(sweep_rank_projection_reader(
+                scores, view, shape, work, level_count=255,
+                memory_bytes=max(1, projection_credit),
+                known_native_boxes=native_boxes))
+        except MemoryError as error:
+            # Large grids may exceed the shared projector's workspace contract.
+            print(f'Bounded confidence projection declined for {view.name} ({error}). '
+                  'Using the bounded reference projection.', flush=True)
+            read = stack.enter_context(score_projection_reader(
+                scores, view, shape, work, memory_bytes=projection_credit))
+
+        read_crop = getattr(read, 'read_crop', None)
+        if read_crop is None:
+            yield read, read
+        else:
+            def iter_crops(z):
+                crop = read_crop(z)
+                return () if crop is None else (crop,)
+            bounds = getattr(read, 'known_z_bounds', (0, shape[0]))
+            yield SimpleNamespace(iter_crops=iter_crops, known_z_bounds=bounds), read
+
+
 def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shape=None,
                                source='fullframe', tile_config_id='', tile_acceptance='',
-                               stage='pre_interpolation', layer_key=None, native_reader=None):
-    """Project immutable native-view scores and persist one prediction companion."""
+                               stage='pre_interpolation', layer_key=None, native_reader=None,
+                               native_boxes=None):
+    """Project immutable native-view scores and persist one prediction companion.
+
+    Bounds supplied by the D1 lease merger must enclose every nonzero score.
+    """
     from .assembly import final_source_output_shape
-    from .confidence_projection import read_score_slice_in_output_shape, score_projection_reader
+    from .confidence_projection import read_score_slice_in_output_shape
     from .cuda_d1 import _nrrd_layer_key
     if not confidence_evidence_enabled():
         return None
@@ -837,6 +899,7 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
     with _LOCK:
         output = _OUTPUT_DIR
         publisher = _PUBLICATION
+        sweep_projection = _SWEEP_SCORE_PROJECTION
     if output is None:
         raise RuntimeError('Confidence evidence publication has no configured run output directory')
     key = str(layer_key or _nrrd_layer_key(
@@ -893,19 +956,58 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
             # retain closure cells even after traceback frames are cleared; only
             # compressed files and scalar metadata may survive this boundary.
             scores = native_reader = read_native = None
-    elif native_reader is not None:
-        if not _can_stream_eager_planes(view):
-            raise ValueError('Eager confidence plane streaming requires a transverse view')
-        reference = write_block_confidence_evidence(output / identity, shape,
-            lambda z: read_score_slice_in_output_shape(scores, shape, z, read_native=native_reader),
-            layer_key=key, model_name=model_name, provenance=provenance, metrics=metrics)
-    elif not any(bool(np.any(scores[index])) for index in range(scores.shape[0])):
-        reference = write_block_confidence_evidence(output / identity, shape, lambda _z: None,
+    elif native_reader is None and not (
+            bool(np.any(native_boxes[:, 1] > native_boxes[:, 0])) if native_boxes is not None
+            else any(bool(np.any(scores[index])) for index in range(scores.shape[0]))):
+        def empty(_z):
+            return None
+        empty.known_z_bounds = (0, 0)
+        reference = write_block_confidence_evidence(output / identity, shape, empty,
             layer_key=key, model_name=model_name, provenance=provenance,metrics=metrics)
     else:
-        with score_projection_reader(scores, view, shape, work) as reader:
-            reference = write_block_confidence_evidence(output / identity, shape, reader,
-                layer_key=key, model_name=model_name, provenance=provenance,metrics=metrics)
+        native_shape = tuple(scores.shape)
+        if native_reader is not None and not _can_stream_eager_planes(view):
+            raise ValueError('Eager confidence plane streaming requires a transverse view')
+        direct = (_direct_eager_score_planes(scores, view, shape, native_reader)
+                  if native_boxes is None else None)
+        if direct is not None:
+            sweep_projection = None
+            operation_scores = nullcontext(direct)
+        else:
+            # Threshold on fully masked native score bytes commutes with numeric
+            # max. Thresholding an output mask alone could keep removed scores.
+            operation_scores = (nullcontext(None) if sweep_projection is None else
+                                sweep_projection.reuse(native_shape, read_native, shape,
+                                    model_name=model_name, layer_key=key,
+                                    provenance=provenance, metrics=metrics))
+        keep_floor = (sweep_projection is not None and sweep_projection.cutoff == sweep_projection.floor
+                      and sweep_projection.budget_bytes > 0)
+        with operation_scores as reused:
+            if reused is not None and getattr(reused, 'copy_from', None) is not None:
+                from .confidence_publication import copy_staged_blocks
+                reference = copy_staged_blocks(reused.copy_from, output / identity,
+                    provenance=_confidence_provenance(provenance), metrics=metrics)
+            elif reused is not None:
+                reference = write_block_confidence_evidence(output / identity, shape, reused,
+                    layer_key=key, model_name=model_name, provenance=provenance, metrics=metrics)
+            elif native_reader is not None:
+                reference = write_block_confidence_evidence(output / identity, shape,
+                    lambda z: read_score_slice_in_output_shape(scores, shape, z, read_native=read_native),
+                    layer_key=key, model_name=model_name, provenance=provenance, metrics=metrics,
+                    track_minimum_score=keep_floor)
+            else:
+                with _source_score_projection(
+                        scores, view, shape, work, native_boxes=native_boxes) as (reader, projection):
+                    reference = write_block_confidence_evidence(output / identity, shape, reader,
+                        layer_key=key, model_name=model_name, provenance=provenance, metrics=metrics,
+                        track_minimum_score=keep_floor)
+                    diagnostics = getattr(projection, 'projection_diagnostics', None)
+                    if diagnostics is not None:
+                        metrics['source_projection'] = diagnostics()
+        if keep_floor:
+            metrics['floor_score_projection_cache'] = sweep_projection.remember(
+                native_shape, read_native, reference, provenance=provenance,
+                minimum_projected_score=metrics['minimum_nonzero_score'])
     result = _register_confidence_reference(reference,metrics=metrics)
     print(f'Confidence {operation} complete {model_name}/{view.name}: '
           f'elapsed_s={time.perf_counter()-started:.3f}, metrics={json.dumps(metrics,sort_keys=True)}.', flush=True)
@@ -1222,16 +1324,24 @@ def publish_confidence_shards(shards, *, view, model_name, temp_dir, output_shap
     path.parent.mkdir(parents=True, exist_ok=True)
     merged = np.memmap(path, dtype=np.uint8, mode='w+', shape=shape)
     try:
+        boxes = np.zeros((shape[0], 4), np.int64)
         for piece in pieces:
             ref, (start, _, _) = piece['reference'], piece['offset_tyx']
             with ref.native_reader() as reader:
                 for local in range(ref.storage_shape[0]):
+                    z = start + local
+                    top, bottom, left, right = shape[1], 0, shape[2], 0
                     for y0,y1,x0,x1,crop in reader.iter_crops(local):
-                        merged[start + local, y0:y1, x0:x1] = crop
+                        merged[z, y0:y1, x0:x1] = crop
+                        top, bottom = min(top, y0), max(bottom, y1)
+                        left, right = min(left, x0), max(right, x1)
+                    if top < bottom:
+                        boxes[z] = (top, bottom, left, right)
         return publish_confidence_scores(merged, view=view, model_name=model_name,
-            temp_dir=temp_dir, output_shape=output_shape, layer_key=layer_key)
+            temp_dir=temp_dir, output_shape=output_shape, layer_key=layer_key, native_boxes=boxes)
     finally:
         close_memmap_array_without_flush(merged, unlink_path=path)
+        merged = None
         try:
             path.unlink(missing_ok=True)
         except PermissionError:
@@ -1241,6 +1351,19 @@ def publish_confidence_shards(shards, *, view, model_name, temp_dir, output_shap
 def _can_stream_eager_planes(view):
     from .geometry import physical_view_name
     return view.family == 'orthogonal' and physical_view_name(view) == 'transverse'
+
+
+def _direct_eager_score_planes(scores, view, shape, native_reader):
+    """Borrow same-grid orthogonal score planes without allocating a resample."""
+    if view.family != 'orthogonal':
+        return None
+    from .geometry import physical_view_name
+
+    axes = {'transverse': (0, 1, 2), 'sagittal': (1, 0, 2), 'coronal': (1, 2, 0)}.get(
+        physical_view_name(view))
+    if axes is None or tuple(scores.shape[ax] for ax in axes) != shape:
+        return None
+    return native_reader if native_reader is not None else scores.transpose(axes).__getitem__
 
 
 def _publish_eager_transverse_pieces(pieces, shape, *, mask=None, **kwargs):

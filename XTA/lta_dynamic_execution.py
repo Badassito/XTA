@@ -42,6 +42,7 @@ class DynamicTask:
     patch: bool
     ordinal: int
     root_id: str
+    anchor_domain: AnchorDomain | None = None
 
 
 class DynamicViewCompletion:
@@ -77,7 +78,7 @@ class DynamicViewCompletion:
 
 
 def _task(objects, crop, window, *, patch, ordinal, root_id, view_plan, cache_ref,
-          temp_root, conf, empty_frame_limit, settings, plan_order=0):
+          temp_root, conf, empty_frame_limit, settings, plan_order=0, anchor_domain=None):
     from .lta_execution import _tile_payload
     identity = {"policy": DYNAMIC_CROP_POLICY, "root_id": root_id, "patch": patch,
                 "ordinal": ordinal, "window": asdict(window), "crop": list(crop.xyxy),
@@ -107,11 +108,11 @@ def _task(objects, crop, window, *, patch, ordinal, root_id, view_plan, cache_re
                "conf": float(conf), "empty_frame_limit": empty_frame_limit, "relay_generation": 0,
                "relay_min_pixels": 16, "relay_min_probability": 0.5,
                "crop_model_side": DYNAMIC_MODEL_SIDE, "dynamic_crop_policy": DYNAMIC_CROP_POLICY}
-    return DynamicTask(work, payload, tuple(objects), crop, window, patch, ordinal, root_id)
+    return DynamicTask(work, payload, tuple(objects), crop, window, patch, ordinal, root_id, anchor_domain)
 
 
 def plan_initial_dynamic_tasks(source, annotations, view_plan, cache_ref, *, temp_root,
-                               conf, empty_frame_limit, settings=DynamicCropSettings()):
+                               conf, empty_frame_limit, settings=DynamicCropSettings(), anchor_domains=None):
     tasks, inventory = [], {}
     by_frame = {}
     for annotation in annotations:
@@ -136,13 +137,16 @@ def plan_initial_dynamic_tasks(source, annotations, view_plan, cache_ref, *, tem
     for frame, objects in sorted(by_frame.items()):
         if not objects:
             continue
-        window = plan_domain_windows(AnchorDomain(frame, 0, view_plan.frame_count))[0]
+        domain = (anchor_domains[frame] if anchor_domains is not None
+                  else AnchorDomain(frame, 0, view_plan.frame_count))
+        window = plan_domain_windows(domain)[0]
         root_id = f"{view_plan.volume_id}::dynamic-anchor-{frame:06d}"
         for group in plan_dynamic_crops(objects, height=view_plan.frame_height, width=view_plan.frame_width,
                                         settings=settings):
             task = _task(group.objects, group.tile, window, patch=False, ordinal=0, root_id=root_id,
                          view_plan=view_plan, cache_ref=cache_ref, temp_root=temp_root,
-                         conf=conf, empty_frame_limit=empty_frame_limit, settings=settings, plan_order=len(tasks))
+                         conf=conf, empty_frame_limit=empty_frame_limit, settings=settings,
+                         plan_order=len(tasks), anchor_domain=domain)
             # A crop's fixed predecessor root prevents later arrival batching.
             task = replace(task, root_id=task.work.work_id,
                            payload={**task.payload, "chain_work_id": task.work.work_id})
@@ -247,6 +251,8 @@ def followup_dynamic_tasks(task, masks, *, view_plan, cache_ref, temp_root, conf
                           empty_frame_limit, settings, audit):
     """Combine edge/split events; patches synchronize at their own boundary."""
     queued = []
+    first = task.anchor_domain.frame_start if task.anchor_domain is not None else 0
+    limit = task.anchor_domain.frame_stop if task.anchor_domain is not None else view_plan.frame_count
     for direction in ("forward", "backward"):
         if task.window.direction not in (direction, "both"):
             continue
@@ -303,8 +309,8 @@ def followup_dynamic_tasks(task, masks, *, view_plan, cache_ref, temp_root, conf
             if item is None:
                 audit["empty_boundary_count"] += 1
                 continue
-            if (direction == "forward" and boundary == view_plan.frame_count - 1
-                    or direction == "backward" and boundary == 0):
+            if (direction == "forward" and boundary == limit - 1
+                    or direction == "backward" and boundary == first):
                 continue
             pieces = split_dynamic_object(item, settings=settings)
             if not depth_budget_recorded and split_depth_budget_reached(item, settings=settings):
@@ -313,7 +319,8 @@ def followup_dynamic_tasks(task, masks, *, view_plan, cache_ref, temp_root, conf
                     "action": "split_depth_limit_combined_foreground_preserved"})
             if len(pieces) > 1:
                 audit["boundary_split_count"] += 1
-            start, stop = (boundary, min(view_plan.frame_count, boundary + 30)) if direction == "forward" else (max(0, boundary - 29), boundary + 1)
+            start, stop = ((boundary, min(limit, boundary + 30)) if direction == "forward"
+                           else (max(first, boundary - 29), boundary + 1))
             followup.setdefault((start, stop, boundary, False), []).extend(pieces)
         for (start, stop, prompt, patch), members in sorted(followup.items()):
             # Patch windows own their prompt frame so repair may add missing
@@ -326,13 +333,13 @@ def followup_dynamic_tasks(task, masks, *, view_plan, cache_ref, temp_root, conf
                                     ordinal=task.ordinal if patch else task.ordinal + 1,
                                     root_id=task.root_id, view_plan=view_plan, cache_ref=cache_ref,
                                     temp_root=temp_root, conf=conf, empty_frame_limit=empty_frame_limit,
-                                    settings=settings))
+                                    settings=settings, anchor_domain=task.anchor_domain))
     return tuple(queued)
 
 
 def drive_dynamic_workers(*, scheduler, pool, initial, view_plan, cache_ref, view_union,
                           temp_root, conf, empty_frame_limit, worker_task_timeout, trace,
-                          settings=DynamicCropSettings()):
+                          settings=DynamicCropSettings(), handoff=None):
     from . import lta_execution as execution
     audit = execution._new_worker_audit()
     audit["worker_slots"] = [list(slot) for slot in pool.worker_slots]
@@ -357,8 +364,11 @@ def drive_dynamic_workers(*, scheduler, pool, initial, view_plan, cache_ref, vie
         if len(seen) >= max_tasks:
             raise RuntimeError("dynamic LTA exceeded its bounded task budget; result is incomplete")
         seen.add(task.work.work_id)
-        remaining = (view_plan.frame_count - task.window.prompt_frame if task.window.direction == "forward"
-                     else task.window.prompt_frame + 1 if task.window.direction == "backward" else view_plan.frame_count)
+        first = task.anchor_domain.frame_start if task.anchor_domain is not None else 0
+        limit = task.anchor_domain.frame_stop if task.anchor_domain is not None else view_plan.frame_count
+        remaining = (limit - task.window.prompt_frame if task.window.direction == "forward"
+                     else task.window.prompt_frame - first + 1 if task.window.direction == "backward"
+                     else limit - first)
         heapq.heappush(heap, (-remaining, not task.patch, task.work.work_id, task))
 
     for task in initial:
@@ -387,6 +397,8 @@ def drive_dynamic_workers(*, scheduler, pool, initial, view_plan, cache_ref, vie
                    "model_side": DYNAMIC_MODEL_SIDE, "seed_lineages": [item.seed.lineage.token for item in task.objects],
                    "owner_device_id": scheduler.owner, "tail_assist": slot[0] != scheduler.owner,
                    "tile_config_id": "dynamic", "tile_index": task.work.tile_index, "relay_generation": 0}
+            if task.anchor_domain is not None:
+                row["authoritative_anchor_frame"] = task.anchor_domain.anchor_frame
             schedule.append(row)
             if trace is not None:
                 trace.event("dynamic_window_dispatch", **row)
@@ -429,7 +441,10 @@ def drive_dynamic_workers(*, scheduler, pool, initial, view_plan, cache_ref, vie
                           "dogfood_seed_count": int(window.get("dogfood_seed_count", 0))}
                          for window in manifest.get("windows", ())]})
         masks = _read_task_masks(task, manifest, settings=settings)
-        execution._consume_chain_manifest(manifest, view_union=view_union)
+        execution._consume_chain_manifest(
+            manifest, view_union=view_union, handoff=handoff,
+            anchor_frame=(task.anchor_domain.anchor_frame if task.anchor_domain is not None else None),
+        )
         execution._accumulate_worker_audit(audit, manifest, result)
         for child in followup_dynamic_tasks(task, masks, view_plan=view_plan, cache_ref=cache_ref,
                                             temp_root=temp_root, conf=conf, empty_frame_limit=empty_frame_limit,

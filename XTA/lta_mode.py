@@ -19,7 +19,7 @@ def run(argv: Sequence[str] | None = None) -> None:
     """Validate LTA arguments and enter the runtime boundary."""
 
     arguments = None if argv is None else [str(value) for value in argv]
-    config = parse_lta_args(arguments)
+    config = parse_lta_args(arguments, for_execution=True)
     runtime = _load_runtime_module()
     runtime.run(config, argv=arguments)
 

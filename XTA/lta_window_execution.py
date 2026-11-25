@@ -39,6 +39,7 @@ class WindowExecution:
     worker_task_timeout: float
     trace: object | None = None
     enable_2D_hole_fill: bool = False
+    handoff: object | None = None
 
 
 @dataclass(frozen=True)
@@ -305,7 +306,12 @@ def _drive_windows_with_coverage(
                 parent_payload = payload_by_work[worker_result.work_id]
                 if list(manifest["output_frame_range"]) != [parent_payload["output_frame_start"], parent_payload["output_frame_stop"]]:
                     raise RuntimeError("worker result changed its owned window frame range")
-                _relays, union_artifact = coordinator._consume_chain_manifest(manifest, view_union=view_union)
+                if execution.handoff is not None and manifest["tile"] != parent_payload["tile"]:
+                    raise RuntimeError("worker result changed its tile coordinates")
+                _relays, union_artifact = coordinator._consume_chain_manifest(
+                    manifest, view_union=view_union,
+                    handoff=execution.handoff, anchor_frame=parent_payload.get("authoritative_anchor_frame"),
+                )
                 input_seeds = ()
                 if manifest.get("dogfood_seed_artifacts") or manifest.get("lineage_coverage") is not None:
                     input_seeds = read_seed_artifact(

@@ -419,7 +419,8 @@ def export_api(review,arrays):
     tree=ast.parse(path.read_text(encoding='utf-8'))
     body=[node for node in tree.body if isinstance(node,ast.FunctionDef)
           and (node.name.startswith('_xta_sweep_')
-               or node.name in {'ExportXTASweepEdits','ExportXTAEdits','_xta_check_review_family'})]
+               or node.name in {'ExportXTASweepEdits','ExportXTAEdits','_xta_check_review_family',
+                                '_xta_current_native_window'})]
     namespace=dict(vars(edits),np=np,os=os,shutil=shutil,tempfile=tempfile,datetime=datetime,timezone=timezone)
     statuses=[]
     vtk=SimpleNamespace(mutable=MutableTag,vtkMatrix4x4=Matrix)

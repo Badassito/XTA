@@ -1,4 +1,4 @@
-"""Nearest-neighbor transfer of scalar categorical NRRDs between registered grids.
+"""Nearest-neighbor transfer of integer NRRD labels between registered grids.
 
 NRRD data axes are XYZ on disk and the bounded working array is ZYX. The
 registration packet maps the original scan's native voxel-center indices. A
@@ -10,11 +10,14 @@ available for labelmaps already stored in the scan's native axes.
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
 import gzip
+from itertools import product
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 from typing import Any, Mapping
 import warnings
@@ -87,6 +90,10 @@ _ANATOMICAL_SPACES = {
     "las": ("left-posterior-superior", (1, -1, 1)),
     "left-anterior-superior": ("left-posterior-superior", (1, -1, 1)),
 }
+_SEGMENT_FIELD = re.compile(r"Segment(\d+)_(\w+)")
+_REFERENCE_OFFSET = "Segmentation_ReferenceImageExtentOffset"
+_REFERENCE_EXTENT = "Segmentation_ReferenceImageExtent"
+_EMPTY_EXTENT = (0, -1, 0, -1, 0, -1)
 
 
 def _pynrrd():
@@ -109,7 +116,7 @@ def _header(path: Path) -> tuple[dict[str, Any], int]:
             length += len(line)
             if not line or len(line) > 1_048_576 or length > 4_194_304:
                 raise ValueError(f"Incomplete or excessive NRRD header in {path}")
-            lines.append(line)
+            lines.append(line.decode("utf-8", errors="ignore"))
             if not line.strip():
                 break
     return dict(_pynrrd().read_header(lines)), length
@@ -125,6 +132,135 @@ def _shape(header: Mapping[str, Any]) -> tuple[int, int, int]:
     if len(kinds) != 3 or any(str(kind).lower() not in {"domain", "space"} for kind in kinds):
         raise ValueError("Registration NRRD transfer requires three scalar spatial axes")
     return tuple(int(value) for value in sizes[::-1])
+
+
+def _segmentation_axes(header):
+    sizes = np.asarray(header["sizes"])
+    kinds = [str(kind).lower() for kind in header.get("kinds", ())]
+    if int(header["dimension"]) == 3:
+        _shape(header)
+        return (0, 1, 2), None
+    if int(header["dimension"]) != 4 or sizes.shape != (4,) or len(kinds) != 4:
+        raise ValueError("Slicer segmentations need three spatial axes and an optional list axis")
+    if sizes.dtype.kind not in "iu" or np.any(sizes <= 0) or kinds.count("list") != 1:
+        raise ValueError("Expected positive NRRD sizes and exactly one segmentation list axis")
+    list_axis = kinds.index("list")
+    spatial = tuple(axis for axis in range(4) if axis != list_axis)
+    if any(kinds[axis] not in {"domain", "space"} for axis in spatial):
+        raise ValueError("Expected three spatial axes in the segmentation")
+    return spatial, list_axis
+
+
+@dataclass
+class _Segment:
+    fields: dict[str, Any]
+    layer: int
+    value: int
+    box: list[int] = field(default_factory=lambda: list(_EMPTY_EXTENT))
+    count: int = 0
+
+    def observe(self, plane, z, first_row, first_column):
+        selected = plane == self.value
+        count = int(np.count_nonzero(selected))
+        if count == 0:
+            return
+        y = np.flatnonzero(np.any(selected, axis=1))
+        x = np.flatnonzero(np.any(selected, axis=0))
+        bounds = [
+            int(x[0]) + first_column, int(x[-1]) + first_column,
+            int(y[0]) + first_row, int(y[-1]) + first_row, z, z,
+        ]
+        if self.count:
+            for axis in range(0, 6, 2):
+                self.box[axis] = min(self.box[axis], bounds[axis])
+                self.box[axis + 1] = max(self.box[axis + 1], bounds[axis + 1])
+        else:
+            self.box[:] = bounds
+        self.count += count
+
+
+def _segments(header, layer_count, dtype):
+    by_index = {}
+    for key, value in header.items():
+        match = _SEGMENT_FIELD.fullmatch(str(key))
+        if match:
+            by_index.setdefault(int(match[1]), {})[match[2]] = value
+    if not by_index:
+        raise ValueError("Missing segment-aware label metadata in the Slicer NRRD")
+    for key in ("Segmentation_SourceRepresentation", "Segmentation_MasterRepresentation"):
+        if key in header and header[key] != "Binary labelmap":
+            raise ValueError("Slicer registration requires a binary labelmap representation")
+    ids, categories, segments = set(), set(), []
+    for _, values in sorted(by_index.items()):
+        try:
+            segment_id = str(values["ID"])
+            layer = int(values["Layer"])
+            value = int(values["LabelValue"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValueError("Incomplete segment-aware metadata: ID, Layer and LabelValue are required") from exc
+        if (
+            not segment_id.strip()
+            or segment_id in ids
+            or (layer, value) in categories
+            or not 0 <= layer < layer_count
+            or not np.iinfo(dtype).min <= value <= np.iinfo(dtype).max
+            or value == 0
+        ):
+            raise ValueError("Invalid or duplicate ID, layer or label value in the segmentation")
+        ids.add(segment_id)
+        categories.add((layer, value))
+        segments.append(_Segment(values, layer, value))
+    return segments
+
+
+def _reference_extent(shape):
+    return " ".join(str(value) for size in shape[::-1] for value in (0, size - 1))
+
+
+def _aligned_crop_matrix(header, stored_shape, source_shape, *, segmentation):
+    matrix = np.eye(4)
+    if segmentation and _REFERENCE_EXTENT in header:
+        extent = " ".join(str(header[_REFERENCE_EXTENT]).split())
+        if extent != _reference_extent(source_shape):
+            raise ValueError("The segmentation reference extent disagrees with the packet source grid")
+    if segmentation and _REFERENCE_OFFSET in header:
+        try:
+            offset = tuple(map(int, str(header[_REFERENCE_OFFSET]).split()))
+        except ValueError as exc:
+            raise ValueError("The segmentation crop requires a valid reference offset") from exc
+        if len(offset) != 3 or any(
+            start < 0 or start + size > full
+            for start, size, full in zip(offset, stored_shape[::-1], source_shape[::-1])
+        ):
+            raise ValueError("The segmentation crop lies outside the packet source grid")
+        matrix[:3, 3] = -np.asarray(offset, dtype=np.float64)
+    elif stored_shape != source_shape:
+        raise ValueError(
+            "An explicitly aligned labelmap must cover the full source grid or contain a segmentation crop offset"
+        )
+    return matrix
+
+
+def _transferred_crop(stored_shape, target_shape, target_to_label):
+    """Bound the potentially nonzero target raster by warped source voxel edges."""
+    label_to_target = np.linalg.inv(target_to_label)
+    edges = np.asarray(list(product(*[(-0.5, size - 0.5) for size in stored_shape[::-1]])))
+    corners = edges @ label_to_target[:3, :3].T + label_to_target[:3, 3]
+    limit = np.asarray(target_shape[::-1])
+    start = np.clip(np.floor(corners.min(axis=0)), 0, limit).astype(int)
+    stop = np.clip(np.ceil(corners.max(axis=0)) + 1, 0, limit).astype(int)
+    if np.any(stop <= start):
+        return (0, 0, 0), (1, 1, 1)
+    if np.all(stop - start == 1):
+        # Slicer reserves a single stored voxel for an empty segmentation.
+        for axis in range(3):
+            if stop[axis] < limit[axis]:
+                stop[axis] += 1
+                break
+            if start[axis] > 0:
+                start[axis] -= 1
+                break
+    return tuple(map(int, start)), tuple(map(int, stop))
 
 
 def _scalar_dtype(header: Mapping[str, Any]) -> np.dtype:
@@ -219,15 +355,10 @@ def _json_value(value: Any) -> Any:
 
 
 @contextmanager
-def _label_array(path: Path, header: Mapping[str, Any], offset: int, work_dir: Path | None):
-    shape = _shape(header)
+def _label_array(path: Path, header: Mapping[str, Any], offset: int, shape, work_dir: Path | None):
     dtype = _scalar_dtype(header)
     if any(key in header for key in ("data file", "datafile", "byte skip", "line skip")):
         raise ValueError("Use an embedded raw or gzip NRRD without detached payloads or skips")
-    if any(re.match(r"^(Segment\d+_|Segmentation_)", str(key)) for key in header):
-        raise ValueError(
-            "Slicer segmentation metadata requires a segment-aware conversion; supply a plain scalar class labelmap"
-        )
     encoding = str(header.get("encoding", "")).lower()
     if encoding not in {"raw", "gzip", "gz"}:
         raise ValueError("Registration NRRD input supports raw and gzip encodings")
@@ -284,17 +415,25 @@ def _output_header(
 
 
 def _write_header(
-    stream, shape: tuple[int, int, int], dtype: np.dtype, geometry: Mapping[str, Any], encoding: str
+    stream, shape: tuple[int, int, int], dtype: np.dtype, geometry: Mapping[str, Any], encoding: str,
+    *, segments=None, layers=None, reference_shape=None, offset_xyz=(0, 0, 0),
 ) -> None:
     def vector(values):
         return "(" + ",".join(format(float(value), ".17g") for value in values) + ")"
 
+    sizes = tuple(shape[::-1])
+    directions = " ".join(vector(row) for row in geometry["space directions"])
+    kinds = "domain domain domain"
+    if layers is not None:
+        sizes = (layers, *sizes)
+        kinds = "list " + kinds
+        directions = "none " + directions
     fields = [
         "NRRD0005",
         "type: " + _CANONICAL_TYPES[dtype.kind + str(dtype.itemsize)],
-        "dimension: 3",
-        "sizes: " + " ".join(str(value) for value in shape[::-1]),
-        "kinds: domain domain domain",
+        f"dimension: {len(sizes)}",
+        "sizes: " + " ".join(str(value) for value in sizes),
+        "kinds: " + kinds,
     ]
     if dtype.itemsize > 1:
         fields.append("endian: little")
@@ -305,7 +444,7 @@ def _write_header(
         fields.append("space dimension: 3")
     fields.extend(
         [
-            "space directions: " + " ".join(vector(row) for row in geometry["space directions"]),
+            "space directions: " + directions,
             "space origin: " + vector(geometry["space origin"]),
         ]
     )
@@ -315,9 +454,24 @@ def _write_header(
             + " ".join(json.dumps(str(unit), ensure_ascii=True) for unit in geometry["space units"])
         )
     fields.append("content: " + str(geometry["content"]))
-    if any("\r" in line or "\n" in line for line in fields):
+    if segments is not None:
+        fields.extend([
+            "Segmentation_ContainedRepresentationNames:=Binary labelmap|",
+            "Segmentation_MasterRepresentation:=Binary labelmap",
+            "Segmentation_SourceRepresentation:=Binary labelmap",
+            _REFERENCE_EXTENT + ":=" + _reference_extent(reference_shape),
+            _REFERENCE_OFFSET + ":=" + " ".join(map(str, offset_xyz)),
+        ])
+        for index, segment in enumerate(segments):
+            extent = (
+                [value - offset_xyz[axis // 2] for axis, value in enumerate(segment.box)]
+                if segment.count else _EMPTY_EXTENT
+            )
+            values = {**segment.fields, "Extent": " ".join(map(str, extent))}
+            fields.extend(f"Segment{index}_{key}:={value}" for key, value in values.items())
+    if any(any(character in line for character in "\r\n\0") for line in fields):
         raise ValueError("NRRD header values must fit on one line")
-    stream.write(("\n".join(fields) + "\n\n").encode("ascii"))
+    stream.write(("\n".join(fields) + "\n\n").encode("utf-8"))
 
 
 def _mapped_block_indices(matrix, limits, xx, yy, z):
@@ -362,13 +516,14 @@ def transfer_nrrd_labelmap(
     coverage_output: str | Path | None = None,
     background_value: int = 0,
 ) -> dict[str, Any]:
-    """Transfer integer class IDs and write a separate known-observation mask.
+    """Transfer categorical labels and write a separate known-observation mask.
 
     Physical alignment requires a source reference header whose axes correspond
     to the original scan's native XYZ grid. Its shape and voxel sizes must agree
     with the packet. The labelmap may have its own crop, origin and directions.
-    Alternatively, ``source_grid_aligned=True`` asserts that a full-sized input
-    already uses the native scan's exact index axes. A target reference supplies
+    Alternatively, ``source_grid_aligned=True`` asserts that the input uses the
+    native scan's exact index axes. An aligned cropped segmentation supplies
+    its native origin via the Slicer reference offset. A target reference supplies
     the output world geometry. Without one the output records the packet's
     spacing in an unnamed local coordinate system at origin zero. A reference
     whose stored axes do not follow +X, +Y, +Z is still used, with a warning;
@@ -376,8 +531,9 @@ def transfer_nrrd_labelmap(
 
     Input and output payloads are streamed. Compressed input uses a temporary
     disk-backed array because an arbitrary rotation requires random access.
-    Plain scalar 3D raw/gzip labelmaps are supported. Layered segmentation
-    NRRDs require segment-aware conversion and are rejected here.
+    Supports embedded raw/gzip integer labelmaps and Slicer binary segmentations
+    with three spatial axes and an optional list axis. Output segment metadata
+    retains layer assignments and describes the warped target geometry.
     """
     packet = packet if isinstance(packet, RegistrationPacket) else load_packet(packet)
     if not packet.usable:
@@ -408,8 +564,18 @@ def transfer_nrrd_labelmap(
     if encoding not in {"raw", "gzip"}:
         raise ValueError("Output encoding must be raw or gzip")
     header, offset = _header(source_path)
-    label_shape = _shape(header)
+    segmentation = any(re.match(r"^(Segment\d+_|Segmentation_)", str(key)) for key in header)
+    spatial_axes, layer_axis = (
+        _segmentation_axes(header) if segmentation else ((0, 1, 2), None)
+    )
+    label_shape = (
+        tuple(int(header["sizes"][axis]) for axis in reversed(spatial_axes))
+        if segmentation else _shape(header)
+    )
+    array_shape = tuple(int(size) for size in reversed(header["sizes"]))
+    layers = None if layer_axis is None else int(header["sizes"][layer_axis])
     dtype = _scalar_dtype(header).newbyteorder("<")
+    segments = _segments(header, layers if layers is not None else 1, dtype) if segmentation else None
     if (
         isinstance(background_value, bool)
         or not isinstance(background_value, (int, np.integer))
@@ -418,24 +584,28 @@ def transfer_nrrd_labelmap(
         raise ValueError(
             "background_value must be an integer representable by the source label type"
         )
+    if segmentation and background_value != 0:
+        raise ValueError("Slicer segmentations use zero as background")
     if source_reference is None:
         if not source_grid_aligned:
             raise ValueError(
                 "Provide source_reference or explicitly assert source_grid_aligned=True"
             )
-        if label_shape != source_shape:
-            raise ValueError(
-                "An explicitly aligned source labelmap must cover the full packet source grid"
-            )
         source_template = None
-        native_to_label = np.eye(4)
+        native_to_label = _aligned_crop_matrix(header, label_shape, source_shape, segmentation=segmentation)
     else:
         if source_grid_aligned:
             raise ValueError(
                 "Choose physical source_reference alignment or source_grid_aligned=True"
             )
         source_template = _reference(source_reference, packet, source_role)
-        label_world, label_space, label_units = _geometry(header)
+        label_header = header
+        if layer_axis is not None:
+            directions = np.asarray(header.get("space directions", []))
+            if directions.shape != (4, 3) or not np.isnan(directions[layer_axis]).all():
+                raise ValueError("The segmentation's list axis must have no spatial direction")
+            label_header = {**header, "space directions": directions[list(spatial_axes)]}
+        label_world, label_space, label_units = _geometry(label_header)
         scan_world, scan_space, scan_units = _geometry(source_template)
         if label_space != scan_space or label_units != scan_units:
             raise ValueError(
@@ -446,6 +616,9 @@ def transfer_nrrd_labelmap(
         _reference(target_reference, packet, target_role) if target_reference is not None else None
     )
     geometry = _output_header(packet, target_role, target_template)
+    if segmentation:
+        geometry.setdefault("space", "left-posterior-superior")
+        geometry["content"] = "XTA registered Slicer segmentation on target scan grid"
     references = {}
     for name, value, template, role in (
         ("source", source_reference, source_template, source_role),
@@ -474,6 +647,25 @@ def transfer_nrrd_labelmap(
     shared_source_grid = label_shape == source_shape and np.array_equal(
         target_to_label, target_to_source
     )
+    if segmentation:
+        warp_start, warp_stop = _transferred_crop(label_shape, target_shape, target_to_label)
+        warp_shape = tuple(stop - start for start, stop in zip(warp_start[::-1], warp_stop[::-1]))
+        warp_geometry = {
+            **geometry,
+            "space origin": np.asarray(geometry["space origin"])
+            + np.asarray(warp_start) @ np.asarray(geometry["space directions"]),
+        }
+    else:
+        warp_start, warp_stop = (0, 0, 0), target_shape[::-1]
+    x0, y0, z0 = warp_start
+    x1, y1, z1 = warp_stop
+    # Coverage still maps rows at full target width, and sampling can retain
+    # both source and label indices plus the output and gathered label bytes.
+    index_bytes_per_row = 64 * target_shape[2] + 48 * (x1 - x0)
+    label_bytes_per_row = 2 * (x1 - x0) * (layers or 1) * dtype.itemsize
+    rows_per_block = min(block_rows, max(1, (64 * 1024 * 1024) // (
+        index_bytes_per_row + label_bytes_per_row
+    )))
     source_mask, target_mask = packet.mask(source_role), packet.mask(target_role)
     for role, mask in ((source_role, source_mask), (target_role, target_mask)):
         shape = packet.shape(role)
@@ -498,12 +690,21 @@ def transfer_nrrd_labelmap(
             os.close(fd)
             stages.append(Path(stage))
         with (
-            _label_array(source_path, header, offset, temporary_root) as labels,
+            _label_array(source_path, header, offset, array_shape, temporary_root) as labels,
             ExitStack() as stack,
         ):
-            label_stream = stack.enter_context(stages[0].open("wb"))
+            label_output = stack.enter_context(stages[0].open("wb"))
+            label_stream = label_output
+            if segmentation:
+                # Segment bounds are known only after sampling. Spool the
+                # encoded raster without materializing the target volume.
+                label_stream = stack.enter_context(tempfile.TemporaryFile(mode="w+b", dir=temporary_root))
+                label_payload = label_stream
+            else:
+                _write_header(label_output, target_shape, dtype, geometry, encoding)
+            if layer_axis is not None:
+                labels = np.moveaxis(labels, 3 - layer_axis, -1)
             coverage_stream = stack.enter_context(stages[1].open("wb"))
-            _write_header(label_stream, target_shape, dtype, geometry, encoding)
             coverage_geometry = {
                 **geometry,
                 "content": "Known registration observation coverage; 1 observed and 0 unavailable",
@@ -520,30 +721,59 @@ def transfer_nrrd_labelmap(
                 )
             xx = np.arange(target_shape[2], dtype=np.float64)[None, :]
             for z in range(target_shape[0]):
-                for start in range(0, target_shape[1], block_rows):
-                    end = min(target_shape[1], start + block_rows)
+                for start in range(0, target_shape[1], rows_per_block):
+                    end = min(target_shape[1], start + rows_per_block)
                     yy = np.arange(start, end, dtype=np.float64)[:, None]
                     native_index, valid = _mapped_block_indices(
                         target_to_source, native_limits, xx, yy, z
                     )
-                    if shared_source_grid:
-                        label_index = native_index
-                    else:
-                        label_index, label_valid = _mapped_block_indices(
-                            target_to_label, label_limits, xx, yy, z
-                        )
-                        valid &= label_valid
                     if source_mask is not None:
                         valid &= _mask_samples(source_mask, native_index)
                     if target_mask is not None:
                         target_plane = target_mask if target_mask.ndim == 2 else target_mask[z]
                         valid &= target_plane[start:end]
-                    block = np.full(valid.shape, background_value, dtype=dtype)
-                    block[valid] = labels[tuple(axis[valid] for axis in label_index[::-1])]
-                    label_stream.write(memoryview(block).cast("B"))
+                    first_row, last_row = max(start, y0), min(end, y1)
+                    if z0 <= z < z1 and first_row < last_row:
+                        rows = slice(first_row - start, last_row - start)
+                        sampled = valid[rows, x0:x1]
+                        if shared_source_grid:
+                            label_index = native_index[:, rows, x0:x1]
+                        else:
+                            label_index, label_valid = _mapped_block_indices(
+                                target_to_label, label_limits, xx[:, x0:x1], yy[rows], z
+                            )
+                            # Cropped segmentations implicitly label unstored
+                            # native voxels as background. Plain cropped maps
+                            # give no label information outside their raster.
+                            if segmentation:
+                                sampled = sampled & label_valid
+                            else:
+                                sampled &= label_valid
+                        shape = sampled.shape if layers is None else (*sampled.shape, layers)
+                        block = np.full(shape, background_value, dtype=dtype)
+                        block[sampled] = labels[tuple(axis[sampled] for axis in label_index[::-1])]
+                        label_stream.write(memoryview(block).cast("B"))
+                        if layers is None:
+                            foreground += int(np.count_nonzero(block != background_value))
+                        else:
+                            foreground += int(np.count_nonzero(np.any(block, axis=-1)))
+                        if segmentation and np.any(sampled):
+                            for segment in segments:
+                                segment.observe(
+                                    block if layers is None else block[..., segment.layer],
+                                    z, first_row, x0,
+                                )
+                        del block
                     coverage_stream.write(memoryview(valid.astype(np.uint8)).cast("B"))
                     observed += int(np.count_nonzero(valid))
-                    foreground += int(np.count_nonzero(block != background_value))
+            if segmentation:
+                if encoding == "gzip":
+                    label_stream.close()
+                label_payload.seek(0)
+                _write_header(label_output, warp_shape, dtype, warp_geometry, encoding,
+                              segments=segments, layers=layers, reference_shape=target_shape,
+                              offset_xyz=warp_start)
+                shutil.copyfileobj(label_payload, label_output, length=1024 * 1024)
         result = dict(
             input=str(source_path.resolve()),
             output=str(destination.resolve()),
@@ -575,6 +805,23 @@ def transfer_nrrd_labelmap(
             output_foreground_voxels=foreground,
             coverage_semantics="One only where the target is observed, the mapped source is observed, and the input labelmap has a voxel. Zero-filled unavailable voxels require this coverage mask.",
         )
+        if segmentation:
+            result["output_geometry"] = _json_value(warp_geometry)
+            result["output_stored_shape_zyx"] = list(warp_shape)
+            result["output_reference_offset_xyz"] = list(warp_start)
+            if target_template is None:
+                result["output_geometry_mode"] = (
+                    "Local LPS scan coordinates with packet voxel sizes and zero reference origin"
+                )
+            result["coverage_semantics"] = (
+                "One where the target and mapped native source are both observed. "
+                "Outside the stored segmentation crop, observed voxels have background label zero."
+            )
+            result["segments"] = [
+                dict(id=segment.fields["ID"], layer=segment.layer, label_value=segment.value,
+                     extent_xyz=segment.box, foreground_voxels=segment.count)
+                for segment in segments
+            ]
         stages[2].write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
         for stage, path in zip(stages, outputs):
             owned = stage.stat()

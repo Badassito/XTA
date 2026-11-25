@@ -4,17 +4,14 @@ from fractions import Fraction
 import numpy as np
 from scipy import ndimage as ndi
 
+from ._morphology import candidate_window, disk
+
 CROSS = ndi.generate_binary_structure(2,1)
 
 
 def fraction_pass(positive,total,fraction):
     ratio=Fraction(str(fraction))
     return ratio.denominator*positive >= ratio.numerator*total
-
-
-def disk(radius):
-    y,x=np.ogrid[-radius:radius+1,-radius:radius+1]
-    return x*x+y*y <= radius*radius
 
 
 def local_additions(candidate,accepted,radius,fraction):
@@ -60,8 +57,6 @@ def decide_slice(candidate,score,support,direct,*,satellites=False,rescue=False,
         eligible=candidate & base & ~satellite
         # Additions only: this stage cannot undo a preserved or rescued region.
         keep |= local_additions(eligible,keep & eligible,fill_radius,agreement)
-    if satellites:
-        keep &= ~satellite | (b3 & strict_ids[labels])
     return keep & candidate
 
 
@@ -74,9 +69,15 @@ def build_hybrid(name,*,satellites=False,rescue=False,fill=False,agreement=.60,
         fill_radius=max(1,int(round(shorter*fill_radius_fraction)))
         result=np.zeros_like(candidate,dtype=bool)
         for z in range(candidate.shape[0]):
-            if not np.any(candidate[z]): continue
-            result[z]=decide_slice(candidate[z],block['score'][z],block['support'][z],
-                block['prediction_support'][z],satellites=satellites,rescue=rescue,fill=fill,
+            window = candidate_window(candidate[z])
+            if window is None:
+                continue
+            # The rectangle contains every component. Fill and rescue only
+            # consider candidates, so exterior pixels are all constant zeros.
+            plane_window = (z, *window)
+            result[plane_window] = decide_slice(
+                candidate[plane_window], block['score'][plane_window], block['support'][plane_window],
+                block['prediction_support'][plane_window], satellites=satellites, rescue=rescue, fill=fill,
                 agreement=agreement,satellite_fraction=satellite_fraction,
                 rescue_radius=rescue_radius,fill_radius=fill_radius)
         return result

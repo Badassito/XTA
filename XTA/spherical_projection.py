@@ -108,7 +108,7 @@ class _SphericalCudaStage:
 
 
 def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False,
-                              scalar_max=False, block_bytes=None, upload_bytes=None):
+                              scalar_max=False, block_bytes=None, upload_bytes=None, purpose=None):
     if not spherical_cuda_backproject_enabled():
         if not quiet:
             print(f'Spherical CUDA disabled {view.name}: using bounded CPU projection.', flush=True)
@@ -133,7 +133,7 @@ def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False,
         options['block_bytes'] = int(block_bytes)
     if upload_bytes is not None:
         options['upload_bytes'] = int(upload_bytes)
-    purpose = f'Spherical source projection {view.name}'
+    purpose = purpose or f'Spherical source projection {view.name}'
     lease = _try_acquire_main_process_overlap_gpu_stage(torch, purpose)
     if lease is not None:
         # Shared with inference: the projector must fit the reserved slice.
@@ -167,7 +167,7 @@ def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False,
         exc.stage_lease = lease
         raise
     except Exception as exc:
-        _cancel_main_process_spherical_retirement_request(f'Spherical source projection {view.name}', failed=True)
+        _cancel_main_process_spherical_retirement_request(purpose, failed=True)
         _close_spherical_cuda_resources(projector, lease)
         if not quiet:
             print(f'Spherical CUDA fallback {view.name}: admission/preflight failed ({exc}); using CPU.', flush=True)
@@ -334,7 +334,7 @@ def _spherical_block_schedule(depth, plane_bytes, workers, *, compact=False, com
     return block_depth, worker_count
 
 
-def _ordered_spherical_blocks(project, depth, plane_bytes, workers, *, cancel_event=None,
+def _ordered_spherical_blocks(project, depth, plane_bytes, workers, *, first_z=0, cancel_event=None,
                                compact=False, compiled=False, while_waiting=None):
     """Yield ordered results, or a None block when the caller acquired CUDA.
 
@@ -342,8 +342,8 @@ def _ordered_spherical_blocks(project, depth, plane_bytes, workers, *, cancel_ev
     its close/join and retain the borrowed source until every CPU reader stops.
     """
     block_depth, worker_count = _spherical_block_schedule(
-        depth, plane_bytes, workers, compact=compact, compiled=compiled)
-    starts = iter(range(0, depth, block_depth))
+        depth - first_z, plane_bytes, workers, compact=compact, compiled=compiled)
+    starts = iter(range(first_z, depth, block_depth))
     if worker_count == 1 and while_waiting is None:
         for first in starts:
             yield first, project(first, min(block_depth, depth - first))
@@ -553,8 +553,15 @@ def backproject_spherical_volume_to_volume(
         cpu_rectangular = bool(cpu_compact and callable(getattr(cpu_pull, 'rectangle', None)))
         compact = bool(compact_supported and (stage is not None or cpu_compact))
         packed = encoded_format == 'packbits_little'
+        # The range consumer can write canonical empty records without a
+        # projector job or a dense staging plane.
+        z_start, z_stop = (cpu_bounds.z0, cpu_bounds.z1) if (
+            compact_supported and empty_consumer and cpu_bounds is not None) else (0, shape[0])
+        plane_bytes = shape[1] * shape[2]
+        cpu_plane_bytes = (cpu_bounds.y1 - cpu_bounds.y0) * (cpu_bounds.x1 - cpu_bounds.x0) if (
+            cpu_rectangular and cpu_bounds is not None) else plane_bytes
         block_depth, actual_workers = _spherical_block_schedule(
-            shape[0], shape[1] * shape[2], workers, compact=cpu_compact, compiled=cpu_rectangular)
+            z_stop - z_start, cpu_plane_bytes, workers, compact=cpu_compact, compiled=cpu_rectangular)
         if stage is not None:
             block_depth, actual_workers = stage.max_block_depth, 1
         backend = f'cpu_{cpu_backend}' if stage is None else ('cuda_direct_qsc_compact' if compact else 'cuda_direct_qsc')
@@ -594,13 +601,23 @@ def backproject_spherical_volume_to_volume(
                     cpu_worker_s += elapsed
                     cpu_cancelled_blocks += int(cancelled)
 
-        next_z = cpu_slices = cuda_slices = 0
-        recheck_at = max(1, int(_CUDA_RECHECK_SLICES))
+        def emit_empty(first, stop):
+            nonlocal callback_aborted
+            try:
+                _emit_projection_empty_range(projection_block_callback, first, stop-first,
+                    shape[1:], desc=desc, required=sink_only)
+            except Exception:
+                callback_aborted = True  # The callback has already been aborted.
+                raise
+
+        emit_empty(0, z_start)
+        next_z, cpu_slices, cuda_slices = z_start, 0, 0
+        recheck_at = z_start + max(1, int(_CUDA_RECHECK_SLICES))
         recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
 
         def promote_cpu():
             nonlocal stage, compact, backend, recheck_at, recheck_time
-            if (next_z >= shape[0] or stage is not None
+            if (next_z >= z_stop or stage is not None
                     or (next_z < recheck_at and time.monotonic() < recheck_time)
                     or not spherical_cuda_backproject_enabled()):
                 return False
@@ -620,11 +637,11 @@ def backproject_spherical_volume_to_volume(
                   f'with backend={backend}', flush=True)
             return True
 
-        while next_z < shape[0]:
+        while next_z < z_stop:
             cpu_blocks = stage is None
-            blocks = (_ordered_spherical_cuda_blocks(stage, shape[0], packed if compact else None, first_z=next_z)
+            blocks = (_ordered_spherical_cuda_blocks(stage, z_stop, packed if compact else None, first_z=next_z)
                       if stage is not None else _ordered_spherical_blocks(
-                          project, shape[0], shape[1] * shape[2], workers,
+                          project, z_stop, cpu_plane_bytes, workers, first_z=next_z,
                           cancel_event=cpu_cancel, compact=cpu_compact, compiled=cpu_rectangular,
                           while_waiting=promote_cpu if spherical_cuda_backproject_enabled() else None))
             try:
@@ -650,7 +667,7 @@ def backproject_spherical_volume_to_volume(
                     if z != next_z:
                         raise RuntimeError('Spherical projection duplicated or skipped an output slice')
                     count = len(block.records) if compact else len(block)
-                    if not compact and (count <= 0 or z + count > shape[0]):
+                    if not compact and (count <= 0 or z + count > z_stop):
                         raise RuntimeError('Spherical projection returned an invalid output block size')
                     publish_started = time.perf_counter()
                     if output is not None:
@@ -658,7 +675,7 @@ def backproject_spherical_volume_to_volume(
                     if compact:
                         expected_depth = block_depth if cpu_blocks else stage.max_block_depth
                         if (block.first_z != z or bool(block.packed) != packed
-                                or count != min(expected_depth, shape[0] - z)):
+                                or count != min(expected_depth, z_stop - z)):
                             raise RuntimeError('Spherical encoded block identity/format/count differs from its request')
                         empty_consumer = getattr(projection_block_callback, 'consume_empty_range', None)
                         if cpu_blocks and block.payload.size == 0 and callable(empty_consumer):
@@ -714,6 +731,7 @@ def backproject_spherical_volume_to_volume(
                 blocks.close()
                 if cpu_blocks:
                     cpu_reader_drain_s += time.perf_counter() - drain_started
+        emit_empty(z_stop, shape[0])
         if output is not None:
             flush = getattr(output, 'flush', None)
             if callable(flush):
@@ -774,7 +792,8 @@ def backproject_spherical_volume_to_volume(
                     f', close_lease_release_seconds={getattr(stage, "close_lease_release_seconds", 0.0)}')
     print(f'Spherical projection complete {spherical_view.name}: backend={backend}, '
           f'total_s={time.perf_counter() - started:.6f}, cpu_slices={cpu_slices}, '
-          f'cuda_slices={cuda_slices}, admission_attempts={admission_attempts}, '
+          f'cuda_slices={cuda_slices}, certified_empty_slices={shape[0] - (z_stop - z_start)}, '
+          f'admission_attempts={admission_attempts}, '
           f'admission_probe_s={admission_probe_s:.6f}, cpu_worker_s={cpu_worker_s:.6f}, '
           f'cpu_result_wait_s={cpu_result_wait_s:.6f}, cpu_publish_s={cpu_publish_s:.6f}, '
           f'cpu_reader_drain_s={cpu_reader_drain_s:.6f}, cpu_cancelled_blocks={cpu_cancelled_blocks}, '

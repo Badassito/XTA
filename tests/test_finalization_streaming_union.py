@@ -12,6 +12,43 @@ import numpy as np
 from XTA import finalization, interpolation
 
 
+def test_preprojected_packed_union_merges_unaligned_crops_and_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(finalization, 'should_use_in_memory_workspace', lambda _required: True)
+    shape = (4, 9, 19)
+    refs = []
+    expected = np.zeros(shape, np.uint8)
+    for offset in range(8):
+        layer = np.zeros(shape, np.uint8)
+        layer[1, offset, offset:offset + 9] = 1
+        layer[3, offset, offset + 1:offset + 4] = 1
+        layer[3, offset, offset + 2] = 0
+        layer[3, -1, -1] = 1
+        expected |= layer
+        path = tmp_path / f'{offset}.cvol'
+        interpolation.write_raw_bbox_mask_store(
+            layer, path, format_name=interpolation.INTERNAL_PACKED_CVOL_FORMAT,
+        )
+        # A reader must ignore legacy nonzero row padding. The first crop has
+        # nine columns and a two-byte row, with seven padding bits.
+        payload = bytearray((path / 'chunks.bin').read_bytes())
+        payload[1] |= 0xFE
+        (path / 'chunks.bin').write_bytes(payload)
+        refs.append(interpolation.NrrdLayerRef(
+            key=str(offset), name=str(offset), path=path, shape=shape,
+            storage_format=interpolation.INTERNAL_PACKED_CVOL_FORMAT,
+        ))
+    result = np.zeros(shape, np.uint8)
+    packed = finalization.try_assemble_preprojected_packed_union(refs, result, workers=2)
+    assert packed.volume is result
+    assert packed.foreground_voxels == int(np.count_nonzero(expected))
+    np.testing.assert_array_equal(result, expected)
+
+    result.fill(0)
+    monkeypatch.setattr(finalization, 'should_use_in_memory_workspace', lambda _required: False)
+    assert finalization.try_assemble_preprojected_packed_union(refs, result, workers=2) is None
+    assert not np.any(result)
+
+
 def test_fallback_centerline_finds_the_center_of_a_tight_solid_crop():
     mask = np.zeros((4, 10, 12), dtype=np.uint8)
     mask[1:3, 3:8, 5:10] = 1

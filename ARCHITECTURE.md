@@ -199,8 +199,8 @@ be installed.
 
 ## Environment controls
 
-The supported defaults select ROI-only CPU mask resizing, GPU
-proto union, retina flattening and eligible GPU warping, tiled proto composition, bilinear
+The supported defaults select ROI-only CPU mask resizing, exact GPU
+retina composition and eligible GPU warping, bilinear
 Tilted intensity sampling, slice-local interpolation labels, bounded bridge
 merges, and run-based topology adjacency. Categorical sampling, generic compact
 label IDs, and automatic eligibility and failure fallbacks have separate contracts.
@@ -281,15 +281,17 @@ private two-context TensorRT ring; the instance pipeline retains its separate
 inference path. GPU failures after a partially consumed task abort it rather
 than replaying writes.
 
-GPU instance-mask composition uses a deliberate approximation: it reduces
-instance logits with a maximum on the prototype grid before interpolation.
-Interpolation and that maximum do not commute. The result can add foreground
-between neighboring instances even away from box boundaries; native-grid
-restoration can enlarge the difference. Coverage qualification proves the
-projection of the accepted canvas, not equivalence to per-instance retina
-masks. Quality changes to this reduction need a separate mask-level comparison
-and end-to-end timing. Disabling direct prediction does not select an exact
-GPU alternative.
+The GPU retina decoder interpolates each contributing instance before
+its binary mask enters the union. A prototype cell used by one box reuses
+that instance's four logits for every output pixel in the cell. Contested
+cells check every intersecting box. Observed confidence comes from the
+highest-scoring positive instance at each pixel. Large cutoff sweeps combine
+disjoint confidence bins using the union of their decoded masks and the
+maximum of their observed scores. The CPU decoder uses BLAS for its initial
+logits, then replays values whose interpolation error bound crosses zero
+with the CUDA decoder's ordered float32 fused multiply-add arithmetic.
+The explicit resident prototype hole
+closing option applies its chosen morphology on a coarse union.
 
 Generic prediction consumers require every logical frame and declared angular
 padding frame before reporting completion. Missing or duplicate logical results

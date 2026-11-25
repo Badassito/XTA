@@ -114,6 +114,50 @@ def test_union_counting_is_binary_checked_and_row_bounded(tmp_path):
         run([], array, cfg, tmp_path)
 
 
+def test_packed_union_count_requires_the_exact_assembled_volume(tmp_path, monkeypatch):
+    from XTA.finalization import PackedFinalUnion
+
+    array = np.zeros((2, 10, 16), np.uint8)
+    array[0, 2, 3] = 1
+    cfg = settings(tmp_path)
+    verified = PackedFinalUnion(array, 1)
+    with monkeypatch.context() as guard:
+        guard.setattr(runtime.np, 'count_nonzero', mock.Mock(side_effect=AssertionError('rescanned union')))
+        result, report = run([], array, cfg, tmp_path, packed_union=verified, publish_report=False)
+    assert result is array
+    assert report['counts']['retained_voxels'] == 1
+    assert report['execution']['count_source'] == 'packed_union_expansion'
+    assert report['execution']['logical_union_count_bytes'] == 0
+
+    other = array.copy()
+    other[0, 2, 4] = 1
+    result, report = run([], other, cfg, tmp_path, packed_union=verified, publish_report=False)
+    assert result is other
+    assert report['counts']['retained_voxels'] == 2
+    assert report['execution']['count_source'] == 'bounded_assembled_union_count'
+
+
+@pytest.mark.parametrize('dtype', [np.uint8, np.bool_])
+def test_native_union_count_can_split_strided_volume_across_budgeted_workers(tmp_path, dtype):
+    # Broadcast a real-sized logical array to cover stride handling without
+    # allocating a second volume for a count oracle.
+    backing = np.zeros((4, 4096, 1), dtype)
+    backing[:, ::16, :] = 1
+    array = np.broadcast_to(backing, (4, 4096, 8192))[:, ::-1]
+    cfg = replace(settings(tmp_path), memory_mib=64)
+    with mock.patch.object(runtime, '_cpu_count', return_value=8):
+        result, report = run([], array, cfg, tmp_path)
+        assert result is array
+        assert report['execution']['count_workers'] == 2
+        assert report['execution']['count_windows'] == 4
+        assert report['planned_working_bytes'] == 64 * 1024**2
+        assert report['counts']['retained_voxels'] == 4 * 256 * 8192
+        if dtype == np.uint8:
+            backing[-1, -1, 0] = 2
+            with pytest.raises(ValueError, match='binary 0/1'):
+                run([], array, cfg, tmp_path)
+
+
 @pytest.mark.parametrize('mode', ['weighted', 'confidence', 'custom'])
 def test_nontrivial_policies_use_component_reconciliation_instead_of_borrowed_union(tmp_path, mode):
     borrowed = np.ones((2, 3, 5), np.uint8)
@@ -231,7 +275,7 @@ def test_pipeline_tail_updates_all_known_union_owners_and_preserves_reused_buffe
         streaming_final_union_holder={'model': original}, model_name='model',
         nrrd_layer_refs=[], inference_views=[], source_output_shape_tyx=original.shape,
         T=2, H=3, W=4, reconciliation_policy={}, out_dir=tmp_path, temp_dir=tmp_path,
-        sweep_reconciliation_policy_stage=None,
+        sweep_reconciliation_policy_stage=None, packed_final_union=None,
         close_memmap_array=lambda value: closed.append(id(value)), print=lambda *args: None)
     saved = runtime.reconcile_tta_layers
     try:

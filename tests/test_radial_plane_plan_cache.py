@@ -309,6 +309,27 @@ class RadialPlanePlanCacheTests(unittest.TestCase):
             np.testing.assert_array_equal(evicted.shell_index, 1)
             self.assertFalse(evicted.shell_index.flags.writeable)
 
+    def test_bounded_rank_setup_reuses_geometry_and_honors_actual_bytes(self):
+        radii = self.radii
+        shape = self.shape
+        expected = cp._build_radial_plane_plan(self.view, radii, shape)
+        allowance = max(12 * shape[1] * shape[2], expected.nbytes)
+        with mock.patch.object(cp, '_build_radial_plane_plan',
+                               wraps=cp._build_radial_plane_plan) as build:
+            actual, hit = cp._radial_plane_plan(self.view, radii, shape,
+                max_plan_bytes=allowance, build_chunk_pixels=13)
+            self.assertFalse(hit)
+            returned, hit = cp._radial_plane_plan(self.view, radii, shape,
+                max_plan_bytes=allowance + 7, build_chunk_pixels=31)
+            self.assertTrue(hit)
+            self.assertIs(actual, returned)
+            with self.assertRaises(cp._RadialPlanePlanTooLarge):
+                cp._radial_plane_plan(self.view, radii, shape,
+                    max_plan_bytes=allowance - 1, build_chunk_pixels=31)
+        build.assert_called_once()
+        for name in ('shell_index', 'column_offsets', 'native_columns'):
+            np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
+
 
 if __name__ == '__main__':
     unittest.main()

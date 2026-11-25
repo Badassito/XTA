@@ -194,6 +194,23 @@ def test_sparse_crop_consumption_never_allocates_full_job_shaped_output(tmp_path
         assert state['dense_plane_allocations']==0
 
 
+def test_spherical_sibling_decline_preserves_the_floor_retirement_request(tmp_path, monkeypatch, shell_stage):
+    view = next(view for view in _views() if view.family == 'spherical')
+    source = np.ones((view.num_slices, 7, 7), np.uint8)
+    attempted, cancelled = [], []
+
+    def decline(*args, purpose, **kwargs):
+        attempted.append(purpose)
+        return None
+
+    monkeypatch.setattr(spherical_projection, '_try_spherical_cuda_stage', decline)
+    monkeypatch.setattr(backprojection, '_cancel_main_process_spherical_retirement_request', cancelled.append)
+    with cuda_rank_projection_reader(source, view, (9, 12, 15), tmp_path,
+            level_count=1, memory_bytes=16*1024**2, known_native_boxes=_boxes(source)) as read:
+        assert read is None
+    assert attempted == cancelled == [f'Spherical source projection {view.name} sibling ranks']
+
+
 def test_bounded_radial_plan_is_exact_and_declines_before_oversized_allocation():
     view=_views()[0]
     radii=np.asarray(geometry.radial_global_radii(view),np.float64)

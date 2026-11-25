@@ -1,6 +1,6 @@
 """Deterministic temporal windows for authoritative-mask LTA propagation.
 
-Each positive anchor owns its nearest-anchor temporal domain.  A domain of at
+Each positive anchor propagates within an assigned temporal domain. A domain of at
 most :data:`XTA.lta_sam.LTA_SESSION_FRAMES` frames is one authoritative SAM
 session.  Longer domains start with one anchor-containing session and extend
 outward through directional sessions that overlap their predecessor by exactly
@@ -31,7 +31,7 @@ def _integer(value: object, *, name: str) -> int:
 
 @dataclass(frozen=True, order=True)
 class AnchorDomain:
-    """Half-open temporal range assigned to its nearest positive anchor."""
+    """Half-open temporal range available to one positive anchor."""
 
     anchor_frame: int
     frame_start: int
@@ -54,6 +54,33 @@ class AnchorDomain:
     @property
     def frame_count(self) -> int:
         return self.frame_stop - self.frame_start
+
+
+def plan_neighbor_anchor_domains(positive_frames, frame_count, *, background_frames=()):
+    """Stop at the nearest annotated slice on either side of each prompt.
+
+    Neighboring positive anchors share only the frames between them. An
+    explicit empty annotation is a boundary with no tracker on its own side.
+    A single positive annotation may propagate throughout its scan. With
+    multiple annotations, tracking stays inside the annotated range.
+    """
+    count = _integer(frame_count, name="frame_count")
+    foreground = {_integer(value, name="foreground frame") for value in positive_frames}
+    background = {_integer(value, name="background frame") for value in background_frames}
+    anchors = sorted(foreground | background)
+    if count < 1 or any(not 0 <= frame < count for frame in anchors):
+        raise ValueError("annotation frames must lie within the volume")
+    if foreground & background:
+        raise ValueError("an annotation cannot have both foreground and background")
+    if len(anchors) > 1:
+        bounds = [anchors[0] - 1, *anchors, anchors[-1] + 1]
+    else:
+        bounds = [-1, *anchors, count]
+    return {
+        frame: AnchorDomain(frame, bounds[index - 1] + 1, bounds[index + 1])
+        for index, frame in enumerate(anchors, 1)
+        if frame in foreground
+    }
 
 
 @dataclass(frozen=True, order=True)

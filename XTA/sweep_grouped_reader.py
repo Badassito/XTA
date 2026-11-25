@@ -316,52 +316,57 @@ class GroupedCatalogue:
                                        row["empty_segment"])
 
     def _inspect(self, path, group, stamp):
-        header, payload_offset = _read_header(path)
-        segments = group["segments"]
-        shape = self.geometry.shape_tyx
-        x, y, z, channels = _ints(header.get("sizes", ""), 4, "grouped sizes")
-        stored = _shape((z, y, x), "grouped crop shape")
-        offset_xyz = _ints(header.get("Segmentation_ReferenceImageExtentOffset", ""), 3, "grouped offset")
-        expected_extent = tuple(v for size in reversed(shape) for v in (0, size - 1))
-        directions, _, list_direction = header.get("space directions", "").rpartition(" ")
-        axes = _vectors(directions, 3, "grouped space directions")
-        origin = np.asarray(_vectors(header.get("space origin", ""), 1, "grouped origin")[0])
-        geometry = ReferenceGeometry(shape, header["space"], axes,
-                                     tuple(origin - np.asarray(offset_xyz) @ np.asarray(axes)))
-        if (header.get("dimension") != "4" or header.get("type") != "uint8"
-                or header.get("encoding") != "gzip" or list_direction != "none"
-                or header.get("kinds", "").split() != ["domain", "domain", "domain", "list"]
-                or any(field in header for field in ("data file", "datafile", "byte skip", "line skip"))
-                or channels != len(segments) or tuple(group["stored_shape_tyx"]) != stored
-                or tuple(group["offset_xyz"]) != offset_xyz
-                or _ints(header.get("Segmentation_ReferenceImageExtent", ""), 6, "grouped extent") != expected_extent
-                or any(o < 0 or o+n > s for o, n, s in zip(reversed(offset_xyz), stored, shape))
-                or not _same_geometry(geometry, self.geometry)
-                or group_stamp(path.stat()) != stamp or group["bytes"] != stamp[2]
-                or not re.fullmatch(r"[0-9a-f]{64}", group["sha256"])):
-            raise ValueError(f"Grouped NRRD header disagrees with its review: {path}")
-        next_offset = payload_offset
-        for channel, segment in enumerate(segments):
-            prefix = f"Segment{channel}_"
-            length = segment["gzip_bytes"]
-            extent = _ints(header.get(prefix + "Extent", ""), 6, "channel extent")
-            empty = all(extent[axis+1] < extent[axis] for axis in (0, 2, 4))
-            expected = extent if empty else tuple(value + offset_xyz[axis//2] for axis, value in enumerate(extent))
-            if (segment["cutoff_cent"] != self.cutoff_cent
-                    or type(segment["layer"]) is not int or segment["layer"] != channel
-                    or type(segment["label_value"]) is not int or segment["label_value"] != 1
-                    or type(segment["gzip_offset"]) is not int or segment["gzip_offset"] != next_offset
-                    or type(length) is not int or length <= 0 or next_offset + length > stamp[2]
-                    or header.get(prefix + "ID") != segment["segment_id"]
-                    or header.get(prefix + "Layer") != str(channel) or header.get(prefix + "LabelValue") != "1"
-                    or segment["empty_segment"] is not empty or tuple(segment["extent_xyz"]) != expected
-                    or not empty and any(lo < 0 or hi < lo or hi >= size for lo, hi, size in
-                                         zip(extent[::2], extent[1::2], reversed(stored)))):
-                raise ValueError(f"Grouped NRRD segment index disagrees with its header: {path}")
-            next_offset += length
-        if next_offset != stamp[2]:
-            raise ValueError(f"Grouped NRRD index does not exhaust the file: {path}")
-        return header, payload_offset, stored, offset_xyz, stamp
+        return inspect_indexed_group(path, group, stamp, self.geometry, self.cutoff_cent)
+
+
+def inspect_indexed_group(path, group, stamp, reference_geometry, cutoff_cent):
+    """Check one indexed binary group against its actual NRRD header."""
+    header, payload_offset = _read_header(path)
+    segments = group["segments"]
+    shape = reference_geometry.shape_tyx
+    x, y, z, channels = _ints(header.get("sizes", ""), 4, "grouped sizes")
+    stored = _shape((z, y, x), "grouped crop shape")
+    offset_xyz = _ints(header.get("Segmentation_ReferenceImageExtentOffset", ""), 3, "grouped offset")
+    expected_extent = tuple(v for size in reversed(shape) for v in (0, size - 1))
+    directions, _, list_direction = header.get("space directions", "").rpartition(" ")
+    axes = _vectors(directions, 3, "grouped space directions")
+    origin = np.asarray(_vectors(header.get("space origin", ""), 1, "grouped origin")[0])
+    geometry = ReferenceGeometry(shape, header["space"], axes,
+                                 tuple(origin - np.asarray(offset_xyz) @ np.asarray(axes)))
+    if (header.get("dimension") != "4" or header.get("type") != "uint8"
+            or header.get("encoding") != "gzip" or list_direction != "none"
+            or header.get("kinds", "").split() != ["domain", "domain", "domain", "list"]
+            or any(field in header for field in ("data file", "datafile", "byte skip", "line skip"))
+            or channels != len(segments) or tuple(group["stored_shape_tyx"]) != stored
+            or tuple(group["offset_xyz"]) != offset_xyz
+            or _ints(header.get("Segmentation_ReferenceImageExtent", ""), 6, "grouped extent") != expected_extent
+            or any(o < 0 or o+n > s for o, n, s in zip(reversed(offset_xyz), stored, shape))
+            or not _same_geometry(geometry, reference_geometry)
+            or group_stamp(path.stat()) != stamp or group["bytes"] != stamp[2]
+            or not re.fullmatch(r"[0-9a-f]{64}", group["sha256"])):
+        raise ValueError(f"Grouped NRRD header disagrees with its review: {path}")
+    next_offset = payload_offset
+    for channel, segment in enumerate(segments):
+        prefix = f"Segment{channel}_"
+        length = segment["gzip_bytes"]
+        extent = _ints(header.get(prefix + "Extent", ""), 6, "channel extent")
+        empty = all(extent[axis+1] < extent[axis] for axis in (0, 2, 4))
+        expected = extent if empty else tuple(value + offset_xyz[axis//2] for axis, value in enumerate(extent))
+        if (segment["cutoff_cent"] != cutoff_cent
+                or type(segment["layer"]) is not int or segment["layer"] != channel
+                or type(segment["label_value"]) is not int or segment["label_value"] != 1
+                or type(segment["gzip_offset"]) is not int or segment["gzip_offset"] != next_offset
+                or type(length) is not int or length <= 0 or next_offset + length > stamp[2]
+                or header.get(prefix + "ID") != segment["segment_id"]
+                or header.get(prefix + "Layer") != str(channel) or header.get(prefix + "LabelValue") != "1"
+                or segment["empty_segment"] is not empty or tuple(segment["extent_xyz"]) != expected
+                or not empty and any(lo < 0 or hi < lo or hi >= size for lo, hi, size in
+                                     zip(extent[::2], extent[1::2], reversed(stored)))):
+            raise ValueError(f"Grouped NRRD segment index disagrees with its header: {path}")
+        next_offset += length
+    if next_offset != stamp[2]:
+        raise ValueError(f"Grouped NRRD index does not exhaust the file: {path}")
+    return header, payload_offset, stored, offset_xyz, stamp
 
 
 def open_grouped_catalog(path, *, grid_id=None, cutoff_cent=None):
