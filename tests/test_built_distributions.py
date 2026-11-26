@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tempfile
 import zipfile
@@ -74,7 +75,11 @@ def test_sdist_contains_maintained_test_helpers_fixtures_and_root_rules(distribu
     payloads, members, *_ = distributions
     expected = {name for name in payloads
                 if name.startswith('tests/') and name.endswith(('.py', '.json'))}
-    expected.update(('.gitattributes', '.gitignore', 'AGENTS.md', 'README.md'))
+    expected.update((
+        '.gitattributes', '.gitignore', 'AGENTS.md', 'README.md',
+        'native/prepared_scheduler.cpp', 'native/prepared_scheduler.hpp', 'native/device_stage.hpp',
+        'tools/build_native_scheduler.py',
+    ))
     assert expected <= members.keys(), sorted(expected - members.keys())
     for name in expected:
         assert members[name] == payloads[name], name
@@ -118,3 +123,17 @@ def test_installed_native_filter_loads_its_sparse_helper_outside_checkout(distri
         cwd=workspace, log='installed-native-filter-help.log')
     run([sys.executable, '-B', str(tool_dir / 'benchmark_cpu_backends.py'), '--help'],
         cwd=workspace, log='installed-cpu-benchmark-help.log')
+
+
+def test_installed_wheel_imports_required_native_scheduler(distributions):
+    *_, wheel, installed, workspace, run = distributions
+    extension = '_prepared_scheduler' + sysconfig.get_config_var('EXT_SUFFIX')
+    with zipfile.ZipFile(wheel) as archive:
+        assert f'XTA/{extension}' in archive.namelist()
+    run([sys.executable, '-X', 'utf8', '-B', '-I', '-c',
+         'from pathlib import Path; import sys; '
+         f'root = Path({str(installed)!r}); sys.path.insert(0, str(root)); '
+         'from XTA import _prepared_scheduler as native; '
+         f'assert Path(native.__file__).resolve() == root / "XTA" / {extension!r}; '
+         'assert "torch" not in sys.modules and "cupy" not in sys.modules'],
+        cwd=workspace, log='installed-native-scheduler.log')

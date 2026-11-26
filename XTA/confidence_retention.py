@@ -1,11 +1,13 @@
 """Selection and provenance for observed numeric prediction confidence."""
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 
 
 def confidence_retention_requested(save_options=(), *, reconciliation_mode=None):
-    """Retain observed scores for score-based reconciliation or an explicit save."""
+    """Capture scores needed for voting or for an explicitly requested output."""
     return reconciliation_mode == 'confidence' or 'confidence' in save_options
 
 
@@ -43,8 +45,18 @@ def observed_confidence_contract(*, prediction_task=None, confidence_floor=None,
                           intermediate_precision='backend-specific floating point'))
 
 
-def published_confidence_manifest(output_dir):
-    """Return completed numeric evidence even when no reconciliation ran."""
-    from pathlib import Path
+def published_confidence_manifest(output_dir, *, run=None):
+    """Resolve the run's public score catalogue, including legacy receipts."""
+    if run is not None:
+        processing = run.get('prediction_processing') or {}
+        if 'observed_confidence' in processing:
+            observed = processing['observed_confidence']
+            if observed is None or observed.get('retained') is False:
+                return None
     path = Path(output_dir) / 'reconciliation_evidence' / 'manifest.json'
-    return path if path.is_file() else None
+    if not path.is_file():
+        return None
+    if run is not None and run.get('run_id') is not None:
+        if json.loads(path.read_bytes()).get('run_id') != run['run_id']:
+            raise ValueError('Confidence catalogue and run manifest come from different runs')
+    return path

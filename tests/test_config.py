@@ -26,9 +26,9 @@ class ConfigTests(unittest.TestCase):
         parser = build_argparser()
         self.assertEqual(parser.parse_args(self.REQUIRED).task, "segment")
         for task in ("segment", "semantic"):
-            args = parser.parse_args([*self.REQUIRED, "--task", task, "--save", "semantic,binary"])
+            args = parser.parse_args([*self.REQUIRED, "--task", task, "--save", "semantic,binary_images"])
             self.assertEqual(args.task, task)
-            self.assertEqual(resolve_save_request(args.save).options, ("semantic", "binary"))
+            self.assertEqual(resolve_save_request(args.save).options, ("semantic", "binary_images"))
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args([*self.REQUIRED, "--task", "detect"])
 

@@ -21,7 +21,8 @@ class SphericalRetirementAdmissionTests(unittest.TestCase):
     def setUp(self):
         self.torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda:4,
             mem_get_info=mock.Mock(return_value=(1000,2000))),device=lambda value:value)
-        self.coordinator = bp._MainProcessGpuStageCoordinator()
+        from tests.native_stage_test_support import native_coordinator
+        self.coordinator = native_coordinator(self)
         self.coordinator.configure_workers([0,1,2,3])
         patch=mock.patch.object(bp,'gpu_worker_aux_interpolation_pool',return_value=None)
         patch.start(); self.addCleanup(patch.stop)
@@ -56,14 +57,23 @@ class SphericalRetirementAdmissionTests(unittest.TestCase):
         self.coordinator.set_inference_asset_retirement_pending(True)
         self.assertIsNone(self.coordinator.try_acquire_stage(self.torch,self.purpose))
         self.coordinator.set_inference_asset_retirement_pending(False)
-        aux=SimpleNamespace(claim_worker_for_stage=lambda index:None,
-                            release_stage_claim=lambda index, token:None)
-        with mock.patch.object(bp,'gpu_worker_aux_interpolation_pool',return_value=aux):
-            self.assertIsNone(self.coordinator.try_acquire_stage(self.torch,self.purpose))
+        import queue
+        from XTA import runtime
+        pool = runtime._GpuWorkerAuxInterpolationPool({i: queue.SimpleQueue() for i in range(4)})
+        handles = []
+        for device in range(4):
+            self.assertTrue(pool.enable_worker(device))
+            handles.append((device, pool.try_submit({'fixture': device})))
+        self.assertTrue(all(handle is not None for _, handle in handles))
+        self.assertIsNone(self.coordinator.try_acquire_stage(self.torch,self.purpose))
+        for device, handle in handles:
+            pool.complete(handle['task_id'], device, True, {}, None)
 
 
 class SphericalProjectionPromotionTests(unittest.TestCase):
     def setUp(self):
+        from tests.native_stage_test_support import native_coordinator
+        native_coordinator(self)
         # Aggregate import tests can stub OpenCV; use the same independent
         # NumPy bbox oracle as the publication-memory and crop-span tests.
         def bbox(a):

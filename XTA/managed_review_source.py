@@ -1,7 +1,7 @@
 """Transient proof and sparse coverage for scalar NRRDs written by a sweep."""
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
@@ -24,8 +24,6 @@ _GIB = 1024**3
 _SCHEMA = "xta.managed_review_source/1"
 _LEDGER_TIMEOUT_SECONDS = 1
 _MAX_SOURCE_PLANE_BYTES = 16 * 1024**2
-_BIT_COUNTS = np.frombuffer(bytes(value.bit_count() for value in range(256)), dtype=np.uint8)
-_BITWISE_COUNT = getattr(np, "bitwise_count", None)
 
 
 def _receipt_dir(path):
@@ -111,6 +109,8 @@ def review_source_identity(ref, shape):
 
 def _inspect_source(directory, shape, extent, packed):
     """Check exact per-plane boxes, binary voxel count and sparse byte identity."""
+    from ._deps import cv2
+
     digest = hashlib.sha256()
     count = 0
     union = [shape[2], -1, shape[1], -1, shape[0], -1]
@@ -122,8 +122,9 @@ def _inspect_source(directory, shape, extent, packed):
             if right_bit < 128 and (crop[:, -1] > (2 * right_bit - 1)).any():
                 raise ValueError("Packed review source has nonzero row padding")
             left, right = crop[:, 0] & 1, crop[:, -1] & right_bit
-            counts = _BITWISE_COUNT(crop) if _BITWISE_COUNT is not None else _BIT_COUNTS[crop]
-            count += int(counts.sum(dtype=np.uint64))
+            # Each plane is at most 16 MiB, so even an all-ones crop fits the
+            # signed 32-bit Hamming accumulator. No popcount array is needed.
+            count += int(cv2.norm(crop, cv2.NORM_HAMMING))
         else:
             if crop.max() > 1:
                 raise ValueError("Raw review source is not binary")
@@ -223,8 +224,8 @@ class ManagedReviewSource:
     directory: Path
     receipt: dict
 
-    def copy_verified(self, source, sink, bound, observe_plane, observe_packed, read_bytes):
-        """Verify the original scalar bytes while copying complete gzip members."""
+    def _verify_scalar(self, source, bound, read_bytes, sink=None):
+        """Bind the retained crops to the scalar header and compressed raster."""
         from .reconciliation_io import _read_header_stream
 
         receipt = self.receipt
@@ -243,24 +244,66 @@ class ManagedReviewSource:
             digest.update(scalar.read(source._payload_offset))
             while data := scalar.read(read_bytes):
                 digest.update(data)
-                sink.write(data)
+                if sink is not None:
+                    sink.write(data)
             if (stamp != _stamp(os.fstat(scalar.fileno())) or stamp != _stamp(source.path.stat())
                     or digest.hexdigest() != receipt["scalar_sha256"]):
                 raise ValueError(f"Managed review scalar digest mismatch: {source.path}")
-        if observe_plane is not None:
-            stamp = _source_stamp(self.directory)
-            if sha256_file(self.directory / "index.bin") != receipt["index_sha256"]:
-                raise ValueError(f"Managed review index digest mismatch: {source.path}")
-            digest = hashlib.sha256()
-            packed = receipt["packed"]
-            for z, crop, y, x, width in _source_planes(self.directory, source.shape_tyx, bound, packed):
+        return count
+
+    def _verified_planes(self, source, bound):
+        stamp = _source_stamp(self.directory)
+        if sha256_file(self.directory / "index.bin") != self.receipt["index_sha256"]:
+            raise ValueError(f"Managed review index digest mismatch: {source.path}")
+        digest = hashlib.sha256()
+        with closing(_source_planes(self.directory, source.shape_tyx, bound, self.receipt["packed"])) as planes:
+            for z, crop, y, x, width in planes:
                 digest.update(memoryview(crop).cast("B"))
-                if packed:
-                    observe_packed(z, crop, y, x, width)
-                else:
-                    observe_plane(z, crop, y, x)
-            if digest.hexdigest() != receipt["crops_sha256"] or stamp != _source_stamp(self.directory):
-                raise ValueError(f"Managed review crop digest mismatch: {source.path}")
+                yield z, crop, y, x, width
+        if digest.hexdigest() != self.receipt["crops_sha256"] or stamp != _source_stamp(self.directory):
+            raise ValueError(f"Managed review crop digest mismatch: {source.path}")
+
+    def copy_verified(self, source, sink, bound, observe_plane, observe_packed, read_bytes):
+        """Verify the original scalar bytes while copying complete gzip members."""
+        count = self._verify_scalar(source, bound, read_bytes, sink)
+        if observe_plane is not None:
+            with closing(self._verified_planes(source, bound)) as planes:
+                for z, crop, y, x, width in planes:
+                    if self.receipt["packed"]:
+                        observe_packed(z, crop, y, x, width)
+                    else:
+                        observe_plane(z, crop, y, x)
+        return count, bound
+
+    def write_repacked(self, source, compressed, bound, offset_xyz, plane_shape, depth,
+                       observe_plane, read_bytes):
+        """Fill a group's wider XY raster directly from the retained plane crops."""
+        count = self._verify_scalar(source, bound, read_bytes)
+        x_origin, y_origin, _ = offset_xyz
+        height, width = plane_shape
+        with closing(self._verified_planes(source, bound)) as planes:
+            next_plane = next(planes, None)
+            for first in range(bound[4], bound[5] + 1, depth):
+                stop = min(first + depth, bound[5] + 1)
+                if next_plane is None or next_plane[0] >= stop:
+                    compressed.write_zeros((stop - first) * height * width)
+                    continue
+                slab = np.zeros((stop - first, height, width), dtype=np.uint8)
+                while next_plane is not None and next_plane[0] < stop:
+                    z, crop, y, x, columns = next_plane
+                    if self.receipt["packed"]:
+                        pixels = np.unpackbits(crop, axis=1, count=columns, bitorder="little")
+                    else:
+                        pixels = crop
+                    if observe_plane is not None:
+                        pixels.flags.writeable = False
+                        observe_plane(z, pixels, y, x)
+                    row, col = y - y_origin, x - x_origin
+                    slab[z - first, row:row + len(pixels), col:col + columns] = pixels
+                    del pixels, crop
+                    next_plane = next(planes, None)
+                compressed.write(memoryview(slab).cast("B"))
+                del slab
         return count, bound
 
 

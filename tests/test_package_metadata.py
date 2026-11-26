@@ -17,7 +17,7 @@ from XTA import cli, config
 
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_VERSION = XTA.__version__
-CURRENT_LAUNCHER = f"Opus-5.5_v{CURRENT_VERSION}_SLURM.py"
+CURRENT_LAUNCHER = f"GPT-6-Astra-Ultra_v{CURRENT_VERSION}_SLURM.py"
 RENAMED_LAUNCHER = "GPT-6-Astra-Ultra_v25.0.2_SLURM.py"
 PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v24.1.1_SLURM.py"
 SCRATCH_REPORTS = (

@@ -12,6 +12,24 @@ from XTA import packed_publication as packed
 
 
 class PackedMetadataTests(unittest.TestCase):
+    def test_unaligned_read_only_source_preserves_partial_slab_bit_phase(self):
+        shape = (9, 3, 37)
+        volume = np.zeros(shape, np.uint8)
+        volume[4, 1, [0, 36]] = 1
+        volume[5, 0, 8:24] = 1
+        packed_bytes = np.packbits(volume.ravel(), bitorder='little')
+        storage = bytearray(1 + 4 * ((volume.size + 31) // 32))
+        storage[1:1 + len(packed_bytes)] = packed_bytes.tobytes()
+        words = np.ndarray((len(storage) // 4,), dtype=np.uint32, buffer=storage, offset=1)
+        words.flags.writeable = False
+        self.assertFalse(words.flags.aligned)
+        before = bytes(storage)
+        records, payload = packed.encode_owner_packed_block(words, shape, 4, 2)
+        self.assertEqual([(r.z, r.y0, r.y1, r.x0, r.x1, r.foreground, r.offset, r.size)
+                          for r in records], [(4, 1, 2, 0, 37, 2, 0, 5), (5, 0, 1, 8, 24, 16, 5, 2)])
+        self.assertEqual(payload.tobytes(), bytes([1, 0, 0, 0, 16, 255, 255]))
+        self.assertEqual(bytes(storage), before)
+
     def test_metadata_matches_dense_oracle_with_dirty_padding_and_partial_slabs(self):
         rng = np.random.default_rng(240123)
         cases = 0

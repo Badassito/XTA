@@ -14,7 +14,7 @@ import numpy as np
 
 from .reconciliation import EvidenceLayer, evidence_role, reconcile
 from .reconciliation_policy import load_reconciliation_policy, validate_policy
-from .runtime import close_memmap_array_without_flush
+from .runtime import close_memmap_array_without_flush, runtime_telemetry
 from .workspace import _cpu_count
 
 
@@ -234,14 +234,12 @@ def _reconciliation_refs(refs, shape, *, needs_confidence):
 
 def _publish_reconciliation_report(report, records, settings, output_dir, *, publish=True):
     """Prepare the report, optionally publishing it as a standalone artifact."""
-    from .confidence_evidence import confidence_evidence_enabled
-    from .confidence_retention import published_confidence_manifest
+    from .confidence_evidence import current_published_confidence_manifest
     from .outputs import interpolation_layer_provenance
 
     output_dir = Path(output_dir)
     run_dir = output_dir.parent if publish else output_dir.resolve()
-    confidence_manifest = (published_confidence_manifest(run_dir)
-                           if confidence_evidence_enabled() else None)
+    confidence_manifest = current_published_confidence_manifest(run_dir)
     report.update(policy_path=settings.path, policy_sha256=settings.sha256,
                   stage='source_grid_before_global_postprocessing',
                   confidence_evidence=(confidence_manifest.relative_to(run_dir).as_posix()
@@ -254,7 +252,9 @@ def _publish_reconciliation_report(report, records, settings, output_dir, *, pub
                 'tile_acceptance', 'stage', 'confidence_evidence', 'confidence_coordinate_space',
                 'confidence_storage_shape_tyx')}
         layer_metadata = report['layers'][identity]['metadata']
-        if not publish and layer_metadata['confidence_evidence'] is not None:
+        if confidence_manifest is None:
+            layer_metadata['confidence_evidence'] = None
+        elif not publish and layer_metadata['confidence_evidence'] is not None:
             confidence_path = Path(layer_metadata['confidence_evidence']).resolve()
             layer_metadata['confidence_evidence'] = confidence_path.relative_to(run_dir).as_posix()
             layer_metadata['confidence_evidence_path_base'] = 'manifest_directory'
@@ -396,9 +396,11 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
                 last[0] = now
         def write(z0, z1, value):
             output[z0:z1] = value
+        telemetry = runtime_telemetry()
         report = reconcile(layers, shape_tyx=shape, policy=policy, write_slab=write,
                            memory_mib=settings.memory_mib, geometry_context=context, progress=progress,
-                           managed_workers=_cpu_count(), parallel_layer_costs=parallel_layer_costs)
+                           managed_workers=_cpu_count(), parallel_layer_costs=parallel_layer_costs,
+                           phase_span=telemetry.span if telemetry.enabled else None)
         settings.assert_unchanged()
         output.flush()
         _record_source_bridge_survival(report, records, output, settings)
@@ -434,7 +436,6 @@ def reconcile_tta_layers(refs, *, views, source_shape_tyx, processing_shape_tyx,
 def _record_source_bridge_survival(report, records, output, settings):
     """Record source filtering separately from native selection and final cleanup."""
     from .tta_outputs import measure_bridge_output_survival
-    from .runtime import runtime_telemetry
     refs = [ref for _identity, ref, _metadata, _confidence in records]
     with runtime_telemetry().span('tta.survival.source_audit'):
         receipts = measure_bridge_output_survival(

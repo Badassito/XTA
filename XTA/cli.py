@@ -13,7 +13,7 @@ from . import __version__
 
 
 SCRIPT_VERSION = __version__
-SCRIPT_BASENAME = f"Opus-5.5_v{SCRIPT_VERSION}_SLURM.py"
+SCRIPT_BASENAME = f"GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py"
 MODE_CHOICES = ("tta", "pta", "lta")
 
 
@@ -119,6 +119,7 @@ def _run_tta(arguments: Sequence[str]) -> None:
     )
     from .tta_augmentation_config import resolve_tta_augmentation
     from .reconciliation_policy import resolve_reconciliation
+    from .scheduler_preflight import preflight_tta_scheduler
     try:
         parse_confidence_sweep_options(parser, parsed, mode_arguments)
         save_request = resolve_save_request(parsed.save)
@@ -127,12 +128,14 @@ def _run_tta(arguments: Sequence[str]) -> None:
         resolve_tta_angles(parsed.angle)
         resolve_cartesian_views(parsed.enable_cartesian)
         resolve_tilted_view_groups(parsed.enable_tilted)
-        resolve_azimuthal_view_requests(parsed.enable_azimuthal)
+        azimuthal = resolve_azimuthal_view_requests(parsed.enable_azimuthal)
         resolve_radial_view_requests(parsed.enable_radial)
         spherical = resolve_spherical_view_requests(parsed.enable_spherical)
         if spherical and parsed.imgsz <= 0:
             raise ValueError('Spherical QSC patches require --imgsz > 0')
         devices = resolve_backend_devices(parsed.device)
+        if azimuthal and devices.cpu and not devices.gpu_devices:
+            raise ValueError('OpenVINO cannot execute the requested Azimuthal detector views')
         models = resolve_backend_models(parsed.model)
         resolve_backend_precisions(parsed.quantize, devices)
         resolve_backend_batches(parsed.batch, devices)
@@ -141,6 +144,10 @@ def _run_tta(arguments: Sequence[str]) -> None:
         interpolation = resolve_interpolation_settings(parsed, models, devices)
         resolve_tta_augmentation(parsed, gpu_devices=devices.gpu_devices, cpu_enabled=devices.cpu)
         resolve_reconciliation(parsed)
+        preflight_tta_scheduler(
+            gpu_device_count=len(devices.gpu_devices), cpu_enabled=devices.cpu,
+            tile_configs=parsed.enable_tile or (),
+        )
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
 
@@ -154,7 +161,7 @@ def _run_tta(arguments: Sequence[str]) -> None:
             output_root=output,
             temp_root=Path(parsed.temp).expanduser() if parsed.temp else None,
             min_conf=parsed.min_conf,
-            save_options=save_request.options,
+            save_request=save_request,
         )
         return
 

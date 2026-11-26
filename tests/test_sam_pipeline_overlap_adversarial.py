@@ -1,4 +1,6 @@
 """SAM overlap must retain exact pixels, bounded publication and source owners."""
+
+from tests.native_stage_test_support import native_stage_context
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import threading

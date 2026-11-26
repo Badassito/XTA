@@ -409,7 +409,16 @@ class StoreKit:
                 return True
         return False
 
-    def _full_finish(self, store, kind, k0, V, Vp, data, after_step1, rule, Q, F, T, confirm_huge_looser, st, scope):
+    @staticmethod
+    def _full_owned_claim(basin, support, displayed):
+        labels, _ = ndimage.label(basin & support)
+        roots = np.unique(labels[displayed])
+        return np.isin(labels, roots[roots > 0])
+
+    def _full_looser_support(self, layer, values, k0):
+        return np.logical_or.reduce([self.values_mask(layer, values, k) for k in range(k0 + 1)])
+
+    def _full_finish(self, store, kind, k0, V, Vp, after_step1, rule, Q, owned, F, T, confirm_huge_looser, st, scope):
         S = self.S
         st["Q"] = int(Q.sum())
         st["Q_minus_F"] = int((Q & ~F).sum())       # 0 without step 2 (Displayed + stricter scope), as windowed
@@ -423,14 +432,15 @@ class StoreKit:
                 return st
             if ans == "displayed_stricter":
                 after = after_step1("stricter")
-                Q[:] = False
+                owned = {}
         new = {}
         for lid in Vp:
             n = after[lid]
-            if lid in V and Q.any():
+            claim = owned.get(lid)
+            if k0 and claim is not None:
                 layer = store.layers[lid]
                 n = n.copy()
-                n[Q] = S._xta_store_rule_q(n[Q], k0, layer.storage, layer.words)
+                n[claim] = S._xta_store_rule_q(n[claim], k0, layer.storage, layer.words)
             new[lid] = n
         return self._commit_full(store, kind, k0, new, T, st)
 
@@ -494,7 +504,9 @@ class StoreKit:
             Q = S._xta_store_claim(p, mk, D, kept, engine)
             st["D"] = int(D.sum())
             assert not (Q & kept).any() and not (F & ~Q).any()
-        return self._full_finish(store, "remove_islands", k0, V, Vp, data, after_step1, rule, Q, F, T,
+        owned = {lid: self._full_owned_claim(Q, self._full_looser_support(store.layers[lid], data[lid], k0), C[lid])
+                 for lid in V if lid in C and Q.any()}
+        return self._full_finish(store, "remove_islands", k0, V, Vp, after_step1, rule, Q, owned, F, T,
                                  confirm_huge_looser, st, scope)
 
     def remove_slices_full_grid(self, store, k0, markers, *, scope="all", engine="sitk", thresholds=None,
@@ -534,8 +546,7 @@ class StoreKit:
                     cross = np.isin(lab[idx], np.unique(seed_lab[s[:, ax] == c]))
                     removed[idx] |= cross
                     if lid in vset:              # non-additive derived layers take no part in step 2
-                        planes_removed.setdefault((ax, c), np.zeros(cross.shape, bool))
-                        planes_removed[(ax, c)] |= cross
+                        planes_removed.setdefault((ax, c), {})[lid] = cross
                     if layer.storage == "bits":
                         dil = ndimage.binary_dilation(cross[None], S._XTA_STORE_STRUCT6)[0]
                         for k in range(k0 + 1, K):
@@ -564,26 +575,33 @@ class StoreKit:
         Ub, sb = self._full_unions(store, V, data, k0)
         Ua, sa = self._full_unions(store, V, after_step1(rule), k0)
         Q = np.zeros(store.shape, bool)
+        owned = {}
         F3 = np.zeros(store.shape, bool)
         if scope == "all":
             P = self._full_painted(store, Cu) if T.painted_kept else np.zeros(store.shape, bool)
             st["painted_kept"] = int(P.sum())
             kept3 = sa | P
-            for (ax, c), rem in sorted(planes_removed.items()):
+            for (ax, c), displayed in sorted(planes_removed.items()):
                 idx = [slice(None)] * 3
                 idx[ax] = c
                 idx = tuple(idx)
-                Fp = rem & sb[idx] & ~sa[idx]
+                Fp = np.logical_or.reduce(list(displayed.values())) & sb[idx] & ~sa[idx]
                 if not Fp.any():
                     continue
                 F3[idx] |= Fp
                 Ubp, Uap, kp = Ub[idx][None], Ua[idx][None], kept3[idx][None]
                 D, _, _ = select(Ubp > 0, np.argwhere(Fp[None]))
                 p, mk, _ = S._xta_store_priorities(Ubp, Uap, Fp[None], kp, D)
-                Q[idx] |= S._xta_store_claim(p, mk, D, kp, engine)[0]
+                claim = S._xta_store_claim(p, mk, D, kp, engine)[0]
+                Q[idx] |= claim
+                for lid, removed in displayed.items():
+                    if lid not in owned:
+                        owned[lid] = np.zeros(store.shape, bool)
+                    support = self._full_looser_support(store.layers[lid], data[lid], k0)[idx]
+                    owned[lid][idx] |= self._full_owned_claim(claim, support, removed)
                 st["D"] += int(D.sum())
         st["F"] = int(F3.sum())
-        return self._full_finish(store, "remove_slices", k0, V, Vp, data, after_step1, rule, Q, F3, T,
+        return self._full_finish(store, "remove_slices", k0, V, Vp, after_step1, rule, Q, owned, F3, T,
                                  confirm_huge_looser, st, scope)
 
 

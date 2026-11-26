@@ -1,4 +1,6 @@
 """Scope-local ACK reception cannot spend new credit or release unproved GPUs."""
+
+from tests.native_stage_test_support import native_stage_context
 import json
 import os
 from pathlib import Path
@@ -111,7 +113,7 @@ class ProofPool:
 
 
 def protocol(tmp_path, monkeypatch, failure=None):
-    coordinator = bp._MainProcessGpuStageCoordinator()
+    coordinator = bp._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     coordinator.configure_workers((0, 1, 2, 3))
     coordinator.set_inference_priority_active(False)
     aux = runtime._GpuWorkerAuxInterpolationPool({device:queue.SimpleQueue() for device in range(4)})

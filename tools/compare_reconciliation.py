@@ -124,8 +124,10 @@ def resolve_saved_confidence(collection, run_manifest_path, *, reader_cleanup=No
         return {}, info, []
     if run_manifest_path is None:
         return {}, info, []
-    manifest_path = Path(run_manifest_path).parent / "reconciliation_evidence" / "manifest.json"
-    if not manifest_path.is_file():
+    from XTA.confidence_retention import published_confidence_manifest
+    run_path = Path(run_manifest_path)
+    manifest_path = published_confidence_manifest(run_path.parent, run=json.loads(run_path.read_bytes()))
+    if manifest_path is None:
         return {}, info, []
     from XTA.confidence_evidence import ConfidenceEvidenceRef, SCHEMA
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

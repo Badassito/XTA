@@ -28,7 +28,7 @@ SCRIPT_VERSION = __version__
 
 SCRIPT_VERSION_COMPACT = ''.join(SCRIPT_VERSION.split('.'))
 
-SCRIPT_BASENAME = f'Opus-5.5_v{SCRIPT_VERSION}_SLURM.py'
+SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
 def _parse_angles(
     values: Sequence[str] | str | float | int | None,
@@ -99,100 +99,70 @@ class _HoleFillStagesAction(argparse.Action):
 
 
 SAVE_OPTION_TOKENS: Tuple[str, ...] = (
-    'images',
-    'labels',
-    'binary',
-    'semantic',
-    'confidence',
-    'low_quality',
-    'nrrd',
-    'voxel_volume',
-    'high_quality',
-    'overlay',
-    'summary',
+    'images', 'labels', 'binary_video', 'binary_images', 'video', 'semantic',
+    'confidence', 'nrrd', 'xtareview', 'voxel_volume', 'summary',
 )
 
-SAVE_OPTION_ALIASES: Dict[str, str] = {
-    'overlay': 'high_quality',
-}
+
+@dataclass(frozen=True)
+class SaveGridRequest:
+    """The outputs requested at one presentation resolution."""
+
+    downbin: str
+    formats: Tuple[str, ...]
+
 
 @dataclass(frozen=True)
 class SaveRequest:
-    """Canonical ``--save`` selection plus embedded low-quality downbins."""
+    full_formats: Tuple[str, ...] = ()
+    low_quality: Tuple[SaveGridRequest, ...] = ()
 
-    options: Tuple[str, ...]
-    low_quality_downbins: Tuple[str, ...] = ()
-
-def resolve_save_request(values: Sequence[str] | str | None) -> SaveRequest:
-    """Validate ``--save`` and parse ``low_quality[:DOWNBIN[,DOWNBIN...]]``.
-
-    Commas normally separate output tokens.  Once a ``low_quality:`` token starts,
-    following numeric comma/whitespace fields remain part of its downbin list until the
-    next recognized output token.  This permits, for example, ``--save
-    images,low_quality:0.5,1024 nrrd`` without reintroducing a second low-quality flag.
-    """
-    if values is None:
-        return SaveRequest(())
-
-    raw_values = [values] if isinstance(values, str) else [str(v) for v in values]
-    pieces: List[str] = []
-    for raw_value in raw_values:
-        for whitespace_group in re.split(r"\s+", str(raw_value).strip()):
-            if not whitespace_group:
-                continue
-            pieces.extend(part.strip() for part in whitespace_group.split(',') if part.strip())
-
-    valid = set(SAVE_OPTION_TOKENS)
-    resolved: List[str] = []
-    low_quality_downbins: List[str] = []
-    collecting_low_quality = False
-
-    for raw in pieces:
-        lowered = str(raw).strip().lower()
-        if lowered.startswith('low_quality:'):
-            option, payload = lowered.split(':', 1)
-            if option != 'low_quality' or not payload:
-                raise ValueError(
-                    '--save low_quality uses low_quality[:LOW_QUALITY_DOWNBIN]; '
-                    f'got {raw!r}'
-                )
-            if 'low_quality' not in resolved:
-                resolved.append('low_quality')
-            low_quality_downbins.append(payload)
-            collecting_low_quality = True
-            continue
-
-        if lowered in valid:
-            collecting_low_quality = False
-            canonical = SAVE_OPTION_ALIASES.get(lowered, lowered)
-            if canonical not in resolved:
-                resolved.append(canonical)
-            continue
-
-        if collecting_low_quality:
-            # Numeric validation and canonical rounding happen after source geometry is
-            # known in ``resolve_low_quality_downbin_specs``.  Reject obviously nonnumeric
-            # fields here so a misspelled output token cannot silently become a downbin.
-            try:
-                float(lowered)
-            except Exception as exc:
-                expected = ', '.join(SAVE_OPTION_TOKENS)
-                raise ValueError(
-                    f'--save values must be one or more of: {expected}; '
-                    f'got {raw!r}'
-                ) from exc
-            low_quality_downbins.append(lowered)
-            continue
-
-        expected = ', '.join(SAVE_OPTION_TOKENS)
-        raise ValueError(
-            f'--save values must be one or more of: {expected}; got {raw!r}'
+    def has(self, format_name: str) -> bool:
+        return format_name in self.full_formats or any(
+            format_name in group.formats for group in self.low_quality
         )
 
-    return SaveRequest(
-        options=tuple(resolved),
-        low_quality_downbins=tuple(low_quality_downbins),
-    )
+    @property
+    def options(self) -> Tuple[str, ...]:
+        """Unambiguous, round-trippable request for provenance and replay."""
+        return (*self.full_formats, *(
+            f'low_quality:{grid.downbin}:{",".join(grid.formats)}'
+            for grid in self.low_quality
+        ))
+
+
+def resolve_save_request(values: Sequence[str] | str | None) -> SaveRequest:
+    """Parse whitespace-delimited resolution groups with comma-delimited formats."""
+    raw_values = (values,) if isinstance(values, str) else (values or ())
+    full: List[str] = []
+    low: Dict[str, List[str]] = {}
+    for raw in raw_values:
+        for group in str(raw).lower().split():
+            fields = group.split(':')
+            if len(fields) == 1:
+                formats = full
+            elif len(fields) == 2 and fields[0] == 'full_quality':
+                formats = full
+            elif len(fields) == 3 and fields[0] == 'low_quality':
+                downbin = fields[1]
+                if not re.fullmatch(r'(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?', downbin):
+                    raise ValueError(f'Invalid --save low_quality downbin {downbin!r}')
+                value = float(downbin)
+                if not math.isfinite(value) or value <= 0 or (
+                    ('.' in downbin or 'e' in downbin) and value >= 1
+                ):
+                    raise ValueError('--save low_quality expects a fraction in (0,1) or a positive integer target')
+                formats = low.setdefault(downbin, [])
+            else:
+                raise ValueError(f'Invalid --save group {group!r}. Use full_quality:FORMATS or low_quality:DOWNBIN:FORMATS')
+            for name in fields[-1].split(','):
+                if name not in SAVE_OPTION_TOKENS:
+                    raise ValueError(f'Invalid TTA --save format {name!r}. Choose from {", ".join(SAVE_OPTION_TOKENS)}')
+                if formats is not full and name in {'summary', 'confidence'}:
+                    raise ValueError(f'--save {name} is a run-level output. Select it bare or under full_quality')
+                if name not in formats:
+                    formats.append(name)
+    return SaveRequest(tuple(full), tuple(SaveGridRequest(key, tuple(names)) for key, names in low.items()))
 
 @dataclass(frozen=True)
 class PostprocessingRequest:
@@ -1463,23 +1433,20 @@ def build_argparser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         type=str,
-        metavar="OUTPUT",
+        metavar="GROUP",
         help=(
-            "Save one or more output groups: images (active-view image sequences; channel "
-            "formats with at least five channels use one grayscale page per channel in multi-page TIFF), labels "
-            "(final YOLO segmentation labels), binary (final TIFF sequence plus FFV1 MKV), "
-            "semantic (final source-frame PNG masks, 0 background and 1 foreground), "
-            "confidence (observed numeric prediction scores and support metadata; "
-            "generated-only support remains unknown), "
-            "low_quality[:LOW_QUALITY_DOWNBIN] (one or more isotropic presentation resolutions; "
-            "for example low_quality:0.5,1024), nrrd "
-            "(single-layer Slicer decomposition plus manifest), voxel_volume (native-space "
-            "foreground-voxel count JSON report, also included in summary when selected), "
-            "high_quality (native-resolution final overlay; "
-            "overlay is an alias), "
-            "and summary (summary text file). Comma-separated, whitespace-separated, and mixed "
-            "forms are accepted. No output group is selected by default; existing output paths "
-            "and filenames are retained"
+            "Select formats at each resolution with full_quality:FORMATS or "
+            "low_quality:DOWNBIN:FORMATS. Bare formats select full quality. "
+            "Separate formats with commas and groups with spaces. Example: "
+            "--save low_quality:0.20:nrrd,xtareview,video full_quality:images,labels,voxel_volume. "
+            "DOWNBIN is a scale fraction or target longest dimension. "
+            "video writes overlay MKV, binary_video writes mask MKV, binary_images writes "
+            "mask TIFFs, semantic writes class-index PNGs, and labels writes YOLO polygons. "
+            "images writes source frames aligned to labels, nrrd selects component layers, "
+            "xtareview selects an editable review archive, and voxel_volume counts the "
+            "selected grid's foreground voxels. Select run summary and observed confidence "
+            "evidence as summary and confidence at full quality. In a cutoff sweep, "
+            "video writes the family cutoff-membership overlay at each selected grid."
         ),
     )
     p.add_argument(
@@ -1496,7 +1463,8 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--centerline_filter_passes", default=0, type=_bounded_number(int, minimum=0),
-                   help="Maximum centerline-guided post-union passes. Pass 0 is the untouched audit checkpoint; 0 disables filtering and its audit NRRDs")
+                   help="Maximum centerline-guided post-union passes. Zero disables filtering. "
+                        "Save nrrd or xtareview to publish audit layers on a selected grid.")
     p.add_argument("--centerline_auto_remove", action="store_true",
                    help="Opt in to removing whole unprotected 2D components that satisfy every centerline, temporal, and backend-reliability guard. Protected connected foreground remains marker-only; this flag never subtracts a watershed partition")
     p.add_argument("--centerline_radius_factor", default=2.5,

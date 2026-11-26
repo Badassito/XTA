@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from copy import deepcopy
 from dataclasses import dataclass
 import time
 from types import MappingProxyType
@@ -608,10 +609,15 @@ def measure_sam_run(bundle, run_id, *, mask_filter=None, _group_endpoints=None):
                 count = int(filtering["raw_component_count"])
                 complete_values = np.asarray([item["maximum_inscribed_radius"] for item in filtering["components"]], dtype=np.float64)
             else:
-                labels, count = ndimage.label(measured_support, structure=np.ones((3, 3), bool))
-                complete_values = None
-                if count:
-                    complete_values = _component_inscribed_radii(measured_support, labels, count)
+                bounds = _foreground_bbox(measured_support)
+                count = 0
+                if bounds is not None:
+                    lower, upper = bounds
+                    support_crop = measured_support[lower[0]:upper[0], lower[1]:upper[1]]
+                    # Component radii use a zero-padded EDT. Removing the
+                    # surrounding zeros preserves distances and scan-order IDs.
+                    labels, count = ndimage.label(support_crop, structure=np.ones((3, 3), bool))
+                    complete_values = _component_inscribed_radii(support_crop, labels, count)
             if count:
                 minimum_support_radius = float(np.min(complete_values))
                 values = complete_values[:128].reshape(-1).tolist()
@@ -796,17 +802,20 @@ def measure_group_topology(bundle, group_id, selected_run_ids, *, connectivity=6
     unintended_count = 0
     unrelated_available = False
     bounds = _foreground_bbox(additions, halo=1)
+    dilated = None
     if bounds is not None:
         lower, upper = bounds
-        dilated = ndimage.binary_dilation(additions[tuple(slice(a,b) for a,b in zip(lower,upper))], structure=structure)
     for frame, index in frame_to_index.items():
         key = f"unrelated:{frame}"
         if key in group["mask_keys"]:
             unrelated_available = True
             if bounds is not None and lower[0] <= index < upper[0]:
-                unrelated = bundle.group_mask(group_id, key)
-                unintended_count += int(np.count_nonzero(dilated[index-lower[0]]
-                    & unrelated[lower[1]:upper[1],lower[2]:upper[2]]))
+                unrelated = bundle.group_mask(group_id, key)[lower[1]:upper[1], lower[2]:upper[2]]
+                if unrelated.any():
+                    if dilated is None:
+                        crop = additions[tuple(slice(a, b) for a, b in zip(lower, upper))]
+                        dilated = ndimage.binary_dilation(crop, structure=structure)
+                    unintended_count += int(np.count_nonzero(dilated[index-lower[0]] & unrelated))
     return dict(connectivity=connectivity, edges=edges, all_requested_edges_connected=bool(edges) and all(v["connected"] for v in edges),
                 selected_addition_voxels=int(np.count_nonzero(additions)), unintended_contact_voxels=unintended_count,
                 unintended_contact_status="measured" if unrelated_available else "ambiguous_unrelated_identity_unavailable")
@@ -1400,22 +1409,26 @@ def _pair_contact(bundle, group_a, runs_a, group_b, runs_b, connectivity, mask_f
     y0, x0, y1, x1 = max(ay0-1, by0), max(ax0-1, bx0), min(ay1+1, by1), min(ax1+1, bx1)
     if y0 >= y1 or x0 >= x1:
         return False
+    # Only candidate pixels within one of the tested window can contact B.
+    cy0, cx0 = max(ay0, y0-1), max(ax0, x0-1)
+    cy1, cx1 = min(ay1, y1+1), min(ax1, x1+1)
     structure = ndimage.generate_binary_structure(3, {6: 1, 18: 2, 26: 3}[connectivity])
     for frame in possible_frames:
         candidate = _support_plane(bundle, group_a, runs_a, frame, attachments=False, mask_filter=mask_filter)
+        candidate = candidate[cy0-ay0:cy1-ay0, cx0-ax0:cx1-ax0]
         if not candidate.any():
             continue
         candidate = np.pad(candidate, 1)
+        reach = None
         for offset in (-1, 0, 1):
             if frame + offset not in frames_b:
                 continue
-            footprint = structure[1 + offset]
-            if not footprint.any():
-                continue
-            expanded = ndimage.binary_dilation(candidate, structure=footprint)
+            # In 26-connectivity the three temporal offsets use the same 3x3 footprint.
+            if connectivity != 26 or reach is None:
+                expanded = ndimage.binary_dilation(candidate, structure=structure[1 + offset])
+                reach = expanded[y0-cy0+1:y1-cy0+1, x0-cx0+1:x1-cx0+1]
             other = _support_plane(bundle, group_b, runs_b, frame + offset, attachments=True, mask_filter=mask_filter)
-            if np.any(expanded[y0-(ay0-1):y1-(ay0-1), x0-(ax0-1):x1-(ax0-1)]
-                      & other[y0-by0:y1-by0, x0-bx0:x1-bx0]):
+            if np.any(reach & other[y0-by0:y1-by0, x0-bx0:x1-bx0]):
                 return True
     return False
 
@@ -1945,7 +1958,13 @@ def _select_sam_proposals(bundle, policy=None, *, upstream_fingerprints=None, fr
             max_group_bytes=operative["max_group_bytes"], mask_filter=selection_filter,
             respect_edge_contract=not (branch_mode and resolved["branch_write_domain"] == "fixed_context"))
         family = measure_family_agreement(bundle, group_id, chosen, mask_filter=selection_filter, edge_ids=selected_edge_ids)
-        raw_family = measure_family_agreement(bundle, group_id, chosen, edge_ids=selected_edge_ids)
+        # Family agreement reads raw, per-owner masks before branch selection.
+        # The component filter only removes pixels. Its completed measurements
+        # therefore establish exact raw agreement whenever none were removed.
+        if any(frame['removed_foreground'] for key in chosen for frame in measurements[key]['component_filter']):
+            raw_family = measure_family_agreement(bundle, group_id, chosen, edge_ids=selected_edge_ids)
+        else:
+            raw_family = deepcopy(family)
         group_reasons = []
         if hook is None:
             if branch_mode:

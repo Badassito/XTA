@@ -29,7 +29,7 @@ def export_score(run_manifest, model, layer, output, *, memory_mib=256, max_stag
     run = json.loads(run_manifest.read_bytes())
     if run.get("status") != "complete":
         raise ValueError("Score export requires a completed TTA run or portable compact package")
-    catalog_path = retained_evidence_manifest(run_manifest)
+    catalog_path = retained_evidence_manifest(run_manifest, run=run)
     folder = catalog_path.parent
     catalog = json.loads(catalog_path.read_bytes())
     if catalog.get("schema") not in SUPPORTED_EVIDENCE_SCHEMAS:

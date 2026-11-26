@@ -19,7 +19,6 @@ from XTA.interpolation import _DirectUnionBackingLease
 from XTA.view_prepare import ViewPrepareLeaseState, classify_dense_ram_backing
 from tests.test_sam_parent_staging_adversarial import TinyTask, queue
 from tests.test_terminal_component_refs import _function
-from tests.test_tta_scheduler_boundary import _state
 
 
 @pytest.mark.parametrize('metric', ['ram_commitment_bytes', 'disk_backed_logical_bytes'])
@@ -61,7 +60,13 @@ def allocation(tmp_path, *, backend='sam', extrapolation=False, ready=False, sha
     if tmpfs:
         monkeypatch.setattr(staging,'path_is_memory_backed',lambda path:
             Path(path).resolve().is_relative_to(staged.source_root.resolve()))
-    state=_state();shape=(3,4,5)
+    state = SimpleNamespace(
+        baseline_union_paths={}, baseline_confmap_paths={},
+        direct_union_backing_leases=leases.leases, direct_union_inference_views=leases.inference_views,
+        direct_union_postprocess_views=leases.postprocess_views, direct_union_inference_bytes=leases.inference_bytes,
+        direct_union_postprocess_bytes=leases.postprocess_bytes,
+    )
+    shape=(3,4,5)
     view=ViewInfo(name='test__tta_a0',family='tilted',num_slices=3,src_h=4,src_w=5,pad_mode='clamp')
     ns=dict(vars(pipeline));telemetry=mock.Mock()
     ns.update(temp_dir=staged.source_root,worker_direct_union_active=True,
@@ -84,9 +89,7 @@ def allocation(tmp_path, *, backend='sam', extrapolation=False, ready=False, sha
         direct_union_postprocess_views=state.direct_union_postprocess_views,
         direct_union_inference_bytes=state.direct_union_inference_bytes,
         direct_union_postprocess_bytes=state.direct_union_postprocess_bytes,
-        view_prepare_leases=ViewPrepareLeaseState(state.direct_union_backing_leases,
-            state.direct_union_inference_views, state.direct_union_inference_bytes,
-            state.direct_union_postprocess_views, state.direct_union_postprocess_bytes),
+        view_prepare_leases=leases,
         view_processing_volume_shape=lambda *_args:shape,_view_uses_interpolation=lambda *_args:interpolation,
         runtime_telemetry=lambda:telemetry)
     source=Path(pipeline.__file__).read_text(encoding='utf-8')
@@ -132,10 +135,10 @@ def test_actual_uint8_allocations_start_zero_and_checkpoint_reuses_identical_mas
     # The normal allocator's logical admission is identical to two uint8 owners.
     assert state.direct_union_inference_bytes[key]==120
     assert state.direct_union_backing_leases[key].ram_commitment_bytes == 0
-    from XTA.view_prepare import ViewPrepareLeaseState
-    leases=ViewPrepareLeaseState(state.direct_union_backing_leases,state.direct_union_inference_views,
-        state.direct_union_inference_bytes,state.direct_union_postprocess_views,state.direct_union_postprocess_bytes)
-    staged.leases=leases;assert leases.handoff(key)
+    leases=staged.leases
+    assert leases is ns['view_prepare_leases']
+    assert staged._dense_owner.run.state.direct_union_backing_leases is leases.leases
+    assert leases.handoff(key)
     staged.defer(task,120);del mask,confidence
     prepare.finish();resumed,released=staged.pump()
     assert released and not resumed and not leases.leases
@@ -153,6 +156,7 @@ def test_actual_uint8_allocations_start_zero_and_checkpoint_reuses_identical_mas
     telemetry.add.assert_called_with('sam_interpolation.staging.disk_from_birth_parents',1)
     staged.ready=lambda:True
     resumed,released=staged.pump();assert len(resumed)==1
+    assert staged._dense_owner.run.native.snapshot()['bytes_used'] == 120
     # Reopening now runs off the owner thread; keep the promise until it proves disk backing.
     assert leases.leases[key].ram_commitment_bytes == 120
     prepare.finish();result=next(iter(resumed)).result()

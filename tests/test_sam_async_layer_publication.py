@@ -238,7 +238,8 @@ def test_deferred_interpolation_is_published_when_extrapolation_has_no_component
         assembly.set_final_source_output_shape(None)
 
 
-def test_source_projected_layers_match_synchronous_publication_across_views(tmp_path):
+def test_source_projected_layers_match_synchronous_publication_across_views(tmp_path, monkeypatch):
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_CUDA', '0')
     shape, target = (5, 9, 11), (7, 13, 15)
     views = geometry.get_view_infos(*shape, cartesian_views=('transverse', 'sagittal', 'coronal'),
         azimuthal_views=('transverse', 'sagittal', 'tilted_transverse'),
@@ -363,9 +364,12 @@ def test_actual_dense_retirement_readmits_staged_parent_while_publication_is_blo
     credits = []
     admission = _ByteAdmissionPool(16 * GIB, 'test SAM parent memory')
     checkpoints, parents = ThreadPoolExecutor(1), ThreadPoolExecutor(1)
+    from tests.native_sam_staging_support import NativeStagingOwner
+    native_owner = NativeStagingOwner(tmp_path, leases, np.prod(target))
     stage = DeferredSamParentQueue(temp_dir=tmp_path / 'temp', output_dir=tmp_path / 'output',
         checkpoint_executor=checkpoints, prepare_executor=parents, leases=leases,
-        dense_limit=np.prod(target), ready=lambda:True)
+        dense_limit=np.prod(target), ready=lambda:True, dense_owner=native_owner)
+    native_owner.retain_for(stage)
     try:
         with redirect_stdout(StringIO()):
             for view, context in ((first_view, first), (second_view, second)):

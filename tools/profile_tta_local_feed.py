@@ -18,7 +18,7 @@ SCRATCH = ROOT.parent / 'Scratch'
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from tools.gpu_reservation import gpu_reservation
-from XTA import __version__
+from tools.profile_tta_scheduler import summarize_capture
 
 
 def replace_option(argv, option, value):
@@ -39,8 +39,8 @@ def main():
                         help='Source checkout/snapshot containing XTA for this arm')
     parser.add_argument('--cprofile', action='store_true',
                         help='Record parent Python call timings; use a separate diagnostic run')
-    parser.add_argument('--line-profile', action='store_true',
-                        help='Record bounded source-line gaps in scheduler dispatch')
+    parser.add_argument('--scheduler-profile', action='store_true',
+                        help='Summarize recorded native and host scheduler diagnostics after each run')
     args = parser.parse_args()
     output = args.output.resolve()
     cache = (args.cache_dir or output).resolve()
@@ -48,7 +48,6 @@ def main():
     if (not output.is_relative_to(SCRATCH.resolve()) or output.exists()
             or not cache.is_relative_to(SCRATCH.resolve())
             or not (source_root / 'XTA/__init__.py').is_file()
-            or (args.cprofile and args.line_profile)
             or args.runs < 1 or args.workers < 1 or args.heat_seconds < 0):
         parser.error('Use a new output beneath Scratch, positive runs/workers and nonnegative heat time')
     recipe = json.loads(args.invocation.read_text(encoding='utf-8'))
@@ -99,12 +98,6 @@ def main():
                 if args.cprofile:
                     module_index = command.index('-m')
                     command[module_index:module_index] = ['-m', 'cProfile', '-o', str(case / 'parent.prof')]
-                elif args.line_profile:
-                    module_index = command.index('-m')
-                    command = [*command[:module_index], '-m', 'tools.profile_tta_scheduler_lines',
-                               '--output', str(case / 'scheduler-lines.json'),
-                               '--script', str(ROOT / f'Opus-5.5_v{__version__}_SLURM.py'),
-                               '--', *command[module_index + 2:]]
                 child_env = dict(environment)
                 child_env.update(YOLO_TTA_TELEMETRY_DIR=str(case / 'telemetry'),
                                  YOLO_CONFIG_DIR=str(case / 'ultralytics-config'),
@@ -122,6 +115,11 @@ def main():
                 row = dict(run=number, process_seconds=time.perf_counter()-started,
                            returncode=result.returncode, output=str(case))
                 report['runs'].append(row)
+                if args.scheduler_profile and result.returncode == 0:
+                    diagnostics = case / 'scheduler.json'
+                    summary = summarize_capture([case / 'telemetry'])
+                    diagnostics.write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
+                    row['scheduler_profile'] = str(diagnostics)
                 save()
                 print(row, flush=True)
                 if result.returncode:

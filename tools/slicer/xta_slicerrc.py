@@ -748,9 +748,9 @@ import time as _xta_display_time
 
 
 def _xta_display_payload(grid):
-    """'grouped' grids carry loadable masks; 'reference_only' grids carry identities only."""
+    """Distinguish loadable review grids from source-only identities."""
     payload = grid.get('payload', 'grouped')
-    if payload not in ('grouped', 'reference_only'):
+    if payload not in ('grouped', 'archive', 'reference_only'):
         raise ValueError('Unsupported review grid payload: %r' % (payload,))
     return payload
 
@@ -766,7 +766,7 @@ def _xta_display_grid(manifest, grid_id):
     if len(grids) != 1:
         raise ValueError('Grid ID must identify exactly one review grid')
     grid = grids[0]
-    if _xta_display_payload(grid) != 'grouped':
+    if _xta_display_payload(grid) == 'reference_only':
         raise ValueError('Review grid %s is reference-only: it binds edit export to native sources '
                          'and has no masks to display. Choose a low-quality review grid.' % grid_id)
     shape = grid.get('shape_tyx')
@@ -2101,7 +2101,11 @@ def _xta_review_group_selection(groups, expected, cutoffs):
         cuts = grown
 
 
-def _xta_cutoff_label(cutoff):
+def _xta_cutoff_label(cutoff, manifest=None):
+    if manifest is not None and tuple(manifest.get("cutoffs_cent", ())) == (cutoff,):
+        exact = manifest.get("confidence_threshold_exact")
+        if exact is not None and exact != cutoff / 100:
+            return repr(exact)
     return f"{cutoff / 100:.2f}"
 
 
@@ -2439,8 +2443,10 @@ def SelectReviewCutoff(cutoff_cent=None):
     """
     native = _xta_current_native_window()
     if native is not None:
+        record = getattr(getattr(native, "store", None), "source_record", None) or {}
+        manifest = dict(cutoffs_cent=native.cutoffs, confidence_threshold_exact=record.get("confidence_threshold_exact"))
         if cutoff_cent is None:
-            labels = {_xta_cutoff_label(c): c for c in (native.cutoff, *native.cutoffs)}
+            labels = {_xta_cutoff_label(c, manifest): c for c in (native.cutoff, *native.cutoffs)}
             option = "Show view colors" if native.coverage.enabled else "Show direct coverage"
             refresh = "Discard pending strokes and refresh window"
             chosen = _choose_item("2D review cutoff", "Native window cutoff", [*labels, option, refresh])
@@ -2455,15 +2461,16 @@ def SelectReviewCutoff(cutoff_cent=None):
                 return native.cutoff
             cutoff_cent = labels[chosen]
         actual = native.select_cutoff(cutoff_cent)
-        slicer.util.showStatusMessage(f"Native window cutoff {_xta_cutoff_label(actual)}.", 5000)
+        slicer.util.showStatusMessage(f"Native window cutoff {_xta_cutoff_label(actual, manifest)}.", 5000)
         return actual
     display = _xta_active_review
     if display is None:
         raise RuntimeError("Run Importer on a cutoff review first.")
+    manifest = getattr(display, "manifest", None)
     if cutoff_cent is None:
         def label(value):
             suffix = "" if value in display.loaded_cutoffs else " (published counts, not loaded)"
-            return _xta_cutoff_label(value) + suffix
+            return _xta_cutoff_label(value, manifest) + suffix
         labels = {label(v): v for v in display.cutoffs}
         native = "Original segment display"
         selected = label(display.selected_cutoff)
@@ -2478,17 +2485,18 @@ def SelectReviewCutoff(cutoff_cent=None):
             return None
         cutoff_cent = labels[selection]
     display.set_cutoff(cutoff_cent)
+    cutoff_label = _xta_cutoff_label(cutoff_cent, manifest)
     if not display.enabled:
         display.enable()
     if display.stats.get("display_source") == "published_coverage":
         slicer.util.showStatusMessage(
-            f"Cutoff {_xta_cutoff_label(cutoff_cent)}: published direct counts (read-only; masks not loaded).", 8000)
+            f"Cutoff {cutoff_label}: published direct counts (read-only; masks not loaded).", 8000)
     elif display.stats.get("display_source") == "unavailable":
         slicer.util.showStatusMessage(
-            f"Cutoff {_xta_cutoff_label(cutoff_cent)} is not loaded and its published counts were not found.", 8000)
+            f"Cutoff {cutoff_label} is not loaded and its published counts were not found.", 8000)
     elif getattr(getattr(display, "store_review", None), "store", None) is not None:
         slicer.util.showStatusMessage(
-            f"Cutoff {_xta_cutoff_label(cutoff_cent)}: the working segments hold this cutoff "
+            f"Cutoff {cutoff_label}: the working segments hold this cutoff "
             "(store-backed review; every cutoff is editable).", 6000)
     _xta_refresh_review_actions()
     return cutoff_cent
@@ -2644,7 +2652,7 @@ def ToggleReviewSurfaces3D(mode=None):
         message = ("3D mode saved; all surfaces stay visible until a 2D Cutoff is selected.")
     else:
         message = ("3D: all loaded cutoffs." if mode == "all" else
-                   f"3D: displayed cutoff {_xta_cutoff_label(display.selected_cutoff)} only.")
+                   f"3D: displayed cutoff {_xta_cutoff_label(display.selected_cutoff, display.manifest)} only.")
     slicer.util.showStatusMessage(message, 5000)
     return mode
 
@@ -2743,6 +2751,64 @@ def OpenXTANativeReview(store_path, *, volume_node=None, window_shape=None,
     return view
 
 
+def OpenXTAReview(store_path, *, grid_id=None, volume_node=None, cutoff_cent=None,
+                  max_working_mib=None, edit_log=None):
+    """Open a preview archive as a full-field review, or a native archive in its window editor."""
+    with _xta_open_preview_archive(store_path) as archive:
+        from XTA.slicer_preview_review import preview_manifest
+
+        path = archive.path
+        if grid_id not in (None, archive.grid_id):
+            raise ValueError(f"This review archive has one grid, {archive.grid_id!r}.")
+        grid_id = archive.grid_id
+        manifest = preview_manifest(archive) if archive.grid_role == "preview" else None
+    active_native = _xta_current_native_window()
+    if active_native is not None:
+        if manifest is None and active_native.store.path == path:
+            return active_native
+        raise RuntimeError("Close the current native review before opening another review.")
+    if manifest is None:
+        return OpenXTANativeReview(path, cutoff_cent=cutoff_cent, volume_node=volume_node,
+                                   max_working_mib=128 if max_working_mib is None else max_working_mib)
+    active = _xta_current_store_review()
+    if (active is not None and active.manifest_path and Path(active.manifest_path) == path and active.plan is not None
+            and active.plan.manifest_sha256 != manifest["archive_identity"]):
+        raise RuntimeError("The preview archive changed. Open the new study in a fresh scene.")
+    working = [node for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+               if _xta_working_node_kind(node)]
+    if cutoff_cent is None and len(manifest["cutoffs_cent"]) == 1:
+        cutoff_cent = manifest["default_cutoff_cent"]
+    try:
+        kind, display = _xta_import_store_review(path, manifest, grid_id, volume_node, working,
+                                                max_working_mib=max_working_mib, cutoff_cents=cutoff_cent,
+                                                review_mode="store", edit_log=edit_log)
+        if kind != "store" or display is None:
+            return None
+        review = _xta_current_store_review()
+        exact = manifest.get("confidence_threshold_exact")
+        if exact is not None:
+            for node in review.nodes:
+                node.SetAttribute("XTA.ConfidenceThresholdExact", repr(exact))
+            slicer.util.showStatusMessage(f"Opened full-field preview at confidence {exact!r}.", 8000)
+        return review
+    finally:
+        _xta_refresh_review_actions()
+
+
+def _xta_open_preview_archive(path, *, expected_identity=None):
+    _xta_native_review_support()
+    from XTA.native_review_store import NativeReviewStore
+
+    return NativeReviewStore(path, expected_identity=expected_identity)
+
+
+def _xta_read_preview_manifest(path):
+    _xta_native_review_support()
+    from XTA.slicer_preview_review import read_preview_manifest
+
+    return read_preview_manifest(path)
+
+
 def SetXTANativeReviewWindow(center_ras):
     """Move the working window to a world RAS location, committing any strokes first."""
     review = _xta_current_native_window()
@@ -2834,7 +2900,7 @@ def ImportXTASegments(source_manifest=None, grid_id=None, volume_node=None, *, m
     counts. Running Importer again on an open store-backed review rebuilds a store
     that is missing (view-only review) and otherwise does nothing.
 
-    An .xtareview native store opens with a bounded editable window. A scene
+    A preview .xtareview opens full-field. Native .xtareview uses its bounded editable window. A scene
     containing only segmentation placeholders without geometry can open a review with Importer.
     """
     native = _xta_current_native_window()
@@ -2860,10 +2926,8 @@ def ImportXTASegments(source_manifest=None, grid_id=None, volume_node=None, *, m
                 return None
     if source_manifest is not None:
         if Path(str(source_manifest)).suffix.lower() == ".xtareview":
-            if grid_id not in (None, "native"):
-                raise ValueError("An indexed native review has one native grid.")
-            return OpenXTANativeReview(source_manifest, cutoff_cent=cutoff_cents, volume_node=volume_node,
-                                       max_working_mib=128 if max_working_mib is None else max_working_mib)
+            return OpenXTAReview(source_manifest, grid_id=grid_id, cutoff_cent=cutoff_cents,
+                                 volume_node=volume_node, max_working_mib=max_working_mib, edit_log=edit_log)
         if native is not None:
             raise RuntimeError("Close the native review before opening another kind of review.")
         if existing is None:
@@ -4607,6 +4671,11 @@ class XTACutoffStore:
             log._fail(self.diverged)
 
     # ---- journal
+    @property
+    def edit_revision(self):
+        """Generation of committed masks, including undo and redo."""
+        return getattr(self, "_edit_revision", 0)
+
     def _push(self, entry):
         _xta_store_require_current(self)
         entry.compute_nbytes()
@@ -4614,6 +4683,7 @@ class XTACutoffStore:
         self._txn = None  # the operation's writes are now this entry: nothing to roll back from here on
         self.last_changed_boxes = entry.boxes
         self.journal.append(entry)
+        self._edit_revision = self.edit_revision + 1
         for e in self.redo_stack:
             self._discard(e)
         self.redo_stack = []
@@ -4876,6 +4946,7 @@ class XTACutoffStore:
         entry.compute_nbytes()
         self.last_changed_boxes = entry.compute_boxes()
         self.redo_stack.append(entry)
+        self._edit_revision = self.edit_revision + 1
         self._notify("undo", entry)  # before the cap: a spill that fails cannot leave the log behind the store
         self._enforce_cap(allow_drop=False)
         return True
@@ -4894,6 +4965,7 @@ class XTACutoffStore:
         entry.compute_nbytes()
         self.last_changed_boxes = entry.compute_boxes()
         self.journal.append(entry)
+        self._edit_revision = self.edit_revision + 1
         self._notify("redo", entry)
         self._enforce_cap(allow_drop=False)
         return True
@@ -5424,18 +5496,17 @@ def _xta_store_report(store, kind, k0, counts_before, global_lid, T, stale, chan
     )
 
 
-def _xta_store_bits_env_union(store, lids, lo, hi):
-    """Max env over the bit-plane layers of lids on [lo, hi) (zeros if none meets the box)."""
-    out = np.zeros(tuple(np.asarray(hi) - np.asarray(lo)), np.uint8)
-    for lid in _xta_store_meeting(store, lids, lo, hi):
-        layer = store.layers[lid]
-        if layer.storage != "bits":
-            continue
-        c = _xta_store_clip(layer, lo, hi)
-        if c is None:
-            continue
-        np.maximum(out[c[0]], layer.env(c[1]), out=out[c[0]])
-    return out
+def _xta_store_owned_basin(candidate, displayed_removal):
+    """Keep a layer's own connected claims seeded by its displayed removal.
+
+    The shared basin supplies context, while the layer's pre-edit support
+    supplies connectivity. A one-voxel-thick candidate gives plane-local
+    four-connectivity under the same face-neighbor rule.
+    """
+    seeds = candidate & displayed_removal
+    if not seeds.any() or np.array_equal(seeds, candidate):
+        return seeds
+    return _xta_store_ndimage.binary_propagation(seeds, structure=_XTA_STORE_STRUCT6, mask=candidate)
 
 
 def _xta_store_global_follow(store, G, lo, hi, fell, after):
@@ -5490,14 +5561,11 @@ def _xta_store_update_maps_regions(store, regions, changes):
 
 
 def _xta_store_apply_edit(store, kind, k0, rule, Cp, ua_regions, q_regions, T, st, workers=1):
-    """Step 3: write C'_l (rule) for every layer of Cp and Q (q_regions) for every layer of V; update both maps
-    (ua_regions: (lo, hi, U_a after step 1) covering every C'_l of V), the Global, the counts, the report and the
-    journal. Every write is a box mask."""
+    """Write selected removals and owned looser claims, then settle maps and journal."""
     t = _xta_store_time.perf_counter()
     V = store.visible_lids()
     G = store.global_layer()
-    touched = set(Cp) | (set(V) if q_regions else set())
-    counts_before = {lid: store.layers[lid].counts.copy() for lid in touched}
+    counts_before = {lid: store.layers[lid].counts.copy() for lid in Cp}
     if G is not None:
         counts_before[G.lid] = G.counts.copy()
     stale_before = store.global_stale
@@ -5517,17 +5585,38 @@ def _xta_store_apply_edit(store, kind, k0, rule, Cp, ua_regions, q_regions, T, s
         m2[m] = chg
         return [store._write_masked(layer, rlo, m2, new[chg], old_vals=vals[chg])]
 
-    def write_q(lid):
-        layer = store.layers[lid]
-        out = []
-        for qlo, qhi, Q in q_regions:
-            c = _xta_store_clip(layer, qlo, qhi)
+    def owned_claims(layer):
+        for qlo, qhi, Q, displayed in q_regions:
+            footprint = displayed.get(layer.lid)
+            c = _xta_store_clip(layer, qlo, qhi) if footprint is not None else None
             if c is None:
                 continue
             bsl, lsl = c
             q = Q[bsl]
-            if not q.any():
+            lo = layer.origin + _xta_store_starts(lsl)
+            overlap = _xta_store_overlap(lo, lo + q.shape, footprint[0], footprint[1])
+            if overlap is None:
                 continue
+            seeds = np.zeros(q.shape, bool)
+            seeds[overlap[0]] = footprint[2][overlap[1]]
+            if not np.any(q & seeds):
+                continue
+            values = layer.data[lsl]
+            if layer.storage == "bits":
+                values = _xta_store_and_const(values, _xta_store_low(k0 + 1), layer.words)
+            owned = _xta_store_owned_basin(q & _xta_store_nonzero(values, layer.words), seeds)
+            claim = _XTAStoreCompactBox.tight(_xta_store_starts(lsl), owned)
+            if claim is not None:
+                yield claim
+
+    def write_layer(item):
+        lid, _ = item
+        layer = store.layers[lid]
+        # Compute all plane claims before any of this layer's support changes.
+        claims = list(owned_claims(layer)) if k0 else ()
+        out = write_c(item)
+        for claim in claims:
+            lsl, q = _xta_store_sl(claim.lo, claim.hi), claim.mask()
             vals = layer.data[lsl][q]
             new = _xta_store_rule_q(vals, k0, layer.storage, layer.words)
             chg = _xta_store_neq(vals, new, layer.words)
@@ -5538,28 +5627,19 @@ def _xta_store_apply_edit(store, kind, k0, rule, Cp, ua_regions, q_regions, T, s
         return out
 
     big = workers > 1 and (
-        sum(cb.n for cb in Cp.values()) + sum(int(Q.size) for _, _, Q in q_regions) > _XTA_STORE_PARALLEL_VOXELS
+        sum(cb.n for cb in Cp.values()) + sum(int(Q.size) for _, _, Q, _ in q_regions) > _XTA_STORE_PARALLEL_VOXELS
     )
-    qV = []
-    if q_regions:  # the layers of V whose box meets some Q region (V's order)
-        qV = _xta_store_meeting(
-            store, V, np.min([r[0] for r in q_regions], axis=0), np.max([r[1] for r in q_regions], axis=0)
-        )
     changes = []
     if big:
         with _XTAStoreThreadPoolExecutor(max_workers=workers) as ex:  # one layer per task: no shared writes
-            for chs in ex.map(write_c, list(Cp.items())):
-                changes += chs
-            for chs in ex.map(write_q, qV):
+            for chs in ex.map(write_layer, Cp.items()):
                 changes += chs
     else:
         for item in Cp.items():
-            changes += write_c(item)
-        for lid in qV:
-            changes += write_q(lid)
+            changes += write_layer(item)
     t1 = _xta_store_time.perf_counter()
     regions = [(lo, hi, Ua != store.U_vis[_xta_store_sl(lo, hi)], Ua) for lo, hi, Ua in ua_regions]
-    regions += [(qlo, qhi, Q, _xta_store_bits_env_union(store, V, qlo, qhi)) for qlo, qhi, Q in q_regions]
+    regions += [(qlo, qhi, Q, store.union_box(V, qlo, qhi)) for qlo, qhi, Q, _ in q_regions]
     if _xta_store_update_maps_regions(store, regions, changes):
         store.global_stale = True
     t2 = _xta_store_time.perf_counter()
@@ -5915,7 +5995,8 @@ def _xta_store_finish_islands(
                     Q = None
             if Q is not None and st["Q"]:
                 q_tb = _xta_store_tight_box(Q)
-                q_regions.append((W_lo + q_tb[0], W_lo + q_tb[1], Q[_xta_store_sl(*q_tb)]))
+                displayed = {lid: (c.lo, c.hi, c.mask()) for lid, c in C.items() if lid in vset}
+                q_regions.append((W_lo + q_tb[0], W_lo + q_tb[1], Q[_xta_store_sl(*q_tb)], displayed))
     _xta_store_apply_edit(
         store,
         "remove_islands",
@@ -6083,7 +6164,7 @@ def _xta_store_remove_slices(
     for lid, _ in hits:
         if lid in vset:
             for key, part in planes_by_lid.get(lid, ()):
-                planes_removed.setdefault(key, []).append(part)
+                planes_removed.setdefault(key, {})[lid] = part
     st["C_sizes"] = {lid: c.n for lid, c in C.items()}
     Cp = {}
     for lid, cb in C.items():
@@ -6111,7 +6192,7 @@ def _xta_store_remove_slices(
             ua_regions.append((plo, phi, Ua))
             if scope != "all":
                 continue
-            rem = _xta_store_merge_masks(planes_removed[key])
+            rem = _xta_store_merge_masks(list(planes_removed[key].values()))
             removed = np.zeros(Ua.shape, bool)
             removed[_xta_store_sl(rem[0] - plo, rem[1] - plo)] = rem[2]
             Fp = removed & sb & ~sa
@@ -6136,7 +6217,7 @@ def _xta_store_remove_slices(
             if Qd.any():
                 qtb = _xta_store_tight_box(Qd)
                 qlo = plo + dtb[0] + qtb[0]
-                q_regions.append((qlo, qlo + (qtb[1] - qtb[0]), Qd[_xta_store_sl(*qtb)]))
+                q_regions.append((qlo, qlo + (qtb[1] - qtb[0]), Qd[_xta_store_sl(*qtb)], planes_removed[key]))
                 Q_lin.append(_xta_store_box_lin(Qd, plo + dtb[0], store.shape))
     F_all = np.unique(np.concatenate(F_lin)) if F_lin else np.empty(0, np.int64)
     Q_all = np.unique(np.concatenate(Q_lin)) if Q_lin else np.empty(0, np.int64)
@@ -7634,16 +7715,28 @@ def _xta_store_review_plan(manifest_path, grid_id=None):
     additive by the Importer's tag rule; exactly one logical layer is role global and it is the
     suffix-Global_final_output one; each row's extent_xyz lies on the grid and agrees with its foreground_voxels.
     """
-    try:
-        path, folder_grid, detached = _xta_sweep_review_location(manifest_path)
-    except ValueError as exc:
-        raise XTACutoffReviewError(str(exc)) from exc
-    path = _XTAStorePath(path)
-    data = path.read_bytes()
-    try:
-        manifest = _xta_store_json.loads(data)
-    except ValueError as exc:
-        raise XTACutoffReviewError(f"{path} is not a JSON review manifest") from exc
+    path = _XTAStorePath(manifest_path)
+    archive = path.suffix.lower() == ".xtareview"
+    if archive:
+        path = path.resolve(strict=True)
+        try:
+            manifest = _xta_read_preview_manifest(path)
+        except ValueError as exc:
+            raise XTACutoffReviewError(str(exc)) from exc
+        folder_grid, detached = manifest["grids"][0]["grid_id"], True
+        manifest_sha = manifest["archive_identity"]
+    else:
+        try:
+            path, folder_grid, detached = _xta_sweep_review_location(manifest_path)
+        except ValueError as exc:
+            raise XTACutoffReviewError(str(exc)) from exc
+        path = _XTAStorePath(path)
+        data = path.read_bytes()
+        try:
+            manifest = _xta_store_json.loads(data)
+        except ValueError as exc:
+            raise XTACutoffReviewError(f"{path} is not a JSON review manifest") from exc
+        manifest_sha = _xta_store_hashlib.sha256(data).hexdigest()
     if not isinstance(manifest, dict) or manifest.get("schema") != "xta.sweep_review/1" or not manifest.get("sweep_id"):
         raise XTACutoffReviewError("Choose the manifest.json of a completed XTA cutoff review.")
     grouped = [g.get("grid_id") for g in manifest.get("grids") or [] if g.get("payload", "grouped") == "grouped"]
@@ -7731,7 +7824,7 @@ def _xta_store_review_plan(manifest_path, grid_id=None):
     by_suffix = [
         lid for lid, info in layers.items() if any(map(_xta_store_row_is_suffix_global, info["rows"].values()))
     ]
-    if len(by_role) != 1 or by_role != by_suffix:
+    if len(by_role) != 1 or (not archive and by_role != by_suffix):
         raise XTACutoffReviewError(
             f"Grid {grid_id} needs exactly one Global: role global {by_role}, "
             f"suffix {_XTA_STORE_GLOBAL_SUFFIX} {by_suffix}."
@@ -7740,7 +7833,7 @@ def _xta_store_review_plan(manifest_path, grid_id=None):
     for group in grid["groups"]:
         rel = group["path"]
         try:
-            file = _xta_child(path.parent, _xta_sweep_review_relative(path.parent, grid, rel))
+            file = path if archive else _xta_child(path.parent, _xta_sweep_review_relative(path.parent, grid, rel))
         except (ValueError, RuntimeError) as exc:
             raise XTACutoffReviewError(str(exc)) from exc
         segs = list(group["segments"])
@@ -7761,7 +7854,7 @@ def _xta_store_review_plan(manifest_path, grid_id=None):
         bool(detached),
         manifest["sweep_id"],
         manifest.get("source_mode", "confidence_sweep"),
-        _xta_store_hashlib.sha256(data).hexdigest(),
+        manifest_sha,
         tuple(int(v) for v in shape),
         np.asarray(affine, np.float64),
         cutoffs,
@@ -8256,6 +8349,72 @@ class XTACutoffBuildReport:
     per_cutoff: list  # dict(cutoff_cent, groups, rows, seconds)
 
 
+def _xta_store_build_layers(plan, states, visible, undo_bytes, spill_dir):
+    store = XTACutoffStore(plan.shape, len(plan.cutoffs), undo_bytes=undo_bytes, spill_dir=spill_dir)
+    bits = {}
+    for lid in plan.order:
+        info, state = plan.layers[lid], states.pop(lid)
+        if state.bits_from_cutoff is not None:
+            bits[lid] = plan.cutoffs[state.bits_from_cutoff]
+        eye = True if visible is None else bool(visible.get(lid, True))
+        layer = XTACutoffLayer(
+            lid, info["role"], state.data(), state.lo, visible=eye,
+            additive=info["additive"] if info["role"] == "derived" else None,
+        )
+        store.add_layer(layer, counts=info["counts"])
+    return store, bits
+
+
+def _xta_store_build_from_preview(plan, progress, cancel, visible, undo_bytes, spill_dir):
+    started = _xta_store_time.perf_counter()
+    K = len(plan.cutoffs)
+    states = {lid: _XTAStoreBuildLayer(lid, plan.layers[lid]["box"], K) for lid in plan.order}
+    total = sum(len(info["rows"]) for info in plan.layers.values())
+    finished, per_cutoff = 0, []
+    with _xta_open_preview_archive(plan.manifest_path, expected_identity=plan.manifest_sha256) as archive:
+        for k, cutoff in enumerate(plan.cutoffs):
+            begun = _xta_store_time.perf_counter()
+            rows = 0
+            for lid, info in plan.layers.items():
+                if k not in info["rows"]:
+                    continue
+                if cancel is not None and cancel():
+                    raise XTACutoffBuildCancelled("The store build was cancelled.")
+                count = 0
+                state = states[lid]
+                for index in archive.iter_blocks(lid, cutoff):
+                    if cancel is not None and cancel():
+                        raise XTACutoffBuildCancelled("The store build was cancelled.")
+                    bounds = archive.block_bounds(index)
+                    block = archive.read_block(lid, cutoff, index)
+                    start = np.asarray([a for a, _ in bounds])
+                    stop = np.asarray([b for _, b in bounds])
+                    lo, hi = np.maximum(start, state.lo), np.minimum(stop, state.hi)
+                    inside = block[_xta_store_sl(lo - start, hi - start)] if np.all(lo < hi) else block[:0]
+                    occupied = int(np.count_nonzero(block))
+                    if np.count_nonzero(inside) != occupied:
+                        raise XTACutoffReviewError(f"Preview layer {lid} has foreground outside its extent.")
+                    if occupied:
+                        state.add(k, lo, inside)
+                        count += occupied
+                if count != info["counts"][k]:
+                    raise XTACutoffReviewError(f"Preview layer {lid} differs from its foreground count.")
+                rows += 1
+                finished += 1
+                if progress is not None:
+                    progress(dict(done_bytes=finished, total_bytes=total, cutoff_cent=cutoff,
+                                  cutoffs_done=k, cutoffs=K))
+            per_cutoff.append(dict(cutoff_cent=cutoff, groups=0, rows=rows,
+                                   seconds=_xta_store_time.perf_counter() - begun))
+        bytes_read = archive.file_stamp[2]
+    store, bits = _xta_store_build_layers(plan, states, visible, undo_bytes, spill_dir)
+    if progress is not None:
+        progress(dict(done_bytes=total, total_bytes=total, cutoff_cent=None, cutoffs_done=K, cutoffs=K))
+    report = XTACutoffBuildReport(_xta_store_time.perf_counter() - started, 1, 0, finished, bytes_read,
+                                sum(layer.data.nbytes for layer in store.layers.values()), bits, per_cutoff)
+    return store, report
+
+
 def _xta_store_build_from_review(
     plan,
     grid_id=None,
@@ -8278,6 +8437,8 @@ def _xta_store_build_from_review(
     t0 = _xta_store_time.perf_counter()
     if not isinstance(plan, XTACutoffReviewPlan):
         plan = _xta_store_review_plan(plan, grid_id)
+    if plan.grid.get("payload") == "archive":
+        return _xta_store_build_from_preview(plan, progress, cancel, visible, undo_bytes, spill_dir)
     K = len(plan.cutoffs)
     states = {lid: _XTAStoreBuildLayer(lid, plan.layers[lid]["box"], K) for lid in plan.order}
     phases = [(k, [g for g in plan.groups if cent in g["cutoffs"]]) for k, cent in enumerate(plan.cutoffs)]
@@ -8348,22 +8509,7 @@ def _xta_store_build_from_review(
     expected_rows = sum(len(info["rows"]) for info in plan.layers.values())
     if rows != expected_rows:
         raise XTACutoffReviewError(f"Decoded {rows} review rows, the manifest lists {expected_rows}.")
-    store = XTACutoffStore(plan.shape, K, undo_bytes=undo_bytes, spill_dir=spill_dir)
-    bits = {}
-    for lid in plan.order:
-        info, st = plan.layers[lid], states.pop(lid)
-        if st.bits_from_cutoff is not None:
-            bits[lid] = plan.cutoffs[st.bits_from_cutoff]
-        eye = True if visible is None else bool(visible.get(lid, True))
-        layer = XTACutoffLayer(
-            lid,
-            info["role"],
-            st.data(),
-            st.lo,
-            visible=eye,
-            additive=info["additive"] if info["role"] == "derived" else None,
-        )
-        store.add_layer(layer, counts=info["counts"])
+    store, bits = _xta_store_build_layers(plan, states, visible, undo_bytes, spill_dir)
     if progress is not None:
         progress(dict(done_bytes=int(total), total_bytes=int(total), cutoff_cent=None, cutoffs_done=K, cutoffs=K))
     rep = XTACutoffBuildReport(
@@ -8497,6 +8643,9 @@ def _xta_store_edit_log_path(manifest_path, grid_id):
     """The edit log of a review grid: <parent>/<sweep folder>.cutoff_edits/<sha256(grid_id)[:12]>/edits.xtalog, beside
     the sweep folder that holds review/ (the review tree is never written). A detached grid folder uses
     <folder>.cutoff_edits/<sha256(grid_id)[:12]>/edits.xtalog."""
+    path = _XTAStorePath(manifest_path)
+    if path.suffix.lower() == ".xtareview":
+        return path.with_suffix(".cutoff_edits") / _XTA_STORE_LOG_NAME
     review, _grid, detached = _xta_sweep_review_location(manifest_path)
     folder = _XTAStorePath(review).parent if detached else _XTAStorePath(review).parent.parent
     token = _xta_store_hashlib.sha256(str(grid_id).encode("utf-8")).hexdigest()[:12]
@@ -10128,7 +10277,7 @@ def _xta_review_store_build(plan, interactive):
     def report(info):
         cut = info["cutoff_cent"]
         text = ("Store ready." if cut is None else
-                f"Reading cutoff {_xta_cutoff_label(cut)} ({info['cutoffs_done'] + 1}/{info['cutoffs']}) "
+                f"Reading cutoff {_xta_cutoff_label(cut, plan.manifest)} ({info['cutoffs_done'] + 1}/{info['cutoffs']}) "
                 f"of {plan.grid_id}…")
         progress.update(info["done_bytes"] / max(1, info["total_bytes"]), text)
 
@@ -10401,7 +10550,7 @@ def _xta_open_store_review(plan, cutoff, intensity, *, max_working_mib=None, int
         notes.append("NO EDIT LOG: " + review.log_error)
     notes.extend("EDIT LOG: " + warning for warning in review.log_warnings)
     message = (f"Opened the store-backed review of {plan.grid_id}: {len(plan.order)} layers, {len(plan.cutoffs)} "
-               f"cutoffs, displaying {_xta_cutoff_label(review.cutoff)}; every cutoff is editable (store "
+               f"cutoffs, displaying {_xta_cutoff_label(review.cutoff, plan.manifest)}; every cutoff is editable (store "
                f"{_xta_size_text(build.store_bytes)}"
                + (f" of about {_xta_size_text(estimate.total_bytes)} in all" if estimate is not None else "")
                + f", {_xta_working_time.perf_counter() - started:.1f} s"
@@ -10538,7 +10687,8 @@ def _xta_review_store_reopen(manifest_path, manifest, grid_id, working, interact
         review = _xta_attach_restored_store_review(display, offer=False)
     if review.store is not None and not review.store.diverged and not review.read_only:
         slicer.util.showStatusMessage(
-            f"The store-backed review of {grid_id} is already open (cutoff {_xta_cutoff_label(review.cutoff)}).", 6000)
+            f"The store-backed review of {grid_id} is already open (cutoff "
+            f"{_xta_cutoff_label(review.cutoff, manifest)}).", 6000)
         return review.display
     if manifest_path is not None and os.path.isfile(str(manifest_path)):
         review.manifest_path = str(manifest_path)
@@ -10629,7 +10779,8 @@ def _xta_review_store_rebuild(review, interactive, edit_log=None):
             slicer.util.showStatusMessage(f"Rebuild cancelled ({exc}); the review stays view-only.", 8000)
             return None
         raise
-    message = (f"Rebuilt the store-backed review of {plan.grid_id} at cutoff {_xta_cutoff_label(review.cutoff)}"
+    message = (f"Rebuilt the store-backed review of {plan.grid_id} at cutoff "
+               f"{_xta_cutoff_label(review.cutoff, plan.manifest)}"
                + (f"; replayed {replayed} logged records" if replayed else "")
                + (f"; {kept}" if kept else "")
                + ("; VIEW ONLY: " + review.view_only_reason if review.read_only else "")
@@ -10785,7 +10936,8 @@ _XTA_REVIEW_SYNC_DELAY_MS = 250  # a Segment Editor stroke is synced this long a
 _XTA_REVIEW_SYNC_RETRY_MS = 500  # ... or later, while a toolbar action or store operation runs
 _XTA_REVIEW_ENTRY_NAMES = {"remove_islands": "Remove Islands", "remove_slices": "Remove Slices",
                            "sync": "Segment Editor edit", "update_global": "Update Global",
-                           "update_nonglobal": "Update Nonglobal", "update_both": "Update Both"}
+                           "update_nonglobal": "Update Nonglobal", "update_both": "Update Both",
+                           "reconcile_global": "Reconcile Global"}
 _XTA_REVIEW_SHORTCUT_KEYS = (("Ctrl+Z", "undo"), ("Ctrl+Y", "redo"))
 _XTA_REVIEW_SHORTCUT_NAMES = {"undo": "XTAStoreReviewUndoShortcut", "redo": "XTAStoreReviewRedoShortcut"}
 _xta_review_busy = []  # the store operation running now (one at a time)
@@ -11408,6 +11560,88 @@ def _xta_review_watch_module_changes():
 
 
 # ---- Update Global / Nonglobal / Both
+def ReconcileGlobal(policy_path=None, *, memory_mib=256, confirm=True):
+    """Preview and optionally apply a same-grid policy to all Global cutoffs."""
+    action = "Reconcile Global"
+    review = _xta_review_for_update(action)
+    if review is None:
+        raise RuntimeError("Open an editable XTA cutoff review with Importer first.")
+    # The trusted-checkout and portable-bundle import setup is shared with native review.
+    _xta_native_review_support()
+    from XTA import slicer_reconciliation
+
+    window = slicer.util.mainWindow()
+    if window is None and confirm:
+        raise RuntimeError("Pass confirm=False to apply reconciliation without an interactive preview.")
+    with _xta_review_exclusive(action):
+        if window is not None and policy_path is None:
+            choices = ("Union", "Choose a trusted local Python policy…")
+            choice = _choose_item(action, "Reconcile on the current review grid", choices)
+            if choice is None:
+                return None
+            if choice == choices[1]:
+                policy_path = qt.QFileDialog.getOpenFileName(window, "Choose a trusted reconciliation policy",
+                                                            "", "Python policy (*.py)")
+                if not policy_path:
+                    return None
+        policy, digest = slicer_reconciliation.load_preview_policy(policy_path, memory_mib)
+        review.sync()
+        store = review.require(action)
+        plan = review.plan
+        if plan is None:
+            raise RuntimeError("This cutoff review has no same-grid reconciliation catalogue.")
+        manifest = getattr(plan, "manifest", None)
+        dialog = None
+        last_update = 0.0
+
+        def progress(cutoff, phase, current, total):
+            nonlocal last_update
+            if dialog is None:
+                return
+            now = _xta_store_time.monotonic()
+            if phase == "setup" or now - last_update >= 0.1:
+                dialog.setLabelText(f"Cutoff {_xta_cutoff_label(cutoff, manifest)} · {phase} · {current:,}/{total:,}")
+                slicer.app.processEvents()
+                last_update = now
+            cancelled = dialog.wasCanceled
+            if (cancelled() if callable(cancelled) else cancelled) or review.closed:
+                raise slicer_reconciliation.ReconciliationCancelled()
+
+        try:
+            if window is not None:
+                dialog = qt.QProgressDialog("Preparing reconciliation…", "Cancel", 0, 0, window)
+                dialog.setWindowTitle(action)
+                dialog.setWindowModality(qt.Qt.ApplicationModal)
+                dialog.setAutoClose(False)
+                dialog.show()
+            staged = slicer_reconciliation.prepare_reconciliation(
+                store, plan, policy, memory_mib=memory_mib, policy_sha256=digest, progress=progress,
+            )
+        except slicer_reconciliation.ReconciliationCancelled:
+            slicer.util.showStatusMessage("Reconciliation cancelled.", 5000)
+            return None
+        finally:
+            if dialog is not None:
+                dialog.close()
+                dialog.deleteLater()
+        if confirm:
+            summary = "\n".join(f"{_xta_cutoff_label(r.cutoff, manifest)}: +{r.added:,} / −{r.removed:,} voxels"
+                                for r in staged.cutoffs)
+            choice = _choose_item(action, f"{staged.policy_name} on {plan.grid_id}\n{summary}",
+                                  ("Keep current Global", "Apply reconciliation"))
+            if choice != "Apply reconciliation":
+                return None
+        if review.closed or review.plan is not plan or review.store is not store:
+            raise RuntimeError("The review changed during reconciliation. Run Reconcile Global again.")
+        review.sync()
+        entry = _xta_review_store_call(review, action, lambda current:
+            slicer_reconciliation.apply_reconciliation(current, staged, _XTAStoreFamily))
+        if entry is not None:
+            review.apply_store_changes(store.last_changed_boxes)
+    slicer.util.showStatusMessage("Reconciled Global." if entry is not None else "Global is unchanged.", 8000)
+    return entry
+
+
 def _xta_review_for_update(action):
     """The open store-backed review an update must include (its working segmentations are in the scene), or None.
     A view-only or diverged review refuses."""
@@ -11507,6 +11741,50 @@ def _xta_review_export_check_rows(review, rx, ks):
                            "nothing was exported.")
 
 
+def _xta_store_export_preview_archive(store, plan, ks, output_dir, policy, stale_ks):
+    from XTA.review_archive import ReviewLayer
+    from XTA.slicer_preview_review import write_preview_edits
+
+    started = _xta_store_time.perf_counter()
+    stale = [plan.cutoffs[k] for k in stale_ks or ()]
+    if stale and policy == "refuse":
+        raise XTACutoffGlobalStaleError("Update Global before exporting the selected cutoff(s).")
+    notes = []
+    if stale and policy == "warn":
+        message = "The preview export includes a stale Global at cutoff(s) " + ", ".join(
+            map(_xta_cutoff_label, stale))
+        notes.append(message)
+        _xta_store_warnings.warn(message, XTACutoffGlobalStaleWarning, stacklevel=2)
+    update = None
+    try:
+        if store.global_stale and policy == "update":
+            update = _xta_store_update_global(store)
+            stale = []
+        layer = store.layers[plan.global_lid]
+        bounds = tuple((int(a), int(b)) for a, b in zip(layer.origin, layer.hi))
+        layers = []
+        for k in ks:
+            row = dict(plan.layers[layer.lid]["rows"][k])
+
+            def read_slab(first, last, cutoff_index=k):
+                start = first - bounds[0][0]
+                stop = last - bounds[0][0]
+                return layer.mask(cutoff_index, (slice(start, stop), slice(None), slice(None)))
+
+            layers.append(ReviewLayer(row, read_slab, bounds))
+        revision = dict(log_records=getattr(store.edit_log, "records", None), undo_entries=len(store.journal),
+                        redo_entries=len(store.redo_stack))
+        path = write_preview_edits(output_dir, plan.manifest_path, plan.manifest_sha256, layers,
+                                   edit_revision=revision, stale_cutoffs=stale, stale_policy=policy)
+    except BaseException:
+        if update is not None:
+            _xta_store_rollback_update(store, update)
+        raise
+    cuts = [dict(cutoff_cent=plan.cutoffs[k]) for k in ks]
+    return XTACutoffExportReport(str(path), cuts, bool(store.global_stale), _xta_store_time.perf_counter() - started,
+                                stale_policy=policy, stale_cutoffs=stale, warnings=notes, global_update=update)
+
+
 def _xta_review_export(review, ks, output_dir=None, if_stale=None):
     """Export cutoff indices ks of a store-backed review as xta-slicer-edits-v1 bundles (one per cutoff,
     a new output directory). if_stale: None asks when the Global is stale and Update Global would change it at an
@@ -11520,17 +11798,22 @@ def _xta_review_export(review, ks, output_dir=None, if_stale=None):
     with _xta_review_exclusive(action):
         review.sync()
         store = review.store
-        try:
-            rx = XTACutoffReviewExport.open(review.manifest_path, review.grid_id)
-            _xta_store_check_binding(store, rx)
-        except (ValueError, KeyError) as exc:
-            raise RuntimeError(f"{action}: {exc}") from exc
-        if tuple(rx.cutoffs) != tuple(review.cutoffs):
-            raise RuntimeError(f"{action}: the review's cutoffs changed since the store was built; run Importer.")
-        if rx.geometry_error is not None:
-            raise RuntimeError(f"{action}: {rx.geometry_error} Edit bundles need the preview grid unit LPS on its "
-                               "own lattice, as the per-cutoff export does; nothing was exported.")
-        _xta_review_export_check_rows(review, rx, ks)
+        archive = Path(review.manifest_path).suffix.lower() == ".xtareview"
+        if archive:
+            if not np.allclose(review.plan.affine, np.diag([-1., -1., 1., 1.]), rtol=0, atol=1e-7):
+                raise RuntimeError(f"{action}: PTA preview export needs the XTA unit-LPS lattice.")
+        else:
+            try:
+                rx = XTACutoffReviewExport.open(review.manifest_path, review.grid_id)
+                _xta_store_check_binding(store, rx)
+            except (ValueError, KeyError) as exc:
+                raise RuntimeError(f"{action}: {exc}") from exc
+            if tuple(rx.cutoffs) != tuple(review.cutoffs):
+                raise RuntimeError(f"{action}: the review's cutoffs changed since the store was built; run Importer.")
+            if rx.geometry_error is not None:
+                raise RuntimeError(f"{action}: {rx.geometry_error} Edit bundles need the preview grid unit LPS on its "
+                                   "own lattice, as the per-cutoff export does; nothing was exported.")
+            _xta_review_export_check_rows(review, rx, ks)
         policy, stale_ks, preview = if_stale or "warn", None, None
         if store.global_stale and if_stale != "update":
             preview = _xta_review_store_call(review, action, lambda s: _xta_store_global_update_preview(s, ks))
@@ -11552,8 +11835,12 @@ def _xta_review_export(review, ks, output_dir=None, if_stale=None):
                 "%Y%m%dT%H%M%S_%fZ"))
         with _xta_review_warnings.catch_warnings(record=True) as caught:
             _xta_review_warnings.simplefilter("always", XTACutoffGlobalStaleWarning)
-            report = _xta_review_store_call(review, action, lambda s: _xta_store_export_cutoffs(
-                s, rx, ks, output_dir, if_stale=policy, stale_cutoffs=stale_ks))
+            if archive:
+                report = _xta_review_store_call(review, action, lambda s: _xta_store_export_preview_archive(
+                    s, review.plan, ks, output_dir, policy, stale_ks))
+            else:
+                report = _xta_review_store_call(review, action, lambda s: _xta_store_export_cutoffs(
+                    s, rx, ks, output_dir, if_stale=policy, stale_cutoffs=stale_ks))
         for item in caught:
             if not issubclass(item.category, XTACutoffGlobalStaleWarning):
                 _xta_review_warnings.warn_explicit(item.message, item.category, item.filename, item.lineno)
@@ -13765,6 +14052,13 @@ def ExportXTAEdits(source_manifest=None, output_dir=None, *, cutoff_cents=None, 
         if not source_manifest:
             return None
     source_manifest = Path(str(source_manifest)).resolve()
+    if source_manifest.suffix.lower() == '.xtareview':
+        review = _xta_current_store_review()
+        if review is None or not review.manifest_path or Path(review.manifest_path) != source_manifest:
+            raise RuntimeError("Open this preview archive in Importer before exporting edits.")
+        if type(cutoff_cents) is int:
+            cutoff_cents = (cutoff_cents,)
+        return _xta_review_export_cents(review, cutoff_cents, output_dir, if_stale)
     if source_manifest.is_dir() or source_manifest.name == 'manifest.json' and not source_manifest.exists():
         source_manifest, _, _ = _xta_sweep_review_location(source_manifest)
     with open(source_manifest, encoding='utf-8') as f:
@@ -14053,8 +14347,10 @@ def AlignNativeIntensity(source_manifest=None, volume_node=None, confirm=True, *
         manifest_path, folder_grid, _ = _xta_sweep_review_location(manifest_path)
         if grid_id is None:
             grid_id = folder_grid
-    data = manifest_path.read_bytes()
-    manifest = json.loads(data)
+    if manifest_path.suffix.lower() == '.xtareview':
+        manifest = _xta_read_preview_manifest(manifest_path)
+    else:
+        manifest = json.loads(manifest_path.read_bytes())
     review_grid = None
     if manifest.get("schema") == "xta.sweep_review/1":
         scene_nodes = slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
@@ -14074,7 +14370,7 @@ def AlignNativeIntensity(source_manifest=None, volume_node=None, confirm=True, *
             raise RuntimeError("The loaded cutoff grid does not appear in this review.")
         review_grid = grids[grid_id]
         low = tuple(review_grid["shape_tyx"])
-        full = tuple(grids.get("native", review_grid)["shape_tyx"])
+        full = tuple(review_grid.get("native_shape_tyx", grids.get("native", review_grid)["shape_tyx"]))
         nodes = working + [node for node, rows in tagged if any(
             sw == manifest["sweep_id"] and gr == grid_id for sw, gr, _, _ in rows.values())]
         if any(n.GetParentTransformNode() for n in nodes):
@@ -14103,7 +14399,8 @@ def AlignNativeIntensity(source_manifest=None, volume_node=None, confirm=True, *
             or volume_node.GetAttribute('SlicerRC.SyntheticZeroVolume') == '1'):
         raise RuntimeError('Select the real full-resolution scalar intensity volume.')
     image = volume_node.GetImageData()
-    if review_grid is not None and tuple(image.GetDimensions()) == low[::-1]:
+    already_preview = review_grid is not None and tuple(image.GetDimensions()) == low[::-1]
+    if already_preview:
         # A calibrated intensity that already has the working resolution only
         # needs physical frame alignment, including on the native review grid.
         full = low
@@ -14113,7 +14410,14 @@ def AlignNativeIntensity(source_manifest=None, volume_node=None, confirm=True, *
     matrix_vtk = vtk.vtkMatrix4x4()
     volume_node.GetIJKToRASMatrix(matrix_vtk)
     original_matrix = _xta_alignment_matrix_array(matrix_vtk)
-    transform_array = _xta_native_to_preview_matrix(full, low, original_matrix, image.GetExtent()[::2])
+    crop = None if review_grid is None or already_preview else review_grid.get('axial_crop')
+    if crop is None:
+        sampling_full, sampling_low = full, low
+    else:
+        sampling_full = crop['original_full_quality_shape_tyx']
+        sampling_low = crop['original_preview_shape_tyx']
+    transform_array = _xta_native_to_preview_matrix(sampling_full, sampling_low, original_matrix,
+                                                   image.GetExtent()[::2])
     if review_grid is not None:
         # The legacy helper returns coordinates in the unit, LPS preview frame.
         # Convert that result to the grid declared by this review manifest.
@@ -15146,6 +15450,7 @@ _TOOLBAR_ACTIONS = [
     ("Update Global", UpdateGlobal),
     ("Update Nonglobal", UpdateNonGlobal),
     ("Update Both", UpdateBoth),
+    ("Reconcile Global", ReconcileGlobal),
     ("Remove Islands", RemoveIslands),
     ("Remove Slices", RemoveSlices),
     ("Remove Markers", RemoveMarkers),
@@ -15225,7 +15530,7 @@ for index, (label, function) in enumerate(_TOOLBAR_ACTIONS):
             "Which cutoff-review masks Remove Islands / Remove Slices may change. "
             "Per-cutoff segments: Displayed cutoff (default), Displayed and stricter, "
             "or All visible cutoffs. A store-backed review: All cutoffs (default; the "
-            "marked island's union basin at every cutoff) or Displayed and stricter. "
+            "union basin within each layer hit at the displayed cutoff) or Displayed and stricter. "
             "With no review open the button sets the per-cutoff scope only; a "
             "store-backed review opens at its own last chosen scope. "
             "Lower cutoffs connect more widely. Ordinary segments are unaffected."

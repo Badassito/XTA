@@ -1,252 +1,292 @@
-"""Prepared input leases use proven procfs access without descriptor handshakes."""
-from contextlib import ExitStack
+"""Exercise native descriptor ownership through spawned actors and the production wire."""
+from __future__ import annotations
+
+import contextlib
 import multiprocessing as mp
 import os
-from pathlib import Path
-import re
-from types import SimpleNamespace
+import pickle
+import socket
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from XTA import runtime
-from tests.test_memfd_source_reuse import _LocalDupFd, _owner, _scheduler
-
-_ORIGINAL_OPEN = os.open
-
-
-def _local_open(path, flags, *args, **kwargs):
-    match = re.fullmatch(r'/proc/' + str(os.getpid()) + r'/fd/([0-9]+)', str(path).replace('\\', '/'))
-    if match is None and not str(path).startswith('/proc/'):
-        return _ORIGINAL_OPEN(path, flags, *args, **kwargs)
-    if match is None or flags & os.O_WRONLY:
-        raise OSError('unsupported proc access')
-    # The portable shim checks flags; the Linux spawn test proves OS read-only access.
-    return os.dup(int(match.group(1)))
+from XTA.native_detector_handles import detector_handle_submission, install_detector_handles, planned_detector_source_pins
+from XTA.native_scheduler import CPU, PreparedWorkScheduler, recv_dispatch, send_receipt
+from XTA.tta_worker_transport import DetectorActorPort
 
 
-def _spawn_input_receiver(tasks, results):
-    persistent = {}
+def _submit(owner, task, **kwargs):
+    with detector_handle_submission(task) as (packet, handles):
+        owner.submit_prepared(task['task_id'], 1, pickle.dumps(packet), CPU, handles=handles, **kwargs)
+
+
+@contextlib.contextmanager
+def _memfd(label, data):
+    fd = os.memfd_create(label, flags=os.MFD_CLOEXEC)
+    os.write(fd, data)
+    path = str(runtime._memfd_proc_path(fd))
+    runtime._register_memfd_owner(path, fd, label)
     try:
-        while True:
-            task = tasks.get()
-            if task is None:
-                break
-            transient = runtime._materialize_worker_task_memfd_paths(task, persistent)
+        yield path
+    finally:
+        runtime._release_memfd_owner_key(path)
+
+
+def _receiver(channel):
+    port = DetectorActorPort(channel, None)
+    sources = {}
+    try:
+        while (task := port.get()) is not None:
+            task_id = task['task_id']
+            transient = []
             try:
-                reply = dict(task_id=task['task_id'], capability=task.get('_memfd_parent_proc_capability'))
+                # This goes through the same materialization + ACK as both detector actors.
+                transient = port.materialize(task, sources)
+                port.installed(task_id)
+                source = Path(task['source_volume_path'])
+                diagnostics = {'source': source.read_bytes(), 'path': str(source),
+                               'source_count': len(sources), 'transient_count': len(transient)}
                 if task.get('cpu_input_path'):
-                    with open(task['cpu_input_path'], 'rb') as handle:
-                        reply['pixels'] = handle.read()
+                    fd = int(Path(task['cpu_input_path']).name)
+                    diagnostics['input'] = os.pread(fd, 1, 0)
                     try:
-                        os.write(transient[0], b'!')
+                        os.pwrite(fd, b'?', 0)
                     except OSError:
-                        reply['read_only'] = True
+                        pass
                     else:
-                        reply['read_only'] = False
+                        raise AssertionError('CPU input descriptor permitted a write')
+                if task.get('result_mask_path'):
+                    os.pwrite(int(Path(task['result_mask_path']).name), bytes([task_id % 256]), 0)
+                port.compute_done(task_id)
+            except BaseException as exc:
+                port.put(dict(type='result', task_id=task_id, worker_kind='cpu', cpu_index=7,
+                              ok=False, error=repr(exc)))
+                raise
             finally:
                 runtime._close_fd_list(transient)
-            reply['closed_inputs'] = 0
-            for fd in transient:
-                try:
-                    os.fstat(fd)
-                except OSError:
-                    reply['closed_inputs'] += 1
-            results.put(reply)
+            diagnostics['closed'] = all(not Path(f'/proc/self/fd/{fd}').exists() for fd in transient)
+            port.put(dict(type='result', task_id=task_id, worker_kind='cpu', cpu_index=7,
+                          ok=True, stats=diagnostics))
     finally:
-        runtime._close_fd_list(persistent.values())
+        runtime._close_fd_list(sources.values())
+        channel.close()
 
 
-class MemfdInputHandoffTests(unittest.TestCase):
-    def setUp(self):
-        self.dups = mock.patch.object(runtime.mp_reduction, 'DupFd', side_effect=_LocalDupFd, create=True)
-        self.duplicate = self.dups.start()
-        self.addCleanup(self.dups.stop)
-        self.persistent = {}
-        self.addCleanup(lambda:runtime._close_fd_list(self.persistent.values()))
-        self.scheduler = _scheduler()
-        self.scheduler.state.gpu_worker_processes = [SimpleNamespace(name='gpu-worker-0', pid=os.getpid())]
+@unittest.skipUnless(hasattr(os, 'memfd_create'), 'Linux SCM_RIGHTS and memfd required')
+class NativeMemfdInputHandoffTests(unittest.TestCase):
+    def test_unfunded_source_only_plan_pins_survive_unregister_until_cancellation(self):
+        channel, actor = socket.socketpair()
+        with channel, actor, PreparedWorkScheduler(31, 1, 1) as owner:
+            owner.register_worker(0, 1, os.getpid(), CPU, 1, channel)
+            owner.declare_parent(1, 1, 1)
+            self.assertEqual(owner.wait_preparation(5)[0], 1)
+            owner.declare_parent(2, 1, 1, descriptor_only=True)
+            with _memfd('native-planned-cancel', b'complete') as path:
+                source = os.stat(path)
+                with planned_detector_source_pins() as pin:
+                    with detector_handle_submission(dict(task_id=2, source_volume_path=path)) as (packet, handles):
+                        retained = pin(packet, handles)
+                    self.assertEqual(len(retained), 1)
+                    owner.submit_planned(2, 2, pickle.dumps(packet), CPU, handles=retained)
+                with self.assertRaises(OSError):
+                    os.fstat(retained[0][0])
 
-    def _grant_capability(self, source_fd):
-        task = dict(task_id=1, source_volume_path=runtime._memfd_proc_path(source_fd).as_posix())
-        self.scheduler._put_worker_inference_task(task, 'gpu', 0)
-        actual = self.scheduler.state.gpu_task_queues[0].get_nowait()
-        runtime._close_fd_list(runtime._materialize_worker_task_memfd_paths(actual, self.persistent))
-        self.scheduler._record_worker_memfd_completion(dict(type='compute_released', gpu_index=0,
-            task_id=1, ok=True, memfd_parent_proc_capability=actual['_memfd_parent_proc_capability']))
-        return self.scheduler._worker_memfd_source_cache('gpu', 0)
+            def surviving_pins():
+                count = 0
+                for fd in Path('/proc/self/fd').iterdir():
+                    try:
+                        witness = fd.stat()
+                    except FileNotFoundError:
+                        continue
+                    count += (witness.st_dev, witness.st_ino) == (source.st_dev, source.st_ino)
+                return count
 
-    def _assert_closed(self, fd):
-        with self.assertRaises(OSError):
-            os.fstat(fd)
+            self.assertEqual(owner.snapshot()['dispatched'], 0)
+            self.assertEqual(surviving_pins(), 1)
+            owner.cancel('discard prepared input before funding')
+            self.assertEqual(surviving_pins(), 0)
 
-    def test_160_packets_use_zero_additional_sharer_registrations_and_read_only_opens(self):
-        telemetry = SimpleNamespace(add=mock.Mock(), enabled=False)
-        with _owner(None) as source_fd, mock.patch.object(runtime.os, 'open', side_effect=_local_open) as opened:
-            cache = self._grant_capability(source_fd)
-            self.duplicate.reset_mock()
-            opened.reset_mock()
-            with mock.patch.object(runtime, '_RUNTIME_TELEMETRY', telemetry):
-                for task_id in range(2, 162):
-                    with _owner(None, b'prepared pixels') as input_fd:
-                        task = dict(task_id=task_id, source_volume_path=runtime._memfd_proc_path(source_fd).as_posix(),
-                            cpu_input_path=runtime._memfd_proc_path(input_fd).as_posix())
-                        self.scheduler._put_worker_inference_task(task, 'gpu', 0)
-                        sent = self.scheduler.state.gpu_task_queues[0].get_nowait()
-                        self.assertNotIn('cpu_input_fd', sent)
-                        self.assertIn('cpu_input_fd_proc', sent)
-                        transient = runtime._materialize_worker_task_memfd_paths(sent, self.persistent)
-                        self.assertEqual(len(transient), 1)
-                        self.assertEqual(os.fstat(transient[0]).st_size, len(b'prepared pixels'))
-                        runtime._close_fd_list(transient)
-                        self._assert_closed(transient[0])
-                        os.fstat(input_fd)
-                        self.scheduler._record_worker_memfd_completion(dict(type='compute_released', gpu_index=0,
-                            task_id=task_id, ok=True, memfd_parent_proc_capability=sent['_memfd_parent_proc_capability']))
-            self.duplicate.assert_not_called()
-            read_flags = [call.args[1] for call in opened.call_args_list if call.args[1] & os.O_RDWR == 0]
-            self.assertEqual(len(read_flags), 160)
-            self.assertTrue(all(flags & os.O_WRONLY == 0 for flags in read_flags))
-            self.assertEqual(len(self.persistent), 1)
-            self.assertFalse(cache.pending)
-            totals = {}
-            for call in telemetry.add.call_args_list:
-                name, value = call.args
-                totals[name] = totals.get(name, 0) + value
-            self.assertEqual(totals['worker.memfd_materialize.detach_calls'], 0)
-            self.assertEqual(totals['worker.memfd_materialize.input_proc_open_calls'], 160)
-            self.assertEqual(totals['worker.memfd_materialize.output_proc_open_calls'], 0)
+    def test_source_only_capture_requires_completed_lazy_cube_and_releases_partial_preflight(self):
+        import fcntl
+        with _memfd('cube', b'cube') as path, tempfile.TemporaryDirectory() as name:
+            ready, failed = Path(name)/'ready', Path(name)/'failed'
+            spec = dict(source_volume_path=path, native_resize=dict(path=path, sentinel=str(ready), failed=str(failed)))
+            with self.assertRaisesRegex(ValueError, 'inventory rejection'):
+                with planned_detector_source_pins() as pin:
+                    with detector_handle_submission(spec) as (packet, handles):
+                        self.assertIsNone(pin(packet, handles))
+                        ready.touch()
+                        fd, _, role = pin(packet, handles)[0]
+                        self.assertEqual(role, 0)
+                        self.assertEqual(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE, os.O_RDONLY)
+                        failed.touch()
+                        self.assertIsNone(pin(packet, handles))
+                    for field in ('cpu_input_path', 'result_mask_path', 'canvas_path', 'd1_bitset_path'):
+                        with detector_handle_submission({field: path}) as (packet, handles):
+                            self.assertIsNone(pin(packet, handles))
+                    raise ValueError('inventory rejection')
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+            self.assertEqual(Path(path).read_bytes(), b'cube')
 
-    def test_unproven_or_replaced_worker_keeps_original_transfer_fallback(self):
-        for invalid in ('unproven', 'parent', 'worker', 'pid'):
-            with self.subTest(invalid=invalid), _owner(None, b'pixels') as input_fd:
-                self.scheduler = _scheduler()
-                self.scheduler.state.gpu_worker_processes = [SimpleNamespace(name='gpu-worker-0', pid=os.getpid())]
-                cache = self.scheduler._worker_memfd_source_cache('gpu', 0)
-                if invalid != 'unproven':
-                    cache.direct_output_capability = dict(parent_pid=os.getpid(), worker_pid=os.getpid())
-                    cache.direct_output_capability['parent_pid' if invalid=='parent' else 'worker_pid'] += 1
-                    if invalid == 'pid':
-                        self.scheduler.state.gpu_worker_processes[0].pid += 1
-                task = dict(task_id=2, cpu_input_path=runtime._memfd_proc_path(input_fd).as_posix())
-                self.scheduler._put_worker_inference_task(task, 'gpu', 0)
-                sent = self.scheduler.state.gpu_task_queues[0].get_nowait()
-                self.assertIn('cpu_input_fd', sent)
-                self.assertNotIn('cpu_input_fd_proc', sent)
-                transient = runtime._materialize_worker_task_memfd_paths(sent, self.persistent)
-                self.assertEqual(len(transient), 1)
-                runtime._close_fd_list(transient)
-                self._assert_closed(transient[0])
-
-    def test_recycled_input_identity_fails_closed_and_drains_later_transfer(self):
-        opened = []
-        def open_proc(path, flags):
-            fd = _local_open(path, flags)
-            opened.append(fd)
-            return fd
-        with _owner(None, b'original') as input_fd, _owner(None, b'wrong!!!') as other_fd:
-            task = dict(cpu_input_path=runtime._memfd_proc_path(input_fd).as_posix(),
-                d1_bitset_path=runtime._memfd_proc_path(other_fd).as_posix())
-            batch = runtime._attach_memfd_transfers_to_task(task,
-                direct_output_capability=dict(parent_pid=os.getpid(), worker_pid=os.getpid()))
-            self.assertEqual(len(batch.handles), 1)
-            os.dup2(other_fd, input_fd)
-            with mock.patch.object(runtime.os, 'open', side_effect=open_proc):
-                with self.assertRaisesRegex(RuntimeError, 'input identity changed'):
-                    runtime._materialize_worker_task_memfd_paths(task, self.persistent)
-            for fd in opened + [batch.handles[0].original_duplicate]:
-                self._assert_closed(fd)
-            os.lseek(other_fd, 0, os.SEEK_SET)
-            self.assertEqual(os.read(other_fd, 8), b'wrong!!!')
-
-    def test_input_open_failure_closes_previous_output_and_later_transfer(self):
-        opened = []
-        def open_proc(path, flags):
-            if flags & os.O_RDWR == 0:
-                raise PermissionError('input proc access lost')
-            fd = _local_open(path, flags)
-            opened.append(fd)
-            return fd
-        with _owner(None) as fd:
-            path = runtime._memfd_proc_path(fd).as_posix()
-            task = dict(result_mask_path=path, cpu_input_path=path, d1_bitset_path=path)
-            batch = runtime._attach_memfd_transfers_to_task(task,
-                direct_output_capability=dict(parent_pid=os.getpid(), worker_pid=os.getpid()))
-            with mock.patch.object(runtime.os, 'open', side_effect=open_proc):
-                with self.assertRaisesRegex(PermissionError, 'input proc access lost'):
-                    runtime._materialize_worker_task_memfd_paths(task, self.persistent)
-            for owned in opened + [batch.handles[0].original_duplicate]:
-                self._assert_closed(owned)
-            os.fstat(fd)
-
-    def test_dispatch_failure_retains_parent_input_without_registering_a_transfer(self):
-        for failure in ('pickle', 'queue'):
-            with self.subTest(failure=failure), _owner(None) as source_fd, _owner(None) as input_fd, \
-                    mock.patch.object(runtime.os, 'open', side_effect=_local_open):
-                self.scheduler = _scheduler()
-                self.scheduler.state.gpu_worker_processes = [SimpleNamespace(name='gpu-worker-0', pid=os.getpid())]
-                self._grant_capability(source_fd)
-                self.duplicate.reset_mock()
-                descriptor = dict(task_id=2, cpu_input_path=runtime._memfd_proc_path(input_fd).as_posix())
-                if failure == 'pickle':
-                    descriptor['unpicklable'] = lambda:None
-                    expected = TypeError
-                else:
-                    self.scheduler.state.gpu_task_queues[0].put = mock.Mock(side_effect=RuntimeError('queue stopped'))
-                    expected = RuntimeError
-                with self.assertRaises(expected):
-                    self.scheduler._put_worker_inference_task(descriptor, 'gpu', 0)
-                self.duplicate.assert_not_called()
-                os.fstat(input_fd)
-                self.assertFalse(self.scheduler._worker_memfd_source_cache('gpu', 0).pending)
-
-
-@unittest.skipUnless(hasattr(os, 'memfd_create') and Path('/proc/self/fd').exists(),
-    'actual parent procfs input access requires Linux')
-class LinuxMemfdInputHandoffTests(unittest.TestCase):
-    def test_spawn_reads_exact_inputs_and_enforces_read_only_fds(self):
-        context = mp.get_context('spawn')
-        tasks, results = context.Queue(), context.Queue()
-        worker = context.Process(target=_spawn_input_receiver, args=(tasks, results))
-        paths = []
+    def test_160_packets_install_one_source_with_zero_additional_sharer_registrations(self):
+        source_channel, child = socket.socketpair()
+        worker = mp.get_context('spawn').Process(target=_receiver, args=(child,))
+        worker.start()
+        child.close()
         try:
-            with ExitStack() as owners:
-                for data in (b'source', b'frame 1', b'frame 2'):
-                    fd = os.memfd_create('cpu-input-test', flags=getattr(os, 'MFD_CLOEXEC', 0))
-                    os.write(fd, data)
-                    path = runtime._memfd_proc_path(fd).as_posix()
-                    runtime._register_memfd_owner(path, fd, 'CPU input spawn test')
-                    owners.callback(runtime._release_memfd_owner_key, path)
-                    paths.append(path)
-                worker.start()
-                initial = dict(task_id=1, source_volume_path=paths[0])
-                batch = runtime._attach_memfd_transfers_to_task(initial, known_sources=())
-                tasks.put(initial)
-                reply = results.get(timeout=20)
-                proof = reply['capability']
-                self.assertEqual(proof['worker_pid'], worker.pid)
-                self.assertEqual(proof['parent_pid'], os.getpid())
-                for task_id, path, data in zip((2, 3), paths[1:], (b'frame 1', b'frame 2')):
-                    task = dict(task_id=task_id, source_volume_path=paths[0], cpu_input_path=path)
-                    direct = runtime._attach_memfd_transfers_to_task(task, known_sources=batch.source_keys,
-                        direct_output_capability=dict(parent_pid=os.getpid(), worker_pid=worker.pid))
-                    self.assertEqual(direct.handles, [])
-                    tasks.put(task)
-                    received = results.get(timeout=20)
-                    self.assertEqual(received['pixels'], data)
-                    self.assertTrue(received['read_only'])
-                    self.assertEqual(received['closed_inputs'], 1)
-                tasks.put(None)
-                worker.join(timeout=20)
+            with PreparedWorkScheduler(41, 8192, 1) as owner, source_channel:
+                owner.register_worker(2**32 + 7, 4, worker.pid, CPU, 4, source_channel)
+                owner.declare_parent(1, 160, 0)
+                parent, generation = owner.wait_preparation(10)
+                self.assertEqual(parent, 1)
+                with _memfd('source', b'source') as source, _memfd('output', b'.') as output, \
+                        mock.patch('multiprocessing.resource_sharer._resource_sharer.register',
+                                   side_effect=AssertionError('Python descriptor broker')):
+                    for task_id in range(160):
+                        with _memfd('input', bytes([task_id])) as pixels:
+                            _submit(owner, dict(task_id=task_id, source_volume_path=source,
+                                                cpu_input_path=pixels, result_mask_path=output))
+                    expected_path = None
+                    for _ in range(160):
+                        kind, lease, payload = owner.wait_event(20)
+                        self.assertEqual(kind, 'final')
+                        stats = pickle.loads(payload)['stats']
+                        self.assertEqual((stats['input'], stats['source'], stats['source_count'],
+                                          stats['transient_count'], stats['closed']),
+                                         (bytes([lease.task_id]), b'source', 1, 2, True))
+                        expected_path = expected_path or stats['path']
+                        self.assertEqual(stats['path'], expected_path)
+                    self.assertEqual(Path(output).read_bytes(), bytes([159]))
+                self.assertEqual(owner.wait_publication(10), (1, generation))
+                owner.retire_parent(1, generation)
+                owner.send_control(2**32 + 7, pickle.dumps(None), stop=True)
+                worker.join(10)
                 self.assertEqual(worker.exitcode, 0)
         finally:
             if worker.is_alive():
                 worker.terminate()
-                worker.join(timeout=10)
-            tasks.close()
-            results.close()
-            tasks.join_thread()
-            results.join_thread()
+                worker.join(10)
+
+    def test_source_install_ack_is_required_per_worker_and_gates_overlap(self):
+        with contextlib.ExitStack() as stack:
+            owner = stack.enter_context(PreparedWorkScheduler(2, 100, 1))
+            actors = []
+            for worker in (5, 8):
+                channel, actor = socket.socketpair()
+                stack.enter_context(actor)
+                with channel:
+                    owner.register_worker(worker, worker + 10, os.getpid(), CPU, 3, channel)
+                actors.append(actor)
+            owner.declare_parent(1, 4, 1)
+            owner.wait_preparation(10)
+            with _memfd('source', b'abc') as path:
+                for task, worker in enumerate((5, 5, 8, 8)):
+                    _submit(owner, dict(task_id=task, source_volume_path=path), required_worker=worker)
+            for actor in actors:
+                installed = {}
+                received = {}
+                lease, data = recv_dispatch(actor, received_handles=received)
+                self.assertEqual(len(received), 1)
+                self.assertEqual(install_detector_handles(pickle.loads(data), installed, received), [])
+                stack.callback(runtime._close_fd_list, tuple(installed.values()))
+                actor.settimeout(0.03)
+                with self.assertRaises(TimeoutError):
+                    actor.recv(1)
+                actor.settimeout(5)
+                send_receipt(actor, lease, 'installed')
+                next_lease, data = recv_dispatch(actor, received_handles=received)
+                self.assertEqual(received, {})
+                self.assertEqual(install_detector_handles(pickle.loads(data), installed, received), [])
+                send_receipt(actor, next_lease, 'installed')
+                for completed in (lease, next_lease):
+                    send_receipt(actor, completed, 'compute')
+                    send_receipt(actor, completed, 'final')
+            self.assertIsNotNone(owner.wait_publication(10))
+
+    def test_cancel_closes_undispatched_and_unacknowledged_pins(self):
+        channel, actor = socket.socketpair()
+        with channel, actor, PreparedWorkScheduler(7, 100, 1) as owner:
+            owner.register_worker(4, 1, os.getpid(), CPU, 1, channel)
+            owner.declare_parent(1, 2, 0)
+            owner.wait_preparation(10)
+            for task_id in (1, 2):
+                with _memfd('native-cancel-test', b'body') as path:
+                    _submit(owner, dict(task_id=task_id, source_volume_path=path))
+            received = {}
+            recv_dispatch(actor, received_handles=received)
+            runtime._close_fd_list(received.values())
+            def pins():
+                result = []
+                for fd in Path('/proc/self/fd').iterdir():
+                    try:
+                        if 'native-cancel-test' in os.readlink(fd):
+                            result.append(fd)
+                    except FileNotFoundError:
+                        pass
+                return result
+            self.assertEqual(len(pins()), 2)
+            owner.cancel('cancel uninstalled work')
+            deadline = time.monotonic() + 5
+            while pins() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(pins(), [])
+
+    def test_forged_identity_and_role_never_install_or_modify_storage(self):
+        with _memfd('identity', b'original') as path:
+            for field, replacement in [('identity', '0:0:0:0:0:0'), ('role', 2)]:
+                with detector_handle_submission(dict(source_volume_path=path)) as (packet, handles):
+                    original = packet['_detector_handle_table'][0]
+                    packet['_detector_handle_table'] = ((replacement, 0) if field == 'identity'
+                                                         else (original[0], replacement),)
+                    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+                    received = {0: fd}
+                    with self.assertRaises(RuntimeError):
+                        install_detector_handles(packet, {}, received)
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+                    self.assertFalse(received)
+                    self.assertEqual(Path(path).read_bytes(), b'original')
+
+    def test_nested_policy_packet_larger_than_one_kernel_descriptor_message(self):
+        channel, actor = socket.socketpair()
+        with channel, actor, PreparedWorkScheduler(3, 1, 1) as owner:
+            owner.register_worker(0, 1, os.getpid(), CPU, 1, channel)
+            owner.declare_parent(1, 1, 0)
+            owner.wait_preparation(5)
+            with contextlib.ExitStack() as parents:
+                children = [dict(canvas_path=parents.enter_context(_memfd('policy', bytes([i % 256]))))
+                            for i in range(260)]
+                _submit(owner, dict(task_id=0, augmentation_pass_tasks=children))
+                self.assertTrue(all(set(child) == {'canvas_path'} for child in children))
+            actor.settimeout(5)
+            received = {}
+            lease, payload = recv_dispatch(actor, received_handles=received)
+            task = pickle.loads(payload)
+            self.assertEqual(len(received), 260)
+            transient = install_detector_handles(task, {}, received)
+            try:
+                self.assertEqual([Path(child['canvas_path']).read_bytes() for child in task['augmentation_pass_tasks']],
+                                 [bytes([i % 256]) for i in range(260)])
+            finally:
+                runtime._close_fd_list(transient)
+            send_receipt(actor, lease, 'installed')
+            send_receipt(actor, lease, 'compute')
+            send_receipt(actor, lease, 'final')
+            self.assertIsNotNone(owner.wait_publication(5))
 
 
-if __name__ == '__main__':
-    unittest.main()
+class PortableDetectorHandleTests(unittest.TestCase):
+    def test_ordinary_file_paths_preserve_their_mapping_without_handle_registration(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / 'ordinary.raw'
+            path.write_bytes(b'bytes')
+            task = dict(source_volume_path=str(path), native_resize={'path': str(path)})
+            with detector_handle_submission(task) as (packet, handles):
+                self.assertEqual(handles, ())
+                self.assertEqual(install_detector_handles(packet, {}, {}), [])
+                self.assertEqual(Path(packet['source_volume_path']).read_bytes(), b'bytes')
+                self.assertEqual(packet, task)

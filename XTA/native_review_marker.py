@@ -226,7 +226,7 @@ class _MarkerPlan:
                 hi = np.maximum(hi, np.array([a.stop for a in bounds]) + b_lo)
         return (lo, hi) if (lo < hi).all() else None
 
-    def stage_basin(self, flood, max_voxels):
+    def stage_basin(self, flood, owned_basin, max_voxels):
         planes = self.db.execute(
             "SELECT DISTINCT axis,plane FROM masks WHERE role='visible-plane' ORDER BY axis,plane"
         )
@@ -258,6 +258,35 @@ class _MarkerPlan:
                     self.put("basin", "", (-1, 0), coords, mask)
                 _, _, footprint, _ = self._basin_block(coords, plane)
                 self.put("footprint", "", (-1, 0), coords, footprint)
+            self._stage_owned_basins(plane, lo, hi, claimed, owned_basin)
+
+    def _stage_owned_basins(self, plane, lo, hi, claimed, owned_basin):
+        cutoffs = self.session.cutoffs[:self.session.cutoffs.index(self.cutoff) + 1]
+        layers = self.db.execute(
+            "SELECT DISTINCT layer FROM masks WHERE role='plane' AND axis=? AND plane=? ORDER BY layer", plane
+        )
+        for (lid,) in layers:
+            if lid not in self.visible_additive:
+                continue
+            displayed = np.zeros_like(claimed)
+            for coords, inside, window in self.session._region_blocks(lo, hi):
+                if claimed[window].any():
+                    cut = self.get("plane", lid, plane, coords)
+                    if cut is not None:
+                        displayed[window] = cut[inside]
+            if not np.any(claimed & displayed):
+                continue
+            supported = np.zeros_like(claimed)
+            for coords, inside, window in self.session._region_blocks(lo, hi):
+                if claimed[window].any():
+                    for cutoff in cutoffs:
+                        supported[window] |= self.session.read_block(lid, cutoff, coords)[inside]
+            owned = owned_basin(claimed & supported, displayed)
+            for coords, inside, window in self.session._region_blocks(lo, hi):
+                if owned[window].any():
+                    block = np.zeros(self.session.block_extent(coords), bool)
+                    block[inside] = owned[window]
+                    self.put("owned-basin", lid, (-1, 0), coords, block)
 
     def count(self, role):
         total = 0
@@ -270,21 +299,21 @@ class _MarkerPlan:
         any_fell = False
         changed = {}
         for coords in self.db.execute(
-            "SELECT DISTINCT z,y,x FROM masks WHERE role IN ('removal','basin') ORDER BY z,y,x"
+            "SELECT DISTINCT z,y,x FROM masks WHERE role IN ('removal','owned-basin') ORDER BY z,y,x"
         ):
             shape = self.session.block_extent(coords)
             before_rank, after_rank = np.zeros(shape, np.uint8), np.zeros(shape, np.uint8)
-            basin = self.get("basin", "", (-1, 0), coords) if include_looser else None
             for lid in self.session.layers_at(coords):
                 if lid == self.session.global_layer_id:
                     continue
                 removal = self.get("removal", lid, (-1, 0), coords)
+                basin = self.get("owned-basin", lid, (-1, 0), coords) if include_looser else None
                 for rank, cutoff in enumerate(self.session.cutoffs, 1):
                     before = self.session.read_block(lid, cutoff, coords)
                     after = before
                     if removal is not None and (include_looser or rank >= current_rank):
                         after = after & ~removal
-                    if basin is not None and rank <= current_rank and lid in self.visible_additive:
+                    if basin is not None and rank < current_rank:
                         after = after & ~basin
                     if lid in self.additive:
                         np.maximum(before_rank, rank, where=before, out=before_rank)
@@ -364,7 +393,7 @@ def stage_marker_removals(
             return dict(stats, status="cancelled_huge_displayed", global_stale=session.global_stale)
         all_cutoffs = scope == "all"
         if all_cutoffs and k0:
-            plan.stage_basin(editor["_xta_store_flood"], max_voxels)
+            plan.stage_basin(editor["_xta_store_flood"], editor["_xta_store_owned_basin"], max_voxels)
             stats["F"], stats["Q"] = plan.count("footprint"), plan.count("basin")
             removed_looser = stats["Q_minus_F"] = stats["Q"] - stats["F"]
             if removed_looser > threshold.huge_looser:

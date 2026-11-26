@@ -86,15 +86,10 @@ def rank_projection_gpu_wait(family):
 
 
 def _inference_active():
-    """Whether central inference is queued or running (no CUDA call, no side effects)."""
+    """Read queued/running inference from the native owner without a CUDA call."""
     from . import backprojection
     coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
-    lock = getattr(coordinator, '_lock', None)
-    if lock is None:
-        return True
-    with lock:
-        return bool(getattr(coordinator, '_pending_inference_backlog', False)
-                    or any(getattr(coordinator, '_inference_inflight', {}).values()))
+    return coordinator.inference_active()
 
 
 def _telemetry(name, value=1):
@@ -118,29 +113,8 @@ def _floor_retirement_pending(purpose):
     coordinator's FIFO grants turns.
     """
     from . import backprojection
-    from .workspace import _env_flag
     coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
-    lock = getattr(coordinator, '_lock', None)
-    if lock is None:
-        return False
-    now = time.monotonic()
-    with lock:
-        requests = dict(getattr(coordinator, '_spherical_retirement_requests', None) or {})
-        declined = set(getattr(coordinator, '_overlap_declined', None) or ())
-        pressure = bool(getattr(coordinator, '_spherical_retirement_pressure', False))
-    if not requests:
-        return False
-    retire = _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True)
-    aged = _env_flag('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', True)
-    for owner, (expiry, _devices, first_request) in requests.items():
-        owner = str(owner)
-        if owner == str(purpose) or owner.endswith(_SIBLING_PURPOSE_SUFFIX) or float(expiry) <= now:
-            continue
-        if owner not in declined:
-            return True  # It competes for the overlap slot itself.
-        if retire and (pressure or (aged and now - float(first_request) >= 30.0)):
-            return True  # It is due a drained device; a sibling lease could park it.
-    return False
+    return coordinator.floor_retirement_pending(purpose)
 
 
 def _acquire_rank_overlap_lease(purpose, required_bytes, state):

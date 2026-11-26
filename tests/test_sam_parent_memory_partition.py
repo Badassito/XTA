@@ -44,8 +44,7 @@ def actual_partition(monkeypatch):
         monkeypatch.delenv(name,raising=False)
     monkeypatch.setenv('YOLO_TTA_CPU_INPUT_PREFETCH','1')
     monkeypatch.setattr('XTA.confidence_evidence.confidence_evidence_enabled',lambda:False)
-    scheduler = SimpleNamespace(inputs=Inputs(),operations=SimpleNamespace(array_nbytes=runtime.array_nbytes))
-    scheduler._direct_union_parent_bytes = lambda task:TtaScheduler._direct_union_parent_bytes(scheduler,task)
+    scheduler = TtaScheduler(native=None, state=None, inputs=Inputs())
     namespace = dict(vars(pipeline))
     namespace.update(scheduler=scheduler,GIB=GIB,replace=replace,_env_flag=runtime._env_flag,
         interpolation_settings=SimpleNamespace(sam_enabled=True),sam_parent_staging=object(),

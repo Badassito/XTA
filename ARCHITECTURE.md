@@ -36,15 +36,17 @@ receipts belong to their scalar branches. See [confidence sweeps](docs/confidenc
 | --- | --- |
 | Immutable geometry and sampling identity | [sampling](XTA/unification/sampling.py), [physical recipes](XTA/unification/geometry_identity.py), [contracts](XTA/unification/contracts.py), [views](XTA/unification/views.py), [tiles](XTA/unification/tiles.py), [geometry](XTA/geometry.py), [render batches](XTA/render_batch.py) |
 | Source and worker resources | [workspace](XTA/workspace.py), [media](XTA/media.py), [runtime lifecycle](XTA/runtime.py), [observability](XTA/runtime_observability.py), [TTA workers](XTA/workers.py) |
+| Prepared TTA detector work and device admission | [native scheduler](native/prepared_scheduler.hpp), [device stages](native/device_stage.hpp), [Python adapter](XTA/tta_scheduler.py), [actor transport](XTA/tta_worker_transport.py) |
 | Input/output identity and manifests | [launch context](XTA/unification/context.py), [manifest helpers](XTA/unification/manifest.py), [TTA manifest](XTA/unification/tta_manifest.py), [execution provenance](XTA/tta_provenance.py) |
 | Image-space and source-space projection | [backprojection](XTA/backprojection.py), [sparse projection](XTA/sparse_projection.py), [native pull CPU kernels](XTA/projection_coverage_cpu.py), [native CUDA gather](XTA/native_pull_cuda.py), [native pull scheduling](XTA/native_pull_scheduling.py), [packed parents](XTA/packed_tilted_projection.py), the `cylindrical_*` and `spherical_*` modules |
 | Common filtering and output | [prediction cleanup](XTA/_prediction_cleanup.py), [Gaussian](XTA/gaussian.py), [finalization](XTA/finalization.py), [outputs](XTA/outputs.py), [NRRD compression](XTA/nrrd_compression.py), [packed publication](XTA/packed_publication.py), [memory grants](XTA/publication_memory.py) |
 
-Parent preparation admission is owned by
-[tta_prepare_planning](XTA/tta_prepare_planning.py); `pipeline` coordinates its
-results. Compression codec admission, ordered member streams and worker-pool
-lifetime have one owner in `nrrd_compression`, while `outputs` retains raster
-formatting and publication. `runtime_observability` owns measurement primitives;
+Python [preparation planning](XTA/tta_prepare_planning.py) describes parent
+work and its memory requirements. The native detector scheduler funds
+preparation for the declared detector inventory. `pipeline` coordinates the
+scientific stages. Compression codec admission, ordered member streams and
+worker-pool lifetime have one owner in `nrrd_compression`. `outputs` retains
+raster formatting and publication. `runtime_observability` owns measurement primitives;
 the `runtime` facade retains process initialization and shutdown. Importing the
 measurement owner does not start threads or open diagnostic files.
 
@@ -211,19 +213,18 @@ layers. Final fusion uses grouped restore and the eligible native sparse CPU
 path. Grouping unions before resampling preserves subpixel support that separate
 integer AREA restores can round away.
 
-Worker GPUs retain inference-first ownership, full-frame workers write bounded
-direct unions, and result queues wake the scheduler through the result pump.
-The scheduler reuses identical parent-admission decisions within each
-read-only backlog scan. It also returns the confidence portion of a parent's
-dense credit after the backing mapping and its aliases have actually retired,
-so slow source projection does not keep charging confidence storage it no longer
-owns. Parent-union credit remains held until its own retirement.
+Native device admission gives detector inference priority and accounts for
+eligible overlapping projection. An authenticated worker receipt can release
+the compute slot and wake native dispatch while Python consumes an earlier
+result. The owner returns dense bytes in response to observed retirement of
+the corresponding backings and aliases.
 With `--enable_2D_hole_fill yolo`, split-view hole filling runs after view
 completion; single-lease eligibility permits device filling. Filling is off by
 default; leaving it off keeps the resident inference and backprojection paths.
 Resource controls set concurrency and peak storage.
 `YOLO_TTA_GPU_INPUT_STAGING_BATCHES=0` disables input staging and its eager source
-warmup. `YOLO_TTA_HYBRID_GPU_STEALBACK_MAX_FRACTION=0` disables hybrid GPU assistance.
+warmup. See the [native scheduler guide](docs/native_scheduler.md) for the
+supported detector configurations.
 
 ## Required compiled CPU backends
 
@@ -232,6 +233,11 @@ broken Numba imports raise a diagnostic instead of selecting interpreted bulk
 work. Compiled topology, interpolation, Spherical/Radial CPU projection, sparse
 scatter and packed publication propagate kernel failures. Configuration and CLI
 help/version discovery keep their lightweight import boundary.
+
+TTA also requires the C++17 prepared scheduler extension. Platform wheels
+supply it. A complete source checkout can build and cache it outside the
+checkout with the matching CPython toolchain. An unavailable or incompatible
+extension stops TTA at preflight. See the [build procedure](docs/maintenance.md#packaging-checks).
 
 Independent slow implementations live in `tests/reference_backends` for
 qualification. Interpolation grows its compiled workspace for valid fragmented
@@ -246,22 +252,27 @@ for the test-reference boundary and development benchmark commands.
 
 ## TTA: inference to source union
 
-The TTA pipeline is coordinated by `pipeline`, `tta_scheduler`, `tta_lifecycle`,
-`tta_terminal`, and `tta_outputs`. `view_prepare` owns admitted
-parent preparation, component-projection reservations, and inference-to-postprocess
-lease handoffs through explicit state objects. The scheduler owns mutable
-task identities, backend claims, worker liveness, parent memory credits, and
-result transport. An execution target is a local CUDA GPU or a socket-local
-OpenVINO process. Worker processes receive picklable contracts; bulk source and
-result data use shared descriptors or artifact paths. CUDA, TensorRT, and
-OpenVINO are initialized inside their respective runtime owners.
-Immutable task descriptors keep the scheduler's shape and byte accounting
-stable across refill passes; mutable owner, credit, and readiness decisions
-are evaluated at selection time.
+The Python TTA pipeline coordinates planning, scientific preparation,
+assembly, projection, and output through `pipeline`, `tta_scheduler`,
+`tta_lifecycle`, `tta_terminal`, and `tta_outputs`. Each scalar run creates a
+single native owner of prepared detector admission, ready work, worker claims,
+receipt validation, publication tickets, detector byte credits, and device
+stages. The Python adapter declares task and parent identities and supplies
+prepared descriptors to the owner. `view_prepare` manages the Python-owned
+scientific inputs and their handoff to projection.
 
-Each physical view renders frames and optional tiles/augmentations, performs
-model inference, assembles the accepted masks, and settles its image-space
-result. Completed physical views can project to source space while other views
+The native dispatcher selects among prepared ranges and writes commands to
+private worker sockets. A local CUDA or socket-local OpenVINO process runs
+the model and returns typed receipts. Backend SDKs initialize inside their
+respective runtime owners. Bulk arrays use shared mappings or artifact paths.
+Native-ready dispatch can continue while Python is busy with result assembly
+when another eligible worker slot, device grant, and the required credits
+are available. The [native scheduler guide](docs/native_scheduler.md) describes
+the supported modes, launch requirements, and receipt lifecycle.
+
+Each supported detector view renders full frames and optional augmentations,
+performs model inference, assembles the accepted masks, and settles its
+image-space result. Completed physical views can project to source space while other views
 continue inference. `assembly` and `tta_terminal` reduce these independent
 layers into a single source union. `interpolation` can add bridges between
 eligible frames; those bridges retain their own provenance. `finalization`
@@ -310,22 +321,13 @@ memory window; file-backed results and retained outputs remain separate
 storage consumers. Inference, completed canvases, source projection, and
 publication have separate credits so one backlog cannot grow without bound.
 
-Process-worker direct-union parents use `detector_workspaces` to separate
-preparation from dispatch. The scheduler reserves each complete parent or policy
-group in its existing byte and view ledgers with a `preparing` lease. A prestarted
-worker creates private mask/confidence backings and qualifies their RAM placement.
-The scheduler adopts the complete group only after checking reservation identity,
-charges and the current RAM-promise basis. A changed basis requalifies the same
-private buffers without allocating them again. Pending preparation stays in the
-work queue and wakes the scheduler on completion; GPU ownership begins only when
-the backing is ready. Cancellation retains credit through actual writer and
-array retirement. Ordinary D1 bitsets need no such parent canvas.
-
-RAM qualification and staging-registry changes are separate operations. Physical
-probes run on the preparation worker; only the scheduler commits RAM-first
-retention permissions and publishes backing dictionaries. In-process inference,
-ordinary unbounded file-result aggregation and tile-result workspace creation
-retain their synchronous compatibility paths.
+Direct-union parents use `detector_workspaces` to separate preparation from
+dispatch. Native funding reserves a complete parent or policy group and emits a
+preparation ticket. A Python preparation worker creates private mask and confidence
+backings and qualifies their RAM placement. The Python adapter submits prepared
+ranges after installing the backing descriptors. The native owner checks worker
+and device eligibility when it dispatches each range. Ordinary D1 bitsets use a
+single resident worker for the parent, with a separate backing contract.
 
 For SAM-blocked detector parents, short-lived physical RAM eligibility is
 separate from long-lived backlog retention. A logical backlog denial therefore
@@ -336,54 +338,23 @@ unwritten promises, existing maps use `r+`, and checkpoints reuse the same
 owned files. Failed births settle mappings before rollback; teardown validates
 the original root identity before deleting owned storage.
 
-Eligible gray, batch-one CUDA process runs admit curved full-frame views before
-unopened Cartesian and Tilted Cartesian work. Once curved inference is assigned
-to another GPU, one CPU-ready Cartesian D1 parent can open alongside it on an
-unowned worker. This early overlap is limited to one cheap owner across the fleet;
-later packets use GPU rendering whenever CPU preparation is unfinished. The
-restriction ends when curved work is exhausted or cannot use the available
-workers. Optional multi-owner D1 groups retain their own scheduling policy.
-Existing parent completion and
-tile dependency rules retain priority when needed to release storage. Meanwhile,
-`yolo_cpu_input` prepares cheap-view canvases from the decoded native time grid
-in bounded shared RAM, without waiting for the resized processing cube. The
-maximum allowance is the smallest of 64 GiB, one quarter of the detector dense
-budget and one eighth of available anonymous-memory headroom. Preparation cycles
-across model/view/augmentation groups so one view cannot occupy the whole backlog.
-A prestarted control thread performs memory probes, submits builders to the
-existing CPU executor and retires arrays. Scheduler refill and retirement calls
-signal that thread; they do not start pool workers. Optional readiness and input
-handoff queries decline immediately when their metadata lock is busy. Memory
-grants and ownership accounting remain exact.
-
-When speculative inputs prevent a ready detector parent from fitting, the
-scheduler can request retirement of unborrowed packets through that controller.
-Attached inputs remain protected through compute release. Revoked builders
-settle cooperatively, and charged credit returns only after the mapping and
-parent keepalive descriptor retire. A reclaim preview is not an allocation
-grant. Refills remain bounded while reclamation is pending and resume after
-the selected parent commits; unavailable optional inputs use GPU rendering.
+In eligible gray, batch-one CUDA runs, `yolo_cpu_input` prepares cheap-view
+canvases from the decoded native time grid in bounded shared RAM. The detector
+budget accounts for the prefetch allowance before native admission. A Python
+control thread performs memory probes, submits builders, and retires arrays.
+The adapter attaches an available canvas during descriptor preparation. A
+prepared descriptor without a prefetched canvas uses GPU rendering.
 
 Ready uint8 canvases feed the same TensorRT ring through pinned asynchronous
-copies. Workers with verified access to the parent's procfs mappings open these
-immutable input descriptors read-only, validating device, inode and length.
-Those local descriptors close with the task; they do not enter a persistent
-input cache. Unqualified workers use the descriptor-sharing transport. A separate
-CUDA copy stream uploads the next canvas while inference
+copies. A Linux worker installs a read-only task handle for a prefetched memfd
+and validates its backing identity. The worker keeps that handle local to the
+task. A separate CUDA copy stream uploads the next canvas while inference
 consumes the previous float input; staging-read and inference-completion events
 protect their respective buffers. One GPU operation converts each uint8 canvas
 to the binding dtype and normalizes it. Model inference, GPU mask processing and D1
-ownership remain on the GPU. An unavailable CPU input immediately uses the
-resident GPU renderer, even while its CPU builder is running. Completed GPU work
-retires that input's coverage; live builders and split consumers retain their
-memory charges until they settle.
-
-The scheduler funds the producer's current grant, yields unused capacity to
-mask admission and replenishes it within the detector budget. Callbacks cannot
-expand that grant or refund live memory. Producer completion and actual memory
-release wake the scheduler to retry admission without requiring a GPU result.
-Cached pinned buffers remain part of
-SAM startup promises. No per-frame files or compression are introduced.
+ownership remain on the GPU. The prefetch controller retains charges for live
+builders and mapped inputs through their retirement. Cached pinned buffers
+remain part of SAM startup promises.
 `YOLO_TTA_CPU_INPUT_PREFETCH=0` disables this detector route. Runtime provenance,
 prepared/offloaded/fallback frame counters and the `yolo.cpu_input.live` gauge
 identify actual use and backlog ownership, while worker receipts separate
@@ -419,7 +390,9 @@ and confidence policies read independent evidence. `confidence_*` modules
 capture native pieces or source-aligned uint8 maxima of detector scores
 (segment) or foreground probabilities (semantic); zero means unknown.
 Interpolation does not fabricate confidence. Native evidence conversion is
-explicit and bounded. `confidence_export` can match numeric evidence to
+explicit and bounded. Confidence policies use run-owned scratch for these
+scores by default. An explicit `--save confidence` publishes a reusable
+catalogue and layer payloads. `confidence_export` can match numeric evidence to
 selected compact masks without loading the NRRD masks.
 
 ### Interpolation and SAM extrapolation
@@ -888,17 +861,18 @@ separate.
 Physical budget eligibility and per-session limits apply; authenticated
 logical execution slots fill only the CPU wave already funded. TTA's interpolation
 session type has no fixed 30-frame ceiling and retains full requested history.
-Resident ownership fences detector/auxiliary reuse separately from one compute
-lease per active physical device. Every worker slot must authenticate its own
-context's completion before the final ACK allows eligible projection borrowing through
-capability and actual free-VRAM checks. Startup, shutdown and failure
-quarantine retain ownership until cleanup is proved; retained model/feature
-memory is never advertised as free capacity.
-On scheduler failure, the original traceback is emitted before executor joins.
-Queued preparation is cancelled; dense credit returns only after its actual
-input owners retire. Planning failures persist a preparation receipt even before
-a plan exists. Wait telemetry exposes parent-pool usage, GPU resident owners and
-quarantine reasons, asset retirement, and inference backlog.
+The native scheduler's device ledger tracks resident ownership separately
+from compute occupancy. Projection borrowing and auxiliary reuse depend on
+the current device lease, the relevant authenticated detector asset-retirement
+receipt, and the required capability and free-VRAM checks. Startup, shutdown,
+and failure quarantine protect resident model and feature memory through
+verified cleanup.
+On scheduler failure, the pipeline emits the original traceback before
+executor joins. It cancels queued preparation. Dense credit returns only
+after the actual input owners retire. Planning failures persist a preparation
+receipt even before a plan exists. Wait telemetry exposes parent-pool usage,
+GPU resident owners and quarantine reasons, asset retirement, and inference
+backlog.
 LTA keeps its separate 30-frame session contract. A persistent SAM pool scheduler
 owns worker submission and completion reception across admitted scopes. When
 only curved and cheap scopes are ready and both classes are present, it serves
@@ -1068,19 +1042,24 @@ and detection. Research context and acceptance-only variants declare their own
 geometry and evidence scope; their results do not automatically change production
 defaults. Source audits and workload qualification have separate scopes.
 
-TTA can save the final source-volume semantic mask as grayscale PNGs with
-`0` background and `1` foreground. This differs from `--save images`, which
-saves rendered model inputs. NRRD layers and their manifests preserve view,
-model, geometry, and policy identities. `tta_outputs` publishes a complete
+TTA saves source intensities as grayscale PNGs with `--save images` and final
+mask polygons with `--save labels`. For a shared resolution, the sequences
+use the same source grid and numbered basenames. The `semantic` format saves
+label PNGs with `0` for background and `1` for foreground. NRRD layers and their
+manifests preserve view, model, geometry, and policy identities. `tta_outputs` publishes a complete
 run manifest only after model workers, projection, finalization, and all output
 futures settle.
 
 ### TTA resource and failure boundaries
 
-A parent canvas holds its dense memory credit through assembly and projection
-until its immutable component backing is published. File-mode results and
-support sidecars have separate accounting. Eligible Radial, Spherical and
-native-gather (Tilted/Azimuthal) projections can borrow an idle worker GPU.
+Dense bytes remain charged through the corresponding backing and every live
+alias. A parent publication ticket reserves a place for the completed work
+while the consumer assembles and publishes it. A separate Python actor handles
+sweep publication, and the adapter checks its completion future once
+ready. After the last use and storage retirement, the adapter returns the
+parent ticket. File-mode results and support sidecars have separate accounting.
+The shared native device ledger also admits eligible Radial, Spherical and
+native-gather (Tilted/Azimuthal) projections onto idle worker GPUs.
 Under a live inference backlog, retirement pressure or a 30-second request age
 grants a bounded turn before the device returns to inference. With
 `YOLO_TTA_GPU_PROJECTION_OVERLAP` (default on), one Spherical or native
@@ -1107,7 +1086,8 @@ Completed view layers are reduced by a single source-union writer. A dense
 handoff credit bounds waiting source-sized volumes. Final sink joins precede
 the complete manifest. TTA first writes an `in_progress` manifest and replaces
 it only after successful completion. Reconciliation cannot consume unfinished
-confidence publication.
+confidence publication. Native receipt, actor, and task faults stop TTA so
+the cause can be diagnosed before rerunning.
 
 ## PTA: deterministic dataset construction
 
@@ -1323,12 +1303,11 @@ Immutable component stores may outlive a dense canvas, but each retained layer
 consumes filesystem capacity. Scratch placement can therefore affect
 RAM usage when its filesystem is memory backed.
 
-For YOLO result masks/confidence, a worker can open parent memfds directly after
-its source ACK proves procfs access and exact storage identity. Capability
-is bound to the current parent/worker PIDs and invalidated on worker replacement.
-Every output open checks device/inode/size before prediction; those descriptors
-remain task-local and close after publication. Unsupported workers use descriptor
-transfer. Worker telemetry separates direct opens from descriptor detaches.
+On Linux, the native actor channel transfers registered detector memfd handles
+with the prepared command. Workers validate the backing identity and access role
+before sending the install receipt. A worker can reuse installed source handles
+through its current incarnation. Prefetch and result handles are task-local.
+File-backed tasks carry the artifact paths. See the [native scheduler guide](docs/native_scheduler.md#detector-backing-handles).
 
 Retiring a shared NumPy mapping does not invalidate live views or independent
 arrays backed by the same mmap. The mapping's last reference governs unmapping
@@ -1394,7 +1373,11 @@ inherited publication locks.
 
 Runtime diagnostics separate queue waits, rendering, inference, projection,
 encoding, publication, and worker retirement. These are overlapping stage
-timings, so summing them does not recover wall time. Validation tools under
+timings, so summing them does not recover wall time. The `scheduler.native`
+gauge reports the native ready work, worker occupancy, byte and ticket
+accounting, and the device stage claim count and epoch. The
+`scheduler.wait_activity` gauge exposes the surrounding pipeline activity.
+Validation tools under
 `tools/` check geometry, model backends, semantic decoding, PTA categorical
 projection, and LTA propagation. Tests live under `tests/`. Benchmark receipts
 and full workload evidence belong outside the repository in

@@ -14,7 +14,6 @@ import numpy as np
 from XTA.yolo_cpu_input import CpuInputPrefetch
 from XTA import runtime
 from tests.test_yolo_cpu_input import task, ManualExecutor
-from tests.test_tta_scheduler_boundary import _scheduler, _state
 
 
 def idle(owner):
@@ -258,54 +257,6 @@ def test_reclaim_during_submit_failure_and_shutdown_settles_exactly_once():
         owner.shutdown()
 
 
-def test_real_scheduler_waits_for_retirement_then_births_parent_and_falls_back():
-    entered, release = threading.Event(), threading.Event()
-    def close(_array):
-        entered.set()
-        assert release.wait(5)
-    descriptor = dict(task(), result_mode='direct_union', processing_shape=(1,1,19900))
-    state = _state()
-    state.gpu_task_queues[0] = queue.Queue()
-    state.gpu_worker_tasks_by_id[0] = descriptor
-    state.gpu_worker_pending_task_ids.append(0)
-    state.direct_union_postprocess_bytes[('model','old')] = 10000
-    state.direct_union_backing_leases[('model','old')] = SimpleNamespace(phase='postprocess')
-    births = []
-    def birth(model, view):
-        assert owner.bytes + 10000 + 19900 <= 30000
-        births.append((model, view.name))
-        state.baseline_union_paths[(model,view.name)] = Path('mask.dat')
-        state.direct_union_inference_views.add((model,view.name))
-        state.direct_union_inference_bytes[(model,view.name)] = 19900
-        state.direct_union_backing_leases[(model,view.name)] = SimpleNamespace(phase='inference')
-    scheduler = _scheduler(Path('.'), state=state, input_overrides=dict(
-        direct_union_total_dense_byte_limit=30000,direct_union_inference_byte_limit=30000,
-        ensure_baseline_workspaces=birth))
-    with prefetch([descriptor], close=close,
-            wake=scheduler.notify_gpu_stage_admission_change) as (owner, executor, _):
-        executor.run()
-        scheduler.cpu_input_prefetch = owner
-        try:
-            assert scheduler.direct_union_task_admissible(descriptor)
-            assert not owner.packets[0].revoked  # The feasibility scan is pure.
-            scheduler.dispatch_gpu_worker_inference_window()
-            assert entered.wait(5)
-            assert not births and state.gpu_task_queues[0].empty()
-            assert owner.bytes == 432
-            scheduler.dispatch_gpu_worker_inference_window()
-            assert not births and owner.bytes == 432
-            release.set()
-            idle(owner)
-            assert state.gpu_stage_admission_dirty.is_set()
-            assert scheduler.service_gpu_stage_admission_retry()
-            dispatched = state.gpu_task_queues[0].get_nowait()
-            assert births == [('model',descriptor['view'].name)]
-            assert 'cpu_input_path' not in dispatched
-            assert dispatched['slice_start'] == descriptor['slice_start']
-            assert dispatched['slice_count'] == descriptor['slice_count']
-            assert owner.bytes == 0
-        finally:
-            release.set()
 
 
 def test_mapping_alias_and_completed_future_hold_no_unfunded_backing(tmp_path):

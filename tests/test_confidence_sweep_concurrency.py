@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import types
 
@@ -160,7 +161,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(sweep.subprocess, 'Popen', launch)
     publisher = types.ModuleType('XTA.sweep_publication')
 
-    def publish(root, rows, *, sweep_id, temp_dir):
+    def publish(root, rows, *, sweep_id, temp_dir, expected_grids):
         state.publications.append([cent for cent, _ in rows])
         return None
 
@@ -201,6 +202,7 @@ def _lines(text):
 def test_limit_order_prefixes_and_retirement_marker(harness, capfd):
     plan = {str(cent): {'sleep': 1.5} for cent in (60, 70, 80, 90)}
     plan['60'] = {'sleep': 3.}
+    harness.arguments.extend(('--save', 'nrrd'))
     path = harness.run('limited', (50, 60, 70, 80, 90), plan=plan, parallel=2)
     family = _read(path)
     assert family['status'] == 'complete'
@@ -579,6 +581,43 @@ def test_large_unterminated_and_undecodable_output_is_drained(harness, capfd):
         assert err.count(prefix + 'b' * 99) == expected
         assert prefix + 'tail-without-newline' in out
         assert any(line.startswith(prefix + 'bad-') and line.endswith('-byte') for line in out)
+
+
+def test_cutoff_validation_status_serializes_with_child_output(harness, monkeypatch):
+    status_write = threading.Event()
+    child_forwarded = threading.Event()
+
+    class InterruptedStatusStream(io.StringIO):
+        def write(self, value):
+            count = super().write(value)
+            if value.startswith('Validated cutoff 0.60 receipt'):
+                status_write.set()
+                # On an unguarded print, force the child text between the status
+                # text and the newline written by print's next write call.
+                if not sweep._OUTPUT_LOCK.locked():
+                    assert child_forwarded.wait(5)
+            return count
+
+    def forward():
+        if status_write.wait(5):
+            sweep._forward_prefixed_output(io.BytesIO(b'complete child line\n'),
+                                           'stdout', '[conf 0.70] ', 'utf-8')
+            child_forwarded.set()
+
+    target = InterruptedStatusStream()
+    monkeypatch.setattr(sys, 'stdout', target)
+    reader = threading.Thread(target=forward, daemon=True)
+    reader.start()
+    try:
+        harness.run('interleaved-output', (50, 60), parallel=1)
+    finally:
+        status_write.set()
+        reader.join(timeout=5)
+    assert not reader.is_alive()
+    lines = [line for line in target.getvalue().splitlines()
+             if 'Validated cutoff 0.60 receipt' in line or 'complete child line' in line]
+    assert '[conf 0.70] complete child line' in lines
+    assert any(line.startswith('Validated cutoff 0.60 receipt') and line.endswith('s.') for line in lines)
 
 
 class _Chunks(io.RawIOBase):

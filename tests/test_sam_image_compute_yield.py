@@ -1,4 +1,6 @@
 """CPU-only fairness/retirement and private-cache continuation oracles."""
+
+from tests.native_stage_test_support import native_stage_context
 import queue
 import sys
 import threading
@@ -94,7 +96,7 @@ def test_upload_is_not_charged_to_service_and_reupload_resets_quantum(tmp_path, 
 
 
 def test_all_four_sources_retire_before_owed_tracker_turn_and_reacquisition(tmp_path, monkeypatch):
-    coordinator=bp._MainProcessGpuStageCoordinator()
+    coordinator=bp._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     coordinator.configure_workers((0,1,2,3));coordinator.set_inference_priority_active(False)
     pool=runtime._GpuWorkerAuxInterpolationPool({d:queue.SimpleQueue() for d in range(4)})
     monkeypatch.setattr(bp,'gpu_worker_aux_interpolation_pool',lambda:pool)

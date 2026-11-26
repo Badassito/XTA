@@ -49,6 +49,8 @@ TODAY = (
     "AlignNativeIntensity", "_xta_native_to_preview_matrix", "_xta_choose_review_manifest", "_xta_edit_scope_for",
     "_xta_display_store_backed", "_xta_new_review_edit_scope", "SelectEditScope", "_xta_current_native_window",
     "_xta_importer_has_geometry", "_extent_is_valid")
+TODAY += ("OpenXTAReview", "_xta_read_preview_manifest", "_xta_open_preview_archive", "_xta_native_review_support",
+          "ExportXTAEdits")
 SCOPE_STATEMENTS = ("_XTA_EDIT_SCOPE_LABELS", "_XTA_STORE_EDIT_SCOPE_LABELS", "_XTA_EDIT_SCOPE_BUTTONS",
                     "_xta_edit_scope", "_xta_store_edit_scope")
 CLOCK = itertools.count(1)
@@ -662,6 +664,8 @@ def open_review(h, path, **kwargs):
 
 @pytest.mark.parametrize("blank_segment", [False, True])
 def test_importer_chooses_native_review_for_geometryless_placeholder(ui, tmp_path, blank_segment):
+    from XTA.review_archive import ReviewLayer, write_review_archive
+
     h = ui
     placeholder = h.scene.AddNewNodeByClass("vtkMRMLSegmentationNode", "Segmentation")
     if blank_segment:
@@ -669,6 +673,12 @@ def test_importer_chooses_native_review_for_geometryless_placeholder(ui, tmp_pat
         segment.AddRepresentation(BINARY, Image())
         placeholder.GetSegmentation().AddSegment(segment, "Segment_1")
     archive = tmp_path / "review.xtareview"
+    geometry = dict(space="left-posterior-superior", directions_xyz=np.eye(3).tolist(), origin_xyz=(0, 0, 0))
+    shape = (2, 3, 4)
+    row = dict(logical_id="global", cutoff_cent=90, role="global")
+    write_review_archive(archive, review_id="native", grid_id="native", shape_tyx=shape, native_shape_tyx=shape,
+                         geometry=geometry, cutoffs_cent=(90,),
+                         layers=(ReviewLayer(row, lambda a, b: np.zeros((b-a, *shape[1:]), bool)),))
     used = []
     opened = object()
     h["_xta_choose_review_manifest"] = lambda: archive
@@ -683,6 +693,60 @@ def test_importer_chooses_native_review_for_geometryless_placeholder(ui, tmp_pat
     assert used == [(archive, {"volume_node": volume, "cutoff_cent": 90, "max_working_mib": 64})]
     assert placeholder in h.scene.nodes
     assert placeholder.GetSegmentation().GetNumberOfSegments() == int(blank_segment)
+
+
+def test_importer_and_exporter_use_full_field_preview_archive(ui, tmp_path):
+    from XTA.native_review_store import NativeReviewStore
+    from XTA.review_archive import ReviewLayer, write_review_archive
+
+    h = ui
+    archive = tmp_path / "preview.xtareview"
+    shape = (3, 5, 9)
+    geometry = dict(space="left-posterior-superior", directions_xyz=np.eye(3).tolist(), origin_xyz=(0, 0, 0))
+    lower = np.zeros(shape, np.uint8)
+    lower[1, 2, 2:5] = 1
+    higher = lower.copy()
+    higher[2, 4, 8] = 1
+    layers = []
+    for cutoff, mask in ((80, lower), (90, higher)):
+        for lid, role in (("radial", "direct"), ("global", "global")):
+            row = dict(logical_id=lid, cutoff_cent=cutoff, role=role, segment_name=lid)
+            layers.append(ReviewLayer(row, lambda a, b, m=mask: m[a:b]))
+    write_review_archive(archive, review_id="preview", grid_id=LOW, shape_tyx=shape, native_shape_tyx=(6, 10, 18),
+                         geometry=geometry, cutoffs_cent=(80, 90), layers=layers,
+                         source_record={"source_stem": "sample"})
+    review = h["ImportXTASegments"](archive, cutoff_cents=90)
+    assert review.plan.shape == shape and review.cutoff == 90
+    assert set(review.store.layers) == {"radial", "global"}
+    np.testing.assert_array_equal(working_masks(h, review)["radial"], higher)
+    h["_xta_store_sync_erase"](review.store, "global", review.k0, np.array([[2, 4, 8]]))
+    review.apply_store_changes(review.store.last_changed_boxes)
+    output = tmp_path / "edited"
+    h["ExportXTAEdits"](archive, output, cutoff_cents=90)
+    with NativeReviewStore(output / "preview.xtareview") as edited:
+        assert edited.cutoffs == (90,) and tuple(edited.layers) == ("global",)
+        np.testing.assert_array_equal(edited.read_region("global", 90, tuple((0, n) for n in shape)), lower)
+    np.testing.assert_array_equal(working_masks(h, review)["radial"], higher)
+
+
+def test_scalar_archive_cutoff_picker_labels_exact_confidence(ui, tmp_path):
+    from XTA.review_archive import ReviewLayer, write_review_archive
+
+    archive = tmp_path / "scalar.xtareview"
+    shape = (3, 5, 7)
+    geometry = dict(space="left-posterior-superior", directions_xyz=np.eye(3).tolist(), origin_xyz=(0, 0, 0))
+    row = dict(logical_id="global", cutoff_cent=0, role="global")
+    write_review_archive(archive, review_id="scalar", grid_id=LOW, shape_tyx=shape, native_shape_tyx=shape,
+                         geometry=geometry, cutoffs_cent=(0,),
+                         layers=(ReviewLayer(row, lambda a, b: np.ones((b-a, *shape[1:]), bool)),),
+                         source_record={"confidence_threshold_exact": 0.333})
+    review = ui["ImportXTASegments"](archive)
+    assert review.cutoff == 0
+    assert any("displaying 0.333" in text for text in ui.record["statuses"])
+    prompts = ui.interactive([0])
+    assert ui["SelectReviewCutoff"]() == 0
+    assert prompts[0][1][0] == "0.333"
+    assert all("0.00" not in label for label in prompts[0][1])
 
 
 def test_importer_cancel_preserves_empty_segment_editor_node(ui):

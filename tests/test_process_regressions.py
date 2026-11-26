@@ -36,11 +36,6 @@ class _DetachHandle:
         return int(self.fd)
 
 
-class _BrokenDetachHandle:
-    def detach(self) -> int:
-        raise RuntimeError('detach failure sentinel')
-
-
 class _SubmitFailureExecutor:
     def submit(self, _function: object, **kwargs: object) -> object:
         stage = np.memmap(
@@ -86,6 +81,13 @@ class _FailingAuxPool:
 
 
 class ProcessRuntimeRegressionTests(unittest.TestCase):
+    def aux_pool(self, queues):
+        from tests.native_stage_test_support import native_coordinator
+        coordinator = native_coordinator(self)
+        coordinator.configure_workers(tuple(queues))
+        coordinator.set_inference_priority_active(False)
+        return runtime._GpuWorkerAuxInterpolationPool(queues)
+
     def tearDown(self) -> None:
         runtime.set_interpolation_process_executor(None, 0)
         runtime.set_gpu_worker_aux_interpolation_pool(None)
@@ -141,7 +143,7 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
         events = []
         with tempfile.TemporaryFile() as data:
             descriptor = os.dup(data.fileno())
-            pool = runtime._GpuWorkerAuxInterpolationPool({
+            pool = self.aux_pool({
                 0: types.SimpleNamespace(put=mock.Mock(side_effect=RuntimeError('queue closed'))),
             })
             kwargs = {'mask_path': 'test-owner'}
@@ -165,7 +167,7 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
 
     def test_aux_interpolation_does_not_transfer_after_pool_invalidates_preflight_reservation(self) -> None:
         task_queue = mock.Mock()
-        pool = runtime._GpuWorkerAuxInterpolationPool({0: task_queue})
+        pool = self.aux_pool({0: task_queue})
         pool.enable_worker(0)
         with mock.patch.object(runtime, 'preflight_multiprocessing_payload',
                                side_effect=lambda _: pool.mark_failed('worker exited')), \
@@ -177,7 +179,7 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
     def test_aux_failure_rolls_back_committed_descriptor(self) -> None:
         with tempfile.TemporaryFile() as data:
             descriptor = os.dup(data.fileno())
-            pool = runtime._GpuWorkerAuxInterpolationPool({0: mock.Mock()})
+            pool = self.aux_pool({0: mock.Mock()})
             pool.enable_worker(0)
             with mock.patch.object(runtime, '_duplicate_memfd_path_for_child',
                                    return_value=_DetachHandle(descriptor)):
@@ -301,157 +303,12 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
                         self.fail('interpolation failure did not propagate')
         self.assertFalse(original.any())
 
-    def test_partial_memfd_materialization_closes_detached_descriptors(self) -> None:
-        first_fd, first_writer = os.pipe()
-        os.close(first_writer)
-        task = {
-            'result_mask_fd': _DetachHandle(first_fd),
-            'result_mask_fd_key': 'first',
-            'result_conf_fd': _BrokenDetachHandle(),
-            'result_conf_fd_key': 'second',
-        }
-        with self.assertRaisesRegex(RuntimeError, 'detach failure sentinel'):
-            runtime._materialize_worker_task_memfd_paths(task, {})
-        with self.assertRaises(OSError):
-            os.fstat(first_fd)
-
-    def test_policy_memfd_attachment_copies_every_nested_dispatch_dictionary(self) -> None:
-        grandchild = {'result_mask_path': 'grandchild-mask'}
-        child = {
-            'source_volume_path': 'source',
-            'result_mask_path': 'policy-mask',
-            'result_conf_path': 'policy-conf',
-            'canvas_path': 'policy-canvas',
-            'd1_bitset_path': 'policy-bitset',
-            'native_resize': {'path': 'native-source'},
-            'augmentation_pass_tasks': [grandchild],
-        }
-        canonical = {
-            'result_mask_path': 'base-mask',
-            'augmentation_pass_tasks': [child],
-        }
-        first, second = dict(canonical), dict(canonical)
-        with mock.patch.object(runtime, '_duplicate_memfd_path_for_child',
-                               side_effect=lambda path: object() if path is not None else None):
-            runtime._attach_memfd_transfers_to_task(first)
-            runtime._attach_memfd_transfers_to_task(second)
-        for dispatch in (first, second):
-            copied = dispatch['augmentation_pass_tasks'][0]
-            self.assertIsNot(dispatch['augmentation_pass_tasks'], canonical['augmentation_pass_tasks'])
-            self.assertIsNot(copied, child)
-            self.assertIsNot(copied['native_resize'], child['native_resize'])
-            self.assertIsNot(copied['augmentation_pass_tasks'][0], grandchild)
-            for path_field, handle_field in (
-                ('source_volume_path', 'source_volume_fd'),
-                ('result_mask_path', 'result_mask_fd'),
-                ('result_conf_path', 'result_conf_fd'),
-                ('canvas_path', 'canvas_fd'),
-                ('d1_bitset_path', 'd1_bitset_fd'),
-            ):
-                self.assertIn(handle_field, copied)
-                self.assertEqual(copied[f'{handle_field}_key'], child[path_field])
-                self.assertNotIn(handle_field, child)
-            self.assertEqual(copied['native_resize']['path_fd_key'], 'native-source')
-            self.assertNotIn('path_fd', child['native_resize'])
-            self.assertIn('result_mask_fd', copied['augmentation_pass_tasks'][0])
-            self.assertNotIn('result_mask_fd', grandchild)
-        self.assertIsNot(first['augmentation_pass_tasks'][0]['result_mask_fd'],
-                         second['augmentation_pass_tasks'][0]['result_mask_fd'])
-        self.assertNotIn('result_mask_fd', canonical)
-
-    def _read_descriptor(self) -> int:
-        reader, writer = os.pipe()
-        os.close(writer)
-        self.addCleanup(runtime._close_fd_list, [reader])
-        return reader
-
-    def test_policy_memfd_materialization_returns_all_result_fds_and_reuses_sources(self) -> None:
-        source_fd, repeated_source_fd = self._read_descriptor(), self._read_descriptor()
-        native_fd, repeated_native_fd = self._read_descriptor(), self._read_descriptor()
-        result_fds = [self._read_descriptor() for _ in range(5)]
-        grandchild = {'result_mask_fd': _DetachHandle(result_fds[4]),
-                      'result_mask_path': 'grandchild-mask'}
-        child = {
-            'source_volume_fd': _DetachHandle(repeated_source_fd), 'source_volume_fd_key': 'source',
-            'result_mask_fd': _DetachHandle(result_fds[1]), 'result_mask_path': 'policy-mask',
-            'result_conf_fd': _DetachHandle(result_fds[2]), 'result_conf_path': 'policy-conf',
-            'canvas_fd': _DetachHandle(result_fds[3]), 'canvas_path': 'policy-canvas',
-            'native_resize': {'path': 'native-source', 'path_fd': _DetachHandle(repeated_native_fd)},
-            'augmentation_pass_tasks': [grandchild],
-        }
-        incoming = {
-            'source_volume_fd': _DetachHandle(source_fd), 'source_volume_fd_key': 'source',
-            'result_mask_fd': _DetachHandle(result_fds[0]),
-            'native_resize': {'path': 'native-source', 'path_fd': _DetachHandle(native_fd)},
-            'augmentation_pass_tasks': [child],
-        }
-        local = dict(incoming)
-        persistent = {}
-        transient = runtime._materialize_worker_task_memfd_paths(local, persistent)
-        self.assertEqual(transient, result_fds)
-        self.assertEqual(persistent, {'source': source_fd, 'native-source': native_fd})
-        copied = local['augmentation_pass_tasks'][0]
-        self.assertEqual(copied['source_volume_path'], local['source_volume_path'])
-        self.assertEqual(copied['native_resize']['path'], local['native_resize']['path'])
-        for holder, field, fd in (
-            (local, 'result_mask_path', result_fds[0]),
-            (copied, 'result_mask_path', result_fds[1]),
-            (copied, 'result_conf_path', result_fds[2]),
-            (copied, 'canvas_path', result_fds[3]),
-            (copied['augmentation_pass_tasks'][0], 'result_mask_path', result_fds[4]),
-        ):
-            self.assertEqual(holder[field], str(runtime._memfd_proc_path(fd, owner_pid=os.getpid())))
-            os.fstat(fd)
-        self.assertEqual(child['result_mask_path'], 'policy-mask')
-        self.assertEqual(child['native_resize']['path'], 'native-source')
-        self.assertEqual(grandchild['result_mask_path'], 'grandchild-mask')
-        self.assertIn('result_mask_fd', child)
-        self.assertIn('result_mask_fd', grandchild)
-        for fd in (repeated_source_fd, repeated_native_fd):
-            with self.assertRaises(OSError):
-                os.fstat(fd)
-        runtime._close_fd_list(transient)
-        for fd in result_fds:
-            with self.assertRaises(OSError):
-                os.fstat(fd)
-        os.fstat(source_fd)
-        os.fstat(native_fd)
-
-    def test_policy_memfd_failure_rolls_back_whole_group_and_preserves_existing_sources(self) -> None:
-        cached_fd = self._read_descriptor()
-        source_duplicate = self._read_descriptor()
-        new_source, new_native = self._read_descriptor(), self._read_descriptor()
-        result_fds = [self._read_descriptor() for _ in range(3)]
-        child = {
-            'source_volume_fd': _DetachHandle(new_source), 'source_volume_fd_key': 'new-source',
-            'result_mask_fd': _DetachHandle(result_fds[1]), 'result_mask_path': 'policy-mask',
-            'native_resize': {'path': 'new-native', 'path_fd': _DetachHandle(new_native)},
-            'augmentation_pass_tasks': [{
-                'result_mask_fd': _DetachHandle(result_fds[2]),
-                'result_conf_fd': _BrokenDetachHandle(),
-            }],
-        }
-        local = {
-            'source_volume_fd': _DetachHandle(source_duplicate), 'source_volume_fd_key': 'cached',
-            'result_mask_fd': _DetachHandle(result_fds[0]),
-            'augmentation_pass_tasks': [child],
-        }
-        persistent = {'cached': cached_fd}
-        with self.assertRaisesRegex(RuntimeError, 'detach failure sentinel'):
-            runtime._materialize_worker_task_memfd_paths(local, persistent)
-        self.assertEqual(persistent, {'cached': cached_fd})
-        os.fstat(cached_fd)
-        for fd in (source_duplicate, new_source, new_native, *result_fds):
-            with self.assertRaises(OSError):
-                os.fstat(fd)
-        self.assertEqual(child['result_mask_path'], 'policy-mask')
-        self.assertEqual(child['native_resize']['path'], 'new-native')
-        self.assertIn('result_mask_fd', child)
-
     @unittest.skipUnless(hasattr(os, 'memfd_create') and Path('/proc/self/fd').exists(),
                          'real memfd descriptor transfer requires Linux procfs')
     def test_policy_memfd_transfers_reopen_independent_parent_arrays(self) -> None:
         shape = (2, 3, 4)
+        from XTA.native_detector_handles import install_detector_handles
+        from tests.test_memfd_source_reuse import native_dispatch
         owners, reopened, transient, persistent = [], [], [], {}
         try:
             with mock.patch.dict(os.environ, {'YOLO_TTA_MEMFD_WORKSPACES': '1'}):
@@ -460,10 +317,8 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
                         shape, np.uint8, f'policy-transfer-{index}', initialize_zero=True))
             members = _policy_memfd_transfer_members(owners)
             members[0]['augmentation_pass_tasks'] = members[1:]
-            dispatch = dict(members[0])
-            runtime._attach_memfd_transfers_to_task(dispatch)
-            local = dict(dispatch)
-            transient = runtime._materialize_worker_task_memfd_paths(local, persistent)
+            with native_dispatch(members[0]) as (local, received):
+                transient = install_detector_handles(local, persistent, received)
             self.assertEqual(len(transient), 6)
             self.assertEqual(len(persistent), 1)
             for index, member in enumerate((local, *local['augmentation_pass_tasks'])):
@@ -491,6 +346,30 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
             runtime._close_fd_list(persistent.values())
             for owner in owners:
                 runtime.close_memmap_array_without_flush(owner)
+
+    @unittest.skipUnless(hasattr(os, 'memfd_create'), 'Linux interpolation descriptor broker')
+    def test_interpolation_sharer_rollback_releases_registered_descriptor(self):
+        descriptor = os.memfd_create('interpolation-rollback', flags=os.MFD_CLOEXEC)
+        path = str(runtime._memfd_proc_path(descriptor))
+        runtime._register_memfd_owner(path, descriptor, 'interpolation rollback')
+        try:
+            for _ in range(20):
+                batch = runtime._attach_interpolation_memfd_transfer({'mask_path': path})
+                self.assertEqual(len(batch.handles), 1)
+                batch.rollback()
+                batch.rollback()
+            expected = os.fstat(descriptor)
+            remaining = []
+            for entry in Path('/proc/self/fd').iterdir():
+                try:
+                    current = entry.stat()
+                except FileNotFoundError:
+                    continue
+                if (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino):
+                    remaining.append(int(entry.name))
+            self.assertEqual(remaining, [descriptor])
+        finally:
+            runtime._release_memfd_owner_key(path)
 
     def _run_interpolation_case(self, executor: object) -> tuple[np.memmap, np.ndarray, dict[str, object], Path]:
         temp_context = tempfile.TemporaryDirectory()
@@ -633,7 +512,7 @@ class ProcessRuntimeRegressionTests(unittest.TestCase):
                 self.items.append(item)
 
         task_queue = _Queue()
-        pool = runtime._GpuWorkerAuxInterpolationPool({0: task_queue})
+        pool = self.aux_pool({0: task_queue})
         self.assertTrue(pool.enable_worker(0))
         handle = pool.try_submit({'unpickleable': lambda: None})
         self.assertIsNone(handle)

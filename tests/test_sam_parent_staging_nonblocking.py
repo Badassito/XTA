@@ -87,7 +87,9 @@ def test_cancelled_unstarted_raw_restore_never_opens_or_calls_prepare(tmp_path, 
     future = next(iter(resumed))
     assert future.cancel()
     prepare.finish()
-    stage.pump()
+    with pytest.raises(CancelledError, match='preparation cancelled'):
+        stage.pump()
+    assert stage._dense_owner.failed
     assert key not in leases.leases and not stage.restore_futures
     assert task.calls == 0 and task.union_mm is None
     stage.close()

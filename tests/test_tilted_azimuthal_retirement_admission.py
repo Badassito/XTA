@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from itertools import permutations
+import queue
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from XTA import backprojection as bp
+from XTA import backprojection as bp, runtime
+from tests.native_stage_test_support import native_coordinator, configure_stage_timing, wait_stage
 
 
 class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
@@ -23,8 +26,9 @@ class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
             device=lambda token: token)
 
     def coordinator(self, *, backlog, pressure, queued=0):
-        result = bp._MainProcessGpuStageCoordinator()
+        result = native_coordinator(self)
         result.configure_workers([0, 1, 2, 3])
+        configure_stage_timing(result, expiry=1., age=.04, handoff=.15)
         result.set_pending_inference_backlog(backlog)
         result.set_spherical_retirement_pressure(pressure)
         for worker in range(4):
@@ -55,15 +59,16 @@ class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
         coordinator.set_inference_asset_retirement_pending(True)
         self.assertIsNone(self.acquire(coordinator, purpose, 0))
         coordinator.set_inference_asset_retirement_pending(False)
-        with mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool',
-                               return_value=SimpleNamespace(
-                                   claim_worker_for_stage=lambda _device: None,
-                                   release_stage_claim=lambda _device, _token: None)):
-            self.assertIsNone(self.acquire(coordinator, purpose, 0))
+        pool = runtime._GpuWorkerAuxInterpolationPool({0: queue.SimpleQueue()})
+        self.assertTrue(pool.enable_worker(0))
+        handle = pool.try_submit({'fixture': True})
+        self.assertIsNotNone(handle)
+        self.assertIsNone(self.acquire(coordinator, purpose, 0))
+        pool.complete(handle['task_id'], 0, True, {}, None)
 
     def test_all_three_families_share_fifo_and_one_two_turn_burst(self):
         for families in permutations(('Native', 'Radial', 'Spherical')):
-            with self.subTest(order=families), mock.patch.object(bp.time, 'monotonic', return_value=10.):
+            with self.subTest(order=families):
                 coordinator = self.coordinator(backlog=True, pressure=True, queued=2)
                 names = [f'{family} source projection {index}' for index, family in enumerate(families)]
                 for name in names:
@@ -88,28 +93,27 @@ class TiltedAzimuthalRetirementAdmissionTests(unittest.TestCase):
                 coordinator.finish_inference(0)
 
     def test_tilted_reader_ages_then_hands_off_to_radial_below_pressure(self):
-        with mock.patch.object(bp.time, 'monotonic', return_value=10.) as clock:
-            coordinator = self.coordinator(backlog=True, pressure=False, queued=2)
-            names = ['Native source projection aged', 'Radial source projection aged',
-                     'Spherical source projection aged']
-            for name in names:
-                self.assertIsNone(self.acquire(coordinator, name))
-            clock.return_value = 35.
-            for name in reversed(names):
-                self.assertIsNone(self.acquire(coordinator, name))
-            clock.return_value = 40.
-            self.assertIsNone(self.acquire(coordinator, names[2]))
-            coordinator.finish_inference(0)
-            coordinator.finish_inference(0)
-            first = self.acquire(coordinator, names[0])
-            self.assertEqual(first.device_index, 0)
-            first.release()
-            second = self.acquire(coordinator, names[1])
-            self.assertEqual(second.device_index, 0)
-            second.release()
-            self.assertEqual(coordinator.snapshot()['spherical_retirement_aged_acquisitions'], 2)
-            self.assertIsNone(self.acquire(coordinator, names[2]))
-            self.assertTrue(coordinator.begin_inference(0))
+        coordinator = self.coordinator(backlog=True, pressure=False, queued=2)
+        names = ['Native source projection aged', 'Radial source projection aged',
+                 'Spherical source projection aged']
+        for name in names:
+            self.assertIsNone(self.acquire(coordinator, name))
+        for name in reversed(names):
+            self.assertIsNone(self.acquire(coordinator, name))
+        wait_stage(coordinator, lambda state: state['spherical_retirement_reserved_device'] is not None)
+        time.sleep(.015)
+        self.assertIsNone(self.acquire(coordinator, names[2]))
+        coordinator.finish_inference(0)
+        coordinator.finish_inference(0)
+        first = self.acquire(coordinator, names[0])
+        self.assertEqual(first.device_index, 0)
+        first.release()
+        second = self.acquire(coordinator, names[1])
+        self.assertEqual(second.device_index, 0)
+        second.release()
+        self.assertEqual(coordinator.snapshot()['spherical_retirement_aged_acquisitions'], 2)
+        self.assertIsNone(self.acquire(coordinator, names[2]))
+        self.assertTrue(coordinator.begin_inference(0))
 
     def test_classifier_requires_exact_source_projection_prefixes(self):
         classifier = bp._MainProcessGpuStageCoordinator._is_source_projection_retirement

@@ -1,5 +1,12 @@
 # Native-window cleanup in 3D Slicer
 
+An archive produced with `--save low_quality:0.20:xtareview` opens in the
+full-field cutoff editor through **Importer**, **Add Data**, or
+`OpenXTAReview`. It retains independent preview masks and an edit log beside
+the archive. **Export XTA Edits** writes a `preview.xtareview` snapshot of the
+edited Global for PTA preparation. Native archives use the window editor
+described below.
+
 Use this workflow to clean a managed TTA sweep at its original voxel resolution.
 An `.xtareview` file holds the exact masks by view, cutoff and spatial block.
 Slicer opens a navigation overview and presents the neighborhood around the

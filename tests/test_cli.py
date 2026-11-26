@@ -12,11 +12,12 @@ from pathlib import Path
 from unittest import mock
 
 from XTA import __version__, cli
+from XTA.config import SaveRequest
 from XTA.unification.context import current_unified_launch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / f"Opus-5.5_v{__version__}_SLURM.py"
+LAUNCHER = ROOT / cli.SCRIPT_BASENAME
 
 
 class CliTests(unittest.TestCase):
@@ -192,7 +193,7 @@ class CliTests(unittest.TestCase):
                 sweep.assert_called_once_with(
                     arguments, cutoffs_hundredths=(50, 60, 70),
                     output_root=Path("review"), temp_root=Path("work"), min_conf=0.2,
-                    save_options=("summary", "voxel_volume"),
+                    save_request=SaveRequest(("summary", "voxel_volume")),
                 )
                 scalar.assert_not_called()
 

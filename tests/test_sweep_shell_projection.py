@@ -1,6 +1,8 @@
 """Numeric shell mode, compact transfer and crop-reader ownership contracts."""
 from __future__ import annotations
 
+from tests.native_stage_test_support import native_stage_context
+
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -319,7 +321,7 @@ def test_sparse_numeric_device_credit_declines_before_any_cuda_array_allocation(
                    reason='Coordinated actual-GPU qualification required')
 @pytest.mark.parametrize('view',_views(),ids=lambda v:v.name)
 def test_actual_shell_rank_crops_match_scalar_masks(tmp_path,monkeypatch,view):
-    coordinator=backprojection._MainProcessGpuStageCoordinator()
+    coordinator=backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     coordinator.configure_workers([0]); coordinator.set_pending_inference_backlog(False)
     coordinator.set_inference_priority_active(False)
     monkeypatch.setattr(backprojection,'_MAIN_PROCESS_GPU_STAGE_COORDINATOR',coordinator)

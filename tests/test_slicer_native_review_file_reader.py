@@ -21,7 +21,7 @@ def test_reader_reuses_same_archive_and_preserves_other_active_review(tmp_path, 
         return view
 
     monkeypatch.setitem(sys.modules, "__main__", SimpleNamespace(
-        OpenXTANativeReview=open_review,
+        OpenXTAReview=open_review,
         _xta_current_native_window=lambda: active[-1] if active else None,
     ))
     monkeypatch.setitem(sys.modules, "vtk", SimpleNamespace(vtkCommand=SimpleNamespace(ErrorEvent=13)))
@@ -40,6 +40,20 @@ def test_reader_reuses_same_archive_and_preserves_other_active_review(tmp_path, 
     assert len(active) == 1
     assert messages[0][0] == 13
     assert "CloseXTANativeReview()" in messages[0][1]
+
+
+def test_reader_returns_both_full_field_working_nodes(tmp_path, monkeypatch):
+    archive = tmp_path / "preview.xtareview"
+    archive.touch()
+    nodes = [SimpleNamespace(GetID=lambda: "layers"), SimpleNamespace(GetID=lambda: "global")]
+    monkeypatch.setitem(sys.modules, "__main__", SimpleNamespace(
+        OpenXTAReview=lambda path: SimpleNamespace(nodes=nodes), _xta_current_native_window=lambda: None,
+    ))
+    monkeypatch.setitem(sys.modules, "vtk", SimpleNamespace(vtkCommand=SimpleNamespace(ErrorEvent=13)))
+    parent = SimpleNamespace(loadedNodes=[])
+    reader = startup.XTANativeReviewIOFileReader(parent)
+    assert reader.load({"fileName": str(archive)})
+    assert parent.loadedNodes == ["layers", "global"]
 
 
 def test_registered_reader_shim_is_private_and_install_is_idempotent(tmp_path, monkeypatch):

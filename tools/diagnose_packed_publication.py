@@ -136,28 +136,23 @@ def _make_cases(np) -> list:
     return cases
 
 
-def _dispatcher_evidence(dispatcher, output: Path, label: str) -> dict:
-    result = {'signatures': list(map(str, dispatcher.signatures)),
-              'target_options': dict(dispatcher.targetoptions),
-              'cache_hits': str(dispatcher._cache_hits),
-              'cache_misses': str(dispatcher._cache_misses), 'overloads': []}
-    for index, (signature, compiled) in enumerate(dispatcher.overloads.items()):
-        descriptor = compiled.fndesc
-        item = {'signature': str(signature), 'objectmode': bool(compiled.objectmode),
-                'native_name': descriptor.llvm_func_name,
-                'cpython_wrapper_name': descriptor.llvm_cpython_wrapper_name}
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
-            try:
-                llvm = dispatcher.inspect_llvm(signature)
-                llvm_path = output / f'{label}-{index}.ll'
-                llvm_path.write_text(llvm, encoding='utf-8')
-                item['llvm'] = _file_info(llvm_path)
-                item['unpack_tuple_occurrences'] = llvm.count('PyArg_UnpackTuple')
-            except Exception as error:
-                item['llvm_error'] = repr(error)
-            item['inspection_warnings'] = [str(w.message) for w in caught]
-        result['overloads'].append(item)
+def _callback_evidence(callback, output: Path, label: str) -> dict:
+    if callback is None:
+        return {'compiled': False}
+    result = {'compiled': True, 'abi': 'cfunc', 'signature': str(callback._sig),
+              'native_name': callback.native_name, 'cache_hits': int(callback._cache_hits)}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        try:
+            llvm = callback.inspect_llvm()
+            llvm_path = output / f'{label}.ll'
+            llvm_path.write_text(llvm, encoding='utf-8')
+            result['llvm'] = _file_info(llvm_path)
+            result['definition_available'] = f'@{callback.native_name}(' in llvm
+            result['unpack_tuple_occurrences'] = llvm.count('PyArg_UnpackTuple')
+        except Exception as error:
+            result['llvm_error'] = repr(error)
+        result['inspection_warnings'] = [str(w.message) for w in caught]
     return result
 
 
@@ -205,8 +200,9 @@ def _worker(output: Path, cache: Path, workers: int, repeat: int) -> dict:
         result['traceback'] = traceback.format_exc()
     finally:
         result['elapsed_seconds'] = time.perf_counter() - started
-        result['metadata_dispatcher'] = _dispatcher_evidence(packed._packed_owner_metadata, output, 'metadata')
-        result['encoder_dispatcher'] = _dispatcher_evidence(packed._packed_owner_encode, output, 'encoder')
+        metadata, encoder = packed._kernels or (None, None)
+        result['metadata_callback'] = _callback_evidence(metadata, output, 'metadata')
+        result['encoder_callback'] = _callback_evidence(encoder, output, 'encoder')
         result['gpu_modules_imported'] = [name for name in GPU_MODULES if name in sys.modules]
         if result['gpu_modules_imported']:
             result['status'] = 'failed'
@@ -303,8 +299,8 @@ def main(argv=None) -> int:
         if result['status'] == 'passed':
             # A warm test is useful only if it really reloaded both saved kernels.
             warm = runs['warm_threaded']['result']
-            if any(warm[name]['cache_hits'] == 'Counter()'
-                   for name in ('metadata_dispatcher', 'encoder_dispatcher')):
+            if any(warm[name].get('cache_hits', 0) < 1
+                   for name in ('metadata_callback', 'encoder_callback')):
                 result['status'] = 'failed'
                 result['validation_error'] = 'Warm process did not reuse both compiled kernels'
         _write(output / 'result.json', result)

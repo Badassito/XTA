@@ -1,7 +1,8 @@
 """Release completed parent canvases while shared SAM awaits detector retirement.
 
 Checkpoints live on ordinary disk, retain exact numeric bytes, and own no dense
-mapping while deferred. Resumed preparation receives a fresh dense reservation.
+mapping while deferred. Resumed preparation receives a fresh reservation from
+the run's native dense owner; local bookkeeping never grants extra capacity.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ from contextlib import contextmanager, nullcontext
 from concurrent.futures import CancelledError, Future
 import os
 import errno
+import queue
 from pathlib import Path
 from types import MappingProxyType
 import shutil
@@ -359,6 +361,17 @@ class ParentCheckpoint:
     codec_fallback_bytes: int = 0
 
 
+@dataclass
+class _NativeRestoreGrant:
+    """One immutable request identity; its native owner alone grants bytes."""
+    namespace: tuple
+    owner: object
+    nbytes: int
+    allow_oversize: bool = False
+    lease: object = None
+    state: str = 'Pending'
+
+
 def _validate_owner(array):
     value = np.asanyarray(array)
     if value.ndim != 3 or value.dtype.hasobject or value.dtype.kind not in 'buifc' or not value.flags.c_contiguous:
@@ -620,11 +633,11 @@ def _cheap_overflow_shares_turns():
 
 
 class DeferredSamParentQueue:
-    """Scheduler-thread queue with a bounded RAM backlog and no SAM waits."""
+    """Scientific staging actor; native grants fund every new dense restore."""
 
     def __init__(self, *, temp_dir, output_dir, checkpoint_executor, prepare_executor,
                  leases, dense_limit, ready, bounded_parent_keys=(),
-                 prepare_workers=None, prepare_view_families=()):
+                 prepare_workers=None, prepare_view_families=(), dense_owner=None):
         self.root = select_checkpoint_root(temp_dir, output_dir)
         self.source_root = Path(temp_dir)
         self._checkpoint_root_identity = _stat_identity(self.root)[:2]
@@ -638,6 +651,14 @@ class DeferredSamParentQueue:
         self.leases = leases
         self._dense_limit = dense_limit
         self.ready = ready
+        # The pipeline constructs staging before its scientific scheduler facade.
+        # Resolve the one run-owned native ledger only when a restore is requested.
+        # There is deliberately no independent Python capacity owner or fallback.
+        self._dense_owner = dense_owner
+        self._native_restore_grants = {}
+        self._native_restore_sequence = 0
+        self._native_restore_events = queue.SimpleQueue()
+        self._native_restore_failure = None
         self.bounded_parent_keys = bounded_parent_keys
         if prepare_workers is not None and int(prepare_workers) < 1:
             raise ValueError('SAM parent preparation workers must be positive')
@@ -670,7 +691,91 @@ class DeferredSamParentQueue:
         self._prepare_cpu_scan_order = []
         self._prepare_cpu_first = False
         self._prepare_denials = dict(worker_limit=0, cheap_lane=0, parent_condition=0,
-                                    dense_limit=0, startup_headroom=0)
+                                    dense_limit=0, startup_headroom=0, native_dense=0)
+
+    def _request_native_restore(self, key, nbytes, *, allow_oversize=False, admission_reserve=0):
+        request = self._native_restore_grants.get(key)
+        if request is None:
+            owner = self._dense_owner() if callable(self._dense_owner) else self._dense_owner
+            if owner is None:
+                raise RuntimeError('SAM parent restore requires the run native dense owner')
+            self._native_restore_sequence += 1
+            request = _NativeRestoreGrant(
+                ('sam_restore', id(self), self._native_restore_sequence), owner, int(nbytes),
+                bool(allow_oversize))
+            funded = request.owner.request_host_workspace(
+                key, request.nbytes, namespace=request.namespace,
+                allow_oversize=request.allow_oversize, admission_reserve=int(admission_reserve))
+            # A failed native declaration created no request to fail/retire.
+            # In particular, abort must not obscure its original refusal with
+            # an "unrequested host failure" while cleaning up the queue.
+            self._native_restore_grants[key] = request
+            return funded
+        if request.nbytes != int(nbytes) or request.lease is not None:
+            raise RuntimeError('SAM parent restore request changed while awaiting native admission')
+        return request.owner.request_host_workspace(
+            key, request.nbytes, namespace=request.namespace,
+            allow_oversize=request.allow_oversize, admission_reserve=int(admission_reserve))
+
+    def _bind_native_restore(self, key, lease):
+        request = self._native_restore_grants[key]
+        request.owner.host_workspace_bound(key, namespace=request.namespace, owner=lease)
+        request.lease = lease
+        request.state = 'Bound'
+
+    def _native_restore_event(self, state, key, lease, error=None):
+        # Scientific workers report facts; only pump mutates the facade/ledger.
+        self._native_restore_events.put((state, key, lease, error))
+        request = self._native_restore_grants.get(key)
+        if request is not None:
+            request.owner.wake_scheduler()
+
+    def _watch_native_restore(self, future, key, lease):
+        def finished(done):
+            error = (CancelledError('SAM parent preparation cancelled') if done.cancelled()
+                     else done.exception())
+            if error is not None:
+                self._native_restore_event('Failed', key, lease, error)
+        future.add_done_callback(finished)
+
+    def _run_funded_prepare(self, task, key, lease):
+        # A compact-shadow parent has no dense input to restore. Its reservation
+        # funds the scientific task's allocations. Its already sealed input is
+        # ready at actor entry; this is not completion of the subsequent SAM job.
+        if self.stop.is_set():
+            raise CancelledError('SAM parent preparation cancelled before input readiness')
+        self._native_restore_event('Ready', key, lease)
+        return task()
+
+    def _run_funded_ready_prepare(self, task, key, lease, future):
+        self._run_ready_prepare(lambda: self._run_funded_prepare(task, key, lease), future)
+
+    def _drain_native_restore_events(self):
+        while True:
+            try:
+                state, key, lease, error = self._native_restore_events.get_nowait()
+            except queue.Empty:
+                break
+            request = self._native_restore_grants.get(key)
+            if request is None or request.lease is not lease:
+                continue  # A replaced generation cannot mutate its successor.
+            if state == 'Failed':
+                if request.state != 'Failed':
+                    request.state = 'Failed'
+                    self._native_restore_failure = error
+                    request.owner.host_workspace_failed(key, error, namespace=request.namespace)
+            elif state == 'Ready' and request.state == 'Bound':
+                request.owner.host_workspace_adopted(key, namespace=request.namespace, owner=lease)
+                request.state = 'Ready'
+        for key, request in tuple(self._native_restore_grants.items()):
+            lease = request.lease
+            if (request.state == 'Ready' and lease.phase == 'released' and lease.owner_count == 0
+                    and self.leases.leases.get(key) is not lease):
+                # This is the existing alias-aware last-owner receipt, never a
+                # request to close a map or the completion of SAM computation.
+                request.owner.host_workspace_retired(key, namespace=request.namespace, owner=lease)
+                request.state = 'Retired'
+                del self._native_restore_grants[key]
 
     @staticmethod
     def _cpu_prepare_family(family):
@@ -875,6 +980,12 @@ class DeferredSamParentQueue:
         del self.ready_prepares[key]
         self._forget_prepare(key)
         self._release_cpu_protection(key)
+        request = self._native_restore_grants.get(key)
+        if request is not None and request.state != 'Failed':
+            error = CancelledError('SAM ready parent cancelled while awaiting native admission')
+            request.state = 'Failed'
+            self._native_restore_failure = error
+            request.owner.host_workspace_failed(key, error, namespace=request.namespace)
         return True
 
     def _prepare_admitted(self, key, record, *, cpu_prepare):
@@ -1440,6 +1551,7 @@ class DeferredSamParentQueue:
                     telemetry.add_scheduler_counter('sam_parent_restore.'+name, record[name])
             except Exception:
                 pass  # Diagnostics cannot replace the restore error or cancel preparation.
+        self._native_restore_event('Ready', key, lease)
         return task()
 
     @staticmethod
@@ -1515,6 +1627,7 @@ class DeferredSamParentQueue:
             if budget is not None:
                 budget.completed(0, progress=progress)
 
+        self._drain_native_restore_events()
         released = False
         # A previously failed checkpoint/restore must surface even when this
         # pass has yielded. Failed restores still retire their exact ownership.
@@ -1557,6 +1670,8 @@ class DeferredSamParentQueue:
                     self.compact_bytes += saved.physical_bytes
                     self.compact_logical_bytes += saved.nbytes
             completed()
+        if self._native_restore_failure is not None:
+            raise self._native_restore_failure
         resumed = {}
         if self.stop.is_set() or not self.ready():
             self._publish_staging()
@@ -1580,6 +1695,8 @@ class DeferredSamParentQueue:
         for key in items(self.ready_prepares):
             if self._discard_cancelled_ready(key):
                 completed(progress=False)
+        if self._native_restore_failure is not None:
+            raise self._native_restore_failure
         for key in self._prepare_candidates(budget, resumed_futures):
             already_owned = key in self.ready_prepares
             if already_owned:
@@ -1591,7 +1708,9 @@ class DeferredSamParentQueue:
                 snapshot = ParentCheckpoint(None, None, required, 0, 0, 0.)
             else:
                 task, snapshot = self.deferred[key]
-            if (not already_owned and key in self.bounded_parent_keys
+                lease = None
+            has_dense_lease = already_owned and lease is not None
+            if (not has_dense_lease and key in self.bounded_parent_keys
                     and snapshot.required_bytes > self.dense_limit):
                 raise RuntimeError('SAM deferred policy parent exceeds bounded dense limit')
             denied = False
@@ -1616,19 +1735,22 @@ class DeferredSamParentQueue:
                     denied = True
                     denial_reason = 'parent_condition'
                 else:
-                    active = sum(self.leases.inference_bytes.values()) + sum(self.leases.postprocess_bytes.values())
-                    emergency = not self.leases.leases and key not in self.bounded_parent_keys
-                    dense_limit = self.dense_limit-(0 if cpu_prepare else protected_dense)
-                    if (not already_owned and (not emergency and active + snapshot.required_bytes > dense_limit
-                            or emergency and protected_dense
-                            and snapshot.required_bytes > dense_limit)):
-                        denied = True
-                        denial_reason = 'dense_limit'
-                    elif not _dense_startup_fits(_dense_startup_budget_locked(task,
-                            0 if already_owned else snapshot.required_bytes)):
+                    # Capacity and singleton exclusivity belong to the native
+                    # ledger. The scientific wave supplies only its current
+                    # cheap-lane reserve; it does not independently grant bytes.
+                    oversize = (key not in self.bounded_parent_keys
+                                and snapshot.required_bytes > self.dense_limit)
+                    reserve = protected_dense if not cpu_prepare or oversize else 0
+                    if not _dense_startup_fits(_dense_startup_budget_locked(task,
+                            0 if has_dense_lease else snapshot.required_bytes)):
                         denied = True  # No dense/base/GPU credit is parked behind startup.
                         denial_reason = 'startup_headroom'
-                    elif not already_owned:
+                    elif not has_dense_lease and not self._request_native_restore(
+                            key, snapshot.required_bytes,
+                            allow_oversize=oversize, admission_reserve=reserve):
+                        denied = True
+                        denial_reason = 'native_dense'
+                    elif not has_dense_lease:
                         self.leases.leases[key] = _DirectUnionBackingLease(key, snapshot.required_bytes, phase='postprocess')
                         self.leases.postprocess_views.add(key)
                         self.leases.postprocess_bytes[key] = snapshot.required_bytes
@@ -1645,6 +1767,8 @@ class DeferredSamParentQueue:
             except Exception:
                 admission_record = None  # Optional ranks cannot strand a new dense lease.
             try:
+                if not has_dense_lease:
+                    self._bind_native_restore(key, lease)
                 if hasattr(task, 'backing_lease') and lease is not None:
                     task.backing_lease = lease
                 rebind_retirement = getattr(task, 'rebind_confidence_retirement', None)
@@ -1652,7 +1776,9 @@ class DeferredSamParentQueue:
                     rebind_retirement(lease)
                 if already_owned:
                     future = ready_future
-                    execution = self.prepare_executor.submit(self._run_ready_prepare, task, future)
+                    execution = (self.prepare_executor.submit(self._run_ready_prepare, task, future)
+                                 if has_dense_lease else self.prepare_executor.submit(
+                                     self._run_funded_ready_prepare, task, key, lease, future))
                     self.ready_execution_futures[execution] = future
                 elif snapshot.mask is not None or snapshot.confidence is not None:
                     task._sam_checkpoint_prepare_started = False
@@ -1661,17 +1787,23 @@ class DeferredSamParentQueue:
                     self.restore_futures[future] = (key, task, lease)
                 else:
                     lease.ram_backed = self._restored_ram_backing(task, lease)
-                    future = self.prepare_executor.submit(task)
+                    future = self.prepare_executor.submit(self._run_funded_prepare, task, key, lease)
+                if not has_dense_lease:
+                    self._watch_native_restore(future, key, lease)
                 track_cancellation = getattr(task, 'track_cancellation', None)
                 if not already_owned and track_cancellation is not None:
                     track_cancellation(future)
-            except BaseException:
+            except BaseException as error:
                 self._release_cpu_protection(key)
                 if already_owned:
                     ready_future.cancel()
-                else:
+                if not has_dense_lease:
                     _close_sources(task, preserve=True)
                     self.leases.complete(key, retain_for_dense_retirement=False)
+                    request = self._native_restore_grants[key]
+                    request.state = 'Failed'
+                    self._native_restore_failure = error
+                    request.owner.host_workspace_failed(key, error, namespace=request.namespace)
                 raise
             if already_owned:
                 del self.ready_prepares[key]
@@ -1698,6 +1830,13 @@ class DeferredSamParentQueue:
 
     def abort(self):
         self.stop.set()
+        self._drain_native_restore_events()
+        for key, request in self._native_restore_grants.items():
+            if request.state in ('Pending', 'Bound'):
+                error = CancelledError('SAM parent staging cancelled before input readiness')
+                request.state = 'Failed'
+                self._native_restore_failure = error
+                request.owner.host_workspace_failed(key, error, namespace=request.namespace)
         # Cancellation is terminal. Policy metadata owns no resources and must
         # not retain identifiers for work that can never be scheduled again.
         self._prepare_arrivals.clear()
@@ -1738,6 +1877,8 @@ class DeferredSamParentQueue:
             pending_checkpoints=len(self.checkpoint_futures), deferred_parents=len(self.deferred),
             queued_ready_parents=len(self.ready_prepares),
             pending_checkpoint_dense_bytes=sum(int(saved[2]) for saved in self.checkpoint_futures.values()),
+            native_restore_states={str(key): request.state
+                                   for key, request in self._native_restore_grants.items()},
             ram_first_owner_key=self.ram_first_key,
             ram_first_owner_keys=tuple(self.ram_first_owners),
             ram_first_owner_count=len(self.ram_first_owners),

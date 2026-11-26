@@ -59,7 +59,6 @@ from .runtime import (
     _close_fd_list,
     _current_process_cpu_affinity,
     _interpolation_process_entry,
-    _materialize_worker_task_memfd_paths,
     _sched_setaffinity_all_threads,
     close_memmap_array,
     cpu_inference_supports_view,
@@ -69,6 +68,7 @@ from .runtime import (
     runtime_telemetry,
 )
 from .workspace import configure_pipeline_modes, yolo_hole_fill_enabled
+from .tta_worker_bootstrap import loaded_runtime_versions
 from .geometry import (
     AugJob,
     BatchResultFrameSpec,
@@ -1501,15 +1501,29 @@ def run_prediction_volume_in_openvino_worker(
                 except Exception:
                     pass
 
+def _trace_detector_worker_ready(device, **fields):
+    versions = loaded_runtime_versions()
+    runtime_telemetry().gauge('startup.worker.runtime_versions', versions)
+    runtime_trace_event('worker_ready', device=device, failed=False, **fields,
+                        **{f'{library}_version': version for library, version in versions.items()})
+
+
 def _cpu_inference_worker_main(
     instance_id: int,
     model_path: str,
     init_dict: Dict[str, object],
     task_queue: object,
     result_queue: object,
+    *,
+    bootstrap_receipt: Optional[Dict[str, object]] = None,
 ) -> None:
     """Persistent socket-local OpenVINO worker process."""
+    from .tta_worker_transport import DetectorActorPort
+    task_queue = result_queue = DetectorActorPort(task_queue, result_queue)
     initialize_runtime_observability()
+    if bootstrap_receipt is not None:
+        runtime_trace_event('worker_bootstrap_timing', device=f'cpu:{instance_id}', **bootstrap_receipt)
+    runtime_trace_event('worker_startup_begin', device=f'cpu:{instance_id}')
     persistent_source_memfds: Dict[str, int] = {}
     cpus = [int(value) for value in init_dict.get('numa_affinity_cpus', ())]
     try:
@@ -1553,6 +1567,7 @@ def _cpu_inference_worker_main(
         if policy_settings is not None and policy_settings.enabled:
             from .tta_augmentation_cpu import worker_cpu_policy
             worker_cpu_policy(policy_settings)
+        _trace_detector_worker_ready(f'cpu:{instance_id}')
         result_queue.put({
             'type': 'ready', 'worker_kind': 'cpu', 'cpu_index': int(instance_id),
             'pid': int(os.getpid()), 'precision': str(runner.resolved_precision),
@@ -1571,6 +1586,8 @@ def _cpu_inference_worker_main(
         })
     except Exception as exc:
         import traceback
+        runtime_trace_event('worker_startup_failed', device=f'cpu:{instance_id}', failed=True,
+                            error=repr(exc))
         try:
             result_queue.put({
                 'type': 'fatal', 'worker_kind': 'cpu', 'cpu_index': int(instance_id),
@@ -1590,9 +1607,10 @@ def _cpu_inference_worker_main(
             transferred_task_fds: List[int] = []
             try:
                 task_local = dict(task)
-                transferred_task_fds = _materialize_worker_task_memfd_paths(
+                transferred_task_fds = task_queue.materialize(
                     task_local, persistent_source_memfds,
                 )
+                task_queue.installed(task_id)
                 render_workers = max(
                     1,
                     min(
@@ -1605,6 +1623,7 @@ def _cpu_inference_worker_main(
                 started = time.perf_counter()
                 runtime_trace_event('worker_compute_start', task=task_local, device=f'cpu:{instance_id}')
                 stats = run_prediction_volume_in_openvino_worker(runner, cfg, task_local)
+                task_queue.compute_done(task_id)
                 runtime_trace_event('worker_compute_done', task=task_local, device=f'cpu:{instance_id}')
                 stats = dict(stats)
                 stats['worker_compute_seconds'] = max(0.0, time.perf_counter() - started)
@@ -1615,7 +1634,6 @@ def _cpu_inference_worker_main(
                     'type': 'result', 'worker_kind': 'cpu',
                     'cpu_index': int(instance_id), 'task_id': int(task_id),
                     'ok': True, 'stats': stats,
-                    'memfd_parent_proc_capability': task_local.get('_memfd_parent_proc_capability'),
                 })
             except Exception as exc:
                 import traceback
@@ -2522,9 +2540,13 @@ def _gpu_inference_worker_main(
     init_dict: Dict[str, object],
     task_queue: object,
     result_queue: object,
+    *,
+    bootstrap_receipt: Optional[Dict[str, object]] = None,
 ) -> None:
     """Persistent GPU worker process: pin to one physical GPU, load the model once, serve tasks."""
     global _GPU_WORKER_NUMA_PIN, _GPU_WORKER_NUMA_FULL
+    from .tta_worker_transport import DetectorActorPort
+    task_queue = result_queue = DetectorActorPort(task_queue, result_queue)
     from .semantic_trt import SemanticTrtRingConsumedError, release_semantic_trt_cache
     try:
         # Pin the process to its physical GPU before any CUDA context is created, so the model and
@@ -2542,6 +2564,8 @@ def _gpu_inference_worker_main(
             min_conf=float(init_dict.get('reconciliation_min_conf', 0.0)),
         )
         initialize_runtime_observability()
+        if bootstrap_receipt is not None:
+            runtime_trace_event('worker_bootstrap_timing', device=f'cuda:{gpu_index}', **bootstrap_receipt)
         runtime_trace_event('worker_startup_begin', device=f'cuda:{gpu_index}')
         # pin every thread of this worker to its GPU's NUMA node BEFORE any
         # CUDA/model work, so allocator arenas, pinned staging and TRT host scratch land
@@ -2648,8 +2672,7 @@ def _gpu_inference_worker_main(
                     cuda_device_uuid = identity
         except Exception:
             pass  # Optional identity must not initialize CUDA or prevent worker readiness.
-        runtime_trace_event('worker_ready', device=f'cuda:{gpu_index}', failed=False,
-                            cuda_device_uuid=cuda_device_uuid)
+        _trace_detector_worker_ready(f'cuda:{gpu_index}', cuda_device_uuid=cuda_device_uuid)
         result_queue.put({'type': 'ready', 'gpu_index': int(gpu_index), 'pid': int(os.getpid()),
                           'device': f'cuda:{gpu_index}', 'cuda_device_uuid': cuda_device_uuid})
     except Exception as exc:  # pragma: no cover - worker init failure surfaced to main
@@ -2674,7 +2697,7 @@ def _gpu_inference_worker_main(
     startup_first_task = True
 
     def _publish_deferred(finished_task_id: int, deferred: _DeferredGpuWorkerTaskResult,
-                          trace_context: Dict[str, object], proc_capability: object = None) -> None:
+                          trace_context: Dict[str, object]) -> None:
         try:
             finished_stats = deferred.finish()
             runtime_trace_event('worker_publication_done', task_id=finished_task_id,
@@ -2682,7 +2705,6 @@ def _gpu_inference_worker_main(
             result_queue.put({
                 'type': 'result', 'task_id': int(finished_task_id),
                 'gpu_index': int(gpu_index), 'ok': True, 'stats': finished_stats,
-                'memfd_parent_proc_capability': proc_capability,
             })
         except Exception as exc:  # pragma: no cover - surfaced to scheduler
             import traceback
@@ -2698,7 +2720,6 @@ def _gpu_inference_worker_main(
         finished_task_id: int,
         deferred: _DeferredGpuWorkerTaskResult,
         trace_context: Dict[str, object],
-        proc_capability: object = None,
     ) -> None:
         future = deferred.flush_future
         with publication_condition:
@@ -2706,7 +2727,7 @@ def _gpu_inference_worker_main(
 
         def _done(_future: Future) -> None:
             try:
-                _publish_deferred(int(finished_task_id), deferred, trace_context, proc_capability)
+                _publish_deferred(int(finished_task_id), deferred, trace_context)
             except BaseException as exc:
                 # Do not strand worker teardown if the result transport itself is broken.
                 try:
@@ -2909,9 +2930,10 @@ def _gpu_inference_worker_main(
             # The parent affinity plan can be uneven across NUMA nodes. Size this worker's
             # pools from its own whole-core allocation instead of a logical-CPU global average.
             task_local = dict(task)
-            transferred_task_fds = _materialize_worker_task_memfd_paths(
+            transferred_task_fds = task_queue.materialize(
                 task_local, persistent_source_memfds,
             )
+            task_queue.installed(task_id)
             local_cpu_workers = max(1, int(init_dict.get('cpu_workers', task.get('postprocess_workers', 1))))
             task_local['render_workers'] = max(
                 1, min(local_cpu_workers, int(task.get('slice_count', 1))),
@@ -2938,12 +2960,10 @@ def _gpu_inference_worker_main(
                     'kind': str(task.get('kind', '')), 'model_name': str(task.get('model_name', '')),
                     'task_type': task_type, 'slice_start': task.get('slice_start'),
                     'slice_count': task.get('slice_count')}
-                _schedule_deferred_publication(int(task_id), completed, trace_context,
-                                               task_local.get('_memfd_parent_proc_capability'))
+                _schedule_deferred_publication(int(task_id), completed, trace_context)
                 result_queue.put({
                     'type': 'compute_released', 'task_id': int(task_id),
                     'gpu_index': int(gpu_index), 'ok': True,
-                    'memfd_parent_proc_capability': task_local.get('_memfd_parent_proc_capability'),
                     'stats': {
                         'worker_compute_seconds': float(compute_seconds),
                         'slice_count': int(task_local.get('slice_count', 0)),
@@ -2965,12 +2985,12 @@ def _gpu_inference_worker_main(
                     )
             else:
                 completed = dict(completed)
+                task_queue.compute_done(task_id)
                 completed['worker_compute_seconds'] = float(compute_seconds)
                 runtime_trace_event('worker_publication_done', task=task_local, device=f'cuda:{gpu_index}')
                 result_queue.put({
                     'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index),
                     'ok': True, 'stats': completed,
-                    'memfd_parent_proc_capability': task_local.get('_memfd_parent_proc_capability'),
                 })
         except (_ResidentTensorRTRingFatalError, RadialCudaProjectionUnsafeFailure,
                 SemanticTrtRingConsumedError) as exc:  # unsafe device state or consumed semantic task

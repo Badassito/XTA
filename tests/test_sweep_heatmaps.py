@@ -29,7 +29,7 @@ def test_heatmaps_preserve_nonnested_membership_and_use_preview_geometry(tmp_pat
     root.mkdir()
     work.mkdir()
     shape = 8, 32, 32
-    preview = 4, 16, 16
+    preview = 4, 15, 15
     gray = np.full(shape, 48, np.uint8)
     gray[1::2] = 112
     source = tmp_path / "gray.mkv"
@@ -65,7 +65,7 @@ def test_heatmaps_preserve_nonnested_membership_and_use_preview_geometry(tmp_pat
     )
     native, low = records
     assert native["path"] == "heatmaps/native.mkv"
-    assert low["path"] == "heatmaps/gray_Heatmap_LowQuality_test.mp4"
+    assert low["path"] == "heatmaps/gray_Heatmap_LowQuality_test.mkv"
     assert low["grid"] == "low_quality/test"
     assert native["fps"] == 8 and low["fps"] == 4
     assert native["cutoffs_hundredths"] == [40, 70]
@@ -90,8 +90,8 @@ def test_heatmaps_preserve_nonnested_membership_and_use_preview_geometry(tmp_pat
     assert low_counts[0, 4, 5] == 2 and counts.max() == 1
     color = np.asarray(low["palette_rgb"][2])
     gray_level = (int(gray[0, 0, 0]) + int(gray[1, 0, 0])) / 2
-    np.testing.assert_allclose(low_video[0, 4, 5], (gray_level + 3 * color) // 4, atol=10)
-    np.testing.assert_allclose(low_video[0, 4, -2], [gray_level] * 3, atol=10)
+    np.testing.assert_array_equal(low_video[0, 4, 5], (gray_level + 3 * color) // 4)
+    np.testing.assert_array_equal(low_video[0, 4, -2], [gray_level] * 3)
 
 
 def test_partial_heatmap_previews_keep_the_requested_palette_and_flat_paths(tmp_path, monkeypatch):
@@ -109,7 +109,7 @@ def test_partial_heatmap_previews_keep_the_requested_palette_and_flat_paths(tmp_
         streaming_decode=True,
     )
     assert {path.name for path in (tmp_path / "heatmaps").iterdir()} == {
-        "gray.v2_Heatmap_LowQuality_half.mp4", "gray.v2_Heatmap_LowQuality_quarter.mp4",
+        "gray.v2_Heatmap_LowQuality_half.mkv", "gray.v2_Heatmap_LowQuality_quarter.mkv",
     }
     for record in records:
         assert record["status"] == "incomplete"
@@ -121,6 +121,20 @@ def test_palette_assigns_a_distinct_color_to_every_possible_support_count():
     for count in range(1, 102):
         palette = _heatmap_palette(count)
         assert len(np.unique(palette[1:], axis=0)) == count
+
+
+def test_heatmap_contract_requires_the_exact_requested_preview_grid(tmp_path):
+    from XTA.sweep_heatmaps import heatmap_input_contract
+
+    grid = "low_quality/half"
+    shape = (4, 8, 12)
+    stage_heatmap_mask(tmp_path, 40, grid, np.zeros(shape, dtype=np.uint8))
+    receipt = {"heatmap_inputs": {"grids": {grid: list(shape)}, "streaming_decode": False}}
+    assert heatmap_input_contract(receipt, {grid: shape}, root=tmp_path, cutoff=40) == receipt["heatmap_inputs"]
+    with pytest.raises(ValueError, match="requested video grids"):
+        heatmap_input_contract(receipt, {"low_quality/quarter": shape}, root=tmp_path, cutoff=40)
+    with pytest.raises(ValueError, match="requested grid"):
+        heatmap_input_contract(receipt, {grid: (8, 8, 12)}, root=tmp_path, cutoff=40)
 
 
 def test_flat_preview_rejects_grid_path_traversal(tmp_path):
@@ -135,47 +149,31 @@ def test_flat_preview_rejects_grid_path_traversal(tmp_path):
 
 def test_sweep_low_quality_binary_reuses_its_mask_for_heatmap_without_resizing_gray(tmp_path, monkeypatch):
     mask = np.ones((4, 4, 4), dtype=np.uint8)
-    spec = outputs.LowQualityDownbinSpec("4", "4_4x4x4", 1.0, mask.shape)
+    spec = outputs.LowQualityDownbinSpec("4", "4_4x4x4", 1.0, mask.shape,
+                                         formats=("video", "binary_video"))
     staged = []
     videos = []
 
-    def forbidden_gray_resize(*args, **kwargs):
-        pytest.fail("A cutoff must skip overlay and grayscale resize for a family heatmap")
-
-    def stage_mask(grid, value):
-        staged.append((grid, value))
+    def forbidden(*args, **kwargs):
+        pytest.fail("A cutoff must skip its scalar overlay and grayscale resize for a family heatmap")
 
     def write_binary(value, path, fps, **kwargs):
         videos.append((value, path, fps))
 
-    monkeypatch.setattr(outputs, "resize_gray_volume_to_shape", forbidden_gray_resize)
-    monkeypatch.setattr(outputs, "write_low_quality_overlay_video", forbidden_gray_resize)
-    monkeypatch.setattr(outputs, "write_low_quality_binary_video", write_binary)
+    monkeypatch.setattr(outputs, "resize_gray_volume_to_shape", forbidden)
+    monkeypatch.setattr(outputs, "write_overlay_video", forbidden)
+    monkeypatch.setattr(outputs, "write_binary_video_from_mask_volume", write_binary)
     paths = outputs.save_single_low_quality_output(
         volume_gray=mask, mask_u8=mask, spec=spec, out_dir=tmp_path, stem="volume", fps=10,
-        temp_dir=tmp_path / "scratch", show_progress=False, save_overlay=False, stage_mask=stage_mask,
-        flat_output=True,
+        temp_dir=tmp_path / "scratch", show_progress=False,
+        stage_mask=lambda grid, value: staged.append((grid, value)), flat_output=True,
     )
     assert staged == [(spec, mask)]
     assert len(videos) == 1 and videos[0][0] is mask
-    assert videos[0][1] == paths[f"low_quality_{spec.token}_binary_video"]
-    assert videos[0][1] == tmp_path / f"volume_Binary_LowQuality_{spec.token}.mp4"
-    assert not (tmp_path / "low_quality").exists()
+    assert videos[0][1] == tmp_path / f"volume_Binary_LowQuality_{spec.token}.mkv"
+    assert paths == {f"low_quality_{spec.token}_binary_video": videos[0][1]}
     assert videos[0][2] == 10
-    assert f"low_quality_{spec.token}_overlay" not in paths
-
-
-def test_cutoff_preview_paths_keep_multiple_resolutions_in_the_cutoff(tmp_path):
-    specs = [
-        outputs.LowQualityDownbinSpec("0.5", "0p5_8x8x4", 0.5, (4, 8, 8)),
-        outputs.LowQualityDownbinSpec("0.25", "0p25_4x4x4", 0.25, (4, 4, 4)),
-    ]
-    options = dict(out_dir=tmp_path, stem="sample", downbin_specs=specs)
-    planned = outputs.planned_low_quality_output_paths(**options, save_overlay=False, flat_output=True)
-    assert set(planned.values()) == {tmp_path / f"sample_Binary_LowQuality_{s.token}.mp4" for s in specs}
-    standalone = outputs.planned_low_quality_output_paths(**options)
-    for spec in specs:
-        assert standalone[f"low_quality_{spec.token}_binary_video"].parent == tmp_path / "low_quality" / spec.token
+    assert not (tmp_path / "low_quality").exists()
 
 
 def test_complete_heatmap_stage_survives_directory_promotion_failure(tmp_path, monkeypatch):

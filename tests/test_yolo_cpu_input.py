@@ -17,8 +17,7 @@ from XTA._deps import cv2
 from XTA.config import DEFAULT_CHANNEL_FORMAT
 from XTA.geometry import AffineSpec, AugJob, ViewInfo, render_fullframe_frame_for_job
 from XTA.yolo_cpu_input import CpuInputPrefetch, NativeCartesianRenderer, _t_map, cpu_input_eligible
-from tests.test_tta_scheduler_boundary import _scheduler, _state
-from tests.test_memfd_source_reuse import _LocalDupFd, _owner
+from tests.test_memfd_source_reuse import _owner, native_dispatch
 
 
 def task(axis='transverse', *, task_id=0, start=0, count=3, tilted=False, direction='vertical'):
@@ -176,35 +175,6 @@ class YoloCpuInputTests(unittest.TestCase):
             self.assertEqual(len(closed),0)
             owner.shutdown()
 
-    def test_unready_cpu_builder_does_not_delay_actual_gpu_fallback_dispatch(self):
-        entered,release=threading.Event(),threading.Event()
-        def wait_source(_volume):
-            entered.set()
-            if not release.wait(3):
-                raise RuntimeError('test source never released')
-        with ThreadPoolExecutor(max_workers=2) as executor, mock.patch(
-                'XTA.yolo_cpu_input.wait_for_volume_ready',side_effect=wait_source):
-            descriptor=task()
-            owner=CpuInputPrefetch([descriptor],self.volume,executor,max_bytes=100000,
-                headroom=lambda:1000000,allocate=lambda shape,*a,**kw:np.empty(shape,np.uint8),
-                backing=lambda array:Path('/proc/fake/shared'),close_array=lambda array:None)
-            try:
-                self.assertTrue(entered.wait(3))
-                state=_state()
-                state.gpu_task_queues[0]=queue.Queue()
-                state.gpu_worker_tasks_by_id[0]=descriptor
-                state.gpu_worker_pending_task_ids.append(0)
-                scheduler=_scheduler(Path('.'),state=state)
-                scheduler.cpu_input_prefetch=owner
-                scheduler.dispatch_gpu_worker_inference_window()
-                actual=state.gpu_task_queues[0].get_nowait()
-                self.assertNotIn('cpu_input_path',actual)
-                owner.retire(descriptor)
-                self.assertGreater(owner.bytes,0)
-            finally:
-                release.set()
-                owner.shutdown()
-            self.assertEqual(owner.bytes,0)
 
     def test_grant_shrink_after_slow_probe_cannot_submit_unfunded_builder(self):
         entered,release=threading.Event(),threading.Event()
@@ -232,172 +202,12 @@ class YoloCpuInputTests(unittest.TestCase):
                 release.set()
                 owner.shutdown()
 
-    def test_old_mask_lease_can_borrow_unused_prefill_grant_then_refill_it(self):
-        descriptor=task()
-        owner,executor,closed=self._prefetch([descriptor],max_bytes=20000)
-        executor.run()
-        scheduler=_scheduler(Path('.'),input_overrides=dict(direct_union_total_dense_byte_limit=30000,
-            direct_union_inference_byte_limit=30000))
-        scheduler.cpu_input_prefetch=owner
-        scheduler.state.direct_union_postprocess_bytes[('model','old')]=10000
-        scheduler.state.direct_union_backing_leases[('model','old')]=SimpleNamespace(phase='postprocess')
-        candidate=dict(descriptor,result_mode='direct_union',processing_shape=(7,30,50))
-        self.assertEqual(owner.bytes,432)
-        self.assertEqual(owner.reserved_bytes,20000)
-        self.assertTrue(scheduler.direct_union_task_admissible(candidate))
-        self.assertEqual(owner.reserved_bytes,20000)  # Read-only preview.
-        self.assertTrue(scheduler._commit_cpu_input_capacity(candidate))
-        self.assertEqual(owner.reserved_bytes,9500)
-        self.assertEqual(owner.bytes,432)
-        scheduler._refresh_cpu_input_capacity()
-        self.assertEqual(owner.reserved_bytes,20000)
-        owner.shutdown()
 
-    def test_grant_yield_never_refunds_actual_build_or_retiring_bytes(self):
-        descriptor=task()
-        owner,executor,closed=self._prefetch([descriptor],max_bytes=20000)
-        charged=owner.bytes
-        self.assertEqual(owner.set_capacity(0),charged)
-        self.assertEqual(owner.bytes,charged)
-        self.assertEqual(owner.reserved_bytes,charged)
-        owner.set_capacity(20000)
-        scheduler=_scheduler(Path('.'),input_overrides=dict(direct_union_total_dense_byte_limit=30000,
-            direct_union_inference_byte_limit=30000))
-        scheduler.cpu_input_prefetch=owner
-        scheduler.state.direct_union_postprocess_bytes[('model','old')]=10000
-        scheduler.state.direct_union_backing_leases[('model','old')]=SimpleNamespace(phase='postprocess')
-        candidate=dict(descriptor,result_mode='direct_union',processing_shape=(7,30,50))
-        self.assertFalse(owner.can_yield_capacity(9500))
-        self.assertTrue(scheduler.direct_union_task_admissible(candidate))  # Pure reclaim preview.
-        self.assertEqual(owner.bytes,charged)
-        self.assertEqual(owner.reserved_bytes,20000)
-        owner.shutdown()
 
-    def test_impossible_mask_parent_does_not_take_usable_prefill_grant(self):
-        descriptor=task()
-        owner,executor,closed=self._prefetch([descriptor],max_bytes=20000)
-        executor.run()
-        scheduler=_scheduler(Path('.'),input_overrides=dict(direct_union_total_dense_byte_limit=30000,
-            direct_union_inference_byte_limit=30000))
-        scheduler.cpu_input_prefetch=owner
-        scheduler.state.direct_union_postprocess_bytes[('model','old')]=10000
-        scheduler.state.direct_union_backing_leases[('model','old')]=SimpleNamespace(phase='postprocess')
-        candidate=dict(descriptor,result_mode='direct_union',processing_shape=(7,100,100))
-        self.assertFalse(scheduler.direct_union_task_admissible(candidate))
-        self.assertEqual(owner.reserved_bytes,20000)
-        owner.shutdown()
 
-    def test_cached_admission_scans_are_pure_and_chosen_parent_yields_once(self):
-        descriptor=task()
-        owner,executor,closed=self._prefetch([descriptor],max_bytes=20000)
-        executor.run()
-        scheduler=_scheduler(Path('.'),input_overrides=dict(direct_union_total_dense_byte_limit=30000,
-            direct_union_inference_byte_limit=30000))
-        scheduler.cpu_input_prefetch=owner
-        scheduler.state.direct_union_postprocess_bytes[('model','old')]=10000
-        scheduler.state.direct_union_backing_leases[('model','old')]=SimpleNamespace(phase='postprocess')
-        totals=scheduler._direct_union_admission_totals()
-        large=dict(descriptor,result_mode='direct_union',processing_shape=(7,30,80))
-        small=dict(descriptor,result_mode='direct_union',processing_shape=(7,30,50))
-        self.assertTrue(scheduler.direct_union_task_admissible(large,admission_totals=totals))
-        self.assertEqual(owner.reserved_bytes,20000)
-        self.assertTrue(scheduler.direct_union_task_admissible(small,admission_totals=totals))
-        self.assertEqual(owner.reserved_bytes,20000)
-        self.assertTrue(scheduler._commit_cpu_input_capacity(large))
-        self.assertEqual(owner.reserved_bytes,3200)
-        owner.shutdown()
 
-    def test_chosen_dispatch_charge_race_requeues_without_claiming_gpu(self):
-        state=_state()
-        state.gpu_task_queues[0]=queue.Queue()
-        descriptor=dict(task(),result_mode='direct_union',processing_shape=(7,30,50))
-        state.gpu_worker_tasks_by_id[0]=descriptor
-        state.gpu_worker_pending_task_ids.append(0)
-        state.direct_union_postprocess_bytes[('model','old')]=10000
-        state.direct_union_backing_leases[('model','old')]=SimpleNamespace(phase='postprocess')
-        begin=mock.Mock(return_value=True)
-        scheduler=_scheduler(Path('.'),state=state,input_overrides=dict(
-            direct_union_total_dense_byte_limit=30000,direct_union_inference_byte_limit=30000),
-            operation_overrides=dict(_main_process_gpu_stage_begin_inference=begin))
-        entered,release=threading.Event(),threading.Event()
-        calls=0
-        def headroom():
-            nonlocal calls
-            calls+=1
-            if calls==2:
-                entered.set()
-                if not release.wait(3):
-                    raise RuntimeError('test refill probe never released')
-            return 1000000
-        executor=ManualExecutor()
-        owner=CpuInputPrefetch([descriptor,dict(descriptor,task_id=1,slice_start=3)],self.volume,
-            executor,max_bytes=20000,headroom=headroom,
-            allocate=lambda shape,*a,**kw:np.empty(shape,np.uint8),
-            backing=lambda array:Path('/proc/fake/shared'),close_array=lambda array:None,
-            on_capacity_change=scheduler.notify_gpu_stage_admission_change)
-        executor.owner=owner
-        self._idle(owner)
-        scheduler.cpu_input_prefetch=owner
-        callback=threading.Thread(target=lambda:executor.run(0))
-        callback.start()
-        original=scheduler.pop_gpu_worker_pending_task_id
-        def select_then_charge(*args,**kwargs):
-            selected=original(*args,**kwargs)
-            release.set()
-            with owner.condition:
-                self.assertTrue(owner.condition.wait_for(lambda:owner.bytes>9500,timeout=3))
-            return selected
-        try:
-            self.assertTrue(entered.wait(3))
-            scheduler.pop_gpu_worker_pending_task_id=select_then_charge
-            scheduler.dispatch_gpu_worker_inference_window()
-            callback.join(3)
-            begin.assert_not_called()
-            self.assertEqual(list(state.gpu_worker_pending_task_ids),[0])
-            self.assertEqual(state.gpu_worker_dispatched_tasks,0)
-            self.assertTrue(state.gpu_task_queues[0].empty())
-            scheduler.pop_gpu_worker_pending_task_id=original
-            scheduler.inputs=replace(scheduler.inputs,ensure_baseline_workspaces=lambda model,view:
-                state.baseline_union_paths.setdefault((model,view.name),Path('mask.dat')))
-            self._idle(owner)  # Queued speculative writer is cancelled by the controller.
-            self.assertTrue(executor.jobs[1][0].cancelled())
-            self.assertEqual(owner.bytes,432)  # The chosen input remains ready and charged.
-            self.assertTrue(state.gpu_stage_admission_dirty.is_set())
-            self.assertTrue(scheduler.service_gpu_stage_admission_retry())
-            self.assertEqual(begin.call_count,1)
-            self.assertEqual(state.gpu_worker_dispatched_tasks,1)
-            actual=state.gpu_task_queues[0].get_nowait()
-            self.assertIn('cpu_input_path',actual)
-        finally:
-            release.set()
-            callback.join(3)
-            owner.shutdown()
 
-    def test_active_parent_commit_adds_no_new_mask_charge_or_grant_yield(self):
-        scheduler=_scheduler(Path('.'))
-        descriptor=dict(task(),result_mode='direct_union')
-        parent=('model',descriptor['view'].name)
-        scheduler.state.direct_union_inference_views.add(parent)
-        owner=SimpleNamespace(try_yield_capacity=mock.Mock(),reserved_bytes=20000)
-        scheduler.cpu_input_prefetch=owner
-        self.assertTrue(scheduler._commit_cpu_input_capacity(descriptor))
-        owner.try_yield_capacity.assert_not_called()
 
-    def test_selected_empty_parent_emergency_preserves_charged_prefill_owners(self):
-        descriptor=task()
-        owner,executor,closed=self._prefetch([descriptor],max_bytes=20000)
-        charged=owner.bytes
-        scheduler=_scheduler(Path('.'),input_overrides=dict(direct_union_total_dense_byte_limit=80000,
-            direct_union_inference_byte_limit=80000))
-        scheduler.cpu_input_prefetch=owner
-        candidate=dict(descriptor,result_mode='direct_union',processing_shape=(7,100,100))
-        self.assertLess(scheduler.direct_union_task_bytes(candidate),80000)
-        self.assertGreater(charged+scheduler.direct_union_task_bytes(candidate),80000)
-        self.assertTrue(scheduler.direct_union_task_admissible(candidate))
-        self.assertTrue(scheduler._commit_cpu_input_capacity(candidate))
-        self.assertEqual(owner.bytes,charged)
-        self.assertEqual(owner.reserved_bytes,20000)
-        owner.shutdown()
 
     def test_backlog_is_bounded_and_failed_preparation_falls_back(self):
         first=task(count=3)
@@ -436,75 +246,6 @@ class YoloCpuInputTests(unittest.TestCase):
             owner.shutdown()
             self.assertEqual(owner.bytes,0)
 
-    def test_executor_startup_lock_cannot_block_scheduler_control_or_gpu_dispatch(self):
-        entered,release,control_submit=threading.Event(),threading.Event(),threading.Event()
-        scheduler_returned,foreign_returned=threading.Event(),threading.Event()
-        allocation=mock.Mock(side_effect=lambda shape,*a,**kw:np.empty(shape,np.uint8))
-        descriptor=task()
-        results={}
-        with ThreadPoolExecutor(max_workers=1) as executor, ThreadPoolExecutor(max_workers=1) as other:
-            owner=CpuInputPrefetch([descriptor],self.volume,executor,max_bytes=100000,
-                headroom=lambda:0,allocate=allocation,
-                backing=lambda array:Path('/proc/fake/shared'),close_array=lambda array:None)
-            self._idle(owner)
-            def stall_startup():
-                entered.set()
-                if not release.wait(3):
-                    raise RuntimeError('test startup lock never released')
-            def foreign_submit():
-                executor.submit(lambda:None)
-                foreign_returned.set()
-            original_submit=executor.submit
-            def tracked_submit(*args,**kwargs):
-                if threading.current_thread() is owner.control_thread:
-                    control_submit.set()
-                return original_submit(*args,**kwargs)
-            def schedule():
-                started=time.perf_counter()
-                owner.set_capacity(0)
-                owner.set_capacity(100000)
-                owner.pump()
-                self.assertTrue(control_submit.wait(3))
-                self.assertFalse(owner.ready(descriptor))
-                state=_state()
-                state.gpu_task_queues[0]=queue.Queue()
-                state.gpu_worker_tasks_by_id[0]=descriptor
-                state.gpu_worker_pending_task_ids.append(0)
-                scheduler=_scheduler(Path('.'),state=state)
-                scheduler.cpu_input_prefetch=owner
-                scheduler.dispatch_gpu_worker_inference_window()
-                results['dispatch']=state.gpu_task_queues[0].get_nowait()
-                owner.retire(descriptor)
-                self.assertGreater(owner.bytes,0)  # Submission owns its credit until the writer settles.
-                results['wall_seconds']=time.perf_counter()-started
-                scheduler_returned.set()
-            holder=foreign=main=None
-            try:
-                with mock.patch.object(other,'_adjust_thread_count',side_effect=stall_startup), \
-                        mock.patch.object(executor,'submit',side_effect=tracked_submit):
-                    holder=threading.Thread(target=lambda:other.submit(lambda:None))
-                    holder.start()
-                    self.assertTrue(entered.wait(3))
-                    # Negative control: an ordinary submit really shares this lock.
-                    foreign=threading.Thread(target=foreign_submit)
-                    foreign.start()
-                    self.assertFalse(foreign_returned.wait(.05))
-                    owner.headroom=lambda:1000000
-                    main=threading.Thread(target=schedule)
-                    main.start()
-                    self.assertTrue(scheduler_returned.wait(.5))
-                    self.assertNotIn('cpu_input_path',results['dispatch'])
-                    self.assertFalse(foreign_returned.is_set())
-            finally:
-                release.set()
-                for thread in (holder,foreign,main):
-                    if thread is not None:
-                        thread.join(3)
-                other._adjust_thread_count()  # Run work queued by the stalled test hook.
-                owner.shutdown()
-            self.assertTrue(foreign_returned.is_set())
-            self.assertEqual(owner.bytes,0)
-            allocation.assert_not_called()  # GPU stole coverage before the queued writer ran.
 
     def test_busy_metadata_lock_declines_optional_handoff_without_waiting(self):
         descriptor=task()
@@ -651,44 +392,6 @@ class YoloCpuInputTests(unittest.TestCase):
                 release.set()
                 owner.shutdown()
 
-    def test_slow_headroom_does_not_block_scheduler_queries_or_gpu_fallback(self):
-        entered,release=threading.Event(),threading.Event()
-        def headroom():
-            entered.set()
-            if not release.wait(3):
-                raise RuntimeError('test headroom probe never released')
-            return 1000000
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            descriptor=task()
-            owner=CpuInputPrefetch([descriptor],self.volume,executor,max_bytes=100000,
-                headroom=headroom,allocate=lambda shape,*_a,**_kw:np.empty(shape,np.uint8),
-                backing=lambda _array:Path('/proc/fake/shared'),close_array=lambda array:None)
-            try:
-                self.assertTrue(entered.wait(3))
-                self.assertFalse(owner.ready(descriptor))
-                self.assertEqual(owner.reserved_bytes,100000)
-                state=_state()
-                state.gpu_task_queues[0]=queue.Queue()
-                state.gpu_worker_tasks_by_id[0]=descriptor
-                state.gpu_worker_pending_task_ids.append(0)
-                state.fullframe_remaining[('model',descriptor['view'].name)]=1
-                scheduler=_scheduler(Path('.'),state=state)
-                scheduler.cpu_input_prefetch=owner
-                returned=threading.Event()
-                def dispatch():
-                    scheduler.dispatch_gpu_worker_inference_window()
-                    returned.set()
-                thread=threading.Thread(target=dispatch)
-                thread.start()
-                self.assertTrue(returned.wait(.5))
-                actual=state.gpu_task_queues[0].get_nowait()
-                self.assertNotIn('cpu_input_path',actual)
-                owner.retire(descriptor)
-                self.assertEqual(owner.reserved_bytes,0)
-            finally:
-                release.set()
-                owner.shutdown()
-                thread.join(3)
 
     def test_slow_retired_array_close_keeps_credit_without_blocking_queries(self):
         entered,release=threading.Event(),threading.Event()
@@ -715,14 +418,6 @@ class YoloCpuInputTests(unittest.TestCase):
                 owner.shutdown()
             self.assertEqual(owner.bytes,0)
 
-    def test_empty_parent_emergency_admission_does_not_wait_for_prefill_consumption(self):
-        scheduler=_scheduler(Path('.'),input_overrides=dict(direct_union_total_dense_byte_limit=700,
-            direct_union_inference_byte_limit=700))
-        scheduler.cpu_input_prefetch=SimpleNamespace(reserved_bytes=175,ready=lambda task:False)
-        descriptor=dict(task(),result_mode='direct_union',processing_shape=(7,9,10))
-        self.assertEqual(scheduler.direct_union_task_bytes(descriptor),630)
-        self.assertGreater(scheduler.direct_union_task_bytes(descriptor)+175,700)
-        self.assertTrue(scheduler.direct_union_task_admissible(descriptor))
 
     def test_finished_future_keeps_credit_until_callback_adopts_payload(self):
         descriptor=task()
@@ -749,150 +444,37 @@ class YoloCpuInputTests(unittest.TestCase):
                 dict(channel_format=SimpleNamespace(kind='rgb',channel_count=3))):
             self.assertFalse(cpu_input_eligible(dict(task(),**change)))
 
-    def _selection(self, *, curved_admissible=True, singleton=False):
-        state=_state()
-        state.gpu_task_queues[0]=queue.Queue()
-        cheap=task()
-        curved=dict(task(task_id=1),view=replace(task()['view'],name='radial',family='radial'))
-        descriptors=[cheap,curved] if singleton else [cheap,dict(cheap,task_id=2,slice_start=3),
-            curved,dict(curved,task_id=3,slice_start=3)]
-        for descriptor in descriptors:
-            state.gpu_worker_tasks_by_id[descriptor['task_id']]=descriptor
-            state.gpu_worker_pending_task_ids.append(descriptor['task_id'])
-            parent=('model',descriptor['view'].name)
-            state.fullframe_remaining[parent]=state.fullframe_remaining.get(parent,0)+1
-        scheduler=_scheduler(Path('.'),state=state,
-            operation_overrides=dict(gpu_worker_default_seconds_per_frame=lambda view:10 if view.family=='orthogonal' else .1))
-        scheduler.cpu_input_prefetch=SimpleNamespace(bytes=0,reserved_bytes=0,ready=lambda _task:True)
-        scheduler.direct_union_task_admissible=lambda descriptor,**_kwargs: curved_admissible or descriptor['view'].family=='orthogonal'
-        return scheduler
 
-    def test_curved_first_is_real_scheduler_priority_including_singleton_unlocks(self):
-        for singleton in (False,True):
-            scheduler=self._selection(singleton=singleton)
-            selected=scheduler.pop_gpu_worker_pending_task_id()
-            self.assertEqual(scheduler.state.gpu_worker_tasks_by_id[selected[0]]['view'].family,'radial')
 
-    def test_cheap_singleton_does_not_jump_a_curved_multilease_parent(self):
-        scheduler=self._selection()
-        scheduler.state.gpu_worker_pending_task_ids.remove(2)
-        scheduler.state.fullframe_remaining[('model',task()['view'].name)]=1
-        selected=scheduler.pop_gpu_worker_pending_task_id()
-        self.assertEqual(scheduler.state.gpu_worker_tasks_by_id[selected[0]]['view'].family,'radial')
 
-    def test_curved_tiles_keep_parent_first_storage_policy(self):
-        scheduler=self._selection()
-        for task_id in (1,3):
-            scheduler.state.gpu_worker_tasks_by_id[task_id]['kind']='tile'
-        selected=scheduler.pop_gpu_worker_pending_task_id()
-        self.assertEqual(scheduler.state.gpu_worker_tasks_by_id[selected[0]]['kind'],'fullframe')
 
-    def test_blocked_curved_work_does_not_idle_gpu_with_ready_cheap_work(self):
-        scheduler=self._selection(curved_admissible=False)
-        selected=scheduler.pop_gpu_worker_pending_task_id()
-        self.assertEqual(scheduler.state.gpu_worker_tasks_by_id[selected[0]]['view'].family,'orthogonal')
 
-    def test_mask_admission_cannot_borrow_callback_refill_credit(self):
-        descriptor=task(count=3)
-        owner,executor,closed=self._prefetch([descriptor],max_bytes=20000)
-        scheduler=self._selection()
-        scheduler.cpu_input_prefetch=owner
-        self.assertEqual(scheduler._direct_union_admission_totals()[2],20000)
-        executor.run()
-        self.assertEqual(owner.bytes,432)
-        self.assertEqual(scheduler._direct_union_admission_totals()[2],20000)
-        owner.retire(descriptor)
-        self._idle(owner)
-        self.assertEqual(scheduler._direct_union_admission_totals()[2],0)
-        owner.shutdown()
 
-    def test_d1_group_waits_for_curved_then_resumes_or_uses_blocked_curved_slack(self):
-        for curved_admissible in (True,False):
-            scheduler=self._selection(curved_admissible=curved_admissible)
-            scheduler.inputs=replace(scheduler.inputs,v1613_d1_owner_active=True)
-            scheduler.d1_owner_group_mode_active=lambda:True
-            scheduler.d1_owner_group_size_limit=lambda:2
-            scheduler.state.gpu_task_queues[1]=queue.Queue()
-            parent=('model',task()['view'].name)
-            scheduler.state.fullframe_task_ids_by_parent[parent]=[0,2]
-            for task_id in (0,2):
-                scheduler.state.gpu_worker_tasks_by_id[task_id]['result_mode']='d1_owner'
-            group=object()
-            scheduler.ensure_d1_parent_group=mock.Mock(return_value=group)
-            if curved_admissible:
-                self.assertIsNone(scheduler.plan_next_d1_parent_group())
-                scheduler.ensure_d1_parent_group.assert_not_called()
-                scheduler.state.gpu_worker_pending_task_ids.remove(1)
-                scheduler.state.gpu_worker_pending_task_ids.remove(3)
-            self.assertIs(scheduler.plan_next_d1_parent_group(),group)
-            scheduler.ensure_d1_parent_group.assert_called_once()
 
-    def test_actual_dispatch_handoff_and_compute_release_retire_prepared_owner(self):
-        descriptor=task()
-        owner,executor,closed=self._prefetch([descriptor])
-        executor.run()
-        state=_state()
-        state.gpu_task_queues[0]=queue.Queue()
-        state.gpu_worker_tasks_by_id[0]=descriptor
-        state.gpu_worker_pending_task_ids.append(0)
-        state.gpu_worker_total_tasks=1
-        state.fullframe_remaining[('model',descriptor['view'].name)]=1
-        scheduler=_scheduler(Path('.'),state=state)
-        scheduler.cpu_input_prefetch=owner
-        scheduler.dispatch_gpu_worker_inference_window()
-        actual=state.gpu_task_queues[0].get_nowait()
-        self.assertEqual(actual['cpu_input_shape'],(3,12,12))
-        self.assertEqual(owner.bytes,432)
-        self.assertEqual(closed,[])
-        scheduler.process_one_worker_result(dict(type='compute_released',task_id=0,gpu_index=0,ok=True,
-            stats=dict(worker_compute_seconds=.1,slice_count=3)),defer_refill=True)
-        self._idle(owner)
-        self.assertEqual(owner.bytes,0)
-        self.assertEqual(len(closed),1)
-        owner.shutdown()
 
+    @unittest.skipUnless(hasattr(os, 'memfd_create'), 'Linux detector descriptor transport')
     def test_prepared_memfd_transfer_is_transient_and_rolls_back(self):
         from XTA import runtime
-        with _owner('cpu-input-test',b'prepared frame') as original, mock.patch.object(
-                runtime.mp_reduction,'DupFd',_LocalDupFd,create=True):
-            descriptor=dict(task_id=0,cpu_input_path='cpu-input-test')
-            batch=runtime._attach_memfd_transfers_to_task(descriptor)
-            duplicate=descriptor['cpu_input_fd'].original_duplicate
-            transient=runtime._materialize_worker_task_memfd_paths(descriptor,{})
-            self.assertEqual(transient,[duplicate])
-            self.assertEqual(os.fstat(duplicate).st_size,len(b'prepared frame'))
+        from XTA.native_detector_handles import install_detector_handles
+        with _owner('cpu-input-test', b'prepared frame') as original:
+            task = dict(task_id=0, cpu_input_path='cpu-input-test')
+            with native_dispatch(task) as (packet, received):
+                duplicate = received[0]
+                transient = install_detector_handles(packet, {}, received)
+            self.assertEqual(transient, [duplicate])
+            self.assertEqual(os.pread(duplicate, 14, 0), b'prepared frame')
             runtime._close_fd_list(transient)
             with self.assertRaises(OSError):
                 os.fstat(duplicate)
-            self.assertEqual(os.fstat(original).st_size,len(b'prepared frame'))
-            failed=dict(task_id=1,cpu_input_path='cpu-input-test')
-            batch=runtime._attach_memfd_transfers_to_task(failed)
-            duplicate=failed['cpu_input_fd'].original_duplicate
-            batch.rollback()
+            with native_dispatch(task) as (packet, received):
+                duplicate = received[0]
+                packet['_detector_handle_slots']['cpu_input_path'] = -1
+                with self.assertRaises(ValueError):
+                    install_detector_handles(packet, {}, received)
             with self.assertRaises(OSError):
                 os.fstat(duplicate)
+            self.assertEqual(os.pread(original, 14, 0), b'prepared frame')
 
-    def test_failed_compute_release_cannot_retire_input_or_mutate_credits(self):
-        descriptor=task()
-        owner,executor,closed=self._prefetch([descriptor])
-        executor.run()
-        state=_state()
-        state.gpu_worker_tasks_by_id[0]=descriptor
-        state.gpu_worker_dispatched_by_id[0]=1
-        state.gpu_worker_task_predicted_seconds_by_id[0]=.3
-        state.gpu_worker_predicted_load_by_id[0]=.3
-        scheduler=_scheduler(Path('.'),state=state)
-        scheduler.cpu_input_prefetch=owner
-        with self.assertRaisesRegex(RuntimeError,'compute credit failed'):
-            scheduler.process_one_worker_result(dict(type='compute_released',task_id=0,gpu_index=0,
-                ok=False,error='uncertain H2D fence'),defer_refill=True)
-        self.assertEqual(state.gpu_worker_compute_released_task_ids,set())
-        self.assertEqual(state.gpu_worker_compute_completed_by_id,{})
-        self.assertEqual(state.gpu_worker_task_predicted_seconds_by_id,{0:.3})
-        self.assertEqual(state.gpu_worker_predicted_load_by_id,{0:.3})
-        self.assertEqual(owner.bytes,432)
-        self.assertEqual(closed,[])
-        owner.shutdown()
 
     def test_uncertain_copy_and_final_fence_quarantine_slots_and_refuse_replay(self):
         from XTA import cuda_backend

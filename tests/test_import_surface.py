@@ -7,10 +7,11 @@ import unittest
 from pathlib import Path
 
 from XTA import __version__
+from XTA.config import SCRIPT_BASENAME
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WRAPPER = ROOT / f"Opus-5.5_v{__version__}_SLURM.py"
+WRAPPER = ROOT / SCRIPT_BASENAME
 UNIFIED_MODULES = (
     "_prediction_cleanup",
     "env_flags",

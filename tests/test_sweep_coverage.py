@@ -59,10 +59,14 @@ def test_native_coverage_admits_cutoffs_within_one_workspace_budget(monkeypatch)
     cutoff_layers = {80: [member], 90: [member], 100: []}
     bands_bytes = 4 * 16 * 21
     monkeypatch.setattr(sam_resources, "physical_sam_headroom", lambda: 1 << 30)
-    monkeypatch.setattr(runtime, "workspace_anon_cap_bytes", lambda: bands_bytes)
+    writer_bytes = 2 * 128 * 1024**2
+    monkeypatch.setattr(runtime, "workspace_anon_cap_bytes", lambda: writer_bytes + bands_bytes)
     plans = _native_coverage_plans(geometry, cutoff_layers, 128, 2)
     assert set(plans) == {80}
     assert plans[80].size_bytes == bands_bytes
+
+    monkeypatch.setattr(runtime, "workspace_anon_cap_bytes", lambda: writer_bytes)
+    assert _native_coverage_plans(geometry, cutoff_layers, 128, 2) == {}
 
     monkeypatch.setattr(runtime, "workspace_anon_cap_bytes", lambda: 0)
     monkeypatch.setattr(sam_resources, "physical_sam_headroom", lambda: 256 << 20)

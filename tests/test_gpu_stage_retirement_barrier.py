@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from XTA import backprojection, pipeline
+from tests.native_stage_test_support import native_coordinator
 
 
 class GpuStageRetirementBarrierTests(unittest.TestCase):
@@ -20,7 +21,7 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
                                        mem_get_info=mock.Mock(return_value=(1000, 2000))),
             device=lambda token: token,
         )
-        self.coordinator = backprojection._MainProcessGpuStageCoordinator()
+        self.coordinator = native_coordinator(self)
         self.coordinator.configure_workers([0, 2])
 
     def test_pending_retirement_blocks_selected_devices(self):
@@ -50,12 +51,15 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
     def test_ack_clear_wakes_waiters_and_configure_reset_remove_stale_state(self):
         wake = mock.Mock()
         self.coordinator.set_wake_callback(wake)
+        before = self.coordinator.snapshot()['change_epoch']
         self.coordinator.set_inference_asset_retirement_pending(True)
+        changed = self.coordinator.snapshot()['change_epoch']
+        self.assertGreater(changed, before)
         self.coordinator.set_inference_asset_retirement_pending(True)
-        self.assertEqual(wake.call_count, 1)
+        self.assertTrue(wake.called)
         self.coordinator.set_inference_priority_active(False)
         self.coordinator.set_inference_asset_retirement_pending(False)
-        self.assertEqual(wake.call_count, 3)
+        self.assertGreater(self.coordinator.snapshot()['change_epoch'], changed)
         lease = self.coordinator.try_acquire_specific_stage(self.torch, 2, 'NRRD output')
         self.assertIsNotNone(lease)
         lease.release()

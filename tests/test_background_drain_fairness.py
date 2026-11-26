@@ -1,7 +1,5 @@
 """Completed output work cannot monopolize the main scheduler between credits."""
 from concurrent.futures import Future
-from pathlib import Path
-import queue
 from types import SimpleNamespace
 
 import pytest
@@ -126,89 +124,31 @@ def test_output_reaping_limit_preserves_pending_and_late_failures():
         manager.executor.shutdown(wait=True)
 
 
-def test_real_pipeline_background_checkpoint_refills_four_workers_before_next_output(tmp_path):
-    from XTA import pipeline
-    from tests.test_terminal_component_refs import _function
-    from tests.test_tta_scheduler_boundary import _bind_callbacks, _scheduler, _state, _view
+def test_native_credits_dispatch_four_workers_while_background_drain_is_bounded():
+    from tests.native_scheduler_support import NativeRun
 
-    state = _state()
-    state.gpu_result_queue = queue.Queue()
-    state.push_drain_active = True
-    state.gpu_task_queues.update({worker: queue.Queue() for worker in range(4)})
-    state.gpu_worker_dispatched_by_id.update({worker: 2 for worker in range(4)})
-    state.gpu_worker_total_tasks = 12
-    for task_id in range(12):
-        state.gpu_worker_tasks_by_id[task_id] = dict(task_id=task_id, kind='fullframe',
-            model_name='model', view=_view(), result_mode='file', slice_start=0,
-            slice_count=1, gpu_eligible=True)
-    state.gpu_worker_pending_task_ids.extend(range(8, 12))
-    scheduler = _scheduler(tmp_path, state=state,
-        input_overrides={'gpu_device_count': 4})
-    callbacks = _bind_callbacks(scheduler)
-    budget = BackgroundDrainBudget(scheduler.service_pending_compute_credits,
-                                   stages=9, max_completed=1, clock=lambda: 0)
-    completed, visited, reaped = set(), [], []
-
-    class PublishedUnion:
-        def __init__(self, index):
-            self.index = index
-        def done(self):
-            return True
-        def result(self):
-            visited.append(self.index)
-            if self.index == 0:
-                for task_id in range(8):
-                    state.pushed_worker_results.append(dict(type='compute_released',
-                        task_id=task_id, gpu_index=task_id // 2, ok=True, stats={}))
-            return ('model', str(self.index))
-
-    unions = {PublishedUnion(index): ('model', str(index)) for index in range(10)}
-    namespace = dict(vars(pipeline))
-    namespace.update(scheduler=scheduler, sam_context=None,
-        _maybe_prepare_sam_cpu_source=lambda:None,
-        _maybe_start_sam_checkpoint_digest=lambda:None,
-        _maybe_prepare_sam_runtime=lambda:None,
-        _reclaim_drained_sam_dense_capacity=lambda:None,
-        background_drain_budget=budget, _drain_parent_mask_ready_events=lambda: None,
-        parent_confidence_retired_events=queue.SimpleQueue(),
-        parent_dense_retired_events=queue.SimpleQueue(),
-        parent_mask_retired_events=queue.SimpleQueue(),
-        _flush_ready_postprocessed_tiles=lambda: None, _flush_ready_residual_tiles=lambda: None,
-        view_processing_futures={}, sam_parent_staging=None, tile_cleanup_futures={}, tile_parent_gate_futures={},
-        tile_bridge_gate_futures={}, tile_consolidation_futures={},
-        tile_parent_finalization_futures={}, physical_view_finalization_futures={},
-        physical_view_union_futures=unions, physical_view_union_completed=completed,
-        output_manager=SimpleNamespace(reap_completed=lambda **kwargs: reaped.append(kwargs)))
-    function = _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
-                         '_drain_completed_background_futures', namespace,
-                         # This fixture exercises only the completed union-future
-                         # branch. Keep an explicit inventory of globals used by
-                         # other drain branches so a newly captured name fails here.
-                         unreachable_globals=frozenset('''
-                             _dispatch_inference_windows _mark_tile_complete
-                             _publish_parent_dense_retired
-                             _mark_view_variant_terminal _maybe_finalize_tile_parent
-                             _maybe_submit_tile_consolidations_for_parent
-                             _release_tile_dense_result_for_key _retire_parent_dense_view
-                             _submit_physical_view_union_reduction _submit_tile_bridge_gate
-                             _submit_tile_parent_gate azimuthal_native_output_by_model
-                             gpu_worker_pending_task_ids
-                             interpolation_stats native_view_support_by_model
-                             nrrd_layer_refs parent_bridge_ready parent_bridge_support_by_model
-                             parent_mask_support_by_model physical_view_dense_handoff_credit
-                             sam_gate_lineage_by_parent
-                             physical_view_finalization_refs tile_accumulator_by_set
-                             tile_consolidation_completed
-                             tile_expected_by_parent tile_parent_bridge_accumulator_by_set
-                             tile_parent_mask_accumulator_by_set
-                             tilted_native_output_by_model view_infos_by_name view_prepare_leases
-                             view_volumes_by_model
-                         '''.split()))
-    function()
-    assert visited == [0] and completed == {('model', '0')}
-    assert len(unions) == 9 and budget.deferred
-    assert [state.gpu_task_queues[worker].qsize() for worker in range(4)] == [1] * 4
-    assert state.gpu_worker_compute_completed_by_id == {worker: 2 for worker in range(4)}
-    assert not state.gpu_worker_pending_task_ids
-    assert not any(callback.called for callback in callbacks)
-    assert reaped == [{'max_completed': 1}]
+    with NativeRun(workers=4, window=2) as run:
+        run.declare(1, tasks=12)
+        run.prepare(1)
+        for task_id in range(12):
+            run.submit(task_id, 1, required_worker=task_id % 4)
+        active = [run.take(worker)[0] for worker in range(4) for _ in range(2)]
+        for lease in active:
+            run.receipt(lease, 'installed')
+        calls = []
+        budget = BackgroundDrainBudget(lambda: None, stages=1, max_completed=1, clock=lambda: 0)
+        groups = [{index: True for index in range(10)}]
+        def complete_first_output():
+            for lease in active:
+                run.receipt(lease, 'compute')
+        drive(budget, groups, calls, advance=complete_first_output)
+        assert calls == [(0, 0)] and len(groups[0]) == 9 and budget.deferred
+        following = [run.take(worker)[0] for worker in range(4)]
+        assert {lease.task_id for lease in following} == {8, 9, 10, 11}
+        assert run.owner.snapshot()['final'] == 0
+        for lease in active:
+            run.receipt(lease, 'final', payload=b'first-wave')
+        for lease in following:
+            run.finish(lease)
+        run.published(1)
+        assert run.owner.snapshot()['final'] == 12

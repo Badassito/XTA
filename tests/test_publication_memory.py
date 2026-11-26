@@ -16,6 +16,7 @@ from XTA import interpolation
 from XTA.config import GIB
 from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter, RawBBoxMaskStore, INTERNAL_PACKED_CVOL_FORMAT
 from XTA.runtime import release_memfd_owners_under
+from tests.native_scheduler_support import NativeRun
 
 
 def test_d1_score_workers_charge_distinct_full_views_within_host_and_scratch_budgets():
@@ -194,35 +195,40 @@ class PublicationMemoryPlanTests(unittest.TestCase):
             memory.native_fullframe_dense_reserve(tasks, total_dense_limit=low['dense_limit_bytes'])
 
     def test_cluster_384_gib_allows_postprocess_overlap_without_two_large_inference_groups(self):
-        from tests.test_tta_scheduler_boundary import _scheduler, _state
         tasks = sorted(self.cluster_policy_tasks(),
                        key=lambda task: int(np.prod(task['processing_shape'])), reverse=True)
-        first, second = tasks[:2]
-        state = _state()
-        scheduler = _scheduler(Path('metadata-only'), state=state, input_overrides={
-            'direct_union_inference_view_limit': 4,
-            'direct_union_inference_byte_limit': 128*GIB,
-            'direct_union_total_dense_byte_limit': 384*GIB})
-        self.assertTrue(scheduler.direct_union_task_admissible(first))
-        for parent in (first, *first['augmentation_pass_tasks']):
-            key = (parent['model_name'], parent['view'].name)
-            size = int(np.prod(parent['processing_shape']))
-            state.direct_union_inference_views.add(key)
-            state.direct_union_inference_bytes[key] = size
-            state.direct_union_backing_leases[key] = interpolation._DirectUnionBackingLease(key, size)
-            state.direct_union_admission_group_by_parent[key] = (first['model_name'], first['view'].name)
-        self.assertFalse(scheduler.direct_union_task_admissible(second))
-        for key in tuple(state.direct_union_inference_views):
-            state.direct_union_backing_leases[key].transition('inference', 'postprocess')
-            state.direct_union_postprocess_views.add(key)
-            state.direct_union_postprocess_bytes[key] = state.direct_union_inference_bytes.pop(key)
-        state.direct_union_inference_views.clear()
-        self.assertTrue(scheduler.direct_union_task_admissible(second))
-        old_scheduler = _scheduler(Path('metadata-only'), state=state, input_overrides={
-            'direct_union_inference_view_limit': 4,
-            'direct_union_inference_byte_limit': 128*GIB,
-            'direct_union_total_dense_byte_limit': 256*GIB})
-        self.assertFalse(old_scheduler.direct_union_task_admissible(second))
+        group_bytes = [sum(int(np.prod(member['processing_shape']))
+                           for member in (task, *task['augmentation_pass_tasks']))
+                       for task in tasks[:2]]
+        self.assertGreater(group_bytes[0], 128 * GIB)
+        self.assertGreater(sum(group_bytes), 256 * GIB)
+        self.assertLessEqual(sum(group_bytes), 384 * GIB)
+        for dense_limit in (384 * GIB, 256 * GIB):
+            with self.subTest(dense_limit=dense_limit), NativeRun(
+                    capacity=dense_limit, inference_capacity=128 * GIB,
+                    preparation_window=4) as run:
+                run.declare(1, bytes=group_bytes[0])
+                run.prepare(1)
+                run.declare(2, bytes=group_bytes[1])
+                self.assertIsNone(run.owner.wait_preparation(0.05))
+                run.submit(1, 1)
+                first, _ = run.take()
+                run.finish(first)
+                run.published(1)
+                run.consume_events()
+                if dense_limit == 384 * GIB:
+                    run.prepare(2)
+                    run.retire(first, parent=True)
+                else:
+                    self.assertIsNone(run.owner.wait_preparation(0.05))
+                    run.retire(first, parent=True)
+                    run.prepare(2)
+                run.submit(2, 2)
+                second, _ = run.take()
+                run.finish(second)
+                run.published(2)
+                run.consume_events()
+                run.retire(second, parent=True)
 
     def test_detection_confidence_and_policy_profile_do_not_resize_parent_canvases(self):
         tasks = self.policy_tasks(shape=(4747,2911,3022), mode='direct_union')

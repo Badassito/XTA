@@ -12,19 +12,20 @@ import weakref
 import numpy as np
 import pytest
 
-from XTA import assembly, confidence_evidence as evidence, pipeline
+from XTA import assembly, confidence_evidence as evidence, geometry, pipeline
+from XTA.backprojection import _MAIN_PROCESS_GPU_STAGE_COORDINATOR
 from XTA import packed_tilted_projection as encoded
 from XTA.confidence_capture import plan_confidence_capture
 from XTA.interpolation import _DirectUnionBackingLease, materialize_raw_bbox_mask_store_workspace
 from XTA.view_prepare import AdmittedViewPrepare, ViewPrepareLeaseState, _array_lifetime_owner
-from tests.test_packed_tilted_projection import _VIEWS
+from tests.native_scheduler_support import NativeRun
 from tests.test_terminal_component_refs import _function
-from tests.test_tta_scheduler_boundary import _scheduler, _state, _view
 
 
 def _owned_prepare(root, mask_callback, confidence_callback, *, with_metadata):
     """Use genuine owning heap allocations, without claiming disk maps are RAM."""
-    view = _VIEWS[0]
+    view = geometry._build_tilted_view_infos(7, 17, 19,
+        tilt_views=('transverse',), tilt_angles=(37.,), tilt_directions=('horizontal',))[0]
     shape = (view.num_slices, view.src_h, view.src_w)
     mask = np.zeros(shape, np.uint8)
     mask[::2, 2:4, 2:4] = 1
@@ -68,12 +69,12 @@ def _owned_prepare(root, mask_callback, confidence_callback, *, with_metadata):
 @pytest.mark.parametrize('external_alias', ['none', 'slice', 'frombuffer'])
 @pytest.mark.parametrize('with_metadata', [False, True], ids=['full-grid', 'metadata-roi'])
 def test_mask_death_returns_real_admission_credit_while_score_capture_is_blocked(
-        tmp_path, monkeypatch, external_alias, with_metadata):
+        tmp_path, monkeypatch, request, external_alias, with_metadata):
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '-1')
     monkeypatch.setenv('YOLO_TTA_GPU_BACKPROJECT', '0')
     monkeypatch.setenv('YOLO_TTA_PACKED_PARENT_MIN_MIB', '0')
     mask_events, confidence_events = queue.SimpleQueue(), queue.SimpleQueue()
-    state, wake = _state(), Event()
+    wake = Event()
     namespace = dict(vars(pipeline), parent_mask_retired_events=mask_events,
         parent_confidence_retired_events=confidence_events,
         scheduler_state=SimpleNamespace(scheduler_wake=wake))
@@ -86,12 +87,7 @@ def test_mask_death_returns_real_admission_credit_while_score_capture_is_blocked
     native_bytes = expected_mask.nbytes
     key = ('model', task.view.name)
     lease = _DirectUnionBackingLease(key, 2*native_bytes, phase='postprocess')
-    state.direct_union_backing_leases[key] = lease
-    state.direct_union_postprocess_views.add(key)
-    state.direct_union_postprocess_bytes[key] = lease.nbytes
-    credits = ViewPrepareLeaseState(state.direct_union_backing_leases,
-        state.direct_union_inference_views, state.direct_union_inference_bytes,
-        state.direct_union_postprocess_views, state.direct_union_postprocess_bytes)
+    credits = ViewPrepareLeaseState({key: lease}, set(), {}, {key}, {key: lease.nbytes})
     task.mask_retired_callback = partial(publish_mask, expected_lease=lease)
     task.confidence_retired_callback = partial(publish_confidence, expected_lease=lease)
     alias = None
@@ -100,12 +96,21 @@ def test_mask_death_returns_real_admission_credit_while_score_capture_is_blocked
     elif external_alias == 'frombuffer':
         alias = np.frombuffer(task.union_mm, dtype=np.uint8).reshape(task.union_mm.shape)
 
-    # A real, separately named parent needs 64 bytes while evidence is enabled.
-    # It exceeds this limit by one byte until an authentic mask-death receipt.
-    pending = dict(kind='fullframe', model_name='model', view=_view(),
-        result_mode='direct_union', processing_shape=(32, 1, 1))
-    scheduler = _scheduler(tmp_path, state=state, input_overrides=dict(
-        direct_union_total_dense_byte_limit=2*native_bytes + 63))
+    # A separate parent needs space for a 32-voxel mask and 32 scores.
+    # The native total is one byte short until the real mask owner dies.
+    native = NativeRun(capacity=2*native_bytes + 63)
+    request.addfinalizer(native.close)
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.bind(native.owner)
+    request.addfinalizer(lambda: _MAIN_PROCESS_GPU_STAGE_COORDINATOR.unbind(native.owner))
+    native.declare(1, bytes=2*native_bytes)
+    native.prepare(1)
+    native.submit(1, 1)
+    completed, _ = native.take()
+    native.finish(completed)
+    generation = native.published(1)
+    native.consume_events()
+    native.retire(completed)
+    native.declare(2, bytes=64)
     entered, release = Event(), Event()
     observations, mask_receipts, packed_resident_bytes = [], [], []
     actual_publish = evidence.publish_confidence_scores
@@ -118,9 +123,11 @@ def test_mask_death_returns_real_admission_credit_while_score_capture_is_blocked
         assert credits.retire_input_bytes(event_key, expected_lease, nbytes, token='mask')
         assert not credits.retire_input_bytes(event_key, expected_lease, nbytes, token='mask')
         mask_receipts.append((event_key, expected_lease, nbytes))
-        assert state.direct_union_postprocess_bytes[key] == 2*native_bytes - nbytes
-        assert state.direct_union_postprocess_bytes[key] == native_bytes + packed_resident_bytes[0]
-        assert scheduler.direct_union_task_admissible(pending)
+        assert credits.postprocess_bytes[key] == 2*native_bytes - nbytes
+        assert credits.postprocess_bytes[key] == native_bytes + packed_resident_bytes[0]
+        native.owner.set_parent_remaining_bytes(1, generation, lease.nbytes)
+        native.prepare(2)
+        assert native.owner.snapshot()['bytes_used'] == lease.nbytes + 64
 
     def blocked_publication(scores, **kwargs):
         # Both the ROI direct-publish path and the full-grid fallback cross
@@ -144,7 +151,7 @@ def test_mask_death_returns_real_admission_credit_while_score_capture_is_blocked
         assert release.wait(30), 'test did not release its confidence reader'
         return actual_publish(scores, **kwargs)
 
-    def observe_projection(*args, **kwargs):
+    def check_projection(*args, **kwargs):
         packed_stats = json.loads((Path(args[0])/'meta.json').read_text(encoding='utf-8'))['stats']
         resident_bytes = int(packed_stats['index_bytes'])
         if packed_stats['payload_backing'] == 'planned_memfd':
@@ -161,9 +168,16 @@ def test_mask_death_returns_real_admission_credit_while_score_capture_is_blocked
         else:
             assert mask_ref() is not None
             assert mask_events.empty()
-            assert not scheduler.direct_union_task_admissible(pending)
+            assert native.owner.wait_preparation(0.05) is None
         observations.append('projection_started_while_capture_blocked')
         return actual_project(*args, **kwargs)
+
+    def observe_projection(*args, **kwargs):
+        try:
+            return check_projection(*args, **kwargs)
+        except BaseException:
+            release.set()
+            raise
 
     monkeypatch.setattr(evidence, 'publish_confidence_scores', blocked_publication)
     monkeypatch.setattr(encoded, 'project_tilted_sparse_store', observe_projection)
@@ -175,7 +189,7 @@ def test_mask_death_returns_real_admission_credit_while_score_capture_is_blocked
         capture_queue = evidence.configure_terminal_confidence_capture(slots=1,
             workspace_bytes=plan.workspace_bytes, source_bytes=2*native_bytes)
         assert capture_queue
-        assert not scheduler.direct_union_task_admissible(pending)
+        assert native.owner.wait_preparation(0.05) is None
         result = task()
         assert observations == ['projection_started_while_capture_blocked']
         assert result._packed_native_source_retired
@@ -185,7 +199,7 @@ def test_mask_death_returns_real_admission_credit_while_score_capture_is_blocked
         if external_alias != 'none':
             np.testing.assert_array_equal(alias, expected_mask)
             assert mask_ref() is not None and mask_events.empty()
-            assert not scheduler.direct_union_task_admissible(pending)
+            assert native.owner.wait_preparation(0.05) is None
             alias = None
             assert mask_ref() is None  # Refcount death, with cyclic GC disabled.
             assert wake.is_set()

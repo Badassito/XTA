@@ -6,12 +6,13 @@ entire view. These tests pin the concurrent contract.
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import errno
 import gzip
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import threading
@@ -43,7 +44,7 @@ def cpu_only(monkeypatch):
                         lambda **_: ("zlib", 1, gzip.compress))
 
 
-def _schedule(monkeypatch, tmp_path, *, publishers="2", backlog="3"):
+def _schedule(monkeypatch, tmp_path, *, publishers="2", backlog="3", fake_journal=True):
     for name, value in (("XTA_YOLO_SWEEP_NATIVE_ROLE", "produce"),
                         ("XTA_YOLO_SWEEP_CUTOFFS_HUNDREDTHS", "50,60"),
                         ("XTA_YOLO_SWEEP_OUTPUT_ROOT", str(tmp_path)),
@@ -55,61 +56,64 @@ def _schedule(monkeypatch, tmp_path, *, publishers="2", backlog="3"):
                            gpu_batch=1, cpu_batch=1, capture_component_replay=None)
     plan = SweepViewSchedule(args, cutoff=50, tiles=[], save_options={"nrrd"}, gpu=False, cpu=True,
         interpolation=SimpleNamespace(enabled=False, extrapolation_enabled=False))
-    monkeypatch.setattr(sweep_views, "seal_view_family",
-                        Mock(return_value=dict(status="ready", prediction_counts={50: 1, 60: 1})))
-    monkeypatch.setattr(sweep_views, "retire_view_payloads", Mock())
-    monkeypatch.setattr(sweep_views, "open_view", lambda *a, **k: nullcontext(SimpleNamespace()))
+    if fake_journal:
+        monkeypatch.setattr(sweep_views, "seal_view_family",
+                            Mock(return_value=dict(status="ready", prediction_counts={50: 1, 60: 1})))
+        monkeypatch.setattr(sweep_views, "retire_view_payloads", Mock())
+        monkeypatch.setattr(sweep_views, "open_view", lambda *a, **k: nullcontext(SimpleNamespace()))
     return plan
 
 
 def _ready(plan, name, publication):
     view = SimpleNamespace(name=name, num_slices=1)
     plan.record_task("model", view, {"sweep_native_fanout": {"status": "complete"}})
-    plan.producer_view_ready("model", view, (1, 2, 2), publication)
+    return plan.producer_view_ready("model", view, (1, 2, 2), publication)
 
 
-def test_scheduler_thread_does_not_wait_below_backlog_limit(monkeypatch, tmp_path):
+def test_funded_views_seal_and_publish_off_the_receipt_thread(monkeypatch, tmp_path):
     plan = _schedule(monkeypatch, tmp_path, publishers="2", backlog="3")
+    seal_entered = threading.Event()
+    publish_entered = threading.Event()
     release = threading.Event()
-    active = []
-    lock = threading.Lock()
-    peak = [0]
+
+    def seal(_model, name, *_args, **_kwargs):
+        if name == "v0":
+            seal_entered.set()
+            assert release.wait(10)
+        return dict(status="ready", prediction_counts={50: 1, 60: 1})
 
     def publish(view, **_):
-        with lock:
-            active.append(view.name)
-            peak[0] = max(peak[0], len(active))
-        release.wait(30)
-        with lock:
-            active.remove(view.name)
+        if view.name == "v1":
+            publish_entered.set()
+            assert release.wait(10)
         return {60: "ref"}
 
+    monkeypatch.setattr(sweep_views, "seal_view_family", seal)
     publication = Mock()
     publication.publish_view_family.side_effect = publish
-    started = time.perf_counter()
-    for index in range(3):
-        _ready(plan, f"v{index}", publication)
-    assert time.perf_counter() - started < 2.0, "scheduler waited although the backlog was below its limit"
-
-    blocked = threading.Thread(target=_ready, args=(plan, "v3", publication))
-    blocked.start()
-    blocked.join(0.5)
-    assert blocked.is_alive(), "a full backlog must apply backpressure"
-    release.set()
-    blocked.join(30)
-    assert not blocked.is_alive()
-    plan.close()
-    assert peak[0] == 2, "two publishers must run views concurrently"
-    summary = plan.summary(4)["early_publication"]
+    try:
+        first = _ready(plan, "v0", publication)
+        assert seal_entered.wait(3)
+        second = _ready(plan, "v1", publication)
+        assert publish_entered.wait(3)
+        third = _ready(plan, "v2", publication)
+        assert not first.done() and not second.done() and not third.done()
+    finally:
+        release.set()
+        plan.close()
+    assert [future.result() for future in (first, second, third)] == ["projected"] * 3
+    summary = plan.summary(3)["early_publication"]
     assert summary["publishers"] == 2 and summary["backlog_limit"] == 3
-    assert summary["backlog_peak"] == 3 and summary["scheduler_waits"] >= 1
+    assert summary["backlog_peak"] == 3
 
 
-def test_publication_failure_surfaces_on_scheduler_thread(monkeypatch, tmp_path):
+def test_publication_failure_is_reported_by_the_completion_future(monkeypatch, tmp_path):
     plan = _schedule(monkeypatch, tmp_path, publishers="2", backlog="8")
     publication = Mock()
     publication.publish_view_family.side_effect = RuntimeError("disk full")
-    _ready(plan, "v0", publication)
+    future = _ready(plan, "v0", publication)
+    with pytest.raises(RuntimeError, match="disk full"):
+        future.result(timeout=3)
     with pytest.raises(RuntimeError, match="disk full"):
         plan.close()
 
@@ -541,56 +545,167 @@ def test_simultaneous_failures_report_every_root_cause(monkeypatch, tmp_path):
 def test_lifecycle_cancel_prevents_queued_publications(monkeypatch, tmp_path):
     plan = _schedule(monkeypatch, tmp_path, publishers="1", backlog="16")
     release = threading.Event()
+    entered = threading.Event()
     calls = []
 
     def publish(view, **_):
         calls.append(view.name)
+        entered.set()
         release.wait(20)
         return {60: "ref"}
 
     publication = Mock()
     publication.publish_view_family.side_effect = publish
-    for index in range(4):
-        _ready(plan, f"v{index}", publication)
-    plan.cancel("TTA run failed during resource teardown")
-    release.set()
-    plan.close()  # the run is already failing; teardown adds no new error
+    try:
+        futures = [_ready(plan, f"v{index}", publication) for index in range(4)]
+        assert entered.wait(3)
+        plan.cancel("TTA run failed during resource teardown")
+        assert all(future.cancelled() for future in futures[1:])
+    finally:
+        release.set()
+        plan.close()
     assert calls == ["v0"]
 
 
-def test_backpressure_follows_native_journal_not_view_count(monkeypatch, tmp_path):
-    plan = _schedule(monkeypatch, tmp_path, publishers="1", backlog="64")
-    usage = {"used": 0}
-    monkeypatch.setattr(sweep_views, "native_journal_usage",
-                        lambda root=None, max_age_seconds=0.5: (usage["used"], 100))
-    # Each pending view will retire 10 journal bytes, so waiting can relieve the journal.
-    monkeypatch.setattr(sweep_views, "seal_view_family",
-                        Mock(return_value=dict(status="ready", prediction_counts={50: 1, 60: 1},
-                                               stored_bytes=10)))
-    release = threading.Event()
+def test_publication_future_waits_for_reader_exit_and_payload_retirement(monkeypatch, tmp_path):
+    plan = _schedule(monkeypatch, tmp_path, publishers="1", backlog="1")
+    reader_closed = threading.Event()
+    retirement_entered = threading.Event()
+    release_retirement = threading.Event()
 
-    def publish(view, **_):
-        release.wait(20)
+    @contextmanager
+    def open_view(*_args, **_kwargs):
+        try:
+            yield SimpleNamespace()
+        finally:
+            reader_closed.set()
+
+    def retire(*_args, **_kwargs):
+        assert reader_closed.is_set()
+        retirement_entered.set()
+        assert release_retirement.wait(10)
+
+    monkeypatch.setattr(sweep_views, "open_view", open_view)
+    monkeypatch.setattr(sweep_views, "retire_view_payloads", retire)
+    publication = Mock()
+    publication.publish_view_family.return_value = {60: "ref"}
+    try:
+        future = _ready(plan, "v0", publication)
+        assert retirement_entered.wait(3)
+        assert not future.done()
+    finally:
+        release_retirement.set()
+        plan.close()
+    assert future.result() == "projected"
+
+
+@pytest.mark.parametrize("third_bytes", (3, 7))
+def test_native_admission_progresses_with_spare_credit_during_publication_retirement(
+        monkeypatch, tmp_path, third_bytes):
+    from XTA.native_scheduler import CPU, PreparedWorkScheduler, recv_dispatch, send_receipt
+
+    plan = _schedule(monkeypatch, tmp_path, publishers="2", backlog="2", fake_journal=False)
+    monkeypatch.setenv("XTA_YOLO_SWEEP_WORK_DIR", str(tmp_path / "work"))
+    monkeypatch.setenv("XTA_YOLO_SWEEP_NATIVE_GIB", "1")
+    retirement_entered = threading.Event()
+    release_retirement = threading.Event()
+    retire = sweep_views.retire_view_payloads
+    shape = (1, 2, 2)
+
+    def delayed_retire(model, view_name, *args, **kwargs):
+        if view_name == "v1":
+            retirement_entered.set()
+            assert release_retirement.wait(10)
+        return retire(model, view_name, *args, **kwargs)
+
+    monkeypatch.setattr(sweep_views, "retire_view_payloads", delayed_retire)
+    mask = np.array([[1, 0], [0, 0]], dtype=np.uint8)
+
+    def publish(_view, *, read_mask_plane, **_kwargs):
+        np.testing.assert_array_equal(read_mask_plane(60, 0), mask)
         return {60: "ref"}
 
     publication = Mock()
     publication.publish_view_family.side_effect = publish
-    started = time.perf_counter()
-    for index in range(12):  # far beyond the old 4 x publishers view limit
-        _ready(plan, f"small{index}", publication)
-    assert time.perf_counter() - started < 2.0, "cheap queued views must not stop the GPUs"
-    usage["used"] = 80  # journal above the 0.75 high-water mark
-    blocked = threading.Thread(target=_ready, args=(plan, "large", publication))
-    blocked.start()
-    blocked.join(0.5)
-    assert blocked.is_alive(), "a nearly full journal must apply backpressure"
-    usage["used"] = 10
-    release.set()
-    blocked.join(30)
-    assert not blocked.is_alive()
-    plan.close()
-    summary = plan.summary(13)["early_publication"]
-    assert summary["journal_peak_fraction"] == 0.8 and summary["scheduler_waits"] >= 1
+    prior_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(3)
+    try:
+        parent_channel, actor_channel = socket.socketpair()
+    finally:
+        socket.setdefaulttimeout(prior_timeout)
+    parent_channel.setblocking(True)
+
+    with (parent_channel, actor_channel,
+          PreparedWorkScheduler(1, byte_capacity=10, ticket_capacity=plan.publish_backlog_limit) as owner):
+        owner.register_worker(1, 1, os.getpid(), CPU, 1, parent_channel)
+        actor_channel.settimeout(3)
+        owner.declare_parent(1, 1, 7)
+        owner.declare_parent(2, 1, 3)
+        owner.declare_parent(3, 1, third_bytes)
+
+        def complete_parent(ticket):
+            parent, _generation = ticket
+            view = SimpleNamespace(name=f"v{parent}", num_slices=1)
+            owner.submit_prepared(parent, parent, b"detector bounds", CPU)
+            lease, command = recv_dispatch(actor_channel)
+            assert lease.parent_id == parent and command == b"detector bounds"
+            send_receipt(actor_channel, lease, "installed")
+            writer = sweep_views.NativeTaskFanoutWriter(None, "model", view.name, shape, (50, 60),
+                frame_start=0, expected_frames=1, scalar_owned_cutoff=50)
+            writer.put_scalar_owned_range(50, 0, 1, prediction_counts=[1], frames_with_predictions=[1])
+            writer.put(60, 0, mask, mask * 210, prediction_count=1, frames_with_predictions=1)
+            packet = json.dumps(writer.finish()).encode()
+            send_receipt(actor_channel, lease, "compute")
+            send_receipt(actor_channel, lease, "final", payload=packet)
+            kind, seen, payload = owner.wait_event(timeout=3)
+            assert kind == "final" and seen == lease
+            assert owner.wait_publication(timeout=3) == ticket
+            plan.record_task("model", view, {"sweep_native_fanout": json.loads(payload)})
+            future = plan.producer_view_ready("model", view, shape, publication)
+            owner.retire_task(lease.task_id, lease.generation)
+            return future
+
+        def settle(ticket, future):
+            assert future.result(timeout=3) == "projected"
+            owner.retire_parent(*ticket)
+
+        try:
+            first = owner.wait_preparation(timeout=3)
+            assert first[0] == 1
+            first_future = complete_parent(first)
+            assert retirement_entered.wait(3)
+            assert not first_future.done()
+
+            second = owner.wait_preparation(timeout=3)
+            assert second[0] == 2
+            second_future = complete_parent(second)
+            assert second_future.result(timeout=3) == "projected"
+            assert owner.wait_preparation(timeout=0.05) is None
+
+            settle(second, second_future)
+            if third_bytes == 7:
+                assert owner.wait_preparation(timeout=0.05) is None
+            else:
+                third = owner.wait_preparation(timeout=3)
+                assert third[0] == 3
+                settle(third, complete_parent(third))
+            assert not first_future.done()
+            release_retirement.set()
+            settle(first, first_future)
+            if third_bytes == 7:
+                third = owner.wait_preparation(timeout=3)
+                assert third[0] == 3
+                settle(third, complete_parent(third))
+            owner.send_control(1, b"stop", stop=True)
+            assert recv_dispatch(actor_channel) == (None, b"stop")
+        finally:
+            release_retirement.set()
+            try:
+                plan.close()
+            finally:
+                # The real worker exits and closes its endpoint upon stop.
+                actor_channel.close()
+    assert plan.summary(3)["native_views_retired_after_projection"] == 3
 
 
 def test_native_journal_usage_reads_the_shared_quota(tmp_path, monkeypatch):
@@ -675,61 +790,77 @@ def test_publication_records_stage_timings(tmp_path, monkeypatch):
         assert f"sweep.publication.stage.orthogonal.{stage}_seconds" in added
 
 
-def test_later_cut_child_waits_for_output_gpu_stage_instead_of_switching_operator(monkeypatch):
-    """A busy output-stage lease must not silently change low-quality rounding in a consumer."""
-    attempts = []
-    sentinel = object()
+@pytest.mark.parametrize('purpose', ['NRRD low-quality GPU mirror tee', 'low-quality mask GPU downbin'])
+def test_cpu_only_prepublished_child_declines_gpu_without_wait(request, monkeypatch, purpose):
+    from tests.native_stage_test_support import native_coordinator
 
-    def flaky(torch_mod, purpose):
-        attempts.append(purpose)
-        return sentinel if len(attempts) >= 3 else None
-
-    monkeypatch.setattr(outputs, "_try_acquire_main_process_gpu_stage", flaky)
-    monkeypatch.setenv("XTA_YOLO_SWEEP_NATIVE_ROLE", "consume")
-    assert outputs._acquire_output_gpu_stage(None, "NRRD low-quality GPU mirror tee") is sentinel
-    assert len(attempts) == 3
-    attempts.clear()
-    monkeypatch.setenv("XTA_YOLO_SWEEP_NATIVE_ROLE", "produce")  # inference-owning: never waits
-    assert outputs._acquire_output_gpu_stage(None, "NRRD low-quality GPU mirror tee") is None
-    assert len(attempts) == 1
-    attempts.clear()
-    monkeypatch.delenv("XTA_YOLO_SWEEP_NATIVE_ROLE")  # scalar run: unchanged behaviour
-    assert outputs._acquire_output_gpu_stage(None, "NRRD low-quality GPU mirror tee") is None
-    assert len(attempts) == 1
-    monkeypatch.setenv("XTA_YOLO_SWEEP_NATIVE_ROLE", "consume")
-    monkeypatch.setenv("XTA_YOLO_SWEEP_OUTPUT_STAGE_WAIT_SECONDS", "0.2")
-    monkeypatch.setattr(outputs, "_try_acquire_main_process_gpu_stage", lambda *_: None)
-    started = time.perf_counter()
-    assert outputs._acquire_output_gpu_stage(None, "x") is None  # bounded, then CPU route
-    assert time.perf_counter() - started < 2.0
+    coordinator = native_coordinator(request, monkeypatch)
+    coordinator.configure_workers(())
+    monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_ROLE', 'consume')
+    monkeypatch.setattr(coordinator._owner, 'wait_stage_change',
+                        lambda *_: pytest.fail('No GPU is configured for this branch'))
+    cuda = SimpleNamespace(device_count=lambda: 1,
+                           mem_get_info=lambda *_: pytest.fail('CPU-only output probed CUDA memory'))
+    device_api = SimpleNamespace(cuda=cuda, device=lambda name: name)
+    assert outputs._acquire_output_gpu_stage(device_api, purpose) is None
+    assert not coordinator.snapshot()['stage_leases']
 
 
+def test_later_cut_child_waits_for_real_device_stage_release(request, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from tests.native_stage_test_support import native_coordinator
 
-def test_unretirable_journal_bytes_do_not_serialize_the_scheduler(monkeypatch, tmp_path):
-    """Above the mark, wait only if pending publications can free enough journal bytes."""
-    plan = _schedule(monkeypatch, tmp_path, publishers="2", backlog="64")
-    usage = {"used": 90}
-    monkeypatch.setattr(sweep_views, "native_journal_usage",
-                        lambda root=None, max_age_seconds=0.5: (usage["used"], 100))
-    monkeypatch.setattr(sweep_views, "seal_view_family",
-                        Mock(return_value=dict(status="ready", prediction_counts={50: 1, 60: 1},
-                                               stored_bytes=1)))
-    release = threading.Event()
+    coordinator = native_coordinator(request, monkeypatch)
+    coordinator.configure_workers((0,))
+    coordinator.set_inference_priority_active(False)
+    cuda = SimpleNamespace(device_count=lambda: 1, mem_get_info=lambda *_: (2**30, 2**31))
+    device_api = SimpleNamespace(cuda=cuda, device=lambda name: name)
+    holder = coordinator.try_acquire_stage(device_api, 'output in progress')
+    assert holder is not None
+    waiting = threading.Event()
+    native_wait = coordinator._owner.wait_stage_change
 
-    def publish(view, **_):
-        release.wait(20)
-        return {60: "ref"}
+    def observe_wait(epoch, timeout):
+        waiting.set()
+        return native_wait(epoch, timeout)
 
-    publication = Mock()
-    publication.publish_view_family.side_effect = publish
-    started = time.perf_counter()
-    for index in range(6):  # pending work can retire 1 byte each: waiting cannot help
-        _ready(plan, f"v{index}", publication)
-    assert time.perf_counter() - started < 2.0
-    release.set()
-    plan.close()
-    summary = plan.summary(6)["early_publication"]
-    assert summary["scheduler_waits"] == 0 and summary["journal_unretirable_peak_bytes"] >= 84
+    monkeypatch.setattr(coordinator._owner, 'wait_stage_change', observe_wait)
+    try:
+        for role in ('produce', ''):
+            monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_ROLE', role)
+            assert outputs._acquire_output_gpu_stage(device_api, 'second output') is None
+        assert not waiting.is_set()
+        monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_ROLE', 'consume')
+        monkeypatch.setenv('XTA_YOLO_SWEEP_OUTPUT_STAGE_WAIT_SECONDS', '2')
+        with ThreadPoolExecutor(1) as executor:
+            task = executor.submit(outputs._acquire_output_gpu_stage, device_api, 'second output')
+            assert waiting.wait(1)
+            holder.release()
+            lease = task.result(timeout=2)
+            assert lease.device_index == 0
+            lease.release()
+    finally:
+        holder.release()
+    assert not coordinator.snapshot()['stage_leases']
+
+
+def test_gpu_probe_failure_does_not_wait_for_unheld_stage(request, monkeypatch):
+    from tests.native_stage_test_support import native_coordinator
+
+    coordinator = native_coordinator(request, monkeypatch)
+    coordinator.configure_workers((0,))
+    coordinator.set_inference_priority_active(False)
+    monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_ROLE', 'consume')
+    monkeypatch.setattr(coordinator._owner, 'wait_stage_change',
+                        lambda *_: pytest.fail('No competing output stage owns this device'))
+
+    def probe(_device):
+        raise RuntimeError('CUDA memory discovery failed')
+
+    cuda = SimpleNamespace(device_count=lambda: 1, mem_get_info=probe)
+    assert outputs._acquire_output_gpu_stage(SimpleNamespace(cuda=cuda, device=str), 'output') is None
+    assert not coordinator.snapshot()['provisional_stage_devices']
+
 
 
 def test_journal_usage_survives_special_characters_and_reports_unknown(tmp_path, monkeypatch):

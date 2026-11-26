@@ -103,6 +103,23 @@ def test_repeated_edge_owner_unions_once_with_exact_family_diagnostics(tmp_path,
         assert set(new_calls.values()) == {1}
 
 
+@pytest.mark.parametrize('radius,raw_passes', [(0., 0), (20., 1)])
+def test_raw_family_replay_only_if_filter_removed_support(tmp_path, radius, raw_passes):
+    bundle = multiple_edges(tmp_path)
+    policy = {'proposal_api_version': 1,
+              'select_proposals': lambda context: [r['run_id'] for r in context['runs']],
+              'sam_bridge_policy': {'version': 2, 'component_min_radius': radius}}
+    with mock.patch.object(sam_policy, 'measure_family_agreement',
+                           wraps=sam_policy.measure_family_agreement) as calls:
+        selection = sam_policy.select_sam_proposals(bundle, policy)
+    group = selection['group_receipts']['g']
+    assert group['selected_run_ids'] == ['f', 'r']
+    assert sum(call.kwargs.get('mask_filter') is None for call in calls.call_args_list) == raw_passes
+    assert group['raw_family_agreement'] == reference.measure_family_agreement(bundle, 'g', ['f', 'r'])
+    assert group['raw_family_agreement'] is not group['family_agreement']
+    assert (group['raw_family_agreement'] != group['family_agreement']) == bool(raw_passes)
+
+
 def _cyclic_branch_bundle(tmp_path, period):
     from tests.test_sam_cyclic_evidence_replay import fixture
     scope, _, _, _, _ = fixture(period)

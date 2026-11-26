@@ -100,6 +100,37 @@ def zero_unmasked_scores_boxes(mask, scores, active, boxes, z0, z1):
                 scores[z, row, column] &= np.uint8(0) - np.uint8(mask[z, row, column] != 0)
 
 
+@_numba.njit(nogil=True, cache=False)
+def mask_eager_scores_and_bound(mask, scores):
+    """Mask the writable scores and certify the exact positive footprint."""
+    depth, height, width = scores.shape
+    bounds = np.zeros((depth, 4), np.int64)
+    for z in range(depth):
+        top, bottom, left, right = height, 0, width, 0
+        for y in range(height):
+            first, stop = width, 0
+            for x in range(width):
+                kept = scores[z, y, x] & (np.uint8(0) - np.uint8(mask[z, y, x] != 0))
+                scores[z, y, x] = kept
+                first = min(first, x if kept else width)
+                stop = max(stop, x + 1 if kept else 0)
+            if stop:
+                top, bottom = min(top, y), y + 1
+                left, right = min(left, first), max(right, stop)
+        if bottom:
+            bounds[z] = (top, bottom, left, right)
+    return bounds
+
+
+def warm_eager_confidence_masking():
+    """Compile the eager confidence path before starting detector threads."""
+    mask = np.ones((1, 2, 3), np.uint8)
+    scores = mask.copy()
+    mask.setflags(write=False)
+    mask_eager_scores_and_bound(mask, scores)
+    return {'signatures': len(mask_eager_scores_and_bound.nopython_signatures)}
+
+
 def warm_terminal_score_kernels():
     """Compile every terminal score-masking signature before the main process is busy.
 

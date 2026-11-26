@@ -16,11 +16,17 @@ def build(destination):
     modules = sorted(package.glob("native_review*.py"))
     if not modules:
         raise ValueError("This XTA checkout does not contain the native-window modules")
-    # These shared modules implement native NRRD export and exclusive publication.
-    shared = ("__init__.py", "slicer_native_window.py", "reconciliation_io.py", "json_publication.py",
-              "run_transport.py", "artifact_archive.py", "env_flags.py", "file_hashing.py")
+    # Keep the portable toolbar independent of the inference runtime.
+    shared = ("__init__.py", "slicer_native_window.py", "slicer_preview_review.py", "slicer_reconciliation.py",
+              "review_archive.py", "reconciliation.py", "reconciliation_components.py",
+              "reconciliation_geometry.py", "reconciliation_io.py", "reconciliation_policy.py",
+              "json_publication.py", "run_transport.py", "artifact_archive.py", "env_flags.py", "file_hashing.py")
     members = {f"XTA/{name}": package / name for name in shared}
     members.update({f"XTA/{p.name}": p for p in modules})
+    examples = package / "examples"
+    members["XTA/examples/__init__.py"] = examples / "__init__.py"
+    members.update({f"XTA/examples/external_reconciliation/{p.name}": p
+                    for p in sorted((examples / "external_reconciliation").glob("*.py"))})
     for name in ("xta_slicerrc.py", "xta_toolbar_startup.py"):
         members[name] = tools_dir / "slicer" / name
     # Read all sources before opening the destination. A missing package

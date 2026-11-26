@@ -1,4 +1,6 @@
 """Cross-parent pressure must not turn CPU publication into a GPU lease barrier."""
+
+from tests.native_stage_test_support import native_stage_context
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from types import SimpleNamespace

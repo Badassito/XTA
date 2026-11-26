@@ -596,43 +596,47 @@ def test_augmented_cleanup_does_not_fill_unknown_holes(monkeypatch):
     assert not mask[0,3:5,3:5].any()
 
 
-def test_scheduler_disables_both_dynamic_split_paths():
-    from XTA.tta_scheduler import TtaScheduler
-    task={'task_id':1,'kind':'fullframe','model_name':'gpu','view':ViewInfo('v',32,12,12,'clamp'),
-          'slice_start':0,'slice_count':32,'disable_runtime_split':True}
-    scheduler=TtaScheduler(inputs=SimpleNamespace(v1613_d1_owner_active=False,gpu_device_count=4,gpu_batch=1),
-                           state=SimpleNamespace(gpu_worker_tasks_by_id={1:task},gpu_worker_pending_task_ids=[1]),
-                           operations=SimpleNamespace(gpu_worker_tail_split_point=lambda *a:pytest.fail('split immutable policy lease')))
-    assert scheduler.split_gpu_worker_task_to_runtime_target(1)==1
-    assert scheduler.split_cpu_worker_task_to_runtime_target(1)==1
-    assert not scheduler.split_one_gpu_worker_dispatch_tail(4)
-    assert task['slice_count']==32
+def test_native_scheduler_preserves_immutable_policy_range(tmp_path):
+    from tests.native_detector_test_support import DetectorRun, detector_view
+    from tests.native_scheduler_cases import detector_task, finish_actor
+    view=detector_view(name='policy-view',num_slices=32,src_h=12,src_w=12)
+    descriptor=detector_task(1,view=view,count=32,disable_runtime_split=True)
+    with DetectorRun(tmp_path) as run:
+        actor=run.worker(0)
+        run.start_transport()
+        run.declare(descriptor)
+        run.drain_until(lambda:run.native.snapshot()['dispatched']==1)
+        received=run.take(0)
+        assert received['slice_start']==0 and received['slice_count']==32
+        assert received['disable_runtime_split'] is True
+        finish_actor(actor,received)
+        run.drain_until(lambda:len(run.results)==1 and not run.scheduler.publication_outstanding())
+        assert run.native.snapshot()['dispatched']==1
+        assert run.scheduler.result().gpu_frames_completed_total==32
 
 
-def test_tile_memory_reservation_accounts_for_all_passes():
-    from XTA.tta_scheduler import TtaScheduler
-    scheduler=TtaScheduler(inputs=SimpleNamespace(batch=4),state=None,
-                           operations=SimpleNamespace(array_nbytes=lambda shape,dtype:int(np.prod(shape))*np.dtype(dtype).itemsize))
-    scheduler.tile_task_azimuthal_padding_count=lambda task:0
-    task={'kind':'tile','processing_shape':(8,12,12),'result_conf_path':'confidence.dat'}
-    baseline=scheduler.tile_dense_result_task_bytes(task)
-    task['augmentation_pass_tasks']=[{},{}]
-    assert scheduler.tile_dense_result_task_bytes(task)==3*baseline
-    scheduler.tile_task_azimuthal_padding_count = lambda task: 2
-    assert scheduler.tile_dense_result_task_bytes(task) == 3 * (baseline + 2 * 2 * 12 * 12 * 2)
+def test_native_tile_policy_configuration_refuses_before_loader(monkeypatch):
+    from XTA.scheduler_preflight import preflight_tta_scheduler
+    entered=[]
+    monkeypatch.setattr('XTA.native_scheduler._load_native',lambda:entered.append(True))
+    with pytest.raises(ValueError,match='dense tile'):
+        preflight_tta_scheduler(gpu_device_count=1,cpu_enabled=False,
+                                tile_configs=({'augmentation_passes':3},),d1_owner_groups=False)
+    assert not entered
 
 
-def test_tile_reservation_waits_for_every_policy_result():
-    from XTA.tta_scheduler import TtaScheduler
-    state=SimpleNamespace(gpu_worker_tile_task_id_by_key={('m','base','base'):4,('m','p1','p1'):4,('m','p2','p2'):4},
-                          gpu_worker_tile_pending_result_ids_by_task={4:{'base','p1','p2'}})
-    scheduler=TtaScheduler(inputs=None,state=state,operations=None)
-    released=[]
-    scheduler.release_tile_dense_result_task_id=lambda task_id,**kw:released.append(task_id) or True
-    assert not scheduler.release_tile_dense_result_for_key('m','p1','p1')
-    assert not scheduler.release_tile_dense_result_for_key('m','base','base')
-    assert scheduler.release_tile_dense_result_for_key('m','p2','p2')
-    assert released==[4]
+def test_unsupported_tile_inventory_cannot_partially_dispatch_fullframe_policy(tmp_path):
+    from tests.native_detector_test_support import DetectorRun
+    from tests.native_policy_test_support import policy_task
+    with DetectorRun(tmp_path) as run:
+        run.worker(0)
+        supported=policy_task(0,ratio=3,size=10,task_id=1)
+        unsupported=policy_task(1,ratio=3,size=10,task_id=2)
+        unsupported['kind']='tile'
+        with pytest.raises(ValueError,match='Unsupported'):
+            run.declare(supported,unsupported)
+        state=run.native.snapshot()
+        assert state['dispatched']==state['tickets_used']==state['bytes_used']==0
 
 
 def test_real_nrrd_writer_retains_empty_pass_files(tmp_path,monkeypatch):

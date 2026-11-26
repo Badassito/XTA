@@ -1968,38 +1968,11 @@ def _duplicate_memfd_path_for_child(path: object) -> Optional[object]:
         return None
     return mp_reduction.DupFd(int(fd))
 
-def _memfd_source_identity(fd: int) -> str:
-    """Identify storage independently of reusable parent fd numbers and mutable pixels."""
-    stat = os.fstat(int(fd))
-    return f'memfd-source-v1:{int(stat.st_dev)}:{int(stat.st_ino)}:{int(stat.st_size)}'
-
-
-def _probe_memfd_parent_proc_capability(path: object, source_fd: int) -> Optional[Dict[str, object]]:
-    """Prove RW procfs access against a source already transferred to this worker."""
-    match = re.fullmatch(r'/proc/([1-9][0-9]*)/fd/([0-9]+)', str(path))
-    if match is None:
-        return None
-    opened = None
-    try:
-        opened = os.open(str(path), os.O_RDWR | getattr(os, 'O_CLOEXEC', 0))
-        key = _memfd_source_identity(source_fd)
-        if _memfd_source_identity(opened) == key:
-            return {'parent_pid': int(match.group(1)), 'worker_pid': int(os.getpid()), 'source_key': key}
-    except OSError:
-        pass  # Unsupported proc permissions keep the existing DupFd protocol.
-    finally:
-        if opened is not None:
-            _close_fd_list((opened,))
-    return None
-
-
 @dataclass
 class _MemfdTransferBatch:
     """Parent dispatch transaction; registered handles belong to the receiver after put."""
 
     handles: List[object]
-    source_keys: Tuple[str, ...] = ()
-    output_probe_key: Optional[str] = None
 
     def rollback(self) -> None:
         # Detaching unregisters DupFd from multiprocessing.resource_sharer. Dropping
@@ -2012,108 +1985,6 @@ class _MemfdTransferBatch:
                 # A broken transport must not hide the original dispatch exception.
                 pass
 
-
-def _attach_memfd_transfers_to_task(
-    task: Dict[str, object], *, known_sources: Optional[Iterable[str]] = None,
-    direct_output_capability: Optional[Dict[str, int]] = None,
-    probe_output: bool = False,
-) -> _MemfdTransferBatch:
-    """Attach handles to a dispatch copy, including independent policy result parents.
-
-    Dispatchers copy only the outer task dictionary. Copy nested policy dictionaries
-    before attaching handles so canonical tasks never retain one-use transfer objects.
-
-    ``known_sources`` contains identities acknowledged by this specific worker after
-    successful materialization/compute. Without it, the one-argument transfer protocol
-    is unchanged. Within a dispatch, preorder traversal also permits reuse after the
-    first real transfer, since the receiver materializes that same order atomically.
-    """
-    batch = _MemfdTransferBatch([])
-    known = None if known_sources is None else set(known_sources)
-    source_keys: Dict[str, None] = {}
-    direct = (direct_output_capability is not None
-              and direct_output_capability.get('parent_pid') == os.getpid()
-              and int(direct_output_capability.get('worker_pid', 0)) > 0)
-
-    def attach(holder: Dict[str, object], path_field: str, handle_field: str,
-               *, persistent: bool = False) -> None:
-        raw_path = holder.get(path_field)
-        key = str(raw_path)
-        if direct and path_field in {'result_mask_path', 'result_conf_path', 'cpu_input_path'}:
-            with _MEMFD_OWNER_LOCK:
-                fd = _memfd_owner_fd_for_path(raw_path)
-                if fd is not None:
-                    holder[f'{handle_field}_proc'] = {
-                        'parent_pid': int(os.getpid()),
-                        'worker_pid': int(direct_output_capability['worker_pid']),
-                        'fd': int(fd), 'identity': _memfd_source_identity(fd),
-                    }
-                    return
-        if persistent and known is not None:
-            # Keep the owner registry stable through identity lookup and DupFd's dup.
-            # The owner lock is reentrant; the path helper uses this same registry.
-            with _MEMFD_OWNER_LOCK:
-                fd = _memfd_owner_fd_for_path(raw_path)
-                if fd is None:
-                    return
-                key = _memfd_source_identity(fd)
-                source_keys[key] = None
-                if key in known:
-                    holder[f'{handle_field}_ref'] = key
-                    return
-                handle = mp_reduction.DupFd(int(fd))
-            known.add(key)
-        elif (probe_output and batch.output_probe_key is None and not source_keys
-              and path_field in {'result_mask_path', 'result_conf_path'}
-              and str(raw_path).startswith(f'/proc/{os.getpid()}/fd/')):
-            # A file-backed input never qualifies the worker via a source transfer.
-            # Use one ordinarily transferred output to prove access to the same inode.
-            with _MEMFD_OWNER_LOCK:
-                fd = _memfd_owner_fd_for_path(raw_path)
-                if fd is None:
-                    return
-                handle = mp_reduction.DupFd(int(fd))
-                batch.handles.append(handle)
-                batch.output_probe_key = _memfd_source_identity(fd)
-            holder[handle_field] = handle
-            holder[f'{handle_field}_probe'] = True
-            return
-        else:
-            handle = _duplicate_memfd_path_for_child(raw_path)
-        if handle is not None:
-            batch.handles.append(handle)
-            holder[handle_field] = handle
-            holder[f'{handle_field}_key'] = key
-
-    def attach_task(holder: Dict[str, object]) -> None:
-        for path_field, handle_field in (
-            ('source_volume_path', 'source_volume_fd'),
-            ('result_mask_path', 'result_mask_fd'),
-            ('result_conf_path', 'result_conf_fd'),
-            ('canvas_path', 'canvas_fd'),
-            ('cpu_input_path', 'cpu_input_fd'),
-            ('d1_bitset_path', 'd1_bitset_fd'),
-        ):
-            attach(holder, path_field, handle_field, persistent=path_field == 'source_volume_path')
-        native_resize = holder.get('native_resize')
-        if isinstance(native_resize, dict):
-            native_copy = dict(native_resize)
-            holder['native_resize'] = native_copy
-            attach(native_copy, 'path', 'path_fd', persistent=True)
-        siblings = holder.get('augmentation_pass_tasks')
-        if siblings:
-            sibling_copies = [dict(sibling) for sibling in siblings]
-            holder['augmentation_pass_tasks'] = sibling_copies
-            for sibling in sibling_copies:
-                attach_task(sibling)
-
-    try:
-        attach_task(task)
-        batch.source_keys = tuple(source_keys)
-        return batch
-    except BaseException:
-        batch.rollback()
-        raise
 
 def _detach_transferred_fd(handle: object) -> int:
     detach = getattr(handle, 'detach', None)
@@ -2132,193 +2003,6 @@ def _attach_interpolation_memfd_transfer(kwargs: Dict[str, object]) -> _MemfdTra
         return _MemfdTransferBatch([])
     kwargs['mask_fd'] = handle
     return _MemfdTransferBatch([handle])
-
-def _materialize_worker_task_memfd_paths(
-    task: Dict[str, object],
-    persistent_sources: Dict[str, int],
-) -> List[int]:
-    """Replace transferred handles with worker-local procfs paths.
-
-    Source-volume descriptors are cached for the worker lifetime so the resident render
-    engine sees one stable source identity. Results, canvases and immutable prepared
-    inputs are task-local; dropping them permits immediate retirement in the parent.
-    All policy siblings share this transaction and its returned descriptor ownership list.
-    """
-    transient_fds: List[int] = []
-    started_ns = time.perf_counter_ns()
-    detach_ns = 0
-    detach_calls = 0
-    source_reference_hits = 0
-    duplicate_sources_closed = 0
-    direct_open_ns = 0
-    direct_open_calls = 0
-    input_open_ns = 0
-    input_open_calls = 0
-    failed = False
-    task.pop('_memfd_parent_proc_capability', None)
-    # The caller can only close descriptors after this function returns.  Keep enough
-    # transaction state here to roll back descriptors detached before a later handle
-    # fails to materialize; otherwise the assignment at the call site never happens and
-    # those descriptors are lost for the lifetime of the worker.
-    persistent_keys_before = set(persistent_sources)
-
-    def _resolve(
-        holder: Dict[str, object],
-        *,
-        path_field: str,
-        handle_field: str,
-        persistent: bool,
-    ) -> None:
-        nonlocal detach_ns, detach_calls, source_reference_hits, duplicate_sources_closed, direct_open_ns, direct_open_calls, input_open_ns, input_open_calls
-        parent_source_path = holder.get(path_field)
-        direct_reference = holder.pop(f'{handle_field}_proc', None)
-        if direct_reference is not None:
-            prepared_input = path_field == 'cpu_input_path'
-            role = 'input' if prepared_input else 'output'
-            if (path_field not in {'result_mask_path', 'result_conf_path', 'cpu_input_path'} or persistent
-                    or holder.get(handle_field) is not None or holder.get(f'{handle_field}_ref') is not None
-                    or not isinstance(direct_reference, dict)
-                    or set(direct_reference) != {'parent_pid', 'worker_pid', 'fd', 'identity'}
-                    or any(type(direct_reference[field]) is not int for field in ('parent_pid', 'worker_pid', 'fd'))
-                    or direct_reference['worker_pid'] != os.getpid()
-                    or direct_reference['parent_pid'] <= 0 or direct_reference['fd'] < 0
-                    or not isinstance(direct_reference['identity'], str)):
-                raise ValueError(f'Invalid direct memfd {role} reference for {handle_field}')
-            started_open = time.perf_counter_ns()
-            if prepared_input:
-                input_open_calls += 1
-            else:
-                direct_open_calls += 1
-            try:
-                fd = os.open(str(_memfd_proc_path(direct_reference['fd'], owner_pid=direct_reference['parent_pid'])),
-                             (os.O_RDONLY if prepared_input else os.O_RDWR) | getattr(os, 'O_CLOEXEC', 0))
-                transient_fds.append(int(fd))
-                if _memfd_source_identity(fd) != direct_reference['identity']:
-                    raise RuntimeError(f'Direct memfd {role} identity changed for {handle_field}')
-            finally:
-                if prepared_input:
-                    input_open_ns += time.perf_counter_ns() - started_open
-                else:
-                    direct_open_ns += time.perf_counter_ns() - started_open
-            holder[path_field] = str(_memfd_proc_path(fd, owner_pid=os.getpid()))
-            return
-        reference = holder.pop(f'{handle_field}_ref', None)
-        if reference is not None:
-            if not persistent or holder.get(handle_field) is not None:
-                raise ValueError(f'Invalid cached memfd reference for {handle_field}')
-            key = str(reference)
-            fd = persistent_sources.get(key)
-            if (not key.startswith('memfd-source-v1:') or fd is None
-                    or _memfd_source_identity(fd) != key):
-                raise RuntimeError(f'Worker has no matching persistent memfd source: {key}')
-            source_reference_hits += 1
-            holder[path_field] = str(_memfd_proc_path(int(fd), owner_pid=os.getpid()))
-            capability = _probe_memfd_parent_proc_capability(parent_source_path, int(fd))
-            if capability is not None:
-                task['_memfd_parent_proc_capability'] = capability
-            return
-        handle = holder.pop(handle_field, None)
-        key_raw = holder.pop(f'{handle_field}_key', None)
-        if handle is None:
-            return
-        key = str(key_raw or holder.get(path_field) or handle_field)
-        before_detach = time.perf_counter_ns()
-        detach_calls += 1
-        try:
-            received_fd = _detach_transferred_fd(handle)
-        finally:
-            detach_ns += time.perf_counter_ns() - before_detach
-        if persistent and key.startswith('memfd-source-v1:'):
-            try:
-                if _memfd_source_identity(received_fd) != key:
-                    raise RuntimeError(f'Transferred memfd source identity changed: {key}')
-            except BaseException:
-                _close_fd_list((received_fd,))
-                raise
-        if persistent:
-            cached = persistent_sources.get(key)
-            if cached is None:
-                persistent_sources[key] = int(received_fd)
-                fd = int(received_fd)
-            else:
-                try:
-                    os.close(int(received_fd))
-                except OSError:
-                    pass
-                duplicate_sources_closed += 1
-                fd = int(cached)
-                if key.startswith('memfd-source-v1:') and _memfd_source_identity(fd) != key:
-                    raise RuntimeError(f'Cached memfd source identity changed: {key}')
-        else:
-            fd = int(received_fd)
-            transient_fds.append(int(fd))
-        holder[path_field] = str(_memfd_proc_path(int(fd), owner_pid=os.getpid()))
-        output_probe = holder.pop(f'{handle_field}_probe', False)
-        if persistent or (output_probe and path_field in {'result_mask_path', 'result_conf_path'}):
-            capability = _probe_memfd_parent_proc_capability(parent_source_path, int(fd))
-            if capability is not None:
-                task['_memfd_parent_proc_capability'] = capability
-
-    def _resolve_task(holder: Dict[str, object]) -> None:
-        _resolve(holder, path_field='source_volume_path', handle_field='source_volume_fd', persistent=True)
-        _resolve(holder, path_field='result_mask_path', handle_field='result_mask_fd', persistent=False)
-        _resolve(holder, path_field='result_conf_path', handle_field='result_conf_fd', persistent=False)
-        _resolve(holder, path_field='canvas_path', handle_field='canvas_fd', persistent=False)
-        _resolve(holder, path_field='cpu_input_path', handle_field='cpu_input_fd', persistent=False)
-        _resolve(holder, path_field='d1_bitset_path', handle_field='d1_bitset_fd', persistent=False)
-
-        native_resize = holder.get('native_resize')
-        if isinstance(native_resize, dict):
-            native_copy = dict(native_resize)
-            holder['native_resize'] = native_copy
-            _resolve(native_copy, path_field='path', handle_field='path_fd', persistent=True)
-        siblings = holder.get('augmentation_pass_tasks')
-        if siblings:
-            sibling_copies = [dict(sibling) for sibling in siblings]
-            holder['augmentation_pass_tasks'] = sibling_copies
-            for sibling in sibling_copies:
-                _resolve_task(sibling)
-
-    try:
-        _resolve_task(task)
-        return transient_fds
-    except BaseException:
-        failed = True
-        _close_fd_list(transient_fds)
-        for key in list(set(persistent_sources) - persistent_keys_before):
-            fd = persistent_sources.pop(key, None)
-            if fd is not None:
-                _close_fd_list((int(fd),))
-        # Later fields may still own registered transfers after an early failure.
-        # Read, rather than mutate, nested dictionaries not yet copied by traversal.
-        remaining: List[object] = []
-
-        def collect(holder: Dict[str, object]) -> None:
-            for field in ('source_volume_fd', 'result_mask_fd', 'result_conf_fd',
-                          'canvas_fd', 'cpu_input_fd', 'd1_bitset_fd'):
-                if holder.get(field) is not None:
-                    remaining.append(holder[field])
-            native = holder.get('native_resize')
-            if isinstance(native, dict) and native.get('path_fd') is not None:
-                remaining.append(native['path_fd'])
-            for sibling in holder.get('augmentation_pass_tasks') or ():
-                collect(sibling)
-
-        collect(task)
-        _MemfdTransferBatch(remaining).rollback()
-        raise
-    finally:
-        telemetry = _RUNTIME_TELEMETRY
-        if telemetry is not None:
-            for name, value in (
-                ('calls', 1), ('seconds', (time.perf_counter_ns() - started_ns) / 1e9),
-                ('detach_calls', detach_calls), ('detach_seconds', detach_ns / 1e9),
-                ('source_reference_hits', source_reference_hits),
-                ('output_proc_open_calls', direct_open_calls), ('output_proc_open_seconds', direct_open_ns / 1e9),
-                ('input_proc_open_calls', input_open_calls), ('input_proc_open_seconds', input_open_ns / 1e9),
-                ('duplicate_sources_closed', duplicate_sources_closed), ('failures', int(failed)),
-            ):
-                telemetry.add(f'worker.memfd_materialize.{name}', value)
 
 def _close_fd_list(fds: Iterable[int]) -> None:
     for fd in list(fds):
@@ -3658,15 +3342,18 @@ class _GpuWorkerAuxInterpolationPool:
         self._capacity = len(self._worker_ids)
         self._lock = threading.Lock()
         self._pending: Dict[int, Dict[str, object]] = {}
-        self._leased: Dict[int, bool] = {}
-        self._busy_workers: set[int] = set()
-        # A main-process CUDA stage excludes new auxiliary work until its lease ends.
-        # The opaque claim also makes a delayed release unable to reopen a newer claim.
-        self._stage_exclusions: Dict[int, object] = {}
         self._next_task_id = 2_000_000_000
-        self._cursor = 0
         self._failed_reason: Optional[str] = None
         self._announced = False
+        from .backprojection import _MAIN_PROCESS_GPU_STAGE_COORDINATOR
+        self._stage_coordinator = _MAIN_PROCESS_GPU_STAGE_COORDINATOR
+        self._stage_owner = self._stage_coordinator._required_owner()
+
+    def _stages(self):
+        # An old pool must not change the next run's shared coordinator binding.
+        if self._stage_coordinator._required_owner() is not self._stage_owner:
+            raise RuntimeError('Auxiliary pool belongs to an earlier native scheduler run')
+        return self._stage_coordinator
 
     @property
     def capacity(self) -> int:
@@ -3675,12 +3362,11 @@ class _GpuWorkerAuxInterpolationPool:
     def enable_worker(self, worker_id: int, *, allow_full_cpu_affinity: bool = False) -> bool:
         worker = int(worker_id)
         with self._lock:
-            if (self._failed_reason is not None or worker not in self._task_queues
-                    or worker in self._stage_exclusions):
+            if self._failed_reason is not None or worker not in self._task_queues:
                 return False
-            changed = worker not in self._leased or bool(self._leased[worker]) != bool(allow_full_cpu_affinity)
-            self._leased[worker] = bool(allow_full_cpu_affinity)
-            announce = changed and not self._announced
+            if not self._stages().enable_auxiliary(worker, bool(allow_full_cpu_affinity)):
+                return False
+            announce = not self._announced
             if announce:
                 self._announced = True
         if announce:
@@ -3694,40 +3380,26 @@ class _GpuWorkerAuxInterpolationPool:
         """Revoke an idle lease; False means an auxiliary pass is still running there."""
         worker = int(worker_id)
         with self._lock:
-            self._leased.pop(worker, None)
-            # The stage exclusion blocks auxiliary enable/submit, but ordinary
-            # stages may explicitly overlap inference in the coordinator.
-            return worker not in self._busy_workers
-
-    def claim_worker_for_stage(self, worker_id: int) -> Optional[object]:
-        """Atomically revoke an idle offer and exclude auxiliary reuse for a CUDA stage."""
-        worker = int(worker_id)
-        with self._lock:
-            if worker in self._busy_workers or worker in self._stage_exclusions:
-                return None
-            self._leased.pop(worker, None)
-            claim = object()
-            self._stage_exclusions[worker] = claim
-            return claim
-
-    def release_stage_claim(self, worker_id: int, claim: object) -> None:
-        worker = int(worker_id)
-        with self._lock:
-            if self._stage_exclusions.get(worker) is claim:
-                self._stage_exclusions.pop(worker, None)
+            return self._stages().revoke_auxiliary(worker)
 
     def outstanding(self) -> int:
         with self._lock:
             return int(len(self._pending))
 
     def mark_failed(self, reason: str) -> None:
+        retirement_error = None
         with self._lock:
             if self._failed_reason is None:
                 self._failed_reason = str(reason)
             entries = list(self._pending.values())
             self._pending.clear()
-            self._leased.clear()
-            self._busy_workers.clear()
+            for worker in self._worker_ids:
+                try:
+                    self._stages().revoke_auxiliary(worker)
+                except Exception as exc:
+                    retirement_error = exc
+            # A failed actor has not proved device quiescence. Its native busy
+            # claim remains until run abort/actor settlement; no optimistic refund.
         for entry in entries:
             if not entry.get('error'):
                 entry['error'] = str(reason)
@@ -3736,31 +3408,25 @@ class _GpuWorkerAuxInterpolationPool:
             transfer = entry.pop('memfd_transfer', None)
             if transfer is not None:
                 transfer.rollback()  # type: ignore[union-attr]
+        if retirement_error is not None:
+            raise retirement_error
 
     def try_submit(self, aux_kwargs: Dict[str, object]) -> Optional[Dict[str, object]]:
         with self._lock:
             if self._failed_reason is not None:
                 return None
-            candidates = [
-                worker_id for worker_id in self._worker_ids
-                if (worker_id in self._leased and worker_id not in self._busy_workers
-                    and worker_id not in self._stage_exclusions)
-            ]
-            if not candidates:
-                return None
-            start = int(self._cursor) % len(self._worker_ids)
-            rank = {worker_id: (self._worker_ids.index(worker_id) - start) % len(self._worker_ids) for worker_id in candidates}
-            worker_id = min(candidates, key=lambda value: rank[value])
-            self._cursor = (self._worker_ids.index(worker_id) + 1) % len(self._worker_ids)
             task_id = int(self._next_task_id)
             self._next_task_id += 1
+            worker_id, stage_token, allow_full_cpu_affinity = self._stages().acquire_auxiliary(
+                task_id, self._worker_ids)
+            if worker_id < 0:
+                return None
             handle: Dict[str, object] = {
                 'event': threading.Event(), 'stats': None, 'error': None,
                 'task_id': task_id, 'worker_id': int(worker_id),
+                'stage_token': stage_token,
             }
             self._pending[task_id] = handle
-            self._busy_workers.add(int(worker_id))
-            allow_full_cpu_affinity = bool(self._leased.get(int(worker_id), False))
             task_queue = self._task_queues[int(worker_id)]
         batch = _MemfdTransferBatch([])
         try:
@@ -3774,6 +3440,7 @@ class _GpuWorkerAuxInterpolationPool:
             with self._lock:
                 # A failed pool permanently withdraws the reservation above.
                 if self._pending.get(task_id) is not handle:
+                    self._stages().complete_auxiliary(worker_id, task_id, stage_token)
                     return None
                 batch = _attach_interpolation_memfd_transfer(envelope['aux_kwargs'])
                 task_queue.put(envelope)
@@ -3783,7 +3450,7 @@ class _GpuWorkerAuxInterpolationPool:
             batch.rollback()
             with self._lock:
                 self._pending.pop(task_id, None)
-                self._busy_workers.discard(int(worker_id))
+                self._stages().complete_auxiliary(worker_id, task_id, stage_token)
             if not isinstance(exc, Exception):
                 raise
             return None
@@ -3798,8 +3465,12 @@ class _GpuWorkerAuxInterpolationPool:
         error: Optional[str],
     ) -> None:
         with self._lock:
-            handle = self._pending.pop(int(task_id), None)
-            self._busy_workers.discard(int(worker_id))
+            handle = self._pending.get(int(task_id))
+            if handle is not None:
+                if int(handle['worker_id']) != int(worker_id):
+                    raise RuntimeError('Auxiliary completion changed its native device owner')
+                self._stages().complete_auxiliary(int(worker_id), int(task_id), handle['stage_token'])
+                self._pending.pop(int(task_id))
         if handle is None:
             return
         handle.pop('memfd_transfer', None)

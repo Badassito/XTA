@@ -1,24 +1,25 @@
 """Exact native gather shares source-retirement turns before inference drains."""
 from types import SimpleNamespace
 from unittest.mock import Mock
+import queue
 
 import pytest
 
-from XTA import backprojection as bp
+from XTA import backprojection as bp, runtime
+from tests.native_stage_test_support import native_coordinator, configure_stage_timing, wait_stage
 
 
 @pytest.fixture
-def policy(monkeypatch):
+def policy(monkeypatch, request):
     monkeypatch.setattr(bp, 'gpu_worker_aux_interpolation_pool', lambda: None)
     monkeypatch.setenv('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', '1')
     monkeypatch.setenv('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', '1')
-    clock = SimpleNamespace(now=100.)
-    monkeypatch.setattr(bp.time, 'monotonic', lambda: clock.now)
-    coordinator = bp._MainProcessGpuStageCoordinator()
+    coordinator = native_coordinator(request, monkeypatch)
     coordinator.configure_workers([0, 1])
+    configure_stage_timing(coordinator, expiry=1., age=.05)
     torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 2,
         mem_get_info=Mock(return_value=(3 * bp.GIB, 4 * bp.GIB))), device=lambda device: device)
-    return coordinator, torch, clock
+    return coordinator, torch, None
 
 
 def test_idle_native_stage_does_not_wait_for_global_inference_drain(policy):
@@ -92,13 +93,12 @@ def test_native_radial_spherical_fifo_bounds_burst_and_returns_inference_turn(po
 
 
 def test_native_waiter_ages_without_pressure_and_keeps_original_fifo_age(policy):
-    coordinator, torch, clock = policy
+    coordinator, torch, _ = policy
     coordinator.set_pending_inference_backlog(True)
     purpose = 'Native source projection aging-parent'
     assert not coordinator.can_attempt_source_projection(purpose)
-    clock.now = 125.
     assert not coordinator.can_attempt_source_projection(purpose)
-    clock.now = 131.
+    wait_stage(coordinator, lambda state: state['spherical_retirement_reserved_device'] is not None)
     assert coordinator.can_attempt_source_projection(purpose)
     lease = coordinator.try_acquire_stage(torch, purpose)
     try:
@@ -115,10 +115,16 @@ def test_terminal_retirement_and_auxiliary_claim_remain_authoritative(policy, mo
     torch.cuda.mem_get_info.assert_not_called()
     coordinator.set_inference_asset_retirement_pending(False)
     assert coordinator.can_attempt_source_projection(purpose)
-    monkeypatch.setattr(bp, 'gpu_worker_aux_interpolation_pool', lambda: SimpleNamespace(
-        claim_worker_for_stage=lambda _: None, release_stage_claim=lambda *args: None))
+    pool = runtime._GpuWorkerAuxInterpolationPool({0: queue.SimpleQueue(), 1: queue.SimpleQueue()})
+    handles = []
+    for device in (0, 1):
+        assert pool.enable_worker(device)
+        handles.append((device, pool.try_submit({'fixture': device})))
+    assert all(handle is not None for _, handle in handles)
     assert coordinator.try_acquire_stage(torch, purpose) is None
     assert not coordinator.snapshot()['stage_leases']
+    for device, handle in handles:
+        pool.complete(handle['task_id'], device, True, {}, None)
 
 
 def test_cancel_native_demand_unparks_the_reserved_worker(policy, monkeypatch):
@@ -129,6 +135,7 @@ def test_cancel_native_demand_unparks_the_reserved_worker(policy, monkeypatch):
     view = SimpleNamespace(name='cancel-parent')
     assert coordinator.can_attempt_source_projection(bp._native_pull_cuda_stage_purpose(view))
     assert not coordinator.begin_inference(0)
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_CUDA', '0')
     bp._cancel_native_pull_cuda_request(view)
     assert coordinator.snapshot()['spherical_retirement_request_count'] == 0
     assert coordinator.begin_inference(0)

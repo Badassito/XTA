@@ -15,6 +15,8 @@ import numpy as np
 
 from .reconciliation_policy import validate_policy
 
+_VOTE_TILE = 128
+
 
 @dataclass
 class EvidenceLayer:
@@ -179,7 +181,25 @@ def _binary_mask(layer, z0, z1, shape):
     return _checked_binary(layer.read_slab(z0, z1), shape, layer.layer_id)
 
 
-def _evidence_regions(layer, z0, z1, block_shape, needs_confidence, *, allow_sparse):
+def _mark_vote_tiles(tiles, z, y0, y1, x0, x1):
+    tiles[z, y0//_VOTE_TILE:(y1-1)//_VOTE_TILE+1, x0//_VOTE_TILE:(x1-1)//_VOTE_TILE+1] = True
+
+
+def _mark_mask_tiles(tiles, selection, mask, count):
+    z, y, x = selection
+    region = tiles[z, y.start//_VOTE_TILE:(y.stop-1)//_VOTE_TILE+1,
+                   x.start//_VOTE_TILE:(x.stop-1)//_VOTE_TILE+1]
+    if region.size == 1 or count == mask.size:
+        region.fill(True)
+    elif not region.all():
+        # Crops start at arbitrary offsets in the full-grid tile lattice.
+        row_starts = [0, *range(_VOTE_TILE - y.start % _VOTE_TILE, mask.shape[0], _VOTE_TILE)]
+        col_starts = [0, *range(_VOTE_TILE - x.start % _VOTE_TILE, mask.shape[1], _VOTE_TILE)]
+        occupied_cols = np.logical_or.reduceat(mask, col_starts, axis=1)
+        region |= np.logical_or.reduceat(occupied_cols, row_starts, axis=0)
+
+
+def _evidence_regions(layer, z0, z1, block_shape, needs_confidence, *, allow_sparse, score_tiles=None):
     """Read only the recorded mask crops for a source-aligned packed layer."""
     reader = layer.confidence_reader
     iter_scores = getattr(reader, 'iter_crops', None)
@@ -211,6 +231,8 @@ def _evidence_regions(layer, z0, z1, block_shape, needs_confidence, *, allow_spa
                 if top < bottom and left < right:
                     target = raw[top-y0:bottom-y0, left-x0:right-x0]
                     np.maximum(target, scores[top-sy0:bottom-sy0, left-sx0:right-sx0], out=target)
+                    if score_tiles is not None:
+                        _mark_vote_tiles(score_tiles, local_z, top, bottom, left, right)
             observed = raw > 0
         yield (local_z, slice(y0, y1), slice(x0, x1)), mask, raw, observed
 
@@ -261,7 +283,7 @@ def _merge_section_votes(scores, direct, extrapolated, codes, pairs, group_bound
 
 
 def _collect_layer_votes(entries, z0, z1, candidate, anchored, scores, direct, extrapolated,
-                         confidence_mode, anchor_confidence, compare_sections):
+                         confidence_mode, anchor_confidence, compare_sections, vote_tiles=None):
     """Collect one lane's evidence with exclusive ownership of its score groups."""
     group_bounds, foreground = {}, {}
     known_total = unknown_total = 0
@@ -269,8 +291,11 @@ def _collect_layer_votes(entries, z0, z1, candidate, anchored, scores, direct, e
     for layer, group, role, weight in entries:
         needs_confidence = confidence_mode and role == 'prediction'
         allow_sparse = weight <= max_finite_score
+        tiles = None if vote_tiles is None or weight == 0 else vote_tiles[group]
+        score_tiles = tiles if needs_confidence else None
         for selection, mask, raw, observed in _evidence_regions(
-                layer, z0, z1, candidate.shape, needs_confidence, allow_sparse=allow_sparse):
+                layer, z0, z1, candidate.shape, needs_confidence,
+                allow_sparse=allow_sparse, score_tiles=score_tiles):
             foreground_count = int(np.count_nonzero(mask))
             if not foreground_count and allow_sparse:
                 continue
@@ -297,6 +322,8 @@ def _collect_layer_votes(entries, z0, z1, candidate, anchored, scores, direct, e
                 direct[group][selection] |= known & (contribution > 0)
             elif role == 'extrapolation' and extrapolated is not None:
                 extrapolated[group][selection] |= mask & (contribution > 0)
+            if tiles is not None and not needs_confidence:
+                _mark_mask_tiles(tiles, selection, mask, foreground_count)
             if compare_sections:
                 z, y, x = selection
                 bounds = ((z, z+1, y.start, y.stop, x.start, x.stop) if isinstance(z, int)
@@ -308,6 +335,53 @@ def _collect_layer_votes(entries, z0, z1, candidate, anchored, scores, direct, e
                     min(previous[4], bounds[4]), max(previous[5], bounds[5]),
                 )
     return candidate, anchored, group_bounds, foreground, known_total, unknown_total
+
+
+def _voting_tile_grid(entries, shape, group_count, confidence_mode):
+    """Bound support with score-block or mask-crop coordinates already being read."""
+    if group_count < 2 or min(shape[1:]) < _VOTE_TILE:
+        return None
+    finite_weight_limit = float(np.finfo(np.float32).max) / (1 + group_count)
+    for layer, _, role, weight in entries:
+        reader = layer.confidence_reader
+        if (layer.read_mask_crop is None or weight > finite_weight_limit
+                or math.copysign(1.0, weight) < 0
+                or (confidence_mode and role == 'prediction' and reader is not None
+                    and not callable(getattr(reader, 'iter_crops', None)))):
+            return None
+    return tuple(math.ceil(axis / _VOTE_TILE) for axis in shape[1:])
+
+
+def _reduce_vote_groups(scores, direct, extrapolated, tiles):
+    """Reduce group votes over covered regions, retaining full callback arrays."""
+    if tiles is None or np.count_nonzero(tiles) * 2 >= tiles.size:
+        return ((scores > 0).sum(axis=0, dtype=np.uint16),
+                direct.sum(axis=0, dtype=np.uint16),
+                scores.sum(axis=0, dtype=np.float32),
+                None if extrapolated is None else extrapolated.sum(axis=0, dtype=np.uint16))
+    shape = scores.shape[1:]
+    support = np.zeros(shape, dtype=np.uint16)
+    direct_support = np.zeros(shape, dtype=np.uint16)
+    total = np.zeros(shape, dtype=np.float32)
+    extrapolation_support = None if extrapolated is None else np.zeros(shape, dtype=np.uint16)
+    # Each row has an even number of changes when both endpoints are treated
+    # as empty. Pair runs in C order so a voxel sees the original group order.
+    changes = np.diff(tiles, axis=-1, prepend=False, append=False)
+    groups, planes, rows, columns = np.nonzero(changes)
+    for group, z, y, start, stop in zip(groups[::2], planes[::2], rows[::2],
+                                       columns[::2], columns[1::2], strict=True):
+        region = (z, slice(y*_VOTE_TILE, (y+1)*_VOTE_TILE),
+                  slice(start*_VOTE_TILE, stop*_VOTE_TILE))
+        selected = (group, *region)
+        values = scores[selected]
+        np.add(support[region], values > 0, out=support[region])
+        np.add(direct_support[region], direct[selected], out=direct_support[region])
+        # The original C-order group stack reduces a strided first axis.
+        # Do not reduce a one-voxel crop with NumPy's pairwise summation.
+        np.add(total[region], values, out=total[region])
+        if extrapolated is not None:
+            np.add(extrapolation_support[region], extrapolated[selected], out=extrapolation_support[region])
+    return support, direct_support, total, extrapolation_support
 
 
 def _voting_lanes(entries, parallel_layer_costs, shape, plan, memory_mib, workers):
@@ -391,7 +465,7 @@ def _union_only(layers, shape, policy, write_slab, memory_mib, progress):
 
 def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
               memory_mib=4096, geometry_context=None, progress=None,
-              managed_workers=1, parallel_layer_costs=None) -> dict:
+              managed_workers=1, parallel_layer_costs=None, phase_span=None) -> dict:
     """Write one candidate-subset result without mutating any input layer.
 
     Scores are positive support, not calibrated voxel probabilities. Absent or
@@ -400,6 +474,7 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
 
     Managed callers may provide layer costs from independent immutable readers.
     A zero cost certifies that the entire mask's slice index is empty.
+    The optional phase span measures coordinator wall time outside the report.
     """
     policy = validate_policy(policy)
     shape = tuple(int(v) for v in shape_tyx)
@@ -449,15 +524,17 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
         for i, layer in enumerate(layers)}
     compare_sections = section_codes is not None and policy['mode'] != 'union'
     angular_tolerance = policy['angular_tolerance_deg']
+    measure = phase_span if phase_span is not None else lambda name: nullcontext()
     cached_codes = {}
     if compare_sections:
         # Section codes with no Z coordinate broadcast from one plane to each slab.
-        cached_codes = {
-            i: section_codes(descriptor, 0, 1, shape, geometry_context,
-                             angular_tolerance_deg=angular_tolerance)
-            for i, descriptor in enumerate(group_descriptors)
-            if descriptor['kind'] != 'azimuthal' or 2 not in descriptor['axes_xyz'][:2]
-        }
+        with measure('tta.reconciliation.voting.section_collision'):
+            cached_codes = {
+                i: section_codes(descriptor, 0, 1, shape, geometry_context,
+                                 angular_tolerance_deg=angular_tolerance)
+                for i, descriptor in enumerate(group_descriptors)
+                if descriptor['kind'] != 'azimuthal' or 2 not in descriptor['axes_xyz'][:2]
+            }
     pairs = _collision_pairs(group_descriptors, cached_codes) if compare_sections else ()
     decide = policy['decide']
     anchor_bonus = policy['anchor_bonus']
@@ -474,6 +551,7 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
         entries, parallel_layer_costs, shape, plan, memory_mib, managed_workers)
     confidence_mode = policy['mode'] == 'confidence'
     anchor_confidence = policy['anchor_confidence']
+    tile_grid = _voting_tile_grid(entries, shape, group_count, confidence_mode)
     score_plane = np.empty(shape[1:], np.float64) if anchor_bonus and decide is None else None
     pool = (ThreadPoolExecutor(max_workers=len(lanes), thread_name_prefix='reconciliation-vote')
             if lanes else nullcontext())
@@ -487,10 +565,12 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
             extrapolated = np.zeros((group_count, *block_shape), bool) if has_extrapolation and decide is not None else None
             candidate = np.zeros(block_shape, bool)
             group_bounds = [None] * group_count
+            vote_tiles = (None if tile_grid is None else
+                          np.zeros((group_count, block_shape[0], *tile_grid), bool))
 
             def collect(batch, local_candidate, local_anchored):
                 return _collect_layer_votes(batch, z0, z1, local_candidate, local_anchored,
-                    scores, direct, extrapolated, confidence_mode, anchor_confidence, bool(pairs))
+                    scores, direct, extrapolated, confidence_mode, anchor_confidence, bool(pairs), vote_tiles)
 
             def merge(result):
                 local_candidate, local_anchored, bounds, foreground, known, unknown = result
@@ -504,31 +584,34 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
                 counts['confidence_known_voxels'] += known
                 counts['confidence_unknown_prediction_voxels'] += unknown
 
-            futures = [executor.submit(collect, lane, np.zeros(block_shape, bool),
-                                       np.zeros(block_shape, bool)) for lane in lanes]
-            merge(collect(serial_entries, candidate, anchored))
-            for future in futures:
-                merge(future.result())
-            if futures:
-                del future
-            del futures
+            with measure('tta.reconciliation.voting.collection'):
+                futures = [executor.submit(collect, lane, np.zeros(block_shape, bool),
+                                           np.zeros(block_shape, bool)) for lane in lanes]
+                merge(collect(serial_entries, candidate, anchored))
+                for future in futures:
+                    merge(future.result())
+                if futures:
+                    del future
+                del futures
             if compare_sections:
-                codes = [cached_codes[i] if i in cached_codes else
-                         section_codes(descriptor, z0, z1, shape, geometry_context,
-                                       angular_tolerance_deg=angular_tolerance)
-                         for i, descriptor in enumerate(group_descriptors)]
-                counts['duplicate_group_support_removed'] += _merge_section_votes(
-                    scores, direct, extrapolated, codes, pairs, group_bounds)
+                with measure('tta.reconciliation.voting.section_collision'):
+                    codes = [cached_codes[i] if i in cached_codes else
+                             section_codes(descriptor, z0, z1, shape, geometry_context,
+                                           angular_tolerance_deg=angular_tolerance)
+                             for i, descriptor in enumerate(group_descriptors)]
+                    counts['duplicate_group_support_removed'] += _merge_section_votes(
+                        scores, direct, extrapolated, codes, pairs, group_bounds)
             # The layer-count check bounds each exact support count to uint16.
-            support = (scores > 0).sum(axis=0, dtype=np.uint16)
-            direct_support = direct.sum(axis=0, dtype=np.uint16)
-            total = scores.sum(axis=0, dtype=np.float32)
+            with measure('tta.reconciliation.voting.terminal_reduction'):
+                # Collision merging only writes to existing positive support.
+                support, direct_support, total, extrapolation_support = _reduce_vote_groups(
+                    scores, direct, extrapolated, vote_tiles)
             # Merging duplicate groups preserves the union of their confidence anchors.
             anchored &= direct_support >= 2
             counts['anchored_voxels'] += int(np.count_nonzero(anchored))
             if decide is not None:
-                extrapolation_support = (extrapolated.sum(axis=0, dtype=np.uint16)
-                    if extrapolated is not None else np.broadcast_to(np.uint16(0), block_shape))
+                if extrapolation_support is None:
+                    extrapolation_support = np.broadcast_to(np.uint16(0), block_shape)
                 effective = total.astype(np.float64)
                 np.add(effective, anchor_bonus, out=effective, where=anchored)
                 block = dict(candidate=candidate, score=effective, support=support,
@@ -536,7 +619,8 @@ def reconcile(layers: Sequence[EvidenceLayer], *, shape_tyx, policy, write_slab,
                              anchored=anchored, z0=z0, z1=z1)
                 for value in (candidate, effective, support, direct_support, extrapolation_support, anchored):
                     value.flags.writeable = False
-                keep = np.asarray(decide(block))
+                with measure('tta.reconciliation.voting.callback'):
+                    keep = np.asarray(decide(block))
                 if keep.dtype != np.bool_ or keep.shape != block_shape:
                     raise ValueError('Custom reconciliation decide() must return a boolean array with the block shape')
             elif policy['mode'] == 'union':

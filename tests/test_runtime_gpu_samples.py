@@ -1,4 +1,6 @@
 """GPU sample identity survives repeated telemetry flushes and sampling errors."""
+
+from tests.native_stage_test_support import native_stage_context
 import json
 import threading
 from types import SimpleNamespace
@@ -122,7 +124,7 @@ def test_pipeline_stage_provider_timestamps_actual_samples_not_later_snapshots(t
     from XTA import backprojection, pipeline
 
     sink = telemetry(tmp_path)
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     coordinator.configure_workers([1])
     registration = next(node for node in ast.walk(ast.parse(inspect.getsource(pipeline._main_impl)))
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)

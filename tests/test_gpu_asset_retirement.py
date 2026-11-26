@@ -7,6 +7,8 @@ import io
 import os
 from pathlib import Path
 import queue
+import pickle
+import socket
 import sys
 import tempfile
 import threading
@@ -18,6 +20,18 @@ import weakref
 import numpy as np
 
 from XTA import backprojection, cuda_backend, cuda_d1, inference, workers
+from XTA.native_scheduler import GPU, PreparedWorkScheduler
+
+
+def _native_worker_transport(cleanup, worker):
+    owner = PreparedWorkScheduler(88450 + worker, 64, 2)
+    source, actor = socket.socketpair()
+    cleanup.addCleanup(actor.close)
+    cleanup.addCleanup(source.close)
+    cleanup.addCleanup(owner.close)
+    owner.stage('configure', (worker,))
+    owner.register_worker(worker, 1, os.getpid(), GPU, 1, source, device=worker)
+    return owner, actor
 
 
 class _Owner:
@@ -337,10 +351,12 @@ class GpuAssetRetirementTests(unittest.TestCase):
     def test_semantic_fatal_error_stops_worker_before_next_task(self):
         from XTA.semantic_trt import SemanticTrtRingConsumedError
         _assets, engine, model, _references, _events, _cuda = self._worker_context(initialized=False)
-        incoming, outgoing = queue.Queue(), queue.Queue()
-        incoming.put({'task_id': 1, 'slice_count': 1})
-        incoming.put({'task_id': 2, 'slice_count': 1})
-        incoming.put(None)
+        native, actor = _native_worker_transport(self, 0)
+        outgoing = queue.Queue()
+        native.declare_parent(1, 2, 0)
+        self.assertEqual(native.wait_preparation(2)[0], 1)
+        for task_id in (1, 2):
+            native.submit_prepared(task_id, 1, pickle.dumps({'task_id': task_id, 'slice_count': 1}), GPU)
         init = {'imgsz': 16, 'conf': 0.5, 'batch': 1, 'quantize': 16,
                 'cpu_workers': 1, 'task': 'semantic'}
         replacements = {
@@ -358,28 +374,24 @@ class GpuAssetRetirementTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(workers, name, return_value=result))
             prediction = stack.enter_context(mock.patch.object(
                 workers, 'run_prediction_volume_in_worker',
-                side_effect=SemanticTrtRingConsumedError('renderer stream could not be fenced'),
-            ))
-            workers._gpu_inference_worker_main(0, 'model.engine', init, incoming, outgoing)
+                side_effect=SemanticTrtRingConsumedError('renderer stream could not be fenced')))
+            workers._gpu_inference_worker_main(0, 'model.engine', init, actor, outgoing)
             self.assertEqual(prediction.call_count, 1)
-        self.assertEqual(incoming.get_nowait()['task_id'], 2)
-        messages = []
-        while not outgoing.empty():
-            messages.append(outgoing.get_nowait())
-        failures = [message for message in messages if message['type'] == 'fatal']
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0]['task_id'], 1)
+        with self.assertRaisesRegex(RuntimeError, 'renderer stream could not be fenced'):
+            native.wait_publication(2)
+        state = native.snapshot()
+        self.assertEqual((state['dispatched'], state['installed'], state['final'], state['ready']), (1, 1, 0, 1))
 
     def test_worker_protocol_uses_logical_gpu_ack_and_keeps_auxiliary_service_alive(self):
-        assets, engine, model, references, events, cuda = self._worker_context(initialized=False)
-        incoming, outgoing = queue.Queue(), queue.Queue()
+        _assets, engine, model, _references, _events, _cuda = self._worker_context(initialized=False)
+        native, actor = _native_worker_transport(self, 1)
+        outgoing = queue.Queue()
         for task in (
             {'task_id': -10, 'task_type': 'control', 'op': 'release_inference_assets', 'inference_drained': True},
             {'task_id': -11, 'task_type': 'control', 'op': 'release_inference_assets', 'inference_drained': True},
             {'task_id': 20, 'task_type': 'interpolation_pass', 'aux_kwargs': {}},
-            {'task_id': 21, 'task_type': 'inference', 'slice_count': 1}, None,
         ):
-            incoming.put(task)
+            native.send_control(1, pickle.dumps(task), expect_reply=True)
         init = {'imgsz': 16, 'conf': 0.5, 'batch': 1, 'quantize': 16, 'cpu_workers': 1}
         replacements = {
             'configure_pipeline_modes': None, 'initialize_runtime_observability': None,
@@ -391,25 +403,47 @@ class GpuAssetRetirementTests(unittest.TestCase):
             'cpu_retina_masks_enabled': True, 'd1_owner_pipeline_enabled': False,
             '_interpolation_process_entry': {'auxiliary_ok': True},
         }
+        errors = []
+        def worker():
+            try:
+                workers._gpu_inference_worker_main(1, 'model.engine', init, actor, outgoing)
+            except BaseException as error:
+                errors.append(error)
         with contextlib.ExitStack() as stack, contextlib.redirect_stdout(io.StringIO()):
             stack.enter_context(mock.patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '3,7'}))
             for name, result in replacements.items():
                 stack.enter_context(mock.patch.object(workers, name, return_value=result))
             prediction = stack.enter_context(mock.patch.object(workers, 'run_prediction_volume_in_worker'))
-            workers._gpu_inference_worker_main(1, 'model.engine', init, incoming, outgoing)
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            try:
+                messages = []
+                for _ in range(3):
+                    event = native.wait_event(3)
+                    self.assertIsNotNone(event)
+                    self.assertEqual(event[0], 'control')
+                    messages.append(pickle.loads(event[2]))
+                acknowledgments = [m for m in messages if m['type'] == 'inference_assets_released']
+                self.assertEqual(len(acknowledgments), 2)
+                self.assertTrue(all(m['ok'] and m['gpu_index'] == 1 for m in acknowledgments))
+                self.assertTrue(acknowledgments[1]['stats']['already_released'])
+                auxiliary = next(m for m in messages if m['type'] == 'aux_result')
+                self.assertTrue(auxiliary['ok'])
+                self.assertEqual(auxiliary['stats'], {'auxiliary_ok': True})
+                # Deliberately inject late inference through a real native lease;
+                # the worker must refuse before reusing its retired model.
+                native.declare_parent(1, 1, 0)
+                self.assertEqual(native.wait_preparation(2)[0], 1)
+                native.submit_prepared(21, 1, pickle.dumps({
+                    'task_id': 21, 'task_type': 'inference', 'slice_count': 1}), GPU)
+                with self.assertRaisesRegex(RuntimeError, 'after the terminal'):
+                    native.wait_publication(3)
+            finally:
+                native.close()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
             prediction.assert_not_called()
-        messages = []
-        while not outgoing.empty(): messages.append(outgoing.get())
-        acknowledgments = [message for message in messages if message['type'] == 'inference_assets_released']
-        self.assertEqual(len(acknowledgments), 2)
-        self.assertTrue(all(message['ok'] and message['gpu_index'] == 1 for message in acknowledgments))
-        self.assertTrue(acknowledgments[1]['stats']['already_released'])
-        auxiliary = next(message for message in messages if message['type'] == 'aux_result')
-        self.assertTrue(auxiliary['ok'])
-        self.assertEqual(auxiliary['stats'], {'auxiliary_ok': True})
-        late = next(message for message in messages if message.get('task_id') == 21)
-        self.assertFalse(late['ok'])
-        self.assertIn('after the terminal', late['error'])
+            self.assertFalse(errors)
 
 
 @unittest.skipUnless(os.environ.get('XTA_RUN_CUDA_ASSET_RETIREMENT_SMOKE') == '1', 'explicit CUDA smoke only')

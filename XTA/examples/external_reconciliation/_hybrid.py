@@ -4,9 +4,7 @@ from fractions import Fraction
 import numpy as np
 from scipy import ndimage as ndi
 
-from ._morphology import candidate_window, disk
-
-CROSS = ndi.generate_binary_structure(2,1)
+from ._morphology import CROSS, box_count, candidate_window, grow_cores, open_disk
 
 
 def fraction_pass(positive,total,fraction):
@@ -16,8 +14,8 @@ def fraction_pass(positive,total,fraction):
 
 def local_additions(candidate,accepted,radius,fraction):
     width=2*radius+1
-    total=np.rint(ndi.uniform_filter(candidate.astype(np.float64),size=width,mode='constant')*width*width).astype(np.int64)
-    positive=np.rint(ndi.uniform_filter(accepted.astype(np.float64),size=width,mode='constant')*width*width).astype(np.int64)
+    total=box_count(candidate,width)
+    positive=box_count(accepted,width)
     return candidate & (total>0) & fraction_pass(positive,total,fraction)
 
 
@@ -46,10 +44,10 @@ def decide_slice(candidate,score,support,direct,*,satellites=False,rescue=False,
     keep=b2 & base
     if rescue:
         domain=b2 & ~base
-        cores=ndi.binary_opening(b3 & ~base,structure=disk(rescue_radius),border_value=0)
+        cores=open_disk(b3 & ~base,rescue_radius)
         # Bounded geodesic growth stays within two-vote support; it cannot jump
         # across an absent-candidate gap into another component at larger scales.
-        recovered=ndi.binary_dilation(cores,structure=CROSS,iterations=rescue_radius,mask=domain)
+        recovered=grow_cores(cores,domain,rescue_radius)
         keep |= recovered
     if satellites:
         keep &= ~satellite | (b3 & strict_ids[labels])

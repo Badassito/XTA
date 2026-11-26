@@ -4,7 +4,7 @@ The `--conf` range form selects multiple operating points in one TTA invocation.
 For example, run this on a GPU with an instance model:
 
 ```text
-python -m XTA --mode tta --input sample.mkv --model gpu:best.pt --device 0 --enable_cartesian transverse sagittal coronal --conf 0.50:0.10:1.00 --interpolation_backend sdf --interpolation_distance 30 --save nrrd low_quality:0.20 summary --output sample_sweep
+python -m XTA --mode tta --input sample.mkv --model gpu:best.pt --device 0 --enable_cartesian transverse sagittal coronal --conf 0.50:0.10:1.00 --interpolation_backend sdf --interpolation_distance 30 --save low_quality:0.20:nrrd,xtareview,video full_quality:images,labels,voxel_volume --output sample_sweep
 ```
 
 The form is `START:STEP:END`. Use values from 0 through 1 on the hundredth
@@ -48,15 +48,17 @@ Publication runs beside inference, so it must keep pace with the GPUs.
 Sibling rank projection uses the GPU when a device can lend a shared slice
 beside inference (radial, tilted, azimuthal and spherical views), and the
 CPU otherwise. Both routes produce identical outputs. Several publishers each
-own one view at a time. The scheduler waits only when the native journal
-nears its quota or the queue reaches its safety cap:
+own one view at a time. The native scheduler reserves a publication ticket
+and parent byte credit before admitting inference. The publisher seals ranges
+and projects on its own thread. The scheduler can receive results and dispatch
+other admitted work while a view is publishing. Admission resumes when the
+publisher and other consumers retire their actual backing references.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `XTA_YOLO_SWEEP_PUBLISHERS` | visible CPUs / 8, 2 to 16 | concurrent view publications |
 | `XTA_YOLO_SWEEP_PROJECTION_LANES` | CPUs / (2 x publishers), 1 to 8 | CPU projection or encoding lanes per publication |
-| `XTA_YOLO_SWEEP_JOURNAL_HIGH_WATER` | 0.75 | journal fraction at which the scheduler waits for publication |
-| `XTA_YOLO_SWEEP_PUBLISH_BACKLOG` | 16 x publishers, at least 64 | safety cap on queued views |
+| `XTA_YOLO_SWEEP_PUBLISH_BACKLOG` | 16 x publishers, at least 64 | ceiling on native-funded parents awaiting publication or backing retirement |
 | `XTA_YOLO_SWEEP_RANK_GPU` | 1 | 0 restores the historical CUDA admission for sibling projection (no shared lease beside inference, no wait policy) |
 | `XTA_YOLO_SWEEP_RANK_GPU_OVERLAP_GIB` | the ordinary slice | largest GPU slice a sibling projection may lease beside inference |
 | `XTA_YOLO_SWEEP_RANK_GPU_HEADROOM_GIB` | 8 | extra free device memory required for an opted-in slice above the ordinary one |
@@ -73,19 +75,18 @@ memory that inference sizing already leaves free. Floor projections keep
 priority over sibling projections for those slices.
 
 Each count accepts a positive integer or `auto`. A GPU-projected view packs its
-planes on up to 4 host threads. The scheduler also keeps going when the bytes
-above the journal mark could not be freed by the queued publications (workers
-then take the exact scalar route if the quota fills). Sibling NRRD encoding uses one
-shared pool sized to what concurrent publications can queue (at most a third
-of the CPUs). Requested observed evidence is written beside those encodes.
-The family `manifest.json` reports `upstream_fanout.early_publication` with
-the backlog peak, the journal's peak fill and the seconds the scheduler waited.
-A nonzero wait means publication, not inference, limited the run.
+planes on up to 4 host threads. The disk journal retains its own quota,
+including sealed native views needed by later scalar consumers. Workers take
+the exact scalar route when native fanout cannot fit that quota. Sibling NRRD
+encoding uses one shared pool sized to what concurrent publications can queue
+(at most a third of the CPUs). Requested observed evidence is written beside
+those encodes. The family `manifest.json` reports
+`upstream_fanout.early_publication` with the publisher count and backlog peak.
 `fanout_progress.json` lists each projector backend with `cuda_declines` (why
 a view took the CPU route). Telemetry adds `sweep.publication.view_seconds`,
 per-family `sweep.publication.<family>_seconds`, per-stage
-`sweep.publication.stage[.<family>].{rank_input,projection,confidence_thread,layers_barrier}_seconds`,
-`sweep.publication.scheduler_wait_seconds` and `sweep.rank_gpu.*` admission counters.
+`sweep.publication.stage[.<family>].{rank_input,projection,confidence_thread,layers_barrier}_seconds`
+and `sweep.rank_gpu.*` admission counters.
 
 Requested sibling confidence evidence and journal decoding run outside the producer's
 Python interpreter lock. Each sibling's journal rows are decoded by nogil
@@ -207,21 +208,31 @@ dimensions.
 | Requested output or feature | Cutoff files |
 |---|---|
 | Every cutoff | `manifest.json`, the cutoff receipt |
-| `--save low_quality[:bins]` | `<stem>_Binary_LowQuality_<token>.mp4` for each requested preview tier |
-| `--save binary` | `<stem>_Binary.mkv` (native FFV1 video) and `binary_masks/<stem>_Binary_####.tiff` |
+| `--save low_quality:0.20:binary_video` | `<stem>_Binary_LowQuality_<token>.mkv` |
+| `--save binary_video` | `<stem>_Binary.mkv`, a native FFV1 mask video |
+| `--save binary_images` | `binary_masks/<stem>_Binary_####.tiff`, a native mask sequence |
 | `--save labels` | `labels/<stem>_####.txt`, final YOLO segmentation labels |
 | `--save semantic` | `semantic_masks/<stem>_####.png`, native masks with pixel values 0 and 1 |
-| `--save images` | `images/model_input/` with active-view model-input images, including multipage TIFFs for five or more channels |
+| `--save images` | `images/<stem>_####.png`, grayscale source frames that match the grid and numbered stems of `labels` |
 | `--save voxel_volume` | `<stem>_VoxelVolume.json`, the native foreground voxel count |
-| `--save confidence` or confidence-mode reconciliation | `reconciliation_evidence/`, the observed-score catalogue and layer payloads |
+| `--save confidence` | `reconciliation_evidence/`, the observed-score catalogue and layer payloads |
 | SAM interpolation or extrapolation that produces artifacts | `sam-artifacts.tar` |
 | External augmentation | `augmentation_manifest.json` and `augmentation_support/`, including policy snapshots and any saved validity data |
 
-The `nrrd`, `summary` and `high_quality` (also spelled `overlay`) save
-options publish at the family level. `low_quality` publishes both the binary
-video for each cutoff and a family heatmap per preview tier. Live or
-interrupted cutoffs can also expose a `temp` scratch link or pointer and
-temporary image or SAM checkpoint stages.
+Use `full_quality:FORMATS` or bare formats for native resolution. Each
+`low_quality:DOWNBIN:FORMATS` group selects its own formats. A downbin is a
+scale fraction or a positive integer target for the longest source dimension.
+When targets round to the same preview shape, the run writes their combined
+format selection once. Preview image sequences, labels and voxel counts are
+stored under `low_quality/<token>/` inside each cutoff. Each voxel count uses
+foreground voxels on its selected grid.
+
+The sweep publishes component NRRDs, editable `.xtareview` archives and
+overlay videos at the family level on the grids selected for each product.
+`summary` and the observed `confidence` evidence use the bare or
+`full_quality` form. The example above produces preview layers, one editable
+preview archive and a preview cutoff-membership overlay, with native matched
+source images, labels and voxel counts at each cutoff.
 
 For managed sweeps, reconciliation runs its memory preflight in memory.
 Cutoff-specific reconciliation counts and layer results are stored in the
@@ -244,13 +255,22 @@ The group index identifies each channel's gzip byte range. Readers that
 stop after the first gzip member, including `pynrrd` 1.1.3's ordinary
 `nrrd.read`, cannot decode every layer of a multi-member group.
 
+Managed review writes independent group files concurrently. Once all groups at
+a cutoff finish, its coverage map can be written alongside groups at other
+cutoffs. Group writers default to half the allocated CPUs, up to 32, and share
+the available memory allowance with resident coverage bands. File names and
+catalogue order follow the original group plan.
+
 Review publication reuses staged gzip members when the source and group share
 the same stored XY crop and the source covers exactly the requested Z slices.
 For eligible native layers in a managed sweep, the scalar writer records the
 compressed file identity and retains the cropped source masks on family
 scratch. The review writer verifies the compressed data as it copies the gzip
 members and obtains bounds, counts and coverage from the corresponding source
-crops. Layers without a matching receipt use the decoded mask scan.
+crops. When the group needs a wider XY crop, the writer also verifies the
+staged compressed file, places each retained native crop at its reference
+coordinates, and encodes the group slab. Coverage uses the same crop. Layers
+without a matching receipt use the decoded mask scan.
 The transient source budget is 64 GiB across the family, set by
 `XTA_YOLO_SWEEP_REVIEW_SOURCE_GIB`. Set it to 0 for the decoded path. The
 writer admits retained masks while at least 8 GiB of scratch headroom remains.
@@ -275,8 +295,8 @@ sweep.
 
 `--save summary` writes one family `summary.txt` with the existing scalar
 summary text under a heading for each validated cutoff in requested order.
-`--save high_quality` writes `heatmaps/native.mkv`.
-`--save low_quality` writes `heatmaps/<input-stem>_Heatmap_LowQuality_<token>.mp4`
+`--save video` writes `heatmaps/native.mkv`.
+`--save low_quality:0.20:video` writes `heatmaps/<input-stem>_Heatmap_LowQuality_<token>.mkv`
 for each preview tier. Each video shows how many finalized cutoff masks
 contain each voxel on that grid.
 Zero support preserves the gray source. Positive support uses a distinct
@@ -285,7 +305,7 @@ so a partially completed sweep preserves the colors for the counts it has.
 The `heatmaps` records in the family manifest give the video paths, exact
 cutoffs, colors, frame rate and opacity.
 The separate binary exports preserve membership at each cutoff, including
-non-nested results. Each branch writes its low-quality binary MP4s directly
+non-nested results. Each branch writes its requested low-quality binary MKVs directly
 in `confidence_cutoffs/conf_NNN/`; their filenames include the preview
 scale and dimensions, including when several tiers were requested.
 
@@ -325,9 +345,10 @@ per cutoff, at most 8 and at most the CPU count, each with its own
 Slicer opens such a review as per-cutoff segments, because masks from
 independent runs need not nest across cutoffs.
 
-Confidence-mode reconciliation retains observed numeric evidence. Use
-`--save confidence` to keep it independently of reconciliation in scalar runs
-or confidence sweeps. The manifest
+Confidence-mode reconciliation collects the observed scores it needs in run
+scratch. Add `confidence` to `--save` to keep a public score catalogue and
+its payloads for later export or replay. This applies to scalar runs and
+each cutoff of a confidence sweep. The manifest
 in `reconciliation_evidence/` identifies the model, layer, task-specific score
 meaning and coordinate space. These bytes describe surviving observed
 predictions before interpolation. Zero includes unknown support. Generated
@@ -342,6 +363,12 @@ splits a quantized score, or unavailable cache data use the independent
 projection. Matching orthogonal grids can read directly in source order.
 The reusable files stay in the family workspace and use
 `XTA_YOLO_SWEEP_CACHE_GIB` as a storage ceiling, subject to local capacity.
+
+Per-branch telemetry records floor-cache storage outcomes under
+`confidence.floor_cache`. The `confidence.score_reuse` counters distinguish
+layers copied directly, layers reconstructed by thresholding, and rejected
+proofs by reason. The proof and storage timers sum work across views and can
+overlap detector and projection work.
 
 To inspect one model and layer as an ordinary uint8 scalar NRRD, use the
 exact `model_name` and `layer_key` from that catalog, for example:

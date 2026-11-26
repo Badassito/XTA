@@ -786,6 +786,39 @@ class ViewPrepareLeaseState:
             finalizer.atexit = False
         return False
 
+    def retire_terminal_arrays(self, key, arrays, owner_refs, *, retired_callback):
+        """Keep the terminal backing charged until every surviving scientific reader is gone."""
+        lease = self.leases.get(key)
+        if lease is None or key in self.retired_for_publication:
+            return False
+        if key not in self.postprocess_views or lease.phase != 'postprocess':
+            raise RuntimeError(f'Terminal detector workspace {key} has no postprocess owner')
+        roots = {}
+        for array in arrays:
+            if array is not None:
+                owner = _array_lifetime_owner(array)
+                roots[id(owner)] = owner
+        for reference in owner_refs:
+            owner = reference() if reference is not None else None
+            if owner is not None:
+                roots[id(owner)] = owner
+        return self._retire_after_owners(key, lease, list(roots.values()), retired_callback)
+
+    def retire_terminal_view(self, key, registries, extra_arrays, owner_refs, *, retired_callback):
+        """Detach the terminal science registries, defer file deletion and fence their shared readers."""
+        arrays = {id(value): value for value in extra_arrays if value is not None}
+        for registry in registries:
+            value = registry.get(key[0], {}).pop(key[1], None)
+            if value is not None:
+                arrays[id(value)] = value
+        detached = 0
+        for value in arrays.values():
+            detached += int(np.asarray(value).nbytes)
+            path = _interpolation_array_backing_path(value)
+            close_memmap_array_without_flush(value, unlink_path=scratch_unlink_path_for_memmap(value, path))
+        self.retire_terminal_arrays(key, arrays.values(), owner_refs, retired_callback=retired_callback)
+        return detached
+
     def settle_publication_retirement(self, key, expected_lease) -> bool:
         """Apply an owner-death receipt only on the scheduler state thread."""
         if key not in self.retired_for_publication or self.leases.get(key) is not expected_lease:
@@ -827,6 +860,7 @@ class ViewPrepareLeaseState:
             return False
         self.leases.pop(key, None)
         lease.release('postprocess')
+        self.retired_for_publication.discard(key)
         self.postprocess_views.remove(key)
         self.postprocess_bytes.pop(key, None)
         return True

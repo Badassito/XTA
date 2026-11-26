@@ -19,6 +19,7 @@ from unittest import mock
 import pytest
 
 from XTA import confidence_sweep as sweep
+from XTA.config import resolve_save_request
 
 
 _POPEN = subprocess.Popen
@@ -56,6 +57,8 @@ record = {'arguments':arguments, 'cwd':str(Path.cwd()), 'pid':os.getpid(),
               'XTA_YOLO_SWEEP_CUTOFFS_HUNDREDTHS','XTA_YOLO_SWEEP_NATIVE_ROLE',
               'XTA_YOLO_SWEEP_OUTPUT_ROOT','XTA_YOLO_SWEEP_QUOTA_DATABASE',
               'XTA_YOLO_SWEEP_SAM_ARCHIVE_ROOT',
+              'XTA_YOLO_SWEEP_MEDIA_ROOT','XTA_YOLO_SWEEP_NRRD_STAGE_ROOT',
+              'XTA_YOLO_SWEEP_XTAREVIEW_STAGE_ROOT',
               'PYTHONPATH','PYTHONSAFEPATH')}}
 (out / 'child_observed.json').write_text(json.dumps(record))
 print('scalar-live-' + str(cent), flush=True)
@@ -257,7 +260,7 @@ def harness(tmp_path, monkeypatch):
     publication_calls = []
     publisher = types.ModuleType('XTA.sweep_publication')
 
-    def publish(root, rows, *, sweep_id, temp_dir):
+    def publish(root, rows, *, sweep_id, temp_dir, expected_grids):
         assert all((out/'manifest.json').is_file() for _,out in rows)
         assert temp_dir == Path(_read(root / 'manifest.json')['work_directory']).parent
         assert temp_dir.is_dir()
@@ -296,7 +299,7 @@ def test_output_mount_check_fails_before_first_cutoff(harness, monkeypatch):
     monkeypatch.setattr(json_publication, '_publish_sweep_directory', unsupported)
     with pytest.raises(RuntimeError, match='publication check failed'):
         sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50, 75), output_root=output,
-                                   save_options=('nrrd',))
+                                   save_request=resolve_save_request('nrrd'))
     receipt = _read(output / 'manifest.json')
     assert not harness.children and receipt['branches'] == []
     assert receipt['status'] == 'failed' and receipt['work_cleanup_complete']
@@ -334,7 +337,7 @@ def test_heatmap_failure_retains_accepted_media_only_cutoffs(harness, monkeypatc
     with pytest.raises(OSError, match='fixture encoder failed'):
         sweep.run_confidence_sweep(
             harness.arguments, cutoffs_hundredths=(50, 75), output_root=output,
-            save_options=('high_quality',),
+            save_request=resolve_save_request('video'),
         )
     receipt = _read(output / 'manifest.json')
     assert receipt['status'] == 'failed'
@@ -354,7 +357,7 @@ def test_heatmaps_namespace_is_reserved_when_requested(harness):
     with pytest.raises(FileExistsError, match='heatmaps'):
         sweep.run_confidence_sweep(
             harness.arguments, cutoffs_hundredths=(50, 75), output_root=output,
-            save_options=('high_quality',),
+            save_request=resolve_save_request('video'),
         )
     assert not harness.children
     sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50, 75), output_root=output)
@@ -475,7 +478,7 @@ def test_separate_quota_storage_is_shared_and_retired(harness, monkeypatch, chil
     assert list(quota_parent.iterdir()) == [keep]
 
 
-@pytest.mark.parametrize('failure', [None, 'branch', 'publication'])
+@pytest.mark.parametrize('failure', [None, 'branch', 'publication', 'preview-only'])
 def test_staged_nrrds_follow_group_publication_and_recovery(harness, monkeypatch, failure):
     import importlib
 
@@ -485,6 +488,7 @@ def test_staged_nrrds_follow_group_publication_and_recovery(harness, monkeypatch
     with monkeypatch.context() as platform_imports:
         platform_imports.setattr(subprocess, 'Popen', _POPEN)
         importlib.import_module('XTA.runtime')
+        from XTA.outputs import resolve_save_grids
         from XTA.reconciliation_io import write_seg_nrrd
 
     monkeypatch.delitem(sys.modules, 'XTA.sweep_publication')
@@ -496,6 +500,7 @@ def test_staged_nrrds_follow_group_publication_and_recovery(harness, monkeypatch
             raise OSError('grouped output write failed')
         monkeypatch.setattr(publication, 'write_grouped_seg_nrrd', failed_group)
     run_child = sweep._run_child
+    request = resolve_save_request('low_quality:0.5:nrrd' if failure == 'preview-only' else 'nrrd')
 
     def with_staged_layer(command, env, *, started):
         returncode = run_child(command, env, started=started)
@@ -506,9 +511,14 @@ def test_staged_nrrds_follow_group_publication_and_recovery(harness, monkeypatch
             receipt = _read(run_path)
             receipt['confidence_sweep']['nrrd_storage'] = 'grouped'
             run_path.write_text(json.dumps(receipt), encoding='utf-8')
-            stage = Path(env['XTA_YOLO_SWEEP_NRRD_STAGE_ROOT']) / f'conf_{cutoff:03d}' / 'nrrd'
-            stage.mkdir(parents=True)
+            stage = Path(env['XTA_YOLO_SWEEP_NRRD_STAGE_ROOT']) / f'conf_{cutoff:03d}'
             shape = tuple(receipt['inputs']['source_shape_t_y_x'])
+            if failure == 'preview-only':
+                (spec,), _ = resolve_save_grids(request, shape)
+                stage = stage / 'low_quality' / spec.token
+                shape = spec.output_shape_t_y_x
+            stage = stage / 'nrrd'
+            stage.mkdir(parents=True)
             mask = np.ones(shape, dtype=np.uint8)
             write_seg_nrrd(stage / 'volume.seg.nrrd', shape_tyx=shape,
                            read_slab=lambda z0, z1: mask[z0:z1])
@@ -526,7 +536,8 @@ def test_staged_nrrds_follow_group_publication_and_recovery(harness, monkeypatch
 
     monkeypatch.setattr(sweep, '_run_child', with_staged_layer)
     output = harness.root / 'grouped'
-    args = dict(cutoffs_hundredths=(50, 75), output_root=output)
+    args = dict(cutoffs_hundredths=(50, 75), output_root=output,
+                save_request=request)
     if failure == 'branch':
         with pytest.raises(subprocess.CalledProcessError):
             sweep.run_confidence_sweep(harness.arguments, **args)
@@ -549,11 +560,105 @@ def test_staged_nrrds_follow_group_publication_and_recovery(harness, monkeypatch
         assert review['cutoffs_cent'] == ([50] if failure == 'branch' else [50, 75])
         assert review['sweep_status'] == ('failed' if failure == 'branch' else 'complete')
         assert all(grid['payload'] == 'grouped' for grid in review['grids'])
+        if failure == 'preview-only':
+            assert len(review['grids']) == 1
+            assert review['grids'][0]['grid_id'].startswith('low_quality/')
+            assert not (output / 'review' / 'native').exists()
+
+
+@pytest.mark.parametrize('wrong_shape', [False, True])
+def test_preview_archives_merge_without_nrrds_or_native_video(harness, monkeypatch, wrong_shape):
+    import importlib
+    import numpy as np
+
+    with monkeypatch.context() as platform_imports:
+        platform_imports.setattr(subprocess, 'Popen', _POPEN)
+        from XTA.native_review_store import NativeReviewStore
+        from XTA.outputs import resolve_save_grids
+        from XTA.review_archive import ReviewLayer, write_review_archive
+
+    monkeypatch.delitem(sys.modules, 'XTA.sweep_publication')
+    importlib.import_module('XTA.sweep_publication')
+    request = resolve_save_request(['low_quality:0.5:xtareview', 'low_quality:0.25:video'])
+    native_shape = (16, 24, 32)
+    specs, _ = resolve_save_grids(request, native_shape)
+    archive_spec, video_spec = specs
+    archive_grid = f'low_quality/{archive_spec.token}'
+    video_grid = f'low_quality/{video_spec.token}'
+    geometry = {'space': 'right-anterior-superior', 'origin_xyz': (0, 0, 0),
+                'directions_xyz': ((2, 0, 0), (0, 2, 0), (0, 0, 2))}
+    run_child = sweep._run_child
+
+    def with_staged_outputs(command, env, *, started):
+        returncode = run_child(command, env, started=started)
+        if returncode != 0:
+            return returncode
+        assert sweep.SWEEP_NRRD_STAGE_ENV not in env
+        cutoff = int(env['XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS'])
+        branch = Path(command[command.index('--output') + 1])
+        run_path = branch / 'manifest.json'
+        receipt = _read(run_path)
+        receipt['inputs'].update(source_shape_t_y_x=list(native_shape),
+                                 processing_shape_t_y_x=list(native_shape))
+        media = Path(env['XTA_YOLO_SWEEP_MEDIA_ROOT']) / f'conf_{cutoff:03d}'
+        (media / 'native.packbits').unlink()
+        video_shape = video_spec.output_shape_t_y_x
+        video = media / f'{video_grid}.packbits'
+        video.parent.mkdir()
+        video.write_bytes(bytes(video_shape[0] * ((video_shape[1] * video_shape[2] + 7) // 8)))
+        receipt['confidence_sweep']['heatmap_inputs']['grids'] = {video_grid: list(video_shape)}
+        receipt['confidence_sweep']['xtareview_grids'] = [archive_grid]
+        run_path.write_text(json.dumps(receipt), encoding='utf-8')
+        shape = native_shape if wrong_shape else archive_spec.output_shape_t_y_x
+        mask = np.zeros(shape, dtype=np.uint8)
+        mask[0, int(cutoff == 75), 0] = 1
+        destination = Path(env[sweep.SWEEP_XTAREVIEW_STAGE_ENV]) / f'conf_{cutoff:03d}' / f'{archive_grid}.xtareview'
+        write_review_archive(destination, review_id=f'branch{cutoff}', grid_id=archive_grid,
+                             shape_tyx=shape, native_shape_tyx=native_shape, geometry=geometry,
+                             cutoffs_cent=(cutoff,), layers=[ReviewLayer(
+                                 {'logical_id': 'global', 'role': 'global', 'cutoff_cent': cutoff},
+                                 lambda z0, z1: mask[z0:z1],
+                             )])
+        return returncode
+
+    from XTA import sweep_heatmaps
+
+    def write_heatmap(path, packed, *_args, **_kwargs):
+        assert all(file.is_file() for file in packed)
+        assert path.suffix == '.mkv' and video_spec.token in path.stem
+        path.write_bytes(b'heatmap')
+
+    monkeypatch.setattr(sweep, '_run_child', with_staged_outputs)
+    monkeypatch.setattr(sweep_heatmaps, '_write_heatmap', write_heatmap)
+    root = harness.root / 'preview-archives'
+    kwargs = dict(cutoffs_hundredths=(50, 75), output_root=root, save_request=request)
+    if wrong_shape:
+        with pytest.raises(ValueError, match='geometry differs from the requested output grid'):
+            sweep.run_confidence_sweep(harness.arguments, **kwargs)
+        receipt = _read(root / 'manifest.json')
+        assert receipt['status'] == 'failed' and 'review_archive_recovery' in receipt
+        assert not (root / 'review_archives').exists()
+        return
+
+    receipt = _read(sweep.run_confidence_sweep(harness.arguments, **kwargs))
+    [archive] = receipt['review_archives']
+    assert archive['grid'] == archive_grid and archive['cutoffs_hundredths'] == [50, 75]
+    assert receipt['review_manifest'] is None and receipt['work_cleanup_complete']
+    assert [heatmap['grid'] for heatmap in receipt['heatmaps']] == [video_grid]
+    assert not list(root.rglob('*.nrrd'))
+    assert not (root / 'heatmaps' / 'native.mkv').exists()
+    with NativeReviewStore(root / archive['path']) as store:
+        assert store.grid_id == archive_grid and store.cutoffs == (50, 75)
+        assert [(store.read_block(store.global_layer_id, cent, (0, 0, 0))[0, row, 0])
+                for cent, row in [(50, 0), (50, 1), (75, 0), (75, 1)]] == [1, 0, 0, 1]
 
 
 def test_scalar_processes_are_independent_and_live_output_is_inherited(harness, tmp_path, monkeypatch, capfd):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv('XTA_YOLO_SWEEP_CACHE_GIB', '0')
+    product_stages = (sweep.SWEEP_NRRD_STAGE_ENV, sweep.SWEEP_XTAREVIEW_STAGE_ENV, 'XTA_YOLO_SWEEP_MEDIA_ROOT')
+    for name in product_stages:
+        monkeypatch.setenv(name, str(tmp_path / 'unowned-stage'))
     original = [*harness.arguments, '--task','semantic','--interpolation','sam',
         '--conf=.10:.10:1.00','--conf','.20', '--output=ignored', '--output','ignored-too',
         '--min_conf=.9','--temp=old-root',
@@ -588,9 +693,10 @@ def test_scalar_processes_are_independent_and_live_output_is_inherited(harness, 
         assert env['XTA_YOLO_SWEEP_CUTOFF_HUNDREDTHS'] == str(cent)
         assert env['XTA_YOLO_SWEEP_FLOOR_HUNDREDTHS'] == '50'
         assert env['XTA_YOLO_SWEEP_CACHE_GIB'] == '0'
+        assert all(env[name] is None for name in product_stages)
         assert env['PYTHONPATH'].split(os.pathsep)[0] == str(Path(sweep.__file__).resolve().parents[1])
         assert not Path(env['XTA_YOLO_SWEEP_WORK_DIR']).exists()
-    assert len(harness.publications) == 1
+    assert harness.publications == []
     assert not (out/'.confidence_sweep.lock').exists()
     assert list((tmp_path/'work-root').iterdir()) == []
     streams = capfd.readouterr()
@@ -636,7 +742,8 @@ def test_failed_or_mismatched_scalar_never_publishes_family(harness, monkeypatch
 def test_degraded_sam_cutoff_preserves_later_branches_and_skips_review(harness, monkeypatch, capsys):
     monkeypatch.setenv('SWEEP_TEST_MODE', 'incomplete')
     root = harness.root / 'degraded'
-    path = sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50, 75, 100), output_root=root)
+    path = sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50, 75, 100), output_root=root,
+                                      save_request=resolve_save_request('nrrd'))
     receipt = _read(path)
     assert receipt['status'] == 'incomplete'
     assert receipt['incomplete_cutoffs_hundredths'] == [75]
@@ -721,20 +828,24 @@ def test_live_unrelated_log_is_preserved(harness):
     summary.write_text('existing unrelated report', encoding='utf-8')
     with pytest.raises(FileExistsError, match='summary.txt'):
         sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50,), output_root=out,
-                                   save_options=('summary',))
+                                   save_request=resolve_save_request('summary'))
     assert not harness.children
     sweep.run_confidence_sweep(harness.arguments,cutoffs_hundredths=(50,),output_root=out)
     assert log.read_text() == 'existing live scheduler output\n'
     assert summary.read_text(encoding='utf-8') == 'existing unrelated report'
 
 
-@pytest.mark.parametrize('reserved',('review','confidence_cutoffs','manifest.json','fanout_progress.json','fanout_storage.json'))
+@pytest.mark.parametrize('reserved',('review','review_archives','heatmaps','confidence_cutoffs',
+                                    'manifest.json','fanout_progress.json','fanout_storage.json'))
 @pytest.mark.parametrize('option',('--temp','--capture_component_replay'))
 def test_work_roots_inside_owned_outputs_fail_before_children(harness,reserved,option):
     out = harness.root/f'collision-{option[2:]}-{reserved}'
     target = out/reserved/'child' if reserved!='manifest.json' else out/reserved
     arguments = list(harness.arguments)
     kwargs = {'temp_root':target} if option=='--temp' else {}
+    format_name = {'review': 'nrrd', 'review_archives': 'xtareview', 'heatmaps': 'video'}.get(reserved)
+    if format_name is not None:
+        kwargs['save_request'] = resolve_save_request(format_name)
     if option=='--capture_component_replay':
         arguments.extend((option,str(target)))
     with pytest.raises(ValueError,match='reserved confidence'):
@@ -825,13 +936,14 @@ def test_publication_failure_and_cleanup_failure_are_not_complete(harness, monke
     out = harness.root/'publication-failure'
     harness.publisher.publish_sweep_review = mock.Mock(side_effect=OSError('publication failed'))
     with pytest.raises(OSError, match='publication failed'):
-        sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50,), output_root=out)
+        sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50,), output_root=out,
+                                   save_request=resolve_save_request('nrrd'))
     assert _read(out/'manifest.json')['status'] == 'failed'
     harness.publisher.publish_sweep_review = mock.Mock(return_value=None)
     with mock.patch.object(sweep, '_remove_owned_work', side_effect=OSError('active work owner')):
         with pytest.raises(OSError, match='active work owner'):
             sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50,),
-                output_root=harness.root/'cleanup-failure')
+                output_root=harness.root/'cleanup-failure', save_request=resolve_save_request('nrrd'))
     failed = _read(harness.root/'cleanup-failure'/'manifest.json')
     assert failed['status'] == 'failed' and failed['work_cleanup_complete'] is False
     harness.publisher.publish_sweep_review.assert_not_called()
@@ -848,7 +960,7 @@ def test_review_receipt_is_relative_and_cache_is_gone_before_complete(harness, m
         return read_bytes(path)
 
     monkeypatch.setattr(Path, 'read_bytes', count_branch_receipts)
-    def publish(root, rows, *, sweep_id, temp_dir):
+    def publish(root, rows, *, sweep_id, temp_dir, expected_grids):
         review = root/'confidence_review'/'manifest.json'
         review.parent.mkdir()
         review.write_text(json.dumps({'status':'complete','sweep_id':sweep_id}))
@@ -858,7 +970,9 @@ def test_review_receipt_is_relative_and_cache_is_gone_before_complete(harness, m
         return review
     harness.publisher.publish_sweep_review = publish
     with mock.patch.object(sweep,'assert_tta_artifacts_unchanged',wraps=sweep.assert_tta_artifacts_unchanged) as final_hash:
-        path = sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50,100), output_root=harness.root/'review')
+        path = sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50,100),
+                                          output_root=harness.root/'review',
+                                          save_request=resolve_save_request('nrrd'))
     assert final_hash.call_count == 1
     assert reads == ['conf_050', 'conf_100']
     receipt = _read(path)
@@ -879,7 +993,8 @@ def test_replaced_scalar_receipt_prevents_family_completion(harness):
     harness.publisher.publish_sweep_review = replace_receipt
     root = harness.root / 'replaced-receipt'
     with pytest.raises(RuntimeError, match='Scalar cutoff receipt changed'):
-        sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50,), output_root=root)
+        sweep.run_confidence_sweep(harness.arguments, cutoffs_hundredths=(50,), output_root=root,
+                                   save_request=resolve_save_request('nrrd'))
     assert _read(root / 'manifest.json')['status'] == 'failed'
 
 

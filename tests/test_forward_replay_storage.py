@@ -189,24 +189,15 @@ def test_raw_unlink_refusal_still_releases_reservation(store_env, monkeypatch):
     np.testing.assert_array_equal(cache.load(key)[0], array)
 
 
-def test_sweep_gpu_tie_remains_stealable_and_stable_across_cursors():
-    from XTA.tta_scheduler import _sweep_gpu_tiebreak
-    task = dict(kind="tile", job_id="a/12", slice_start=8, model_name="Y",
-                view=SimpleNamespace(name="Sagittal"), sweep_source_stamp=["witness"])
-    positions_a, positions_b = {0: 0, 1: 1, 2: 2}, {0: 2, 1: 0, 2: 1}
-    _sweep_gpu_tiebreak(task, [0,1,2], positions_a)
-    _sweep_gpu_tiebreak(task, [2,0,1], positions_b)
-    preferred = min(positions_a, key=positions_a.get)
-    assert min(positions_b, key=positions_b.get) == preferred
-    # Only the final key changes. Either a nonzero predicted load or an extra
-    # inflight task still breaks the tie in favor of an already-free worker.
-    assert min(positions_a, key=lambda w:(int(w==preferred),0,positions_a[w])) != preferred
-    assert min(positions_a, key=lambda w:(0,int(w==preferred),positions_a[w])) != preferred
-    remaining = {w: rank for rank,w in enumerate(sorted(set(positions_a)-{preferred}))}
-    original = remaining.copy()
-    _sweep_gpu_tiebreak(task, [0,1,2], remaining)
-    assert remaining == original
-    for changes in ({"sweep_source_stamp":None},{"augmentation_pass_tasks":[{}]}):
-        ordinary = {0:1,1:0,2:2}
-        _sweep_gpu_tiebreak({**task, **changes}, [0,1,2], ordinary)
-        assert ordinary == {0:1,1:0,2:2}
+def test_native_worker_assignment_cannot_alias_distinct_runtime_packets(store_env):
+    root, model = store_env
+    source = np.arange(8, dtype=np.float32)
+    first = _cache(root, model, settings={'runtime': {'device_identity': 'actor-A'}})
+    second = _cache(root, model, settings={'runtime': {'device_identity': 'actor-B'}})
+    first_key, second_key = first.input_key(source), second.input_key(source)
+    assert first_key != second_key
+    assert first.store(first_key, (source,))
+    assert second.load(second_key) is None
+    assert second.store(second_key, (source + 1,))
+    np.testing.assert_array_equal(first.load(first_key)[0], source)
+    np.testing.assert_array_equal(second.load(second_key)[0], source + 1)

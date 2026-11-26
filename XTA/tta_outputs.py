@@ -90,7 +90,7 @@ def measure_bridge_output_survival(
                     else:
                         mask = owner.read_slab(z, z + 1)
                     if z not in validated_planes:
-                        if np.any(final[z] > 1):
+                        if final.dtype != np.bool_ and np.max(final[z], initial=0) > 1:
                             raise ValueError('Bridge survival final output must be binary 0/1')
                         validated_planes.add(z)
                         validation_planes += 1
@@ -284,14 +284,23 @@ def measure_sam_final_connections(
                         attachments.append((remaining, dict(observation_id=endpoint['observation_id'],
                             original_voxels=int(np.count_nonzero(original)),
                             retained_voxels=int(np.count_nonzero(remaining)))))
-                    labels, _ = ndimage.label(local, structure=structure)
-                    source_labels = set(map(int, np.unique(labels[source_frame - lo][attachments[0][0]]))) - {0}
-                    target_labels = set(map(int, np.unique(labels[target_frame - lo][attachments[1][0]]))) - {0}
-                    addition_labels = set(map(int, np.unique(labels[edge_additions]))) - {0}
-                    connected = bool(source_labels & target_labels & addition_labels)
+                    addition_count = int(np.count_nonzero(edge_additions))
+                    connected = False
+                    if addition_count and all(row['retained_voxels'] for _, row in attachments):
+                        from .sam_policy import _label_foreground_crop
+                        # Both end planes have surviving foreground, so only
+                        # the XY margins can disappear from this local extent.
+                        labels, (lower, upper) = _label_foreground_crop(local, structure)
+                        ys, xs = slice(lower[1], upper[1]), slice(lower[2], upper[2])
+                        source_labels = np.unique(labels[source_frame - lo][attachments[0][0][ys, xs]])
+                        target_labels = np.unique(labels[target_frame - lo][attachments[1][0][ys, xs]])
+                        common = np.intersect1d(source_labels, target_labels, assume_unique=True)
+                        if common.size:
+                            # Surviving endpoints and additions are all in local.
+                            connected = bool(np.isin(labels[edge_additions[:, ys, xs]], common).any())
                     edges.append(dict(edge_id=edge['edge_id'], source_id=source['observation_id'],
                         target_id=target['observation_id'], connected=connected, local_native_interval=[lo, hi],
-                        local_surviving_addition_voxels=int(np.count_nonzero(edge_additions)),
+                        local_surviving_addition_voxels=addition_count,
                         endpoint_survival=[item[1] for item in attachments]))
                 connected = bool(edges) and all(edge['connected'] for edge in edges)
                 group_receipts[group_id] = dict(group_id=group_id, stage=stage,

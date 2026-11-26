@@ -126,9 +126,15 @@ def main():
         if transform['view_family'] != 'orthogonal' or transform['view_name'] != 'transverse':
             raise ValueError('Native-to-source restoration audit currently requires verified Transverse geometry')
         from XTA.confidence_evidence import ConfidenceEvidenceRef
+        from XTA.confidence_retention import published_confidence_manifest
         from XTA.interpolation import RawBBoxMaskStore
         from XTA.outputs import _restore_source_indices_for_output_z, _resize_binary_mask_frame_to_output_shape
-        confidence_manifest = json.loads((root/'reconciliation_evidence'/'manifest.json').read_text())
+        receipt = root / 'manifest.json'
+        catalogue = published_confidence_manifest(root,
+            run=json.loads(receipt.read_bytes()) if receipt.is_file() else None)
+        if catalogue is None:
+            raise FileNotFoundError('Native auditing requires scores retained with --save confidence')
+        confidence_manifest = json.loads(catalogue.read_bytes())
         confidence_entries = [layer for layer in confidence_manifest['layers']
                               if layer['layer_key'] == detector['layer_key']]
         model_name = detector.get('model_name')

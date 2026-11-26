@@ -1,6 +1,8 @@
 """CPU-only admission and lifetime checks for TTA's persistent SAM context."""
 from __future__ import annotations
 
+from tests.native_stage_test_support import native_stage_context
+
 from concurrent.futures import ThreadPoolExecutor
 import ast
 import os
@@ -278,17 +280,21 @@ def test_gate_support_fingerprint_is_stable_across_policy_receipt_updates(tmp_pa
 
 @pytest.mark.parametrize('fanout_only', (False, True), ids=('cpu-detector', 'native-fanout'))
 def test_cpu_detector_sam_pool_does_not_keep_detector_inference_priority(tmp_path, fanout_only):
-    # Execute the actual coordinator configuration and immediately following
-    # conditional initialization, without launching the rest of the pipeline.
+    # Execute the actual coordinator configuration and its priority guard,
+    # allowing unrelated scalar initialization between those source statements.
     tree = ast.parse(Path(pipeline.__file__).read_text(encoding='utf-8'))
     main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_main_impl')
     start = next(index for index, node in enumerate(main.body)
                  if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
                  and isinstance(node.value.func, ast.Name)
                  and node.value.func.id == '_configure_main_process_gpu_stage_workers')
-    statements = main.body[start:start + 2]
-    assert isinstance(statements[1], ast.If)
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    priority_guard = next(node for node in main.body[start + 1:] if isinstance(node, ast.If)
+        and {'_set_main_process_gpu_inference_priority_active',
+             '_set_main_process_gpu_asset_retirement_pending'}.issubset({
+                 call.func.id for call in ast.walk(node)
+                 if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)}))
+    statements = [main.body[start], priority_guard]
+    coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     devices = [0] if fanout_only else []
     namespace = dict(vars(pipeline))
     namespace.update(

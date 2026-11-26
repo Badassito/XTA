@@ -1,7 +1,6 @@
-"""Conditional build hooks for the optional Intel accelerator extensions.
+"""Build the required TTA scheduler and optional Intel accelerator extensions.
 
-The ordinary project remains a pure-Python install when the relevant Linux
-development packages are absent.  Source builds on an Intel accelerator image
+The scheduler requires a C++17 compiler. Source builds on an Intel accelerator image
 discover QATzip/QPL through pkg-config and the kernel DSA user ABI through
 ``linux/idxd.h``.  Explicit requests fail during the build instead of silently
 producing a wheel without the requested backend.
@@ -21,10 +20,29 @@ from typing import Dict, List, Optional
 from setuptools import Extension, setup
 
 
-ROOT = Path(__file__).resolve().parent
 SUPPORTED_MACHINE = platform.machine().strip().lower() in {"x86_64", "amd64"}
 SUPPORTED_PLATFORM = sys.platform.startswith("linux") and SUPPORTED_MACHINE
 BACKENDS = ("qat", "qpl", "dsa")
+
+
+def _prepared_scheduler() -> Extension:
+    if sys.platform == "win32":
+        compile_args = ["/std:c++17", "/EHsc"]
+        link_args = []
+        libraries = ["ws2_32"]
+    else:
+        compile_args = ["-std=c++17", "-pthread"]
+        link_args = ["-pthread"]
+        libraries = []
+    return Extension(
+        "XTA._prepared_scheduler",
+        sources=["native/prepared_scheduler.cpp"],
+        depends=["native/prepared_scheduler.hpp", "native/prepared_scheduler_handles.hpp", "native/device_stage.hpp"],
+        language="c++",
+        libraries=libraries,
+        extra_compile_args=compile_args,
+        extra_link_args=link_args,
+    )
 
 
 def _pkg_config(
@@ -144,7 +162,7 @@ def _extension_from_pkg_config(
         compile_args.append("-std=c11")
     return Extension(
         module,
-        sources=[str(ROOT / source)],
+        sources=[source],
         include_dirs=list(config["include_dirs"]),  # type: ignore[arg-type]
         library_dirs=list(config["library_dirs"]),  # type: ignore[arg-type]
         libraries=list(config["libraries"]),  # type: ignore[arg-type]
@@ -228,7 +246,7 @@ def _intel_extensions() -> List[Extension]:
             extensions.append(
                 Extension(
                     "XTA._dsa_copy",
-                    sources=[str(ROOT / "native/dsa_copy.c")],
+                    sources=["native/dsa_copy.c"],
                     define_macros=[("_GNU_SOURCE", "1")],
                     extra_compile_args=["-O3", "-std=c11", "-pthread"],
                     extra_link_args=["-pthread"],
@@ -237,4 +255,4 @@ def _intel_extensions() -> List[Extension]:
     return extensions
 
 
-setup(ext_modules=_intel_extensions(), zip_safe=False)
+setup(ext_modules=[_prepared_scheduler(), *_intel_extensions()], zip_safe=False)

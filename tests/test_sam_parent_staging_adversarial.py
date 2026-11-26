@@ -16,6 +16,8 @@ from XTA import sam_parent_staging as staging
 from XTA.interpolation import _DirectUnionBackingLease,PreparedViewResult
 from XTA.runtime import close_memmap_array_without_flush,wait_for_retired_memmap_unlinks
 from XTA.view_prepare import ViewPrepareLeaseState
+from tests.native_scheduler_support import NativeRun
+from tests.native_sam_staging_support import NativeStagingOwner
 
 
 class ManualExecutor:
@@ -67,9 +69,11 @@ def admit(leases,task,amount):
 def queue(tmp_path, *, cap=120, ready=lambda:False, bounded=(), leases=None):
     check,prepare=ManualExecutor(),ManualExecutor()
     leases=leases or lease_state()
+    owner = NativeStagingOwner(tmp_path, leases, cap)
     result=staging.DeferredSamParentQueue(temp_dir=tmp_path/'temp',output_dir=tmp_path/'output',
         checkpoint_executor=check,prepare_executor=prepare,leases=leases,dense_limit=cap,
-        ready=ready,bounded_parent_keys=bounded)
+        ready=ready,bounded_parent_keys=bounded,dense_owner=owner)
+    owner.retain_for(result)
     return result,check,prepare,leases
 
 
@@ -78,42 +82,47 @@ def owning_mask():
     return result
 
 
+def complete_detector_parent(run, parent_id):
+    """Move an already funded native parent into postprocess without simulating its ledger."""
+    run.submit(parent_id, parent_id)
+    lease, _ = run.take()
+    run.finish(lease)
+    generation = run.published(parent_id)
+    run.consume_events()
+    run.retire(lease)
+    return generation
+
+
 def test_three_policy_groups_release_real_buffers_before_detector_drain(tmp_path):
-    from tests.test_tta_policy_parent_admission import policy_task
-    from tests.test_tta_scheduler_boundary import _state,_scheduler
-    state=_state();arrays={}
-    def ensure(model,view):
-        key=(model,view.name)
-        arrays[key]=np.zeros((1,1,30),np.uint8)
-        state.baseline_union_paths[key]=tmp_path/(view.name+'.mask')
-        state.direct_union_backing_leases[key]=_DirectUnionBackingLease(key,30)
-        state.direct_union_inference_views.add(key);state.direct_union_inference_bytes[key]=30
-    scheduler=_scheduler(tmp_path,state=state,input_overrides=dict(ensure_baseline_workspaces=ensure,
-        direct_union_inference_view_limit=1,direct_union_inference_byte_limit=60,
-        direct_union_total_dense_byte_limit=60))
-    leases=ViewPrepareLeaseState(state.direct_union_backing_leases,state.direct_union_inference_views,
-        state.direct_union_inference_bytes,state.direct_union_postprocess_views,state.direct_union_postprocess_bytes)
-    groups=[policy_task(index,ratio=2,size=30,task_id=index) for index in range(3)]
-    all_keys={(str(member['model_name']),member['view'].name) for group in groups
-              for member in (group,*group['augmentation_pass_tasks'])}
+    leases = lease_state()
+    groups = [(f'pass0_{index}', f'pass1_{index}') for index in range(3)]
+    all_keys = {('model', name) for group in groups for name in group}
     staged,check,prepare,_=queue(tmp_path,cap=60,leases=leases,bounded=all_keys)
     references=[]
     try:
-        for group in groups:
-            assert scheduler.direct_union_task_admissible(group)
-            scheduler.activate_direct_union_task(group)
-            for member in (group,*group['augmentation_pass_tasks']):
-                key=(str(member['model_name']),member['view'].name)
-                mask=arrays.pop(key);references.append(weakref.ref(mask))
-                task=TinyTask(tmp_path,member['view'].name,mask)
-                assert leases.handoff(key)
-                staged.defer(task,30)
-                del mask,task
-            check.finish();resumed,released=staged.pump();gc.collect()
-            assert released and not resumed and not prepare.entries
-            assert not leases.leases and not leases.postprocess_bytes
-        assert all(reference() is None for reference in references)
-        assert staged.snapshot()['deferred_parents']==6
+        with NativeRun(capacity=60, preparation_window=1) as run:
+            for parent_id in range(1, len(groups) + 1):
+                run.declare(parent_id, bytes=60)
+            for parent_id, group in enumerate(groups, 1):
+                run.prepare(parent_id)
+                generation = complete_detector_parent(run, parent_id)
+                for name in group:
+                    mask = np.zeros((1, 1, 30), np.uint8)
+                    references.append(weakref.ref(mask))
+                    task = TinyTask(tmp_path, name, mask)
+                    admit(leases, task, 30)
+                    staged.defer(task, 30)
+                    del mask, task
+                if parent_id < len(groups):
+                    assert run.owner.wait_preparation(0.05) is None
+                check.finish()
+                resumed, released = staged.pump()
+                gc.collect()
+                assert released and not resumed and not prepare.entries
+                assert not leases.leases and not leases.postprocess_bytes
+                run.owner.retire_parent(parent_id, generation)
+            assert all(reference() is None for reference in references)
+            assert staged.snapshot()['deferred_parents'] == 6
     finally:staged.close()
 
 
@@ -816,14 +825,10 @@ def test_ram_token_held_until_complete_codec_future_and_retirement_pump(tmp_path
     staged.close();staged.finalize_cleanup()
 
 
-def test_verified_raw_disk_retirement_bypasses_blocked_codec_and_refills_detector(tmp_path,monkeypatch):
-    from tests.test_tta_scheduler_boundary import _state,_scheduler,_view
-    state=_state()
-    scheduler=_scheduler(tmp_path,state=state,input_overrides=dict(
-        direct_union_inference_view_limit=4,direct_union_inference_byte_limit=120,
-        direct_union_total_dense_byte_limit=120))
-    leases=ViewPrepareLeaseState(state.direct_union_backing_leases,state.direct_union_inference_views,
-        state.direct_union_inference_bytes,state.direct_union_postprocess_views,state.direct_union_postprocess_bytes)
+def test_verified_raw_disk_retirement_bypasses_blocked_codec_and_refills_detector(tmp_path,monkeypatch,request):
+    run = NativeRun(capacity=120)
+    request.addfinalizer(run.close)
+    leases = lease_state()
     staged,codec,fast,_=queue(tmp_path,cap=120,leases=leases)
     ram=TinyTask(tmp_path,'bank',np.ones((1,5,5),np.uint8),np.ones((1,5,5),np.uint8))
     key=admit(leases,ram,50)
@@ -838,15 +843,18 @@ def test_verified_raw_disk_retirement_bypasses_blocked_codec_and_refills_detecto
     disk=TinyTask(staged.source_root,'disk',*arrays)
     disk.union_path,disk.confmap_path=paths
     disk_key=admit(leases,disk,50);staged.defer(disk,50)
-    with mock.patch('XTA.confidence_evidence.confidence_evidence_enabled',return_value=True):
-        candidate=dict(kind='fullframe',model_name='model',view=_view(),
-            result_mode='direct_union',processing_shape=(1,5,5))
-        assert not scheduler.direct_union_task_admissible(candidate)
-        assert len(codec.entries)==1 and len(fast.entries)==1
-        fast.finish();staged.pump()
-        assert disk_key not in leases.leases and key in leases.leases
-        assert staged.owns_ram_first_parent(key) and not next(iter(codec.entries)).done()
-        assert scheduler.direct_union_task_admissible(candidate)
+    for parent_id in (1, 2):
+        run.declare(parent_id, bytes=50)
+        run.prepare(parent_id)
+        complete_detector_parent(run, parent_id)
+    run.declare(3, bytes=50)
+    assert run.owner.wait_preparation(0.05) is None
+    assert len(codec.entries)==1 and len(fast.entries)==1
+    fast.finish();staged.pump()
+    assert disk_key not in leases.leases and key in leases.leases
+    assert staged.owns_ram_first_parent(key) and not next(iter(codec.entries)).done()
+    run.owner.retire_parent(2, run.parents[2])
+    run.prepare(3)
     saved=staged.deferred[disk_key][1]
     assert saved.mask.reused and saved.confidence.reused and saved.written_bytes==0
     for snapshot in (saved.mask,saved.confidence):
@@ -857,12 +865,12 @@ def test_verified_raw_disk_retirement_bypasses_blocked_codec_and_refills_detecto
     staged.close();staged.finalize_cleanup()
 
 
-def test_two_ram_parents_drain_while_full_spool_routes_detector_to_disk(tmp_path,monkeypatch):
+def test_two_ram_parents_drain_while_full_spool_routes_detector_to_disk(tmp_path,monkeypatch,request):
     from concurrent.futures import ThreadPoolExecutor
-    from tests.test_tta_scheduler_boundary import _state,_scheduler,_view
-    state=_state();shape=(7,33,35);amount=2*int(np.prod(shape));cap=3*amount
-    leases=ViewPrepareLeaseState(state.direct_union_backing_leases,state.direct_union_inference_views,
-        state.direct_union_inference_bytes,state.direct_union_postprocess_views,state.direct_union_postprocess_bytes)
+    shape=(7,33,35);amount=2*int(np.prod(shape));cap=3*amount
+    run = NativeRun(capacity=cap, inference_capacity=amount)
+    request.addfinalizer(run.close)
+    leases = lease_state()
     monkeypatch.setattr(staging,'publication_ram_headroom',lambda:staging.RAM_RESERVE_BYTES+cap)
     monkeypatch.setattr(staging,'workspace_anon_cap_bytes',lambda:0)
     gate=threading.Event();both_started=threading.Event();started=[];lock=threading.Lock()
@@ -879,24 +887,22 @@ def test_two_ram_parents_drain_while_full_spool_routes_detector_to_disk(tmp_path
     with ThreadPoolExecutor(max_workers=2) as codec,ThreadPoolExecutor(max_workers=1) as fast:
         staged=staging.DeferredSamParentQueue(temp_dir=tmp_path/'temp',output_dir=tmp_path/'output',
             checkpoint_executor=codec,prepare_executor=fast,leases=leases,dense_limit=cap,ready=lambda:False)
-        def ensure(model,view):
-            key=(model,view.name);arrays=[]
+        def materialize_disk_parent(key):
+            arrays=[]
             for label in ('mask','confidence'):
                 path=staged.source_root/(label+'.dat')
                 value=np.memmap(path,mode='w+',dtype=np.uint8,shape=shape);value[:]=0
                 arrays.append(value)
             nonlocal disk_task
-            disk_task=TinyTask(staged.source_root,view.name,*arrays)
+            disk_task=TinyTask(staged.source_root,key[1],*arrays)
             disk_task.union_path=Path(arrays[0].filename);disk_task.confmap_path=Path(arrays[1].filename)
-            state.baseline_union_paths[key]=disk_task.union_path
-            state.baseline_confmap_paths[key]=disk_task.confmap_path
-            state.direct_union_backing_leases[key]=_DirectUnionBackingLease(key,amount)
-            state.direct_union_inference_views.add(key);state.direct_union_inference_bytes[key]=amount
-        scheduler=_scheduler(tmp_path,state=state,input_overrides=dict(ensure_baseline_workspaces=ensure,
-            min_conf=.5,direct_union_inference_byte_limit=amount,direct_union_total_dense_byte_limit=cap),
-            operation_overrides=dict(staged_ram_backlog_bytes=staged.detector_backlog_bytes))
+            leases.leases[key]=_DirectUnionBackingLease(key,amount)
+            leases.inference_views.add(key);leases.inference_bytes[key]=amount
         try:
-            for name in ('first','second'):
+            for parent_id, name in enumerate(('first','second'), 1):
+                run.declare(parent_id, bytes=amount)
+                run.prepare(parent_id)
+                complete_detector_parent(run, parent_id)
                 mask=np.zeros(shape,np.uint8);mask[:,2:-2,3:-3]=255
                 scores=np.arange(np.prod(shape),dtype=np.uint8).reshape(shape).copy()
                 expected[name]=(mask.copy(),scores.copy())
@@ -909,17 +915,20 @@ def test_two_ram_parents_drain_while_full_spool_routes_detector_to_disk(tmp_path
             assert staged.ram_first_bytes==2*amount and staged.detector_backlog_bytes()==2*amount
             next_key=('model','transverse__tta_a0')
             assert not staged.claim_ram_first(next_key,amount,2*amount,amount)
-            candidate=dict(kind='fullframe',model_name='model',view=_view(),
-                result_mode='direct_union',processing_shape=shape)
-            assert scheduler.direct_union_task_admissible(candidate)
-            scheduler.activate_direct_union_task(candidate)
+            run.declare(3, bytes=amount)
+            run.prepare(3)
+            materialize_disk_parent(next_key)
+            complete_detector_parent(run, 3)
             disk_task.union_mm[:]=expected['first'][0];disk_task.confmap_mm[:]=expected['first'][1]
             assert leases.handoff(next_key);staged.defer(disk_task,amount)
             assert staged.detector_backlog_bytes()==2*amount  # Disk owners remain in the active window.
             disk_future=next(future for future,saved in staged.checkpoint_futures.items() if saved[0]==next_key)
             disk_future.result(timeout=5);staged.pump()
             assert next_key not in leases.leases and staged.ram_first_bytes==2*amount
-            assert scheduler.direct_union_task_admissible(candidate)
+            run.declare(4, bytes=amount)
+            assert run.owner.wait_preparation(0.05) is None
+            run.owner.retire_parent(3, run.parents[3])
+            run.prepare(4)
             gate.set()
             for future in list(staged.checkpoint_futures):future.result(timeout=10)
             staged.pump()

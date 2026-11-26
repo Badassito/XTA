@@ -1,318 +1,260 @@
-"""Dense-parent backpressure opens idle Radial GPUs without releasing busy workers."""
-from __future__ import annotations
-
-import tempfile
-import unittest
-from pathlib import Path
-from dataclasses import replace
+"""Native dense backpressure and real actor ACKs share projection ownership."""
+import queue
+import time
 from types import SimpleNamespace
-from unittest import mock
 
-from tests.test_tta_policy_parent_admission import policy_task
-from tests.test_tta_scheduler_boundary import _bind_callbacks, _scheduler, _state, _view
-from XTA import backprojection as bp
-from XTA.interpolation import _DirectUnionBackingLease
+import pytest
 
-
-class RadialSchedulerRetirementAdmissionTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        aux = mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=None)
-        aux.start()
-        self.addCleanup(aux.stop)
-        self.coordinator = bp._MainProcessGpuStageCoordinator()
-        self.coordinator.configure_workers([0, 1, 2, 3])
-        self.torch = SimpleNamespace(cuda=SimpleNamespace(
-            device_count=lambda: 4, mem_get_info=mock.Mock(return_value=(1000, 2000))),
-            device=lambda value: value)
-        self.state = _state()
-        self.finish_inference = mock.Mock(wraps=self.coordinator.finish_inference)
-        self.scheduler = _scheduler(Path(self.temporary.name), state=self.state,
-            input_overrides=dict(gpu_device_count=4, direct_union_inference_view_limit=4,
-                direct_union_inference_byte_limit=400, direct_union_total_dense_byte_limit=400),
-            operation_overrides=dict(
-                _set_main_process_gpu_pending_inference=self.coordinator.set_pending_inference_backlog,
-                _main_process_gpu_stage_begin_inference=self.coordinator.begin_inference,
-                _main_process_gpu_stage_finish_inference=self.finish_inference,
-                _main_process_gpu_stage_can_dispatch_inference=self.coordinator.can_dispatch_inference))
-        _bind_callbacks(self.scheduler)
-        pending = policy_task(1, ratio=4, size=100, task_id=0)
-        self.state.gpu_worker_tasks_by_id[0] = pending
-        self.state.gpu_worker_pending_task_ids.append(0)
-        self.state.gpu_worker_total_tasks = 1
-        for index in range(4):
-            key = ('model', f'completed-parent-{index}')
-            lease = _DirectUnionBackingLease(key, 100)
-            lease.transition('inference', 'postprocess')
-            self.state.direct_union_backing_leases[key] = lease
-            self.state.direct_union_postprocess_views.add(key)
-            self.state.direct_union_postprocess_bytes[key] = 100
-        self.purpose = 'Radial source projection completed-parent'
-
-    def acquire(self, device):
-        lease = self.coordinator.try_acquire_specific_stage(self.torch, device, self.purpose)
-        if lease is not None:
-            self.addCleanup(lease.release)
-        return lease
-
-    def begin_task(self, task_id, worker):
-        self.assertTrue(self.coordinator.begin_inference(worker))
-        self.state.gpu_worker_tasks_by_id[task_id] = dict(task_id=task_id, kind='fullframe',
-            result_mode='file', model_name='model', view=_view(), slice_count=1,
-            gpu_eligible=True, disable_runtime_split=True)
-        self.state.gpu_worker_total_tasks += 1
-        self.state.gpu_worker_dispatched_tasks += 1
-        self.state.gpu_worker_dispatched_by_id[worker] = self.state.gpu_worker_dispatched_by_id.get(worker, 0) + 1
-
-    def release_compute(self, task_id, worker):
-        self.scheduler.process_one_worker_result(dict(type='compute_released',
-            task_id=task_id, gpu_index=worker, stats={}))
-
-    def finish_result(self, task_id, worker, *, ok=True):
-        self.scheduler.process_one_worker_result(dict(type='result', task_id=task_id,
-            gpu_index=worker, ok=ok, stats={}, error='injected worker failure'))
-
-    def test_dense_cap_publishes_no_admissible_backlog_and_opens_idle_radial_stage(self):
-        self.scheduler.publish_gpu_worker_admissible_backlog()
-        self.assertTrue(self.state.gpu_worker_pending_task_ids)
-        snapshot = self.coordinator.snapshot()
-        self.assertFalse(snapshot['pending_inference_backlog'])
-        self.assertTrue(snapshot['inference_priority_active'])
-        self.assertFalse(snapshot['inference_inflight'])
-        lease = self.acquire(0)
-        self.assertIsNotNone(lease)
-        lease.release()
-
-    def test_cluster_shaped_57_parent_255_gib_backlog_opens_idle_projection(self):
-        gib = 1024 ** 3
-        self.scheduler.inputs = replace(self.scheduler.inputs,
-            direct_union_inference_byte_limit=128 * gib,
-            direct_union_total_dense_byte_limit=256 * gib)
-        self.scheduler.operations = replace(self.scheduler.operations,
-            _set_main_process_gpu_spherical_retirement_pressure=self.coordinator.set_spherical_retirement_pressure)
-        self.state.direct_union_backing_leases.clear()
-        self.state.direct_union_postprocess_views.clear()
-        self.state.direct_union_postprocess_bytes.clear()
-        for index in range(57):
-            key = ('model', f'completed-parent-{index}')
-            need = (4 if index < 56 else 31) * gib
-            lease = _DirectUnionBackingLease(key, need)
-            lease.transition('inference', 'postprocess')
-            self.state.direct_union_backing_leases[key] = lease
-            self.state.direct_union_postprocess_views.add(key)
-            self.state.direct_union_postprocess_bytes[key] = need
-        pending = self.state.gpu_worker_tasks_by_id[0]
-        for member in (pending, *pending['augmentation_pass_tasks']):
-            member['processing_shape'] = (1024, 1024, 1024)
-        self.scheduler.publish_gpu_worker_admissible_backlog()
-        snapshot = self.coordinator.snapshot()
-        self.assertEqual(len(self.state.direct_union_postprocess_views), 57)
-        self.assertEqual(sum(self.state.direct_union_postprocess_bytes.values()), 255 * gib)
-        self.assertEqual(snapshot['inference_inflight'], {})
-        self.assertEqual(snapshot['stage_leases'], {})
-        self.assertTrue(snapshot['inference_priority_active'])
-        self.assertTrue(snapshot['spherical_retirement_pressure'])
-        self.assertFalse(snapshot['pending_inference_backlog'])
-        self.assertIsNotNone(self.acquire(0))
-
-    def test_retiring_parent_bytes_restores_inference_priority_before_global_drain(self):
-        self.scheduler.publish_gpu_worker_admissible_backlog()
-        for key in list(self.state.direct_union_postprocess_views):
-            self.state.direct_union_backing_leases.pop(key).release('postprocess')
-            self.state.direct_union_postprocess_views.remove(key)
-            self.state.direct_union_postprocess_bytes.pop(key)
-        self.scheduler.publish_gpu_worker_admissible_backlog()
-        self.assertTrue(self.coordinator.snapshot()['pending_inference_backlog'])
-        self.assertIsNone(self.acquire(0))
-        self.assertEqual(self.state.gpu_worker_results_collected, 0)
-        self.torch.cuda.mem_get_info.assert_not_called()
-
-    def test_queued_worker_leases_and_result_lag_keep_exact_per_device_fences(self):
-        self.begin_task(10, 0)
-        self.begin_task(11, 0)
-        self.begin_task(12, 1)
-        self.scheduler.publish_gpu_worker_admissible_backlog()
-        self.assertEqual(self.coordinator.snapshot()['inference_inflight'], {0: 2, 1: 1})
-        self.assertIsNone(self.acquire(0))
-        self.assertIsNone(self.acquire(1))
-        idle = self.acquire(2)
-        self.assertIsNotNone(idle)
-        idle.release()
-
-        self.release_compute(10, 0)
-        self.release_compute(10, 0)
-        self.assertEqual(self.coordinator.snapshot()['inference_inflight'], {0: 1, 1: 1})
-        self.assertEqual(self.scheduler.gpu_worker_inflight(0), 1)
-        self.assertEqual(self.state.gpu_worker_results_collected, 0)
-        self.assertEqual(self.finish_inference.call_count, 1)
-        self.assertIsNone(self.acquire(0))
-
-        self.finish_result(10, 0)
-        self.assertEqual(self.finish_inference.call_count, 1)
-        self.assertEqual(self.coordinator.snapshot()['inference_inflight'], {0: 1, 1: 1})
-        self.release_compute(11, 0)
-        self.assertEqual(self.scheduler.gpu_worker_inflight(0), 0)
-        self.assertEqual(self.coordinator.snapshot()['inference_inflight'], {1: 1})
-        # Task 11 publication has not arrived, but its GPU compute lease is free.
-        self.assertEqual(self.state.gpu_worker_results_collected, 1)
-        lease = self.acquire(0)
-        self.assertIsNotNone(lease)
-        self.assertFalse(self.coordinator.begin_inference(0))
-        self.assertIsNone(self.acquire(1))
-        self.finish_result(11, 0)
-        self.assertEqual(self.finish_inference.call_count, 2)
-        self.assertEqual(self.coordinator.snapshot()['inference_inflight'], {1: 1})
-        lease.release()
-
-        # A synchronous result without a preceding compute-release message also
-        # returns exactly one device credit before its parent result is handled.
-        self.finish_result(12, 1)
-        self.assertEqual(self.finish_inference.call_count, 3)
-        self.assertFalse(self.coordinator.snapshot()['inference_inflight'])
-        self.assertEqual(self.state.gpu_worker_results_collected, 3)
-        self.assertIsNotNone(self.acquire(1))
-
-    def test_radial_stage_stays_exclusive_during_inference(self):
-        self.begin_task(10, 0)
-        self.scheduler.publish_gpu_worker_admissible_backlog()
-        self.assertIsNone(self.acquire(0))
-        self.release_compute(10, 0)
-        lease = self.acquire(0)
-        self.assertIsNotNone(lease)
-        self.assertFalse(self.coordinator.can_dispatch_inference(0))
-        self.assertFalse(self.coordinator.begin_inference(0))
-        lease.release()
-        self.assertTrue(self.coordinator.begin_inference(0))
-        self.coordinator.finish_inference(0)
-
-    def test_terminal_asset_ack_and_active_auxiliary_work_remain_authoritative(self):
-        self.scheduler.publish_gpu_worker_admissible_backlog()
-        self.coordinator.set_inference_asset_retirement_pending(True)
-        self.assertIsNone(self.acquire(0))
-        self.coordinator.set_inference_asset_retirement_pending(False)
-        with mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool',
-                               return_value=SimpleNamespace(
-                                   claim_worker_for_stage=lambda _device: None,
-                                   release_stage_claim=lambda _device, _token: None)):
-            self.assertIsNone(self.acquire(0))
-        self.assertIsNotNone(self.acquire(0))
-
-    def test_failed_result_clears_only_its_own_compute_credit_before_raising(self):
-        self.begin_task(10, 0)
-        self.begin_task(11, 1)
-        self.scheduler.publish_gpu_worker_admissible_backlog()
-        with self.assertRaisesRegex(RuntimeError, 'injected worker failure'):
-            self.finish_result(10, 0, ok=False)
-        self.assertEqual(self.coordinator.snapshot()['inference_inflight'], {1: 1})
-        self.assertEqual(self.finish_inference.call_count, 1)
-        self.assertEqual(self.scheduler.gpu_worker_inflight(0), 0)
-        self.assertEqual(self.scheduler.gpu_worker_inflight(1), 1)
+from XTA import runtime
+from tests.native_scheduler_support import NativeRun
+from tests.native_stage_test_support import native_coordinator, configure_stage_timing, wait_stage
 
 
-class MixedNativeRetirementQueueTests(unittest.TestCase):
-    def setUp(self):
-        for patch in (
-            mock.patch.object(bp, 'gpu_worker_aux_interpolation_pool', return_value=None),
-            mock.patch.dict('os.environ', {'YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT': '1',
-                                           'YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT': '1'}),
-        ):
-            patch.start()
-            self.addCleanup(patch.stop)
-        self.torch = SimpleNamespace(cuda=SimpleNamespace(
-            device_count=lambda: 4, mem_get_info=lambda _device: (1000, 2000)),
-            device=lambda value: value)
-
-    def coordinator(self, *, pressure=True):
-        coordinator = bp._MainProcessGpuStageCoordinator()
-        coordinator.configure_workers([0, 1, 2, 3])
-        coordinator.set_pending_inference_backlog(True)
-        coordinator.set_spherical_retirement_pressure(pressure)
-        for worker in range(4):
-            coordinator.begin_inference(worker)
-            coordinator.begin_inference(worker)
-        return coordinator
-
-    def acquire(self, coordinator, purpose):
-        lease = coordinator.try_acquire_stage(self.torch, purpose)
-        if lease is not None:
-            self.addCleanup(lease.release)
-        return lease
-
-    def test_radial_and_spherical_share_fifo_refresh_and_two_turn_burst_cap(self):
-        for first_family, second_family in (('Radial', 'Spherical'), ('Spherical', 'Radial')):
-            with self.subTest(first_family=first_family), mock.patch.object(bp.time, 'monotonic', return_value=10.) as clock:
-                coordinator = self.coordinator()
-                oldest = f'{first_family} source projection oldest'
-                middle = f'{second_family} source projection middle'
-                newest = f'{first_family} source projection newest'
-                for purpose in (oldest, middle, newest):
-                    self.assertIsNone(self.acquire(coordinator, purpose))
-                    clock.return_value += 1.
-                clock.return_value = 15.
-                self.assertIsNone(self.acquire(coordinator, oldest))
-                self.assertEqual(coordinator.snapshot()['spherical_retirement_reserved_device'], 0)
-                coordinator.finish_inference(0)
-                coordinator.finish_inference(0)
-                self.assertIsNone(self.acquire(coordinator, newest))
-                first = self.acquire(coordinator, oldest)
-                self.assertEqual(first.device_index, 0)
-                self.assertIsNone(self.acquire(coordinator, middle))
-                first.release()
-                self.assertFalse(coordinator.begin_inference(0))
-                self.assertTrue(all(coordinator.can_dispatch_inference(worker) for worker in (1, 2, 3)))
-                self.assertIsNone(self.acquire(coordinator, newest))
-                second = self.acquire(coordinator, middle)
-                self.assertEqual(second.device_index, 0)
-                second.release()
-                self.assertEqual(coordinator.snapshot()['spherical_retirement_handoffs'], 1)
-                self.assertEqual(coordinator.snapshot()['spherical_retirement_pressure_acquisitions'], 2)
-                # Changing projection families does not reset the two-turn cap.
-                self.assertIsNone(self.acquire(coordinator, newest))
-                self.assertEqual(coordinator.snapshot()['spherical_retirement_reserved_device'], 1)
-                self.assertTrue(coordinator.begin_inference(0))
-                coordinator.finish_inference(0)
-
-    def test_aged_radial_reader_hands_off_to_spherical_without_memory_pressure(self):
-        with mock.patch.object(bp.time, 'monotonic', return_value=10.) as clock:
-            coordinator = self.coordinator(pressure=False)
-            radial = 'Radial source projection aged'
-            spherical = 'Spherical source projection aged'
-            self.assertIsNone(self.acquire(coordinator, radial))
-            clock.return_value = 11.
-            self.assertIsNone(self.acquire(coordinator, spherical))
-            clock.return_value = 35.
-            self.assertIsNone(self.acquire(coordinator, spherical))
-            self.assertIsNone(self.acquire(coordinator, radial))
-            clock.return_value = 40.
-            self.assertIsNone(self.acquire(coordinator, radial))
-            coordinator.finish_inference(0)
-            coordinator.finish_inference(0)
-            first = self.acquire(coordinator, radial)
-            self.assertEqual(first.device_index, 0)
-            clock.return_value = 41.
-            self.assertIsNone(self.acquire(coordinator, spherical))
-            first.release()
-            second = self.acquire(coordinator, spherical)
-            self.assertEqual(second.device_index, 0)
-            self.assertEqual(coordinator.snapshot()['spherical_retirement_aged_acquisitions'], 2)
-            self.assertEqual(coordinator.snapshot()['spherical_retirement_pressure_acquisitions'], 0)
-            second.release()
-
-    def test_cancelled_radial_cpu_reader_yields_fifo_to_spherical(self):
-        coordinator = self.coordinator()
-        radial = 'Radial source projection CPU finished'
-        spherical = 'Spherical source projection pending'
-        self.assertIsNone(self.acquire(coordinator, radial))
-        self.assertIsNone(self.acquire(coordinator, spherical))
-        coordinator.cancel_spherical_retirement_request(radial)
-        coordinator.finish_inference(0)
-        coordinator.finish_inference(0)
-        lease = self.acquire(coordinator, spherical)
-        self.assertEqual(lease.device_index, 0)
-        self.assertEqual(coordinator.snapshot()['spherical_retirement_request_count'], 0)
-        lease.release()
+@pytest.fixture
+def native_case(request, monkeypatch):
+    runs = []
+    def make(*, capacity=400, tickets=64, workers=4, window=2):
+        run = NativeRun(capacity=capacity, tickets=tickets, workers=workers, window=window)
+        runs.append(run)
+        c = native_coordinator(request, monkeypatch, owner=run.owner)
+        c.configure_workers(range(workers))
+        torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: workers,
+            mem_get_info=lambda _device: (1000, 2000)), device=lambda value: value)
+        return run, c, torch
+    yield make
+    for run in reversed(runs):
+        run.close()
 
 
-if __name__ == '__main__':
-    unittest.main()
+def retain_host(run, parent, size):
+    run.declare(parent, tasks=0, bytes=size)
+    generation = run.prepare(parent)
+    run.owner.host_prepared(parent, generation)
+    run.published(parent)
+    return generation
+
+
+def acquire(c, torch, device=0, purpose='Radial source projection completed-parent'):
+    return c.try_acquire_specific_stage(torch, device, purpose)
+
+
+def test_dense_cap_reports_no_dispatchable_backlog_and_opens_idle_radial_stage(native_case):
+    run, c, torch = native_case()
+    for parent in range(4):
+        retain_host(run, parent, 100)
+    run.declare(4, bytes=100)
+    assert run.owner.wait_preparation(.03) is None
+    assert run.owner.snapshot()['blocked_parents'] == 1
+    snapshot = c.snapshot()
+    assert not snapshot['pending_inference_backlog']
+    assert snapshot['inference_priority_active']
+    assert not snapshot['inference_inflight']
+    lease = acquire(c, torch)
+    assert lease is not None
+    lease.release()
+
+
+def test_cluster_shaped_57_parent_255_gib_retention_opens_idle_projection(native_case):
+    gib = 1024**3
+    run, c, torch = native_case(capacity=256*gib)
+    for parent in range(57):
+        retain_host(run, parent, (4 if parent < 56 else 31)*gib)
+    run.declare(57, bytes=2*gib)
+    assert run.owner.wait_preparation(.03) is None
+    snapshot = run.owner.snapshot()
+    assert snapshot['retained_parent_bytes'] == 255*gib
+    assert snapshot['tickets_used'] == 57
+    assert snapshot['retirement_pressure']
+    assert not c.snapshot()['pending_inference_backlog']
+    lease = acquire(c, torch)
+    assert lease is not None
+    lease.release()
+
+
+def test_physical_parent_retirement_restores_actual_inference_before_global_drain(native_case):
+    run, c, torch = native_case()
+    retained = [retain_host(run, parent, 100) for parent in range(4)]
+    run.declare(4, tasks=9, bytes=100)
+    assert run.owner.wait_preparation(.03) is None
+    run.owner.retire_parent(0, retained[0])
+    run.prepare(4)
+    for task in range(9):
+        run.submit(task, 4)
+    state = run.wait_snapshot(lambda value: value['dispatched'] == 8 and value['ready'] == 1)
+    assert state['final'] == 0
+    assert c.snapshot()['pending_inference_backlog']
+    assert acquire(c, torch) is None
+
+
+def test_real_queued_actor_acks_and_late_final_keep_per_device_fences(native_case):
+    run, c, torch = native_case()
+    run.declare(1, tasks=3)
+    run.prepare(1)
+    run.submit(10, 1, required_worker=0)
+    run.submit(11, 1, required_worker=0)
+    run.submit(12, 1, required_worker=1)
+    first, second, third = run.take(0)[0], run.take(0)[0], run.take(1)[0]
+    assert c.snapshot()['inference_inflight'] == {0: 2, 1: 1}
+    assert acquire(c, torch, 0) is None and acquire(c, torch, 1) is None
+    idle = acquire(c, torch, 2)
+    assert idle is not None
+    idle.release()
+    run.receipt(first, 'installed')
+    run.receipt(first, 'compute')
+    run.wait_snapshot(lambda state: state['active'] == 2)
+    assert c.snapshot()['inference_inflight'] == {0: 1, 1: 1}
+    assert run.owner.snapshot()['final'] == 0
+    run.receipt(first, 'final')
+    assert run.owner.wait_task_final(first.task_id, first.generation, 2)
+    assert c.snapshot()['inference_inflight'] == {0: 1, 1: 1}
+    run.receipt(second, 'installed')
+    run.receipt(second, 'compute')
+    run.wait_snapshot(lambda state: state['active'] == 1)
+    lease = acquire(c, torch, 0)
+    assert lease is not None and not c.begin_inference(0)
+    assert acquire(c, torch, 1) is None
+    run.receipt(second, 'final')
+    assert run.owner.wait_task_final(second.task_id, second.generation, 2)
+    assert c.snapshot()['inference_inflight'] == {1: 1}
+    lease.release()
+    run.finish(third, final_first=True)
+    run.published(1)
+    assert not c.snapshot()['inference_inflight']
+    assert run.owner.snapshot()['final'] == 3
+
+
+def test_duplicate_compute_is_fatal_without_releasing_another_devices_credit(native_case):
+    run, c, _ = native_case(workers=2)
+    run.declare(1, tasks=2, bytes=32)
+    run.prepare(1)
+    run.submit(10, 1, required_worker=0)
+    run.submit(11, 1, required_worker=1)
+    first, second = run.take(0)[0], run.take(1)[0]
+    run.receipt(first, 'installed')
+    run.receipt(second, 'installed')
+    run.receipt(first, 'compute')
+    run.wait_snapshot(lambda state: state['active'] == 1)
+    run.receipt(first, 'compute')
+    with pytest.raises(RuntimeError, match='duplicate compute receipt'):
+        run.owner.wait_publication(2)
+    assert c.snapshot()['inference_inflight'] == {1: 1}
+    assert run.owner.snapshot()['bytes_used'] == 32
+
+
+def test_radial_stage_stays_exclusive_until_actual_compute_ack(native_case):
+    run, c, torch = native_case(workers=1)
+    run.declare(1)
+    run.prepare(1)
+    run.submit(10, 1)
+    lease = run.take()[0]
+    assert acquire(c, torch) is None
+    run.receipt(lease, 'installed')
+    run.receipt(lease, 'compute')
+    run.wait_snapshot(lambda state: state['active'] == 0)
+    projection = acquire(c, torch)
+    assert projection is not None
+    assert not c.begin_inference(0)
+    run.receipt(lease, 'final')
+    assert run.owner.wait_task_final(lease.task_id, lease.generation, 2)
+    projection.release()
+    assert c.begin_inference(0)
+    c.finish_inference(0)
+
+
+def test_terminal_asset_fence_and_actual_auxiliary_work_remain_authoritative(native_case):
+    run, c, torch = native_case(workers=1)
+    c.set_inference_asset_retirement_pending(True)
+    assert acquire(c, torch) is None
+    c.set_inference_asset_retirement_pending(False)
+    pool = runtime._GpuWorkerAuxInterpolationPool({0: queue.SimpleQueue()})
+    assert pool.enable_worker(0)
+    handle = pool.try_submit({'fixture': True})
+    assert handle is not None and acquire(c, torch) is None
+    pool.complete(handle['task_id'], 0, True, {}, None)
+    lease = acquire(c, torch)
+    assert lease is not None
+    lease.release()
+
+
+@pytest.mark.parametrize('compute_proven', [False, True])
+def test_failed_actor_keeps_unproven_compute_and_other_device_ownership(native_case, compute_proven):
+    run, c, _ = native_case(workers=2)
+    run.declare(1, tasks=2)
+    run.prepare(1)
+    run.submit(10, 1, required_worker=0)
+    run.submit(11, 1, required_worker=1)
+    first, second = run.take(0)[0], run.take(1)[0]
+    run.receipt(first, 'installed')
+    run.receipt(second, 'installed')
+    if compute_proven:
+        run.receipt(first, 'compute')
+        run.wait_snapshot(lambda state: state['active'] == 1)
+    run.receipt(first, 'failed', reason='injected publication failure')
+    with pytest.raises(RuntimeError, match='injected publication failure'):
+        run.owner.wait_publication(2)
+    assert c.snapshot()['inference_inflight'] == ({1: 1} if compute_proven else {0: 1, 1: 1})
+
+
+@pytest.fixture
+def mixed_case(request, monkeypatch):
+    c = native_coordinator(request, monkeypatch)
+    c.configure_workers((0, 1, 2, 3))
+    configure_stage_timing(c, expiry=1., age=.04, handoff=.15)
+    c.set_pending_inference_backlog(True)
+    torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 4,
+        mem_get_info=lambda _device: (1000, 2000)), device=lambda value: value)
+    for device in range(4):
+        c.begin_inference(device); c.begin_inference(device)
+    return c, torch
+
+
+@pytest.mark.parametrize('families', [('Radial', 'Spherical'), ('Spherical', 'Radial')])
+def test_mixed_projection_families_share_fifo_refresh_and_two_turn_cap(mixed_case, families):
+    c, torch = mixed_case
+    c.set_spherical_retirement_pressure(True)
+    names = [f'{families[0]} source projection oldest', f'{families[1]} source projection middle',
+             f'{families[0]} source projection newest']
+    for name in (*names, names[0]):
+        assert c.try_acquire_stage(torch, name) is None
+    c.finish_inference(0); c.finish_inference(0)
+    assert c.try_acquire_stage(torch, names[2]) is None
+    first = c.try_acquire_stage(torch, names[0])
+    first.release()
+    assert not c.begin_inference(0)
+    second = c.try_acquire_stage(torch, names[1])
+    assert second.device_index == 0
+    second.release()
+    assert c.try_acquire_stage(torch, names[2]) is None
+    assert c.snapshot()['spherical_retirement_reserved_device'] == 1
+    assert c.begin_inference(0)
+
+
+def test_aged_radial_waiter_hands_to_aged_spherical_without_pressure(mixed_case):
+    c, torch = mixed_case
+    names = ['Radial source projection aged', 'Spherical source projection aged']
+    for name in names:
+        assert c.try_acquire_stage(torch, name) is None
+    wait_stage(c, lambda state: state['spherical_retirement_reserved_device'] is not None)
+    time.sleep(.015)  # Both independently submitted waiters reach their native age deadline.
+    c.finish_inference(0); c.finish_inference(0)
+    first = c.try_acquire_stage(torch, names[0])
+    first.release()
+    second = c.try_acquire_stage(torch, names[1])
+    assert second.device_index == 0
+    assert c.snapshot()['spherical_retirement_aged_acquisitions'] == 2
+    assert c.snapshot()['spherical_retirement_pressure_acquisitions'] == 0
+    second.release()
+
+
+def test_cancelled_radial_cpu_reader_yields_to_spherical(mixed_case):
+    c, torch = mixed_case
+    c.set_spherical_retirement_pressure(True)
+    radial, spherical = 'Radial source projection CPU done', 'Spherical source projection pending'
+    assert c.try_acquire_stage(torch, radial) is None
+    assert c.try_acquire_stage(torch, spherical) is None
+    c.cancel_spherical_retirement_request(radial)
+    c.finish_inference(0); c.finish_inference(0)
+    lease = c.try_acquire_stage(torch, spherical)
+    assert lease.device_index == 0
+    assert c.snapshot()['spherical_retirement_request_count'] == 0
+    lease.release()

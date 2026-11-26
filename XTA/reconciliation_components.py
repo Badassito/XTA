@@ -88,7 +88,7 @@ def _plan_slabs(shape_tyx: Sequence[int], memory_mib: float) -> dict:
 
 
 def _advance_frontier(
-    labels: np.ndarray,
+    labels: Sequence[np.ndarray] | np.ndarray,
     local_sizes: np.ndarray,
     previous_face: np.ndarray,
     previous_sizes: np.ndarray,
@@ -97,13 +97,14 @@ def _advance_frontier(
     local_count = int(local_sizes.size)
     previous_count = int(previous_sizes.size)
     node_count = local_count + previous_count
-    if node_count == 0:
-        return np.zeros_like(previous_face), np.empty(0, np.int64), 0, 0
+    if local_count == 0:
+        return (np.zeros_like(previous_face), np.empty(0, np.int64),
+                previous_count, int(previous_sizes.max(initial=0)))
 
     # Nodes 0..local_count-1 are local components. Remaining nodes represent
     # historical components that still touch the immediately preceding plane.
-    overlap = (labels[0] != 0) & (previous_face != 0)
-    if local_count and previous_count and np.any(overlap):
+    overlap = (labels[0] != 0) & (previous_face != 0) if previous_count else None
+    if overlap is not None and np.any(overlap):
         from scipy.sparse import coo_matrix
         from scipy.sparse.csgraph import connected_components
 
@@ -122,8 +123,9 @@ def _advance_frontier(
         del graph, current_ids, previous_ids
     else:
         del overlap
-        merged_count = node_count
-        merged_ids = np.arange(node_count, dtype=np.int32)
+        retired_count = previous_count
+        largest_retired = int(previous_sizes.max(initial=0))
+        return _compact_frontier(labels[-1], local_sizes, retired_count, largest_retired)
 
     # Integer aggregation avoids the precision loss of bincount's floating
     # weights on very large components.
@@ -136,6 +138,12 @@ def _advance_frontier(
     del merged_ids
     last_face = label_to_merged[labels[-1]]
     del label_to_merged
+    return _compact_frontier(last_face, merged_sizes)
+
+
+def _compact_frontier(last_face, merged_sizes, retired_count=0, largest_retired=0):
+    """Retire IDs outside the last face and keep contiguous IDs for survivors."""
+    merged_count = int(merged_sizes.size)
     active = np.zeros(merged_count + 1, dtype=bool)
     active[last_face] = True
     active[0] = False
@@ -144,8 +152,8 @@ def _advance_frontier(
 
     retired = np.ones(merged_count, dtype=np.bool_)
     retired[active_ids - 1] = False
-    retired_count = int(merged_count - active_ids.size)
-    largest_retired = int(np.max(merged_sizes, where=retired, initial=0))
+    retired_count += int(merged_count - active_ids.size)
+    largest_retired = max(largest_retired, int(np.max(merged_sizes, where=retired, initial=0)))
     del retired
 
     # Compact IDs on every step, so neither indices nor storage grow with the
@@ -155,6 +163,50 @@ def _advance_frontier(
     next_face = remap[last_face]
     next_sizes = merged_sizes[active_ids - 1]
     return next_face, next_sizes, retired_count, largest_retired
+
+
+def _sampled_support_is_broad(slab, height, width):
+    """Use only observed foreground to rule out a small occupied window."""
+    row_step, col_step = max(1, height // 16), max(1, width // 16)
+    rows, cols = np.nonzero(slab[len(slab) // 2, ::row_step, ::col_step])
+    if not rows.size:
+        return False
+    height_bound = (int(rows[-1]) - int(rows[0])) * row_step + 1
+    width_bound = (int(cols.max()) - int(cols.min())) * col_step + 1
+    return height_bound * width_bound > height * width // 2
+
+
+def _label_slab(slab, structure, ndimage):
+    """Label a compact occupied window when it removes at least half the grid."""
+    height, width = slab.shape[1:]
+    output_slices = None
+    if height * width >= 32_768 and not _sampled_support_is_broad(slab, height, width):
+        occupied = np.any(slab, axis=0) if len(slab) > 1 else slab[0]
+        rows = np.flatnonzero(np.any(occupied, axis=1))
+        if not rows.size:
+            return (), np.empty(0, dtype=np.int64)
+        top, bottom = int(rows[0]), int(rows[-1]) + 1
+        cols = np.flatnonzero(np.any(occupied[top:bottom], axis=0))
+        del occupied
+        left, right = int(cols[0]), int(cols[-1]) + 1
+        if (bottom - top) * (right - left) <= height * width // 2:
+            output_slices = (slice(top, bottom), slice(left, right))
+            slab = slab[(slice(None), *output_slices)]
+
+    labels = np.empty(slab.shape, dtype=np.int32)
+    local_count = int(ndimage.label(slab, structure=structure, output=labels))
+    # scipy's compact labels make this table bounded by the current window.
+    local_sizes = np.bincount(labels.ravel(), minlength=local_count + 1)[1:]
+    if output_slices is None or not local_count:
+        return labels, local_sizes
+
+    first = np.zeros((height, width), dtype=np.int32)
+    first[output_slices] = labels[0]
+    if len(labels) == 1:
+        return (first, first), local_sizes
+    last = np.zeros_like(first)
+    last[output_slices] = labels[-1]
+    return (first, last), local_sizes
 
 
 def component_statistics(
@@ -205,11 +257,8 @@ def component_statistics(
             )
         if slab.dtype not in (np.dtype(np.bool_), np.dtype(np.uint8)):
             raise ValueError("read_slab must return a bool or uint8 array")
-        labels = np.empty(expected_shape, dtype=np.int32)
-        local_count = int(ndimage.label(slab, structure=structure, output=labels))
+        labels, local_sizes = _label_slab(slab, structure, ndimage)
         del slab
-        # scipy's compact labels make this table bounded by the current slab.
-        local_sizes = np.bincount(labels.ravel(), minlength=local_count + 1)[1:]
         foreground_voxels += int(local_sizes.sum(dtype=np.int64))
         next_face, next_sizes, retired_count, largest_retired = _advance_frontier(
             labels, local_sizes, previous_face, previous_sizes,

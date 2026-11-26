@@ -503,7 +503,8 @@ class ViewMajorPublication:
                     max_workers=max(1, min(self.publishers * siblings_count, max(4, int(_cpu_count()) // 8))),
                     thread_name_prefix="sweep-confidence")
             producing = os.environ.get("XTA_YOLO_SWEEP_NATIVE_ROLE") == "produce"
-            if producing:
+            if producing and (self.scalar_sink.write_native_nrrd or any(
+                    'nrrd' in self.scalar_sink._layer_formats(spec) for spec in self.scalar_sink.low_quality_specs)):
                 # Sibling layer files leave this process's GIL: each write holds it
                 # for 0.1-1.0 s of glue around its nogil kernels. The sinks keep
                 # every name, row and record; workers return the plans they wrote.
@@ -536,7 +537,9 @@ class ViewMajorPublication:
                     low_quality_root=nrrd_root/"low_quality", executor=self._executor,
                     relative_artifact_paths=self.nrrd_stage_root is None,
                     managed_review_root=self.scalar_sink.managed_review_root,
-                    layer_file_processes=self._nrrd_processes)
+                    layer_file_processes=self._nrrd_processes,
+                    full_quality_formats=self.scalar_sink.full_quality_formats,
+                    cutoff=cent / 100., output_root=root)
                 if self.retain_confidence:
                     floors = {backend: max(cent/100., float(floor))
                               for backend, floor in floor_by_backend.items()}

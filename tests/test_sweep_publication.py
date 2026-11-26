@@ -380,6 +380,94 @@ def test_parallel_cutoffs_publish_identical_files_and_records(tmp_path):
     assert [g["path"] for g in groups] == [f"low_quality/half/group_{i:04d}.seg.nrrd" for i in (1, 2, 3)]
 
 
+@pytest.mark.parametrize("resident", [False, True])
+def test_parallel_groups_within_one_cutoff_preserve_the_managed_review(tmp_path, monkeypatch, resident):
+    import threading
+    from XTA import sam_resources, sweep_publication as publisher, workspace
+
+    stage = tmp_path / "staged"
+    branches = [scalar(tmp_path, 80, stage_root=stage, grids=("native",))[0]]
+    monkeypatch.setattr(publisher, "_MAX_CHANNELS", 1)
+    monkeypatch.setattr(sam_resources, "physical_sam_headroom", lambda: 128 << 20)
+    if not resident:
+        monkeypatch.setattr(publisher, "_native_coverage_plans", lambda *args: {})
+    args = dict(sweep_id="sweep-test", memory_mib=2, nrrd_stage_root=stage)
+    expected = publish_sweep_review(tmp_path, branches, workers=1, review_name="serial", **args)
+
+    rendezvous = threading.Barrier(2, timeout=10)
+    owner_by_group = {}
+    lock = threading.Lock()
+    original = publisher.write_grouped_seg_nrrd
+    def overlapping(path, **kwargs):
+        with lock:
+            owner_by_group[path.name] = kwargs["segments"][0].source_layer._owner
+            first_pair = len(owner_by_group) <= 2
+        if first_pair:
+            rendezvous.wait()
+        return original(path, **kwargs)
+    monkeypatch.setattr(publisher, "write_grouped_seg_nrrd", overlapping)
+    monkeypatch.setattr(workspace, "_cpu_count", lambda: 64)
+    monkeypatch.setattr(workspace, "_slurm_allocated_cpu_count", lambda: 4)
+    created_workers = []
+    make_pool = publisher.ThreadPoolExecutor
+    def record_pool(*, max_workers, thread_name_prefix):
+        created_workers.append(max_workers)
+        return make_pool(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
+    monkeypatch.setattr(publisher, "ThreadPoolExecutor", record_pool)
+    actual = publish_sweep_review(tmp_path, branches, review_name="parallel", **args)
+
+    assert created_workers == [2]
+    assert len(owner_by_group) == len(set(owner_by_group.values())) == 5
+    assert all(owner._closed and owner._open_count == 0 for owner in owner_by_group.values())
+    assert actual.read_bytes() == expected.read_bytes()
+    assert published_files(actual.parent) == published_files(expected.parent)
+
+
+def test_managed_group_failure_drains_active_writers_before_releasing_coverage(tmp_path, monkeypatch):
+    import threading
+    from XTA import sam_resources, sweep_publication as publisher
+
+    stage = tmp_path / "staged"
+    branches = [scalar(tmp_path, 80, stage_root=stage, grids=("native",))[0]]
+    inputs = published_files(stage)
+    monkeypatch.setattr(publisher, "_MAX_CHANNELS", 1)
+    # An explicit request for 20 group writers fits only two 2 MiB reservations.
+    monkeypatch.setattr(sam_resources, "physical_sam_headroom", lambda: 6 << 20)
+    barrier = threading.Barrier(2, timeout=10)
+    lock = threading.Lock()
+    active = peak = started = 0
+    original = publisher.write_grouped_seg_nrrd
+    close = DirectCoverage.close
+    def injected(path, **kwargs):
+        nonlocal active, peak, started
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            started += 1
+            order = started
+        try:
+            if order <= 2:
+                barrier.wait()
+            if order == 1:
+                raise OSError("injected pack write failure")
+            return original(path, **kwargs)
+        finally:
+            with lock:
+                active -= 1
+    def checked_close(self):
+        assert active == 0
+        close(self)
+    monkeypatch.setattr(publisher, "write_grouped_seg_nrrd", injected)
+    monkeypatch.setattr(DirectCoverage, "close", checked_close)
+    with pytest.raises(OSError, match="injected pack write failure"):
+        publish_sweep_review(tmp_path, branches, sweep_id="sweep-test", memory_mib=2,
+                             nrrd_stage_root=stage, workers=20)
+    assert peak == 2
+    assert inputs == published_files(stage)
+    assert not (tmp_path / "review").exists()
+    assert not list(tmp_path.glob(".review.atomic-result-*"))
+
+
 def test_masks_and_coverage_share_one_compression_pool_across_cutoffs_and_grids(tmp_path, monkeypatch):
     from XTA import sweep_publication as publisher
 
@@ -411,6 +499,26 @@ def test_masks_and_coverage_share_one_compression_pool_across_cutoffs_and_grids(
         assert totals["reused_bytes"] + totals["data_bytes"] + totals["zero_bytes"] == sum(
             int(np.prod(g["stored_shape_tyx"])) * len(g["segments"]) for g in grid["groups"])
         assert all(c["gzip_spans"]["data_codec"] == totals["data_codec"] for c in grid["coverage"])
+
+
+def test_review_links_only_the_captured_cutoff_receipts_confidence(tmp_path):
+    stage = tmp_path / 'staged'
+    branches = [scalar(tmp_path, cent, stage_root=stage)[0] for cent in (50,80)]
+    for cent, branch in branches:
+        folder = branch / 'reconciliation_evidence'
+        folder.mkdir()
+        (folder / 'manifest.json').write_text('{"layers":[]}')
+        if cent == 50:
+            p = branch / 'manifest.json'
+            receipt = json.loads(p.read_bytes())
+            receipt['prediction_processing'] = {'observed_confidence':None}
+            p.write_text(json.dumps(receipt))
+    index = publish_sweep_review(tmp_path, branches, sweep_id='sweep-test', nrrd_stage_root=stage)
+    for grid in json.loads(index.read_bytes())['grids']:
+        transient, legacy = grid['branches']
+        assert transient['observed_confidence_manifest'] is None
+        assert (index.parent / legacy['observed_confidence_manifest']).resolve() == (
+            branches[1][1] / 'reconciliation_evidence/manifest.json').resolve()
 
 
 def test_one_failed_cutoff_worker_publishes_nothing(tmp_path, monkeypatch):

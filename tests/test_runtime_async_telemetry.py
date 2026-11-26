@@ -5,14 +5,14 @@ import io
 import json
 import os
 from pathlib import Path
-import queue
 import tempfile
 import threading
 import time
 import unittest
 from unittest import mock
 
-from XTA import runtime, tta_scheduler
+from XTA import runtime
+from tests.native_scheduler_support import NativeRun
 from tools.analyze_pipeline_trace import read_events
 
 
@@ -383,53 +383,38 @@ class RuntimeAsyncTelemetryTests(unittest.TestCase):
             self.assertEqual(sum(len(r['events']) for r in records), 121)
             self.assertTrue(records[-1]['final'])
 
-    def test_slow_sink_does_not_block_push_receipt_or_main_handling_of_four_gpu_credits(self):
-        from tests.test_tta_scheduler_boundary import _scheduler, _state, _view
-        with tempfile.TemporaryDirectory() as directory:
+    def test_slow_sink_does_not_block_native_refill_on_four_gpu_credits(self):
+        with tempfile.TemporaryDirectory() as directory, NativeRun(workers=4) as run:
             telemetry = self.telemetry(directory)
             telemetry._trace_batch_limit = 1
-            state = _state()
-            state.push_drain_active = True
-            state.gpu_result_queue = queue.Queue()
+            run.declare(1, tasks=8)
+            run.prepare(1)
             for worker in range(4):
-                state.gpu_task_queues[worker] = queue.Queue()
-                state.gpu_worker_tasks_by_id[worker] = dict(task_id=worker, kind='fullframe',
-                    model_name='model', view=_view(), slice_start=0, slice_count=1)
-            scheduler = _scheduler(Path(directory), state=state)
-            scheduler.dispatch_inference_windows = mock.Mock()
-            scheduler.refresh_gpu_aux_interpolation_leases = mock.Mock()
-            scheduler.update_gpu_worker_cost = mock.Mock()
-            scheduler.release_d1_owner_if_complete = mock.Mock()
+                run.submit(worker + 1, 1, required_worker=worker)
+                run.submit(worker + 5, 1, required_worker=worker)
+            first = [run.take(worker)[0] for worker in range(4)]
+            self.assertEqual([lease.task_id for lease in first], [1, 2, 3, 4])
             with self.blocked_sink(telemetry) as (entered, release, _handles), \
                  mock.patch.dict(os.environ, {'YOLO_TTA_TASK_TRACE': '1'}), \
                  mock.patch.object(runtime, 'runtime_telemetry', return_value=telemetry):
                 telemetry.trace_event('initial')
                 self.assertTrue(entered.wait(timeout=2))
-                pump = threading.Thread(target=scheduler.push_drain_pump)
-                pump.start()
-                try:
-                    for worker in range(4):
-                        state.gpu_result_queue.put(dict(type='compute_released', task_id=worker,
-                                                       gpu_index=worker, ok=True, stats={}))
-                    deadline = time.monotonic()+1
-                    while len(state.pushed_worker_results)<4 and time.monotonic()<deadline:
-                        state.scheduler_wake.wait(timeout=.01)
-                    self.assertEqual(len(state.pushed_worker_results), 4)
-                    handled = threading.Event()
-                    def handle_credits():
-                        scheduler.drain_process_inference_results()
-                        handled.set()
-                    thread = threading.Thread(target=handle_credits)
-                    thread.start()
-                    self.assertTrue(handled.wait(timeout=1))
-                    thread.join(timeout=1)
-                    self.assertFalse(release.is_set())
-                    self.assertEqual(state.gpu_worker_compute_completed_by_id, {i:1 for i in range(4)})
-                    # Four compute credits share one main-thread refill.
-                    self.assertEqual(scheduler.dispatch_inference_windows.call_count, 1)
-                finally:
-                    state.push_drain_stop.set()
-                    pump.join(timeout=1)
+                for lease in first:
+                    run.receipt(lease, 'installed')
+                    run.receipt(lease, 'compute')
+                second = [run.take(worker)[0] for worker in range(4)]
+                self.assertEqual([lease.task_id for lease in second], [5, 6, 7, 8])
+                self.assertFalse(release.is_set())
+                for lease in first:
+                    run.receipt(lease, 'final', payload=b'result')
+                    self.assertTrue(run.owner.wait_task_final(lease.task_id, lease.generation, 2))
+                for lease in second:
+                    run.finish(lease)
+                run.published(1)
+                run.consume_events()
+                for lease in first + second:
+                    run.retire(lease)
+                run.owner.retire_parent(1, run.parents[1])
 
     def test_due_requests_coalesce_while_writer_is_blocked(self):
         with tempfile.TemporaryDirectory() as directory:

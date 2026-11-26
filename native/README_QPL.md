@@ -37,7 +37,8 @@ XTA_BUILD_INTEL=qpl python -m pip wheel . --no-deps
 ```
 
 The normal `auto` build includes the extension only when pkg-config discovers
-QPL; `XTA_BUILD_INTEL=none` forces a pure-Python build.
+QPL; `XTA_BUILD_INTEL=none` omits optional Intel accelerators. The required
+native TTA scheduler is still built.
 
 ## Runtime contract
 

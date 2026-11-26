@@ -18,7 +18,7 @@ from XTA.view_prepare import AdmittedViewPrepare
 from tests.test_per_device_gpu_asset_retirement import case
 from tests.test_sam_parent_staging_adversarial import queue, TinyTask, owning_mask, admit
 from tests.test_terminal_component_refs import _function
-from tests.test_tta_gpu_asset_release import _ack
+from tests.test_tta_gpu_asset_release import _ack, deliver_ack, ready_gpu_case
 
 
 def add_deferred(stage, root, name, amount=1):
@@ -69,7 +69,7 @@ def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
 def test_slow_resume_sweep_returns_to_authentic_late_ack(
         tmp_path, monkeypatch, case, bounded, expected_probes):
     c = case
-    c.scheduler.process_one_worker_result(_ack(0, c.commands[0]))
+    deliver_ack(c, _ack(0, c.commands[0]))
     c.state.push_drain_active = True
     c.state.gpu_result_queue = queues.Queue()
     stage, _writer, _prepare, leases = queue(tmp_path, cap=10**6, ready=lambda: True)
@@ -80,11 +80,11 @@ def test_slow_resume_sweep_returns_to_authentic_late_ack(
         probes.append(task.view.name)
         now[0] += .05  # Deterministic slow probe; no sleep or real memory pressure.
         if len(probes) == 1:
-            c.state.pushed_worker_results.append(_ack(2, c.commands[2]))
+            c.actors[2].put(_ack(2, c.commands[2]))
         return {'physical_headroom_bytes': 0, 'required_host_bytes': 1,
                 'remaining_startup_bytes': 1}
     monkeypatch.setattr(staging, '_dense_startup_budget_locked', slow_probe)
-    budget = BackgroundDrainBudget(c.scheduler.service_pending_compute_credits,
+    budget = BackgroundDrainBudget(c.scheduler.service_preparation,
         stages=9, seconds=.01, clock=lambda: now[0])
     if bounded:
         pipeline_drain(stage, budget, c.scheduler)()
@@ -92,7 +92,7 @@ def test_slow_resume_sweep_returns_to_authentic_late_ack(
         stage.pump()  # Prior unbounded owner-loop behavior.
     assert len(probes) == expected_probes
     assert c.notifications[-1].device_index != 2
-    c.scheduler.drain_process_inference_results()
+    c.run.drain_until(lambda: c.notifications[-1].device_index == 2)
     assert c.notifications[-1].device_index == 2
     assert now[0] == pytest.approx(.05 * expected_probes)
     assert len(stage.deferred) == 64 and not leases.leases
@@ -236,8 +236,8 @@ def test_sam_completion_pass_stays_bounded_until_context_closes(
         return dict(physical_headroom_bytes=0, required_host_bytes=1, remaining_startup_bytes=1)
     monkeypatch.setattr(staging, '_dense_startup_budget_locked', slow_probe)
     scheduler = SimpleNamespace(process_inference_outstanding=lambda: False,
-        service_pending_compute_credits=lambda: checkpoints.append(True))
-    budget = BackgroundDrainBudget(scheduler.service_pending_compute_credits,
+        service_preparation=lambda: checkpoints.append(True), publication_outstanding=lambda: False)
+    budget = BackgroundDrainBudget(scheduler.service_preparation,
         stages=9, seconds=.01, clock=lambda: now[0])
     pipeline_drain(stage, budget, scheduler, sam_context=SimpleNamespace(_closed=closed))()
     assert len(probes) == expected_probes
@@ -264,8 +264,8 @@ def test_locked_parent_drain_reaches_wakeable_wait_and_independent_completion(tm
     holder = threading.Thread(target=hold_parent_condition)
     checkpoints = []
     scheduler = SimpleNamespace(process_inference_outstanding=lambda: False,
-        service_pending_compute_credits=lambda: checkpoints.append(True))
-    budget = BackgroundDrainBudget(scheduler.service_pending_compute_credits,
+        service_preparation=lambda: checkpoints.append(True), publication_outstanding=lambda: False)
+    budget = BackgroundDrainBudget(scheduler.service_preparation,
         stages=9, max_completed=2)
     drain = pipeline_drain(stage, budget, scheduler, sam_context=SimpleNamespace(_closed=False))
     independent = Future()
@@ -355,8 +355,8 @@ def test_denied_probe_keeps_ready_prepared_parent_ahead_of_unrelated_wait(tmp_pa
     leases.postprocess_bytes[('model', 'live')] = 120
     now = [0.]
     scheduler = SimpleNamespace(process_inference_outstanding=lambda: False,
-        service_pending_compute_credits=lambda: now.__setitem__(0, now[0] + .02))
-    budget = BackgroundDrainBudget(scheduler.service_pending_compute_credits,
+        service_preparation=lambda: now.__setitem__(0, now[0] + .02))
+    budget = BackgroundDrainBudget(scheduler.service_preparation,
                                    stages=9, max_completed=1, clock=lambda: now[0])
     drain = pipeline_drain(stage, budget, scheduler, sam_context=SimpleNamespace(_closed=False))
     ready, unrelated = Future(), Future()

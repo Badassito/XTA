@@ -1,4 +1,6 @@
 """CPU regression for normal detector-drained standalone GPU admission setup."""
+
+from tests.native_stage_test_support import native_stage_context
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +13,7 @@ from tools import smoke_sam_extrapolation as shared
 
 @pytest.fixture
 def coordinator(monkeypatch):
-    owner = bp._MainProcessGpuStageCoordinator()
+    owner = bp._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     monkeypatch.setattr(bp, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR', owner)
     monkeypatch.setattr(bp, 'gpu_worker_aux_interpolation_pool', lambda: None)
     return owner

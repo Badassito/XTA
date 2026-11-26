@@ -8,10 +8,12 @@ import pytest
 
 from XTA import backprojection as bp
 from XTA.geometry import _build_tilted_view_infos
+from tests.native_stage_test_support import native_coordinator
 
 
 @pytest.fixture
-def native_job(monkeypatch):
+def native_job(monkeypatch, request):
+    native_coordinator(request, monkeypatch)
     view = _build_tilted_view_infos(5, 7, 9, tilt_views=('transverse',),
         tilt_angles=(30.,), tilt_directions=('horizontal',))[0]
     shape = (5, 7, 9)
@@ -100,13 +102,13 @@ def test_cuda_failure_aborts_publication_and_closes_stage(native_job, monkeypatc
     assert records['projection.native_destination_pull.live.' + view.name]['state'] == 'failed'
 
 
-def test_inference_priority_performs_no_cuda_or_torch_probe(native_job, monkeypatch):
+def test_inference_priority_performs_no_cuda_or_torch_probe(native_job, monkeypatch, request):
     view, shape, source, plan, records = native_job
     monkeypatch.setenv('YOLO_TTA_GPU_BACKPROJECT', '1')
     monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_CUDA', '1')
     plan.backend = 'compiled_native_tilted'
     monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
-    coordinator = bp._MainProcessGpuStageCoordinator()
+    coordinator = native_coordinator(request, monkeypatch)
     coordinator.configure_workers([0])
     coordinator.set_pending_inference_backlog(True)
     monkeypatch.setenv('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', '1')
@@ -249,9 +251,9 @@ def test_small_remaining_work_skips_source_upload(native_job, monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize('minimum', [0, 64 * 1024**2])
-def test_cpu_completion_and_small_suffix_cancel_live_retirement_request(native_job, monkeypatch, tmp_path, minimum):
+def test_cpu_completion_and_small_suffix_cancel_live_retirement_request(native_job, monkeypatch, tmp_path, minimum, request):
     view, shape, source, plan, records = native_job
-    coordinator = bp._MainProcessGpuStageCoordinator()
+    coordinator = native_coordinator(request, monkeypatch)
     coordinator.configure_workers([0])
     coordinator.set_pending_inference_backlog(True)
     coordinator.set_spherical_retirement_pressure(True)
@@ -276,11 +278,11 @@ def test_cpu_completion_and_small_suffix_cancel_live_retirement_request(native_j
     coordinator.finish_inference(0)
 
 
-def test_safe_unavailable_admission_cancels_queued_turn(native_job, monkeypatch):
+def test_safe_unavailable_admission_cancels_queued_turn(native_job, monkeypatch, request):
     from XTA.native_pull_cuda import NativePullCudaUnavailable
     view, shape, source, plan, records = native_job
     plan.backend = 'compiled_native_tilted'
-    coordinator = bp._MainProcessGpuStageCoordinator()
+    coordinator = native_coordinator(request, monkeypatch)
     coordinator.configure_workers([0])
     coordinator.set_pending_inference_backlog(True)
     coordinator.set_spherical_retirement_pressure(True)

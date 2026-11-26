@@ -33,6 +33,7 @@ _MANIFEST_WRITE_LOCK = threading.Lock()
 _BATCH_MANIFEST = False
 _MANIFEST_DIRTY = False
 _OUTPUT_DIR: Path | None = None
+_TRANSIENT_WORKSPACE = None
 _ENABLED = False
 _DEFER_PROJECTION = False
 _REGISTRY: dict[tuple[str, str], 'ConfidenceEvidenceRef'] = {}
@@ -49,20 +50,27 @@ def configure_confidence_evidence(output_dir=None, *, enabled=False, min_conf=0.
                                   defer_projection=False, background_publication=False,
                                   prediction_task=None, confidence_floor=None,
                                   confidence_floor_by_backend=None, run_id=None,
-                                   adopt_existing=False, sweep_score_projection=None):
-    """Start a run-owned collection; output_dir is the run's output directory."""
+                                   adopt_existing=False, sweep_score_projection=None, transient_parent=None):
+    """Start a public collection or keep voting inputs in owned run scratch."""
+    from tempfile import TemporaryDirectory
     from .confidence_retention import observed_confidence_contract
     contract = observed_confidence_contract(prediction_task=prediction_task,
         confidence_floor=confidence_floor, min_conf=min_conf,
         confidence_floor_by_backend=confidence_floor_by_backend)
     global _OUTPUT_DIR, _ENABLED, _DEFER_PROJECTION, _PUBLICATION, _OBSERVED_CONFIDENCE, _RUN_ID
-    global _BATCH_MANIFEST, _MANIFEST_DIRTY, _SWEEP_SCORE_PROJECTION
+    global _BATCH_MANIFEST, _MANIFEST_DIRTY, _SWEEP_SCORE_PROJECTION, _TRANSIENT_WORKSPACE
     shutdown_confidence_publication()
     with _MANIFEST_WRITE_LOCK, _LOCK:
         _ENABLED = bool(enabled)
         _DEFER_PROJECTION = bool(defer_projection)
         _BATCH_MANIFEST = bool(background_publication)
         _MANIFEST_DIRTY = False
+        if _TRANSIENT_WORKSPACE is not None:
+            _TRANSIENT_WORKSPACE.cleanup()
+            _TRANSIENT_WORKSPACE = None
+        if enabled and transient_parent is not None:
+            _TRANSIENT_WORKSPACE = TemporaryDirectory(prefix='reconciliation-scores-', dir=transient_parent)
+            output_dir = _TRANSIENT_WORKSPACE.name
         _OUTPUT_DIR = None if output_dir is None else Path(output_dir) / 'reconciliation_evidence'
         _OBSERVED_CONFIDENCE = contract
         _RUN_ID = run_id
@@ -84,6 +92,16 @@ def configure_confidence_evidence(output_dir=None, *, enabled=False, min_conf=0.
             _PUBLICATION._automatic_terminal_bounds = True
     from .confidence_tiles import reset_tile_confidence
     reset_tile_confidence()
+
+
+def current_published_confidence_manifest(run_dir):
+    """Return a public catalogue owned by the active scalar run."""
+    from .confidence_retention import published_confidence_manifest
+    with _LOCK:
+        if (not _ENABLED or _TRANSIENT_WORKSPACE is not None or _OUTPUT_DIR is None
+                or _OUTPUT_DIR.resolve() != (Path(run_dir) / 'reconciliation_evidence').resolve()):
+            return None
+        return published_confidence_manifest(run_dir, run={'run_id': _RUN_ID})
 
 
 def drain_confidence_publication():
@@ -979,7 +997,7 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
             operation_scores = (nullcontext(None) if sweep_projection is None else
                                 sweep_projection.reuse(native_shape, read_native, shape,
                                     model_name=model_name, layer_key=key,
-                                    provenance=provenance, metrics=metrics))
+                                    provenance=provenance, metrics=metrics, native_boxes=native_boxes))
         keep_floor = (sweep_projection is not None and sweep_projection.cutoff == sweep_projection.floor
                       and sweep_projection.budget_bytes > 0)
         with operation_scores as reused:
@@ -1005,10 +1023,25 @@ def publish_confidence_scores(scores, *, view, model_name, temp_dir, output_shap
                     if diagnostics is not None:
                         metrics['source_projection'] = diagnostics()
         if keep_floor:
+            cache_started = time.perf_counter()
             metrics['floor_score_projection_cache'] = sweep_projection.remember(
                 native_shape, read_native, reference, provenance=provenance,
-                minimum_projected_score=metrics['minimum_nonzero_score'])
+                minimum_projected_score=metrics['minimum_nonzero_score'], native_boxes=native_boxes)
+            metrics['floor_score_cache_seconds'] = time.perf_counter() - cache_started
     result = _register_confidence_reference(reference,metrics=metrics)
+    if sweep_projection is not None:
+        from .runtime import runtime_telemetry
+        telemetry = runtime_telemetry()
+        if 'floor_score_projection_cache' in metrics:
+            telemetry.add('confidence.floor_cache.' + metrics['floor_score_projection_cache'] + '.layers', 1)
+            telemetry.add('confidence.floor_cache.store_seconds', metrics['floor_score_cache_seconds'])
+        if metrics.get('source_projection_reused'):
+            strategy = 'copied' if 'copied_numeric_bytes' in metrics else 'thresholded'
+            telemetry.add('confidence.score_reuse.' + strategy + '.layers', 1)
+        elif 'score_reuse_reason' in metrics:
+            telemetry.add('confidence.score_reuse.' + metrics['score_reuse_reason'] + '.layers', 1)
+        if 'score_reuse_proof_seconds' in metrics:
+            telemetry.add('confidence.score_reuse.proof_seconds', metrics['score_reuse_proof_seconds'])
     print(f'Confidence {operation} complete {model_name}/{view.name}: '
           f'elapsed_s={time.perf_counter()-started:.3f}, metrics={json.dumps(metrics,sort_keys=True)}.', flush=True)
     return result
@@ -1192,6 +1225,25 @@ class _MaskedNativeScoreReader:
                               native_batch_seconds=native_batch_seconds,**codec_metrics)
 
 
+def _eager_rank_score_bounds_supported(mask, scores, view):
+    from .geometry import is_tilted_view
+    from .runtime import _root_memmap_for_array
+
+    if (str(view.family) not in ('radial', 'spherical', 'azimuthal') and not is_tilted_view(view)
+            or scores.shape[0] != int(view.num_slices)
+            or not scores.flags.writeable or not scores.flags.c_contiguous or not mask.flags.c_contiguous
+            or mask.dtype not in (np.dtype('uint8'), np.dtype(bool)) or np.may_share_memory(mask, scores)):
+        return False
+    # Different virtual mappings can still alias the same physical file.
+    mask_backing, score_backing = _root_memmap_for_array(mask), _root_memmap_for_array(scores)
+    if mask_backing is None or score_backing is None:
+        return True
+    try:
+        return not os.path.samefile(mask_backing.filename, score_backing.filename)
+    except (OSError, TypeError):
+        return False
+
+
 def capture_prediction_confidence(mask, scores, *, view, model_name, temp_dir,
                                   known_slice_any=None, known_slice_bboxes=None, **kwargs):
     """Mask a retiring score workspace, then publish before it is closed/deleted."""
@@ -1221,8 +1273,20 @@ def capture_prediction_confidence(mask, scores, *, view, model_name, temp_dir,
             # A failed nested writer can keep the lambda alive in a closure cycle
             # with GC disabled. Empty its captured arrays after its last read.
             reader = values = retained = None
-    for index in range(values.shape[0]):
-        values[index][np.asarray(retained[index]) == 0] = np.uint8(0)
+    if 'native_boxes' not in kwargs and _eager_rank_score_bounds_supported(retained, values, view):
+        from .confidence_capture_cpu import mask_eager_scores_and_bound
+        from .runtime import runtime_telemetry
+        started = time.perf_counter()
+        read_only_mask = retained.view(np.uint8)
+        read_only_mask.setflags(write=False)
+        kwargs['native_boxes'] = mask_eager_scores_and_bound(read_only_mask, values)
+        telemetry = runtime_telemetry()
+        telemetry.add('confidence.eager_masking.certified_sources', 1)
+        telemetry.add('confidence.eager_masking.certified_source_bytes', int(values.nbytes))
+        telemetry.add('confidence.eager_masking.seconds', time.perf_counter()-started)
+    else:
+        for index in range(values.shape[0]):
+            values[index][np.asarray(retained[index]) == 0] = np.uint8(0)
     return publish_confidence_scores(values, view=view, model_name=model_name, temp_dir=temp_dir, **kwargs)
 
 

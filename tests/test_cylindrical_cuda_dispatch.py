@@ -1,6 +1,8 @@
 """CUDA admission, publication and borrowed-buffer lifetime regression checks."""
 from __future__ import annotations
 
+from tests.native_stage_test_support import native_stage_context
+
 import contextlib
 import io
 from pathlib import Path
@@ -221,7 +223,7 @@ class CylindricalCudaDispatchTests(unittest.TestCase):
         lease.release.assert_not_called()
 
     def test_retirement_barrier_blocks_radial_without_probing_or_allocating(self):
-        coordinator = backprojection._MainProcessGpuStageCoordinator()
+        coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
         coordinator.configure_workers([0, 1])
         coordinator.set_inference_asset_retirement_pending(True)
         torch = types.SimpleNamespace(
@@ -231,7 +233,7 @@ class CylindricalCudaDispatchTests(unittest.TestCase):
         torch.cuda.mem_get_info.assert_not_called()
 
     def test_radial_source_projection_uses_inference_priority(self):
-        coordinator = backprojection._MainProcessGpuStageCoordinator()
+        coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
         coordinator.configure_workers([0, 1])
         torch = types.SimpleNamespace(
             cuda=types.SimpleNamespace(device_count=lambda: 2, mem_get_info=mock.Mock()),

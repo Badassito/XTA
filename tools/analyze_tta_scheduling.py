@@ -14,8 +14,10 @@ import re
 
 try:
     from .analyze_pipeline_trace import analyze_events, read_events
+    from .profile_tta_scheduler import native_timing_summary
 except ImportError:
     from analyze_pipeline_trace import analyze_events, read_events
+    from profile_tta_scheduler import native_timing_summary
 from XTA.run_transport import telemetry_streams
 
 
@@ -31,10 +33,11 @@ def _parent_final_sample(paths):
                     continue
         if last is not None:
             samples.append(last)
-    # Child inference processes do not own scheduler.operation counters.
-    return max(samples, key=lambda sample:sum(
-        key.startswith('scheduler.operation.') for key in sample.get('counters', {})),
-        default={})
+    # Worker samples do not own a native scheduler snapshot or legacy operation counters.
+    return max(samples, key=lambda sample: (
+        bool(sample.get('gauges', {}).get('scheduler.native')),
+        sum(key.startswith('scheduler.operation.') for key in sample.get('counters', {})),
+    ), default={})
 
 
 def analyze_run(results_root, run_id):
@@ -82,6 +85,7 @@ def analyze_run(results_root, run_id):
                         previous_task=previous['task_id'], task=event['task_id']))
             previous = event if event['event'] == 'worker_compute_done' else None
     counters = final.get('counters', {})
+    native = final.get('gauges', {}).get('scheduler.native')
     return dict(run_id=str(run_id), source_directory=str(folder), log_path=str(log_path),
         launcher=manifest.get('launcher'),
         interpolation=manifest.get('prediction_processing', {}).get('interpolation', {}),
@@ -94,6 +98,9 @@ def analyze_run(results_root, run_id):
         largest_inter_task_compute_gaps=sorted(gaps, key=lambda gap:gap['seconds'], reverse=True)[:30],
         scheduler_counters={key:value for key,value in counters.items()
             if key.startswith(('scheduler.operation.', 'scheduler.step.'))},
+        native_scheduler=None if not native else {
+            'snapshot': native, 'timing': native_timing_summary(native),
+        },
         scheduler_wait_log_lines=[dict(line_number=index+1, text=line)
             for index,line in enumerate(lines) if line.startswith('Scheduler wait:')])
 
@@ -111,11 +118,16 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True)+'\n', encoding='utf-8')
     for run, data in result['runs'].items():
-        backlog = sum(data['scheduler_counters'].get(f'scheduler.step.backlog_{phase}.wall_seconds', 0)
-                      for phase in ('initial', 'final'))
+        detail = ''
+        if data['native_scheduler'] is not None:
+            dispatched = data['native_scheduler']['snapshot'].get('dispatched')
+            detail = f', native assignments={dispatched}'
+        elif data['scheduler_counters']:
+            backlog = sum(data['scheduler_counters'].get(f'scheduler.step.backlog_{phase}.wall_seconds', 0)
+                          for phase in ('initial', 'final'))
+            detail = f', legacy backlog scan spans={backlog:.3f}s'
         print(f'{run}: wall={data["wall_seconds"]}s, tasks={data["task_count"]}, '
-              f'compute span={data["first_to_last_worker_compute_seconds"]:.3f}s, '
-              f'backlog scan spans={backlog:.3f}s')
+              f'compute span={data["first_to_last_worker_compute_seconds"]:.3f}s{detail}')
     print(args.output)
 
 

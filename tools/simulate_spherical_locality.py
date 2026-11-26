@@ -1,81 +1,47 @@
-"""Exercise the real scheduler with descriptor-only Spherical work and fake GPUs.
+"""Check Spherical range ownership through the native scheduler on one host.
 
-Reports cache-plan changes, coverage, and bounded admission for the production
-120-parent/22-lease pattern. Simulated walltime is an explicit cost model, not a
-hardware benchmark; no model, CUDA allocation, or native canvas is constructed.
+Each Spherical parent submits the retained 1,212-frame, 22-lease shape. Spawned
+host actors echo the exact assigned ranges back through validated native receipts.
+The tool exercises parent-worker residency and credits without loading CUDA,
+constructing Spherical plans, or estimating avoided cache builds.
 """
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
-import heapq
 import json
-import os
 from pathlib import Path
 import sys
-import time
 
-for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
-    os.environ[name] = '2'
-sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from tests.test_spherical_locality import locality_scheduler, complete_synthetic_task
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tools.profile_tta_dispatch import TaskSpec, run_replay
 
 
-def simulate(*, enabled, parents=120, speeds=(1., 1., 1., 1.), view_limit=4,
-             seconds_per_frame=.01, plan_seconds=.909911):
-    scheduler = locality_scheduler(parents=parents, leases=22, workers=len(speeds),
-                                   enabled=enabled, view_limit=view_limit)
-    state = scheduler.state
-    for parent, indexed in state.fullframe_task_ids_by_parent.items():
-        first = state.gpu_worker_tasks_by_id[indexed[0]]
-        view = replace(first['view'], num_slices=1212)
-        for task_id in indexed:
-            task = state.gpu_worker_tasks_by_id[task_id]
-            task['view'] = view
-            task['slice_count'] = min(57, 1212 - task['slice_start'])
-            task['processing_shape'] = (1212, 3072, 3072)
-    events, running, last, completed = [], set(), {}, []
-    now, misses, frames, max_active, max_bytes, max_queue = 0., 0, 0, 0, 0, 0
-    started = time.perf_counter()
+_FRAMES_PER_PARENT = 1212
+_FRAMES_PER_TASK = 57
 
-    def dispatch_and_start(preferred_parent=None):
-        nonlocal misses, frames, max_active, max_bytes, max_queue
-        scheduler.dispatch_gpu_worker_inference_window(preferred_parent)
-        max_active = max(max_active, len(state.direct_union_inference_views))
-        max_bytes = max(max_bytes, sum(state.direct_union_inference_bytes.values()))
-        max_queue = max(max_queue, *(scheduler.gpu_worker_inflight(worker) for worker in state.gpu_task_queues))
-        for worker, work in state.gpu_task_queues.items():
-            if worker in running or work.empty():
-                continue
-            task = work.get_nowait()
-            parent = scheduler.gpu_worker_fullframe_parent_key(task)
-            cold = last.get(worker) != parent
-            misses += int(cold)
-            frames += task['slice_count']
-            last[worker] = parent
-            seconds = (seconds_per_frame * task['slice_count'] + plan_seconds * cold) / speeds[worker]
-            heapq.heappush(events, (now + seconds, worker, task['task_id']))
-            running.add(worker)
 
-    dispatch_and_start()
-    while events:
-        now, worker, task_id = heapq.heappop(events)
-        running.remove(worker)
-        completed.append(task_id)
-        task = state.gpu_worker_tasks_by_id[task_id]
-        complete_synthetic_task(scheduler, worker, task)
-        dispatch_and_start(scheduler.gpu_worker_fullframe_parent_key(task))
-    expected = set(state.gpu_worker_tasks_by_id)
-    if set(completed) != expected or len(completed) != len(expected) or state.gpu_worker_pending_task_ids:
-        raise AssertionError('Synthetic dispatch lost, duplicated, or stranded inference work')
+def simulate(*, parents=120, workers=4, view_limit=4, max_seconds=180.0):
+    if not 1 <= parents <= 120:
+        raise ValueError('parents must be from 1 through 120')
+    specs = []
+    for parent_id in range(parents):
+        view_name = f'spherical_replay_{parent_id:03d}__tta_a0'
+        for start in range(0, _FRAMES_PER_PARENT, _FRAMES_PER_TASK):
+            count = min(_FRAMES_PER_TASK, _FRAMES_PER_PARENT - start)
+            specs.append(TaskSpec(len(specs), view_name, 'spherical', start, count))
+    replay = run_replay(specs, workers=workers, ticket_capacity=view_limit,
+                        max_seconds=max_seconds, resident_group=True)
+    if replay['max_workers_per_parent'] != 1:
+        raise RuntimeError('Native Spherical parent was not resident on one actor')
     return {
-        'enabled': enabled, 'parents': parents, 'workers': len(speeds), 'worker_speed_factors': speeds,
-        'view_limit': view_limit, 'tasks_completed': len(completed), 'frames': frames,
-        'plan_misses': misses, 'max_active_parents': max_active, 'max_inference_canvas_bytes': max_bytes,
-        'max_inflight_tasks_per_worker': max_queue, 'final_hint_entries': len(state.spherical_render_parent_by_worker),
-        'simulated_seconds': now, 'host_simulation_seconds': time.perf_counter() - started,
+        'schema': 'xta.spherical-native-ownership/1',
+        'scope': __doc__.strip(),
+        'verified_frames': parents * _FRAMES_PER_PARENT,
+        'frames_per_parent': _FRAMES_PER_PARENT,
+        'requested_parent_ticket_limit': view_limit,
+        'native_replay': replay,
     }
 
 
@@ -83,30 +49,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--parents', type=int, default=120)
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--view-limit', type=int, default=4)
+    parser.add_argument('--max-seconds', type=float, default=180.)
     args = parser.parse_args()
-    if not 1 <= args.parents <= 120:
-        parser.error('parents must be from 1 through 120')
-    results = {
-        'description': 'Real scheduler, synthetic equal 1212-frame Spherical parents; no CUDA or mask data.',
-        'seconds_per_frame_assumption': .01,
-        'plan_seconds_assumption': .909911,
-        'plan_seconds_source': '142812 mean 0.883487s build plus 0.026424s upload',
-        'limitations': 'Cost-model walltime is not a cluster prediction; fake results publish immediately and retire canvases immediately.',
-        'cases': {},
-    }
-    for name, options in {
-        'equal_workers': {},
-        'unequal_workers': {'speeds': (.85, 1., 1.1, 1.2)},
-        'one_parent_budget': {'view_limit': 1},
-    }.items():
-        baseline = simulate(enabled=False, parents=args.parents, **options)
-        locality = simulate(enabled=True, parents=args.parents, **options)
-        results['cases'][name] = {'baseline': baseline, 'locality': locality,
-                                 'avoided_plan_builds': baseline['plan_misses'] - locality['plan_misses'],
-                                 'simulated_seconds_saved': baseline['simulated_seconds'] - locality['simulated_seconds']}
+    if not 1 <= args.parents <= 120 or args.workers < 1 or args.view_limit < 1:
+        parser.error('Use 1–120 parents and positive worker and view limits')
+    result = simulate(parents=args.parents, workers=args.workers,
+                      view_limit=args.view_limit, max_seconds=args.max_seconds)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(results, indent=2) + '\n', encoding='utf-8')
-    print(json.dumps(results, indent=2))
+    args.output.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+    print(args.output)
 
 
 if __name__ == '__main__':

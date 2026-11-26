@@ -12,6 +12,7 @@ Otherwise, and whenever fanout is disabled, children run one after another.
 """
 from __future__ import annotations
 
+from argparse import ArgumentParser
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -52,7 +53,7 @@ _IDENTITY_FIELDS = ('path', 'size_bytes', 'modified_time_ns',
                     'change_or_creation_time_ns', 'device', 'file_id')
 _OPTIONAL_IDENTITIES = ('sam_checkpoint_identity_sha256', 'augmentation_policy_sha256',
                         'reconciliation_policy_sha256')
-_SCALAR_OUTPUTS = ('confidence_cutoffs','review','manifest.json')
+_SCALAR_OUTPUTS = ('confidence_cutoffs', 'manifest.json')
 _RESERVED_OUTPUTS = (*_SCALAR_OUTPUTS,'fanout_progress.json','fanout_storage.json')
 _OPTIONAL_FANOUT_COUNTS = ('native_frames','stored_native_bytes','native_views_retired_after_projection')
 _CHILD_SETTLE_SECONDS = 2.
@@ -69,6 +70,9 @@ _OUTPUT_JOIN_SECONDS = 10.
 _OUTPUT_LOCK = threading.Lock()
 SWEEP_SUMMARY_FILENAME = 'summary.txt'
 SWEEP_SUMMARY_SECTION_ENV = 'XTA_YOLO_SWEEP_SUMMARY_SECTION'
+SWEEP_NRRD_STAGE_ENV = 'XTA_YOLO_SWEEP_NRRD_STAGE_ROOT'
+SWEEP_XTAREVIEW_STAGE_ENV = 'XTA_YOLO_SWEEP_XTAREVIEW_STAGE_ROOT'
+SWEEP_XTAREVIEW_DIRECTORY = 'review_archives'
 
 
 def _now():
@@ -419,8 +423,8 @@ def _run_child(command, env, *, started=None):
             raise RuntimeError('Scalar cutoff exited with live descendants; refusing completion')
         # Compare with the child's own "End-to-end pipeline walltime" line: the
         # difference is interpreter/resource teardown after its pipeline ended.
-        print(f'Scalar cutoff process {process.pid} lived {exited - launched:.1f}s; '
-              f'descendants settled {time.monotonic() - exited:.1f}s after exit.', flush=True)
+        _say(f'Scalar cutoff process {process.pid} lived {exited - launched:.1f}s; '
+             f'descendants settled {time.monotonic() - exited:.1f}s after exit.')
         return returncode
     except BaseException:
         if process is not None:
@@ -1089,7 +1093,7 @@ def _check_sweep_directory_publication(output_root):
 @contextmanager
 def _time_sweep_publication(manifest, product):
     started = time.monotonic()
-    print(f'Confidence sweep {product} publication started.', flush=True)
+    _say(f'Confidence sweep {product} publication started.')
     try:
         yield
     except SweepDirectoryPublicationError as error:
@@ -1099,7 +1103,7 @@ def _time_sweep_publication(manifest, product):
     finally:
         elapsed = time.monotonic() - started
         manifest.setdefault('publication_seconds', {})[product] = elapsed
-        print(f'Confidence sweep {product} publication elapsed: {elapsed:.1f}s.', flush=True)
+        _say(f'Confidence sweep {product} publication elapsed: {elapsed:.1f}s.')
 
 
 def _publish_sweep_summary(destination, cutoffs, sections):
@@ -1135,8 +1139,38 @@ def _publish_sweep_summary(destination, cutoffs, sections):
     return destination.name
 
 
+def _family_output_grids(save_request, source_shape):
+    source_shape = tuple(source_shape)
+    grids = [('native', source_shape, save_request.full_formats)]
+    if save_request.low_quality:
+        from .outputs import resolve_save_grids
+
+        specs, _ = resolve_save_grids(save_request, source_shape)
+        grids.extend(
+            (f'low_quality/{spec.token}', spec.output_shape_t_y_x, spec.formats)
+            for spec in specs
+        )
+    return {
+        format_name: {grid_id: shape for grid_id, shape, formats in grids if format_name in formats}
+        for format_name in ('nrrd', 'video', 'xtareview')
+    }
+
+
+def _archive_inputs(ownership, expected_grids, stage_root, cutoff):
+    grids = ownership.get('xtareview_grids')
+    if (not isinstance(grids, list) or any(not isinstance(grid, str) for grid in grids)
+            or len(grids) != len(expected_grids) or set(grids) != expected_grids.keys()):
+        raise ValueError('Scalar cutoff archive grids differ from the requested xtareview grids')
+    branch = stage_root / f'conf_{cutoff:03d}'
+    paths = {grid: branch / f'{grid}.xtareview' for grid in grids}
+    for path in paths.values():
+        if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(stage_root):
+            raise ValueError(f'Scalar cutoff has no sealed review archive at {path}')
+    return paths
+
+
 def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
-                         temp_root=None, min_conf=0.0, save_options=None):
+                         temp_root=None, min_conf=0.0, save_request=None):
     """Run independent scalar branches and atomically publish one family receipt.
 
     Existing sweep-owned paths are rejected without replacing their receipts.
@@ -1145,15 +1179,14 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
     """
     mode_arguments = tuple(str(value) for value in mode_arguments)
     cents = _cutoffs(cutoffs_hundredths)
-    if save_options is None:
-        from argparse import ArgumentParser
+    parser = ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
+    parser.add_argument('--save', nargs='+')
+    parsed, scalar_arguments = parser.parse_known_args(mode_arguments)
+    if save_request is None:
         from .config import resolve_save_request
-
-        # Programmatic callers can supply the same save arguments as the CLI.
-        parser = ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
-        parser.add_argument('--save', nargs='+')
-        parsed, _ = parser.parse_known_args(mode_arguments)
-        save_options = resolve_save_request(parsed.save).options
+        save_request = resolve_save_request(parsed.save)
+    if save_request.options:
+        scalar_arguments.extend(('--save', *save_request.options))
     view_major = os.environ.get('XTA_YOLO_SWEEP_VIEW_MAJOR','1')
     if view_major not in ('0','1'):
         raise ValueError('XTA_YOLO_SWEEP_VIEW_MAJOR must be 0 or 1')
@@ -1162,17 +1195,23 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
     reserved_outputs = _RESERVED_OUTPUTS if fanout_enabled else _SCALAR_OUTPUTS
     if len(cents) > 1:
         reserved_outputs = (*reserved_outputs, SWEEP_SHARED_GEOMETRY_FILENAME)
-    summary_requested = 'summary' in save_options
+    summary_requested = save_request.has('summary')
     if summary_requested:
         reserved_outputs = (*reserved_outputs, SWEEP_SUMMARY_FILENAME)
     from .sweep_heatmaps import HEATMAP_DIRECTORY, HEATMAP_STAGING_ENV
-    heatmaps_requested = bool({'high_quality', 'low_quality'}.intersection(save_options))
+    heatmaps_requested = save_request.has('video')
+    review_requested = save_request.has('nrrd')
+    archives_requested = save_request.has('xtareview')
     if heatmaps_requested:
         reserved_outputs = (*reserved_outputs, HEATMAP_DIRECTORY)
+    if review_requested:
+        reserved_outputs = (*reserved_outputs, 'review')
+    if archives_requested:
+        reserved_outputs = (*reserved_outputs, SWEEP_XTAREVIEW_DIRECTORY)
     if isinstance(min_conf, bool) or not math.isfinite(float(min_conf)) or not 0 <= float(min_conf) <= 1:
         raise ValueError('Fixed sweep min_conf must be finite and in [0,1]')
     min_conf = float(min_conf)
-    base_arguments, capture_root = _base_arguments(mode_arguments)
+    base_arguments, capture_root = _base_arguments(scalar_arguments)
     cache_gib = os.environ.get('XTA_YOLO_SWEEP_CACHE_GIB', '64')
     if not math.isfinite(float(cache_gib)) or float(cache_gib) < 0:
         raise ValueError('XTA_YOLO_SWEEP_CACHE_GIB must be finite and nonnegative')
@@ -1192,6 +1231,8 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
     heatmap_contract = None
     heatmap_attempted = False
     nrrd_stage_root = None
+    archive_stage_root = None
+    archive_branches = {}
     review_attempted = False
     rows = []
     quota_work = None
@@ -1205,12 +1246,15 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
         work_parent = Path(temp_root).expanduser().resolve() if temp_root is not None else Path(tempfile.gettempdir()).resolve()
         _check_work_destination(work_parent,root,'--temp',reserved_outputs)
         work_storage = _work_storage(work_parent)
-        print(f"Confidence sweep workspace: {work_parent} "
-              f"({'memory-backed' if work_storage['memory_backed'] else 'disk-backed'}).", flush=True)
+        _say(f"Confidence sweep workspace: {work_parent} "
+             f"({'memory-backed' if work_storage['memory_backed'] else 'disk-backed'}).")
         if capture_root is not None:
             _check_work_destination(capture_root,root,'--capture_component_replay',reserved_outputs)
         work = _create_owned_work(work_parent, sweep_id)
-        nrrd_stage_root = work / 'nrrd_sources'
+        if review_requested:
+            nrrd_stage_root = work / 'nrrd_sources'
+        if archives_requested:
+            archive_stage_root = work / 'xtareview_sources'
         quota_root = os.environ.get('XTA_YOLO_SWEEP_QUOTA_DIR') if fanout_enabled else None
         if quota_root:
             quota_parent = Path(quota_root).expanduser().resolve()
@@ -1228,6 +1272,7 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
             'branch_policy': ('independent_scalar_suffix_with_native_fanout' if fanout_enabled
                               else 'independent_scalar_full_pipeline'),
             'mode_arguments': [str(value) for value in mode_arguments],
+            'save': list(save_request.options),
             'work_directory': str(work), 'work_storage': work_storage,
             'forward_cache': {'requested_budget_gib': float(cache_gib),
                 'budget_gib': float(cache_gib) if len(cents)>1 else 0.,
@@ -1241,13 +1286,18 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                 if fanout_enabled else {'status':'disabled_singleton' if len(cents)==1 else 'disabled'}),
         }
         write_json_atomic(manifest_path, manifest)
-        if heatmaps_requested or 'nrrd' in save_options:
+        if heatmaps_requested or review_requested or archives_requested:
             _check_sweep_directory_publication(root)
         env = dict(os.environ)
         env.pop(HEATMAP_STAGING_ENV, None)
         if heatmaps_requested:
             env[HEATMAP_STAGING_ENV] = str(work / 'heatmap-input')
-        env['XTA_YOLO_SWEEP_NRRD_STAGE_ROOT'] = str(nrrd_stage_root)
+        env.pop(SWEEP_NRRD_STAGE_ENV, None)
+        env.pop(SWEEP_XTAREVIEW_STAGE_ENV, None)
+        if nrrd_stage_root is not None:
+            env[SWEEP_NRRD_STAGE_ENV] = str(nrrd_stage_root)
+        if archive_stage_root is not None:
+            env[SWEEP_XTAREVIEW_STAGE_ENV] = str(archive_stage_root)
         reconciliation_policy_stage = work / 'reconciliation-policies'
         env[SWEEP_RECONCILIATION_POLICY_STAGE] = str(reconciliation_policy_stage)
         env.pop(SWEEP_SUMMARY_SECTION_ENV, None)
@@ -1282,6 +1332,7 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
         # The coordinator owns this marker: only concurrently running consumers defer.
         env.pop(_DEFER_NATIVE_RETIREMENT_ENV, None)
         reference = None
+        expected_grids = {}
         receipt_versions = {}
         shared_geometry_cache = {}
         # Only the coordinator thread changes the family receipt; output readers never do.
@@ -1314,7 +1365,8 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
             )
             with _time_sweep_publication(manifest, 'review'):
                 review = publish_sweep_review(root, sorted(rows), sweep_id=sweep_id,
-                                              temp_dir=work_parent, **options)
+                                              temp_dir=work_parent,
+                                              expected_grids=expected_grids['nrrd'], **options)
             if review is not None:
                 review = Path(review).resolve()
                 if not review.is_file():
@@ -1322,6 +1374,16 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                 manifest['review_manifest'] = review.relative_to(root).as_posix()
                 if options:
                     manifest['review_manifest_sha256'] = hashlib.sha256(review.read_bytes()).hexdigest()
+
+        def publish_archives():
+            from .sweep_publication import publish_sweep_archives
+
+            with _time_sweep_publication(manifest, 'review_archives'):
+                manifest['review_archives'] = publish_sweep_archives(
+                    root / SWEEP_XTAREVIEW_DIRECTORY, archive_branches, sweep_id=sweep_id,
+                    expected_grids=expected_grids['xtareview'],
+                    native_shape=manifest['inputs']['source_shape_t_y_x'],
+                )
 
         def open_branch(index, *, slot=None):
             cent = cents[index]
@@ -1385,20 +1447,25 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
             receipt_versions[receipt_path] = {**version, "sha256": digest}
             for path, (file_identity, descriptor, _) in shared_geometry_cache.items():
                 receipt_versions[path] = {**file_identity, 'sha256': descriptor['sha256']}
-            print(f'Validated cutoff {cent / 100:.2f} receipt in {time.monotonic() - validation_started:.1f}s.',
-                  flush=True)
+            _say(f'Validated cutoff {cent / 100:.2f} receipt in {time.monotonic() - validation_started:.1f}s.')
             if reference is not None and identity != reference:
                 raise ValueError('Input/model/configuration identity changed between confidence cutoffs')
+            if reference is None and (heatmaps_requested or review_requested or archives_requested):
+                expected_grids.update(_family_output_grids(save_request, receipt['inputs']['source_shape_t_y_x']))
             reference = identity
             if heatmaps_requested:
                 from .sweep_heatmaps import heatmap_input_contract
                 contract = heatmap_input_contract(
-                    receipt['confidence_sweep'], save_options, root=work / 'heatmap-input',
-                    cutoff=cent, source_shape=receipt['inputs']['source_shape_t_y_x'],
+                    receipt['confidence_sweep'], expected_grids['video'],
+                    root=work / 'heatmap-input', cutoff=cent,
                 )
                 if heatmap_contract is not None and heatmap_contract != contract:
                     raise ValueError('Confidence cutoff heatmap inputs use different grids or source decoding')
                 heatmap_contract = contract
+            if archives_requested:
+                archive_branches[cent] = _archive_inputs(
+                    receipt['confidence_sweep'], expected_grids['xtareview'], archive_stage_root, cent,
+                )
             with manifest_lock:
                 manifest['inputs'] = receipt['inputs']
                 if 'shared_run_geometry' in receipt:
@@ -1538,14 +1605,19 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                 manifest['incomplete_cutoffs_hundredths'] = incomplete
             # An offline-style review without staged masks has no dependency on
             # the worker workspace and keeps the existing cleanup-before-export order.
-            staged_nrrds = nrrd_stage_root.is_dir()
+            staged_nrrds = nrrd_stage_root is not None and nrrd_stage_root.is_dir()
             if staged_nrrds:
                 publish_review('incomplete' if incomplete else 'complete')
+            if archives_requested:
+                if incomplete:
+                    manifest['review_archives_omitted_reason'] = 'incomplete_requested_sam_work'
+                else:
+                    publish_archives()
             _remove_owned_work(work, work_parent, sweep_id)
             work = None
-            if not staged_nrrds and not incomplete:
+            if review_requested and not staged_nrrds and not incomplete:
                 publish_review('complete')
-            if incomplete and manifest['review_manifest'] is None:
+            if review_requested and incomplete and manifest['review_manifest'] is None:
                 manifest['review_omitted_reason'] = 'incomplete_requested_sam_work'
             _check_receipt_versions(receipt_versions)
             # The coordinator can inherit an unrelated scalar run's environment.
@@ -1558,17 +1630,20 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
             committed = True
             if incomplete:
                 affected = ', '.join(f'{cent / 100:.2f}' for cent in incomplete)
-                review_status = ('Available NRRDs were published with incomplete sweep status.'
-                                 if manifest['review_manifest'] is not None else 'Aggregate review was skipped.')
-                print(f'WARNING: SAM work was incomplete at {affected}. {review_status} '
-                      f'See {manifest_path}.', file=sys.stderr, flush=True)
+                review_status = ''
+                if manifest['review_manifest'] is not None:
+                    review_status = ' Available NRRDs carry incomplete sweep status.'
+                if archives_requested:
+                    review_status += ' Review archives require complete cutoffs.'
+                _say(f'WARNING: SAM work was incomplete at {affected}.{review_status} '
+                     f'See {manifest_path}.', file=sys.stderr)
             try:
                 _release_owned_lock(lock_path, sweep_id)
             except Exception as lock_error:
                 # The validated family commit is authoritative. A stale owner
                 # file cannot invalidate settled products after that commit.
-                print(f'Warning: completed confidence sweep root lock could not be retired: {lock_path}: {lock_error}',
-                      file=sys.stderr,flush=True)
+                _say(f'Warning: completed confidence sweep root lock could not be retired: {lock_path}: {lock_error}',
+                     file=sys.stderr)
             lock_held = False
         return manifest_path
     except BaseException as error:
@@ -1591,6 +1666,10 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                 manifest['partial_review_error'] = str(review_error)
         nrrds_pending = bool(staged_nrrds and manifest['review_manifest'] is None
                              and any(nrrd_stage_root.rglob('*.nrrd')))
+        archive_cutoffs_pending = (
+            [cent for cent, _ in rows if cent in archive_branches]
+            if work is not None and archive_branches and 'review_archives' not in manifest else []
+        )
         if summary_sections and not summary_publish_attempted:
             try:
                 manifest['summary'] = _publish_sweep_summary(summary_destination, cents, summary_sections)
@@ -1609,7 +1688,7 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                 if quota_work is not None:
                     _remove_owned_work(quota_work, quota_parent, sweep_id)
                     quota_work = None
-                if not summaries_pending and not heatmaps_pending and not nrrds_pending:
+                if not (summaries_pending or heatmaps_pending or nrrds_pending or archive_cutoffs_pending):
                     _remove_owned_work(work, work_parent, sweep_id)
                     work = None
             except Exception as cleanup_error:
@@ -1625,6 +1704,11 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
                 manifest['nrrd_recovery'] = {
                     'path': str(nrrd_stage_root),
                     'validated_cutoffs_hundredths': sorted(cent for cent, _ in rows),
+                }
+            if archive_cutoffs_pending:
+                manifest['review_archive_recovery'] = {
+                    'path': str(archive_stage_root),
+                    'validated_cutoffs_hundredths': archive_cutoffs_pending,
                 }
             _finalize_storage_pointer(manifest,root)
             manifest.update(status='cancelled' if isinstance(error, KeyboardInterrupt) else 'failed',

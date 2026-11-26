@@ -13,7 +13,7 @@ from XTA.detector_workspaces import DetectorWorkspacePreparation
 from XTA.geometry import ViewInfo
 from XTA.interpolation import _ByteAdmissionPool
 from XTA.view_prepare import ViewPrepareLeaseState
-from tests.test_tta_scheduler_boundary import _scheduler, _state, _view
+from tests.native_detector_test_support import DetectorRun, detector_inputs, detector_state, detector_view
 
 
 def _pipeline_helpers(namespace):
@@ -32,7 +32,7 @@ def _pipeline_helpers(namespace):
 def workspace(tmp_path):
     import weakref
     from XTA.interpolation import _DirectUnionBackingLease
-    state = _state()
+    state = detector_state()
     allocations, closed = [], []
     pool = _ByteAdmissionPool(1 << 24, 'test workspace promises')
     leases = ViewPrepareLeaseState(state.direct_union_backing_leases, state.direct_union_inference_views,
@@ -69,38 +69,38 @@ def workspace(tmp_path):
     namespace['allocate_workspace_array'] = allocate
     namespace['close_memmap_array_without_flush'] = lambda value,**kwargs:closed.append(id(value))
     _pipeline_helpers(namespace)
-    scheduler = _scheduler(tmp_path, state=state,
-        input_overrides=dict(gpu_device_count=2, v1613_d1_owner_active=True))
-    namespace['scheduler'] = scheduler
-    service = DetectorWorkspacePreparation(build=namespace['_build_baseline_workspaces'],
-        refresh=namespace['_refresh_workspace_plans'], adopt=namespace['_adopt_baseline_workspaces'],
-        discard=namespace['_discard_baseline_bundles'], rollback=namespace['_rollback_workspace_plans'],
-        wake=scheduler.notify_gpu_stage_admission_change)
-    namespace['detector_workspace_preparation'] = service
-    scheduler.inputs = replace(scheduler.inputs,
-        ensure_baseline_workspaces=namespace['_ensure_baseline_workspaces'],
-        request_baseline_workspaces=namespace['_request_baseline_workspaces'],
-        drain_baseline_workspaces=service.drain)
-    yield SimpleNamespace(state=state, namespace=namespace, scheduler=scheduler, service=service,
-        pool=pool, allocations=allocations, closed=closed)
-    service.shutdown()
+    with DetectorRun(tmp_path, state=state, inputs=detector_inputs(
+            tmp_path, gpu_device_count=2, v1613_d1_owner_active=True)) as run:
+        namespace['scheduler'] = run.scheduler
+        service = DetectorWorkspacePreparation(build=namespace['_build_baseline_workspaces'],
+            refresh=namespace['_refresh_workspace_plans'], adopt=namespace['_adopt_baseline_workspaces'],
+            discard=namespace['_discard_baseline_bundles'], rollback=namespace['_rollback_workspace_plans'],
+            wake=run.scheduler.notify_gpu_stage_admission_change)
+        namespace['detector_workspace_preparation'] = service
+        run.scheduler.inputs = replace(run.scheduler.inputs,
+            ensure_baseline_workspaces=namespace['_ensure_baseline_workspaces'],
+            request_baseline_workspaces=namespace['_request_baseline_workspaces'],
+            drain_baseline_workspaces=service.drain)
+        try:
+            yield SimpleNamespace(state=state, namespace=namespace, scheduler=run.scheduler, service=service,
+                native_run=run, pool=pool, allocations=allocations, closed=closed)
+        finally:
+            service.shutdown()
 
 
 def _task(workspace, task_id, *, name='curved', family='spherical', mode='direct_union'):
-    view = replace(_view(), name=name, family=family)
+    view = detector_view(name=name, family=family)
     task = dict(task_id=task_id, model_name='model', view=view, kind='fullframe',
         result_mode=mode, slice_start=0, slice_count=16, processing_shape=(16,8,8), out_size=8,
         gpu_eligible=True, disable_runtime_split=True)
     state = workspace.state
     state.gpu_worker_tasks_by_id[task_id] = task
-    state.gpu_worker_pending_task_ids.append(task_id)
     state.fullframe_task_ids_by_parent[('model',name)] = [task_id]
     state.fullframe_remaining[('model',name)] = 1
     return task
 
 
 def test_blocked_birth_does_not_claim_gpu_or_block_ready_d1_dispatch(workspace):
-    import queue
     entered, release = threading.Event(), threading.Event()
     original = workspace.namespace['allocate_workspace_array']
     def allocate(**kwargs):
@@ -110,23 +110,27 @@ def test_blocked_birth_does_not_claim_gpu_or_block_ready_d1_dispatch(workspace):
     workspace.namespace['allocate_workspace_array'] = allocate
     curved = _task(workspace, 10)
     cheap = _task(workspace, 20, name='cheap', family='orthogonal', mode='d1_owner')
-    workspace.state.gpu_task_queues.update({0:queue.Queue(), 1:queue.Queue()})
+    run = workspace.native_run
+    actor = run.worker(0)
+    run.start_transport()
     try:
-        workspace.scheduler.prepare_baseline_backlog()
+        run.declare(curved, cheap)
+        run.drain_until(lambda: bool(workspace.service.futures))
         assert entered.wait(3)
         assert workspace.state.direct_union_inference_bytes[('model','curved')] == 1024
         assert workspace.state.direct_union_backing_leases[('model','curved')].phase == 'preparing'
-        workspace.scheduler.dispatch_gpu_worker_inference_window()
-        actual = [tasks.get_nowait() for tasks in workspace.state.gpu_task_queues.values() if not tasks.empty()]
-        assert [task['task_id'] for task in actual] == [20]
-        assert workspace.state.d1_owner_by_parent == {('model','cheap'):0}
-        assert 10 in workspace.state.gpu_worker_pending_task_ids
+        run.drain_until(lambda: run.native.snapshot()['dispatched'] == 1)
+        assert run.take(0)['task_id'] == 20
+        assert run.native.snapshot()['active'] == 1
         assert not workspace.namespace['baseline_union_by_model_view']
-        assert workspace.scheduler.process_quiescence_issues()['preparing_workspaces'] == [('model','curved')]
+        actor.installed(20)
+        actor.compute_done(20)
+        actor.put(dict(type='result', task_id=20, gpu_index=0, ok=True, stats={}))
         release.set()
         workspace.service.futures[0].result(timeout=3)
         assert not workspace.namespace['baseline_union_by_model_view']
-        workspace.scheduler.dispatch_gpu_worker_inference_window()
+        run.drain_until(lambda: ('model','curved') in workspace.namespace['baseline_union_by_model_view'])
+        assert run.take(0)['task_id'] == 10
         assert ('model','curved') in workspace.namespace['baseline_union_by_model_view']
         assert workspace.state.direct_union_backing_leases[('model','curved')].phase == 'inference'
         assert workspace.allocations == ['detector-workspace-birth']
@@ -150,7 +154,7 @@ def test_policy_group_is_funded_before_birth_and_published_atomically(workspace)
         assert not workspace.namespace['_request_baseline_workspaces'](first)
         assert entered.wait(3)
         assert sum(workspace.state.direct_union_inference_bytes.values()) == 2048
-        assert workspace.scheduler._direct_union_admission_totals()[0] == 1
+        assert set(workspace.state.direct_union_admission_group_by_parent.values()) == {('model','pass0')}
         assert len(workspace.service.records) == 1
         assert not workspace.namespace['baseline_union_by_model_view']
         release.set()
@@ -176,12 +180,23 @@ def test_planning_failure_returns_only_this_unpublished_groups_credit(workspace)
 @pytest.mark.parametrize('state', ['closed', 'failed_hydration', 'success'])
 def test_sweep_hydration_overlaps_within_dense_credit_and_settles_ownership(workspace, monkeypatch, state):
     from XTA import sweep_views
+    from XTA.interpolation import _DirectUnionBackingLease
 
-    view = _view()
+    run = workspace.native_run
+    run.scheduler.inputs = replace(run.scheduler.inputs, direct_union_total_dense_byte_limit=1700,
+                                   direct_union_inference_byte_limit=1700)
+    run.start_transport()
+    run.declare()
+    view = detector_view()
     key = ('model', view.name)
     busy = ('model', 'previous')
     postprocess = workspace.state.direct_union_postprocess_bytes
     postprocess[busy] = 700
+    busy_lease = _DirectUnionBackingLease(busy, 700, phase='postprocess')
+    workspace.state.direct_union_backing_leases[busy] = busy_lease
+    workspace.state.direct_union_postprocess_views.add(busy)
+    run.drain_until(lambda: run.scheduler.request_host_workspace(busy, 700))
+    run.scheduler.host_workspace_adopted(busy)
     workspace.namespace.update(os=os, model_name='model', sweep_cutoff=50,
         sweep_fanout_plan=SimpleNamespace(cutoffs=(50, 60), identities={view.name: 'sweep-id'}),
         direct_union_postprocess_bytes=postprocess, direct_union_total_dense_byte_limit=1700,
@@ -200,13 +215,20 @@ def test_sweep_hydration_overlaps_within_dense_credit_and_settles_ownership(work
 
     request(view, key)
     assert not workspace.service.pending and not workspace.state.direct_union_inference_bytes
-    workspace.namespace['direct_union_total_dense_byte_limit'] = 1724
+    assert run.native.snapshot()['blocked_parents'] == 1
+    credits = workspace.namespace['view_prepare_leases']
+    assert credits.retire_input_bytes(busy, busy_lease, 24, token='confidence')
+
+    def request_hydration():
+        request(view, key)
+        return workspace.service.pending
+
     if state == 'closed':
         workspace.service.shutdown()
         with pytest.raises(RuntimeError, match='preparation is closed'):
-            request(view, key)
+            run.drain_until(request_hydration)
     else:
-        request(view, key)
+        run.drain_until(request_hydration)
         assert workspace.state.direct_union_inference_bytes == {key: 1024}
         future = workspace.service.futures[0]
         if state == 'failed_hydration':
@@ -222,9 +244,9 @@ def test_sweep_hydration_overlaps_within_dense_credit_and_settles_ownership(work
             assert workspace.namespace['view_slice_meta'][key]['prediction_count'] == 9
             assert workspace.state.direct_union_backing_leases[key].phase == 'inference'
     if state != 'success':
-        assert not workspace.state.direct_union_backing_leases
+        assert workspace.state.direct_union_backing_leases == {busy: busy_lease}
         assert not workspace.state.direct_union_inference_bytes
-    assert postprocess == {busy: 700}
+    assert postprocess == {busy: 676}
     assert not workspace.service.pending
 
 
@@ -324,21 +346,29 @@ def test_failed_adoption_leaves_private_bundle_for_background_shutdown_cleanup(w
 
 def test_refill_grant_is_yielded_before_initial_workspace_birth(workspace):
     class Grant:
+        max_bytes = 2000
         reserved_bytes = 2000
-        def can_yield_capacity(self, amount):
-            return True
+
         def try_yield_capacity(self, amount):
             self.reserved_bytes = amount
             return amount
+
+        def attach_ready(self, _task):
+            return None
+
     owner = Grant()
     workspace.namespace['cpu_input_prefetch'] = workspace.scheduler.cpu_input_prefetch = owner
     workspace.scheduler.inputs = replace(workspace.scheduler.inputs,
         direct_union_total_dense_byte_limit=2048, direct_union_inference_byte_limit=2048)
-    _task(workspace, 10)
-    _task(workspace, 20, name='d1', family='orthogonal', mode='d1_owner')
-    _task(workspace, 30, name='unresolved', mode='hybrid_deferred')
-    workspace.scheduler.prepare_baseline_backlog()
+    curved = _task(workspace, 10)
+    d1 = _task(workspace, 20, name='d1', family='orthogonal', mode='d1_owner')
+    run = workspace.native_run
+    run.worker(0)
+    run.start_transport()
+    run.declare(curved, d1)
+    run.drain_until(lambda: ('model', 'curved') in workspace.state.direct_union_inference_bytes)
     assert owner.reserved_bytes == 1024
+    assert run.native.snapshot()['byte_capacity'] == 1024
     assert set(workspace.state.direct_union_inference_bytes) == {('model','curved')}
     assert workspace.state.direct_union_inference_bytes[('model','curved')] + owner.reserved_bytes == 2048
 

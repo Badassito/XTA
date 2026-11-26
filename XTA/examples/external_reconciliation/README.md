@@ -8,9 +8,10 @@ retaining the prediction, bridge, and gated-tile layers used to construct it.
 python -m XTA --mode tta ... --reconciliation XTA/examples/external_reconciliation/confidence_core_rescue.py
 ```
 
-Confidence-mode reconciliation retains prediction-confidence evidence under
-`reconciliation_evidence/`. Use `--save confidence` to retain these scores with a
-different policy or without reconciliation.
+Confidence-mode reconciliation uses prediction scores in run scratch. Add
+`confidence` to `--save` to retain the scores under `reconciliation_evidence/`
+for later inspection or replay. This save option works with any policy and
+with ordinary TTA.
 
 In TTA, a plain union policy reuses the already assembled source union. It
 counts and validates that buffer without reopening component masks or allocating
@@ -172,8 +173,8 @@ The engine does not substitute the run's `--conf` threshold for missing scores.
 
 Confidence collection is independent of `--min_conf`. CPU, GPU, external
 augmentation, resident D1, and accepted tile paths keep their existing binary
-mask processing and morphology. Policies whose mode is not `confidence` retain
-native-view evidence without immediately expanding it into source space.
+mask processing and morphology. With an explicit confidence save, policies
+using other modes retain native-view evidence for later source projection.
 Compressed numeric blocks and native-piece manifests explicitly distinguish
 their storage coordinates from the source grid. D1 captures only supported
 score/mask crops before releasing device buffers. Bounded host compression can
@@ -255,6 +256,13 @@ median using its interquartile range; multipliers are clipped to the policy's
 bounds, normally 0.75–1.25. This limits the influence of a large connected
 false-positive mass. The reported largest fraction and component count are
 descriptive metrics, not ground-truth quality scores.
+
+When indexed prediction scores or packed binary masks bound each group's
+support, voting can sum occupied tiles in the original group order. A custom
+decision still receives the full source-coordinate slab. Use the
+`tta.reconciliation.voting` telemetry phases to time evidence collection,
+section collisions, terminal reduction and the decision callback separately.
+SAM proposal generation and selection occur earlier in the pipeline.
 
 ## Memory and saved-layer comparison
 

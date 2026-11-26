@@ -1,20 +1,23 @@
 """Parallel TTA voting preserves sequential policy input and receipts."""
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from threading import Barrier, get_ident
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
-from XTA import confidence_evidence, reconciliation_runtime
+from XTA import confidence_evidence, reconciliation, reconciliation_runtime
 from XTA.interpolation import (
     INTERNAL_PACKED_CVOL_FORMAT, NrrdLayerRef, RawBBoxMaskStore, write_raw_bbox_mask_store,
 )
 from XTA.reconciliation_policy import resolve_reconciliation
 
 
-def test_packed_group_votes_overlap_and_preserve_callback_blocks(tmp_path, monkeypatch):
-    shape = (17, 12, 140)
+@pytest.mark.parametrize('height', [12, 129])
+def test_packed_group_votes_overlap_and_preserve_callback_blocks(tmp_path, monkeypatch, height):
+    shape = (17, height, 140)
     settings = resolve_reconciliation(SimpleNamespace(
         reconciliation=Path('XTA/examples/external_reconciliation/union.py'),
         reconciliation_memory_mib=128,
@@ -42,6 +45,16 @@ def test_packed_group_votes_overlap_and_preserve_callback_blocks(tmp_path, monke
                         lambda ref: confidence_by_key[ref.key])
     coordinator = get_ident()
     calls = []
+    spans = []
+
+    @contextmanager
+    def measure(name):
+        assert get_ident() == coordinator
+        spans.append(name)
+        yield
+
+    monkeypatch.setattr(reconciliation_runtime, 'runtime_telemetry',
+                        lambda: SimpleNamespace(enabled=True, span=measure))
 
     def decide(block):
         assert get_ident() == coordinator
@@ -51,6 +64,7 @@ def test_packed_group_votes_overlap_and_preserve_callback_blocks(tmp_path, monke
 
     def execute(directory, execution_settings=settings):
         calls.clear()
+        spans.clear()
         output, report = reconciliation_runtime.reconcile_tta_layers(
             refs, views=[], source_shape_tyx=shape, processing_shape_tyx=shape,
             policy=dict(mode='confidence', decide=decide), settings=execution_settings,
@@ -76,7 +90,17 @@ def test_packed_group_votes_overlap_and_preserve_callback_blocks(tmp_path, monke
         return original(owner, z, **kwargs)
 
     with monkeypatch.context() as patch:
+        reduce_votes = reconciliation._reduce_vote_groups
+
+        def verify_reduction(scores, direct, extrapolated, tiles):
+            if height >= 128:
+                assert tiles is not None and np.count_nonzero(tiles) * 2 < tiles.size
+            else:
+                assert tiles is None
+            return reduce_votes(scores, direct, extrapolated, tiles)
+
         patch.setattr(RawBBoxMaskStore, 'decode_slice_crop', read_crop)
+        patch.setattr(reconciliation, '_reduce_vote_groups', verify_reduction)
         mask, report, parallel_calls = execute('parallel')
 
     execution = report.pop('execution')
@@ -87,6 +111,9 @@ def test_packed_group_votes_overlap_and_preserve_callback_blocks(tmp_path, monke
     assert report['planned_working_bytes'] - execution['parallel_vote_working_bytes'] == expected_report['planned_working_bytes']
     report['planned_working_bytes'] = expected_report['planned_working_bytes']
     assert report == expected_report
+    for phase, count in (('collection', 2), ('section_collision', 3),
+                         ('terminal_reduction', 2), ('callback', 2)):
+        assert spans.count(f'tta.reconciliation.voting.{phase}') == count
     np.testing.assert_array_equal(mask, expected_mask)
     for actual, expected in zip(parallel_calls, expected_calls, strict=True):
         assert actual.keys() == expected.keys()

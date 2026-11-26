@@ -30,9 +30,9 @@ def reset_confidence():
 
 def test_scalar_confidence_save_is_optional_and_composes_with_existing_outputs():
     assert resolve_save_request(None).options == ()
-    request = resolve_save_request(['confidence,labels', 'low_quality:0.5', 'confidence'])
-    assert request.options == ('confidence', 'labels', 'low_quality')
-    assert request.low_quality_downbins == ('0.5',)
+    request = resolve_save_request(['confidence,labels', 'low_quality:0.5:video', 'confidence'])
+    assert request.options == ('confidence', 'labels', 'low_quality:0.5:video')
+    assert request.low_quality[0].formats == ('video',)
     assert not confidence_retention_requested(())
     assert confidence_retention_requested(request.options)
     assert confidence_retention_requested((), reconciliation_mode='confidence')
@@ -110,6 +110,44 @@ def test_capture_contract_rejects_unrecordable_floors_or_task(options):
 
 def test_missing_evidence_manifest_is_not_reported(tmp_path):
     assert published_confidence_manifest(tmp_path) is None
+
+
+def test_transient_score_owner_releases_only_its_private_scratch(tmp_path):
+    from XTA.confidence_evidence import current_published_confidence_manifest
+
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    marker = scratch / 'keep'
+    marker.write_bytes(b'other scratch')
+    out = tmp_path / 'out'
+    catalog = out / 'reconciliation_evidence' / 'manifest.json'
+    catalog.parent.mkdir(parents=True)
+    catalog.write_bytes(b'{"run_id":"old","layers":[]}')
+    configure_confidence_evidence(out, enabled=True, transient_parent=scratch,
+                                  run_id='current', defer_projection=True)
+    mask = np.ones((2,5,7), np.uint8)
+    view = geometry.get_view_infos(*mask.shape, cartesian_views=('transverse',))[0]
+    ref = capture_prediction_confidence(mask, mask * 212, view=view, model_name='m', temp_dir=scratch)
+    assert ref.path.is_relative_to(scratch) and ref.path.is_dir()
+    assert current_published_confidence_manifest(out) is None
+    configure_confidence_evidence(None, enabled=False)
+    assert not ref.path.exists()
+    assert marker.read_bytes() == b'other scratch'
+    assert catalog.read_bytes() == b'{"run_id":"old","layers":[]}'
+
+
+def test_receipt_owns_saved_scores_and_legacy_catalogues_remain_readable(tmp_path):
+    directory = tmp_path / 'reconciliation_evidence'
+    directory.mkdir()
+    catalog = directory / 'manifest.json'
+    catalog.write_bytes(b'{"run_id":"old","layers":[]}')
+    assert published_confidence_manifest(tmp_path, run={}) == catalog
+    assert published_confidence_manifest(tmp_path, run={'run_id':'old'}) == catalog
+    with pytest.raises(ValueError, match='different runs'):
+        published_confidence_manifest(tmp_path, run={'run_id':'new'})
+    for observed in (None, {'retained':False}):
+        receipt = {'run_id':'new', 'prediction_processing':{'observed_confidence':observed}}
+        assert published_confidence_manifest(tmp_path, run=receipt) is None
 
 
 def test_backend_capture_floors_do_not_hide_gpu_instance_prefilter():

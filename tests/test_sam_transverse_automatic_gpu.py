@@ -1,4 +1,6 @@
 """Opt-in real GPU smoke of the restored SAM Transverse assembly route."""
+
+from tests.native_stage_test_support import native_stage_context
 import hashlib
 import json
 import os
@@ -33,7 +35,7 @@ def gpu_owner(monkeypatch):
     for flag in ('YOLO_TTA_GPU_BACKPROJECT', 'YOLO_TTA_GPU_RADIAL_BACKPROJECT',
                  'YOLO_TTA_GPU_SPHERICAL_BACKPROJECT'):
         monkeypatch.delenv(flag, raising=False)
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     coordinator.configure_workers([0])
     coordinator.set_inference_priority_active(False)
     monkeypatch.setattr(backprojection, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR', coordinator)

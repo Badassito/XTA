@@ -1,6 +1,8 @@
 """CPU parity and ownership proofs for the admitted production CUDA adapter."""
 from __future__ import annotations
 
+from tests.native_stage_test_support import native_stage_context
+
 from types import SimpleNamespace
 import os
 import json
@@ -204,7 +206,7 @@ def test_actual_admitted_cuda_rank_projection_matches_scalar_oracle(tmp_path, mo
     import torch
     if not torch.cuda.is_available():
         pytest.fail('Explicit CUDA qualification requires an available device')
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     coordinator.configure_workers([0])
     coordinator.set_pending_inference_backlog(False)
     coordinator.set_inference_priority_active(False)

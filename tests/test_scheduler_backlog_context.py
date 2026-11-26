@@ -1,153 +1,71 @@
-"""Blocked backlog scans preserve admission while reusing sibling evaluation."""
-from dataclasses import replace
-from pathlib import Path
-from unittest import mock
-
+"""Actual native byte and publication-ticket backpressure."""
 import pytest
+from tests.native_scheduler_support import NativeRun
 
-from tests.test_scheduler_selection_context import random_scheduler
-from tests.test_tta_scheduler_boundary import _scheduler, _state, _view
+def test_held_publication_does_not_block_another_funded_parent():
+    with NativeRun(capacity=128, tickets=2) as run:
+        run.declare(1, bytes=64)
+        run.prepare(1)
+        run.submit(1, 1)
+        first = run.take()[0]
+        run.finish(first)
+        run.published(1)
+        run.declare(2, bytes=64)
+        run.prepare(2)
+        run.submit(2, 2)
+        second = run.take()[0]
+        assert run.owner.snapshot()['bytes_used'] == 128
+        run.finish(second)
+        run.published(2)
+        assert len(run.consume_events()) == 2
+        run.retire(first, parent=True)
+        run.retire(second, parent=True)
+        assert run.owner.snapshot()['bytes_used'] == 0
 
+@pytest.mark.parametrize('capacity,tickets', [(64, 2), (128, 1)])
+def test_actual_cap_blocks_next_parent_until_retirement(capacity, tickets):
+    with NativeRun(capacity=capacity, tickets=tickets) as run:
+        run.declare(1, bytes=64)
+        run.prepare(1)
+        run.submit(1, 1)
+        first = run.take()[0]
+        run.finish(first)
+        run.published(1)
+        run.declare(2, bytes=64)
+        assert run.owner.wait_preparation(0.03) is None
+        assert run.owner.snapshot()['blocked_parents'] == 1
+        assert len(run.consume_events()) == 1
+        run.retire(first, parent=True)
+        run.prepare(2)
+        run.submit(2, 2)
+        assert run.take()[0].parent_id == 2
 
-def reference_backlog(scheduler):
-    for task_id in list(scheduler.state.gpu_worker_pending_task_ids):
-        task = scheduler.state.gpu_worker_tasks_by_id[task_id]
-        if ((scheduler.hybrid_task_is_gpu_mandatory(task)
-             or scheduler.hybrid_task_is_active_cpu_assist(task))
-                and scheduler.direct_union_task_admissible(task)
-                and scheduler.tile_dense_result_task_admissible(task)):
-            return True
-    return False
+def test_final_does_not_refund_live_task_bytes():
+    with NativeRun(capacity=100) as run:
+        run.declare(1, bytes=40, headroom=20)
+        run.prepare(1)
+        run.submit(1, 1, retained_bytes=30)
+        first = run.take()[0]
+        run.finish(first)
+        run.published(1)
+        assert run.owner.snapshot()['bytes_used'] == 70
+        assert len(run.consume_events()) == 1
+        with pytest.raises(RuntimeError, match='retained task'):
+            run.owner.retire_parent(1, run.parents[1])
+        assert run.owner.snapshot()['bytes_used'] == 70
+        run.retire(first, parent=True)
+        assert run.owner.snapshot()['bytes_used'] == 0
 
-
-def publish(scheduler):
-    observed = []
-    scheduler.operations = replace(scheduler.operations,
-        _set_main_process_gpu_pending_inference=observed.append)
-    scheduler.publish_gpu_worker_admissible_backlog()
-    return observed[-1]
-
-
-def test_backlog_matches_reference_across_dynamic_ownership_and_byte_pressure():
-    for seed in range(100):
-        scheduler = random_scheduler(seed)
-        for retained in (0, 4000, 0):
-            scheduler.state.direct_union_postprocess_bytes[('model', 'completed')] = retained
-            assert publish(scheduler) is reference_backlog(scheduler)
-
-
-def test_blocked_siblings_check_dense_admission_once_per_contract():
-    state = _state()
-    for parent_index in range(20):
-        view = replace(_view(), name=f'parent_{parent_index}')
-        for _ in range(100):
-            tid = len(state.gpu_worker_tasks_by_id)
-            state.gpu_worker_tasks_by_id[tid] = dict(task_id=tid, kind='fullframe',
-                model_name='model', view=view, result_mode='direct_union',
-                processing_shape=(16, 8, 8), slice_count=2)
-            state.gpu_worker_pending_task_ids.append(tid)
-    state.direct_union_postprocess_bytes[('model', 'completed')] = 4096
-    state.direct_union_backing_leases[('model', 'completed')] = object()
-    scheduler = _scheduler(Path('.'), state=state,
-        input_overrides=dict(direct_union_total_dense_byte_limit=4096))
-    with mock.patch.object(scheduler, 'direct_union_task_admissible',
-                           wraps=scheduler.direct_union_task_admissible) as admission:
-        assert not publish(scheduler)
-        assert admission.call_count == 20
-        state.direct_union_postprocess_bytes.clear()
-        state.direct_union_backing_leases.clear()
-        assert publish(scheduler)
-        assert admission.call_count == 21  # Fresh totals, first parent now fits.
-
-
-def test_same_parent_different_explicit_shapes_remain_independent():
-    state = _state()
-    for tid, shape in enumerate(((16, 8, 8), (1, 8, 8))):
-        state.gpu_worker_tasks_by_id[tid] = dict(task_id=tid, kind='fullframe',
-            model_name='model', view=_view(), result_mode='direct_union',
-            processing_shape=shape, slice_count=2)
-        state.gpu_worker_pending_task_ids.append(tid)
-    state.direct_union_postprocess_bytes[('model', 'completed')] = 4000
-    state.direct_union_backing_leases[('model', 'completed')] = object()
-    scheduler = _scheduler(Path('.'), state=state,
-        input_overrides=dict(direct_union_total_dense_byte_limit=4096))
-    assert reference_backlog(scheduler)
-    assert publish(scheduler)
-
-
-def test_policy_siblings_keep_each_validation_error():
-    state = _state()
-    view = _view()
-    for tid in range(2):
-        state.gpu_worker_tasks_by_id[tid] = dict(task_id=tid, kind='fullframe',
-            model_name='model', view=view, result_mode='direct_union',
-            processing_shape=(16, 8, 8), bounded_parent_admission=True,
-            slice_count=2)
-        state.gpu_worker_pending_task_ids.append(tid)
-    state.gpu_worker_tasks_by_id[1]['augmentation_pass_tasks'] = (
-        state.gpu_worker_tasks_by_id[1],)
-    state.direct_union_postprocess_bytes[('model', 'completed')] = 4000
-    state.direct_union_backing_leases[('model', 'completed')] = object()
-    scheduler = _scheduler(Path('.'), state=state,
-        input_overrides=dict(direct_union_total_dense_byte_limit=4096))
-    with pytest.raises(RuntimeError, match='duplicate pass'):
-        publish(scheduler)
-
-
-@pytest.mark.parametrize('scan', ['backlog', 'selection'])
-def test_blocked_policy_leases_check_complete_group_contract_once(scan):
-    import queue
-    from tests.test_tta_policy_parent_admission import policy_task
-
-    state = _state()
-    state.gpu_task_queues[0] = queue.Queue()
-    for group in range(20):
-        for lease in range(100):
-            tid = len(state.gpu_worker_tasks_by_id)
-            state.gpu_worker_tasks_by_id[tid] = policy_task(
-                group, task_id=tid, size=100, slice_start=lease)
-            state.gpu_worker_pending_task_ids.append(tid)
-    state.direct_union_postprocess_bytes[('model', 'completed')] = 4096
-    state.direct_union_backing_leases[('model', 'completed')] = object()
-    scheduler = _scheduler(Path('.'), state=state,
-        input_overrides=dict(direct_union_total_dense_byte_limit=4096))
-    def evaluate():
-        return (publish(scheduler) if scan == 'backlog' else
-                scheduler.pop_gpu_worker_pending_task_id(candidate_workers=[0]))
-    with mock.patch.object(scheduler, 'direct_union_task_admissible',
-                           wraps=scheduler.direct_union_task_admissible) as admission:
-        assert not evaluate()
-        assert admission.call_count == 20
-        state.direct_union_postprocess_bytes.clear()
-        state.direct_union_backing_leases.clear()
-        assert evaluate()
-        # Selection examines all groups to preserve scheduling priority.
-        assert admission.call_count == (21 if scan == 'backlog' else 40)
-
-
-@pytest.mark.parametrize('scan', ['backlog', 'selection'])
-def test_policy_group_contract_observes_changed_sibling_shape_and_validation(scan):
-    import queue
-    from tests.test_tta_policy_parent_admission import policy_task
-
-    state = _state()
-    state.gpu_task_queues[0] = queue.Queue()
-    for tid in range(2):
-        state.gpu_worker_tasks_by_id[tid] = policy_task(0, task_id=tid, size=100)
-        state.gpu_worker_pending_task_ids.append(tid)
-    state.direct_union_postprocess_bytes[('model', 'completed')] = 3746
-    state.direct_union_backing_leases[('model', 'completed')] = object()
-    scheduler = _scheduler(Path('.'), state=state,
-        input_overrides=dict(direct_union_total_dense_byte_limit=4096))
-    second = state.gpu_worker_tasks_by_id[1]
-    second['augmentation_pass_tasks'][-1]['processing_shape'] = (1, 1, 40)
-    def evaluate():
-        return (publish(scheduler) if scan == 'backlog' else
-                scheduler.pop_gpu_worker_pending_task_id(candidate_workers=[0]))
-    # The bases match; one changed sibling makes only the second group fit (340/350).
-    assert evaluate()
-    if scan == 'selection':
-        state.gpu_worker_pending_task_ids.append(1)
-    second['augmentation_pass_tasks'][1]['bounded_parent_admission'] = False
-    with pytest.raises(RuntimeError, match='independently marked'):
-        evaluate()
+def test_successful_empty_is_not_missing_inventory():
+    with NativeRun() as run:
+        run.declare(1, tasks=2)
+        run.prepare(1)
+        run.submit(1, 1, descriptor={'mask_voxels': 0})
+        run.submit(2, 1, descriptor={'mask_voxels': 4})
+        empty = run.take()
+        run.finish(empty[0], payload=b'computed-empty')
+        assert run.owner.wait_publication(0) is None
+        nonempty = run.take()
+        run.finish(nonempty[0])
+        run.published(1)
+        assert run.owner.snapshot()['final'] == 2

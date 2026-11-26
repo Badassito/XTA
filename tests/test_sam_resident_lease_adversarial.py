@@ -12,8 +12,9 @@ from XTA import runtime
 
 
 @pytest.fixture
-def admission(monkeypatch):
-    coordinator = bp._MainProcessGpuStageCoordinator()
+def admission(monkeypatch, request):
+    from tests.native_stage_test_support import native_coordinator
+    coordinator = native_coordinator(request, monkeypatch)
     coordinator.configure_workers((0, 1))
     coordinator.set_inference_priority_active(False)
     pool = runtime._GpuWorkerAuxInterpolationPool(
@@ -297,6 +298,7 @@ def test_old_resident_quarantine_cannot_poison_replacement_residency(admission):
 def test_stale_startup_promotion_cannot_replace_current_compute_owner(admission):
     coordinator, pool, torch = admission
     old = coordinator.try_acquire_specific_stage(torch, 0, 'SAM startup')
+    old.release()
     coordinator.configure_workers((0, 1))
     coordinator.set_inference_priority_active(False)
     current = coordinator.try_acquire_specific_stage(torch, 0, 'SAM startup')

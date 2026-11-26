@@ -98,10 +98,33 @@ variable.
 
 ## Packaging checks
 
+TTA requires the compiled `XTA._prepared_scheduler` extension. Standard XTA
+wheels carry it. Build a wheel from source with setuptools, the CPython
+development headers, and a C++17 toolchain. On Windows use MSVC Build Tools and
+the Windows SDK. The additional Intel extensions remain optional.
+
+A source-checkout TTA launch can build and reuse an external scheduler cache
+before starting pipeline work. To prepare the cache explicitly, use the same
+Python interpreter as the launcher and point the tool at a directory outside
+the checkout, such as the task's Scratch directory.
+
+```text
+python -X utf8 -B tools/build_native_scheduler.py --cache-dir ../Scratch/Temp/xta-native-scheduler
+```
+
+Set `XTA_NATIVE_SCHEDULER_CACHE` to use that directory for source launches.
+Without an override the source build uses the platform's per-user cache.
+Alternatively, set `XTA_NATIVE_SCHEDULER_BINARY` to the absolute extension path
+printed by the tool. Keep the build receipt beside the artifact's `XTA`
+directory. Source launches check the build inputs, interpreter ABI, and binary
+digest. A missing or unusable extension stops TTA before work starts. CLI help,
+PTA, and LTA do not need a scheduler build.
+
 The packaging integration tests build an sdist, build a wheel from that sdist,
 and install it into an isolated target outside the checkout. They check that
-test helpers and fixtures survive source packaging, companion scripts accompany
-installed user tools, and `tests` is not installed as a runtime Python package.
+test helpers and fixtures survive source packaging, that the installed wheel
+loads its native scheduler, that companion scripts accompany installed user
+tools, and that `tests` is not installed as a runtime Python package.
 Keep this artifact check when changing packaging patterns: a list of filenames
 in metadata does not prove the built package contains a working tool.
 

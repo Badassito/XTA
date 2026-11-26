@@ -7,6 +7,7 @@ frame. Python 3.10+, NumPy, ffmpeg and ffprobe are required.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from fractions import Fraction
 import json
 import math
@@ -18,11 +19,13 @@ import tempfile
 from zipfile import BadZipFile
 
 if __package__:
+    from . import prepare_pta_input as prep
     from .prepare_pta_input import preview_cut_columns as cut_columns
     from .xta_cut_edits import inspect_edits, write_edits
     from .xta_cut_nrrd import probe_nrrd, write_nrrd
     from .xta_cut_video import probe_video, write_video
 else:
+    import prepare_pta_input as prep
     from prepare_pta_input import preview_cut_columns as cut_columns
     from xta_cut_edits import inspect_edits, write_edits
     from xta_cut_nrrd import probe_nrrd, write_nrrd
@@ -53,6 +56,68 @@ def preview_shape(native_xyz, manifest_path, scale):
 def _file_state(path):
     stat = path.stat()
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+@dataclass(frozen=True)
+class ArchiveEdits:
+    path: Path
+    stem: str
+    preview_xyz: tuple[int, ...]
+    native_xyz: tuple[int, ...]
+    identity: str
+    sha256: str
+
+
+def _inspect_archive_edits(directory):
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("The edit bundle must be a regular directory.")
+    path = prep.child(directory, "preview.xtareview")
+    with prep._preview_archive_store(path) as store:
+        source = store.source_record or {}
+        name = store.layers.get(store.global_layer_id, {}).get("name", "")
+        stem = source.get("source_stem")
+        if stem is None and name.endswith("_Global_final_output"):
+            stem = name.removesuffix("_Global_final_output")
+        if not isinstance(stem, str) or not stem:
+            raise ValueError("Cannot determine the edited preview archive's source volume stem.")
+    low, full, _, provenance = prep.load_bundle(directory, stem, allow_empty_global=True)
+    if "axial_crop" in provenance:
+        raise ValueError("Select the original edited preview archive before axial cropping.")
+    return ArchiveEdits(path, stem, low[::-1], full[::-1], provenance["archive_identity"],
+                        provenance["archive_sha256"])
+
+
+def _write_archive_edits(info, destination, first_preview, first_native, marker):
+    from XTA.review_archive import ReviewLayer, write_review_archive
+
+    with prep._preview_archive_store(info.path, expected_identity=info.identity) as store:
+        cutoff = store.cutoffs[0]
+        lid = store.global_layer_id
+        layer = store.layers[lid]
+        row = dict(layer["segments_by_cutoff"][str(cutoff)], logical_id=lid, cutoff_cent=cutoff,
+                   role="global", segment_name=layer["name"], color_rgb=layer["color"])
+        depth, height, _ = store.shape
+        shape = depth, height, first_preview
+        native = (*store.native_shape_tyx[:2], first_native)
+        crop = dict(original_preview_shape_tyx=store.shape,
+                    original_full_quality_shape_tyx=store.native_shape_tyx,
+                    first_removed_preview_i=first_preview, first_removed_native_i=first_native,
+                    marker_preview_ras=[float(v) for v in marker], marker_preview_ras_exact=[str(v) for v in marker],
+                    source_edits_sha256=info.sha256)
+
+        def read_slab(first, stop):
+            return store.read_region(lid, cutoff, ((first, stop), (0, height), (0, first_preview)))
+
+        output = write_review_archive(
+            destination / "preview.xtareview", review_id=store.sweep_id, grid_id=store.grid_id, shape_tyx=shape,
+            native_shape_tyx=native, geometry=store.geometry, cutoffs_cent=(cutoff,),
+            layers=(ReviewLayer(row, read_slab),), source_record=store.source_record,
+            axial_crop=crop, chunk_shape=store.chunk_shape,
+        )
+    if prep.digest(info.path) != info.sha256:
+        raise ValueError("The original edited preview archive changed during cropping.")
+    return dict(format="xta-preview-archive-edits/1", volume_stem=info.stem,
+                archive_sha256=prep.digest(output), source_edits_sha256=info.sha256)
 
 
 def nrrd_cut(info, requested_grid, native, low, first_native, first_preview):
@@ -98,13 +163,15 @@ def run(args):
         if output_path.is_relative_to(bundle_path) or bundle_path.is_relative_to(output_path):
             raise ValueError("The output and source edit bundle directories must be disjoint.")
     inputs = [p.resolve() for p in (args.mkv, args.nrrd, args.preview_manifest) if p]
+    archived_edits = bool(args.edits and (args.edits / "preview.xtareview").exists())
     if args.edits:
-        inputs.extend(args.edits / name for name in ("edits.json", "source_manifest.json"))
+        names = ("preview.xtareview",) if archived_edits else ("edits.json", "source_manifest.json")
+        inputs.extend(args.edits / name for name in names)
     before = {p: _file_state(p) for p in inputs}
     video = probe_video(args.mkv)
     native = (video.width, video.height, video.frames)
     if args.edits:
-        bundle = inspect_edits(args.edits)
+        bundle = _inspect_archive_edits(args.edits) if archived_edits else inspect_edits(args.edits)
         if bundle.native_xyz != native:
             raise ValueError(f"The original MKV XYZ {native} differs from the bundle's native grid {bundle.native_xyz}.")
         low = bundle.preview_xyz
@@ -153,7 +220,13 @@ def run(args):
     with tempfile.TemporaryDirectory(prefix=".xta-cut-", dir=target.parent) as tmp:
         staged = Path(tmp) / "pair"
         staged.mkdir()
-        if args.edits:
+        if archived_edits:
+            print("Cropping the edited preview archive...", flush=True)
+            plan["source_edits_directory"] = str(args.edits.resolve())
+            plan["preview_archive"] = "edits/preview.xtareview"
+            plan["edits_output"] = _write_archive_edits(bundle, staged / "edits", first_preview,
+                                                          first_native, args.ras)
+        elif args.edits:
             print("Cropping Slicer snapshots and writing the low-quality Global NRRD...", flush=True)
             preview_dir = staged / "preview"
             preview_dir.mkdir()
@@ -184,7 +257,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mkv", type=Path, required=True, help="Original full-resolution FFV1 gray8 MKV")
     label = parser.add_mutually_exclusive_group()
-    label.add_argument("--edits", type=Path, help="Slicer export directory containing edits.json and NPZ snapshots")
+    label.add_argument("--edits", type=Path, help="Slicer export directory containing preview.xtareview or NPZ edits")
     label.add_argument("--nrrd", type=Path, help="Scalar XTA NRRD on the native or preview grid")
     parser.add_argument("--nrrd-grid", choices=("preview", "native"),
                         help="Parent grid of a cropped NRRD, e.g. preview for Global_union.seg.nrrd. "

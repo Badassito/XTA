@@ -290,6 +290,10 @@ def _scan_segment(segment, bound, window, first, stop, depth, stored_shape, offs
             segment.observe_plane(z0 + index, crop, y0 + top, x0 + left)
             del crop
         del slab
+    if source is not None:
+        # A trusted extent can end before the stored raster does. Release its
+        # decoder before the next channel even when read_slab did not reach EOF.
+        source.close()
     return foreground, exact
 
 
@@ -397,6 +401,7 @@ def write_grouped_seg_nrrd(
     stored_z = stored_shape[0]
     records = []
     managed_spans = 0
+    managed_repacked = 0
 
     try:
         payload_dir = Path(tempfile.mkdtemp(prefix=".grouped-seg-payload-", dir=payload_root))
@@ -413,15 +418,21 @@ def write_grouped_seg_nrrd(
                 else:
                     first, stop = max(crop_z, bound[4]), min(crop_z+stored_z, bound[5]+1)
                 compressed.write_zeros((first-crop_z) * plane_bytes)
-                if source is None:
+                managed = segment.managed_source if segment.observe_slab is None else None
+                if (source is None and managed is not None and first < stop and segment.source_layer is not None
+                        and segment.source_layer.can_copy_gzip_payload):
+                    foreground, exact = managed.write_repacked(
+                        segment.source_layer, compressed, bound, offset_xyz, stored_shape[1:], depth,
+                        segment.observe_plane, zero_write_buffer_bytes)
+                    managed_repacked += 1
+                elif source is None:
                     foreground, exact = _scan_segment(
                         segment, bound, window, first, stop, depth, stored_shape, offset_xyz, compressed)
                 else:
                     with compressed.gzip_payload_sink((stop-first) * plane_bytes) as sink:
                         packed_observer = segment.observe_packed_plane
-                        if (segment.managed_source is not None and segment.observe_slab is None
-                                and (segment.observe_plane is None or packed_observer is not None)):
-                            foreground, exact = segment.managed_source.copy_verified(
+                        if managed is not None and (segment.observe_plane is None or packed_observer is not None):
+                            foreground, exact = managed.copy_verified(
                                 source, sink, bound, segment.observe_plane, packed_observer, zero_write_buffer_bytes)
                             managed_spans += 1
                         else:
@@ -467,6 +478,7 @@ def write_grouped_seg_nrrd(
             "chunk_slices": depth, "payload_uncompressed_bytes": math.prod(stored_shape)*len(records),
             "gzip_spans": dict(compressed.stats),
             "managed_gzip_spans": managed_spans,
+            "managed_repacked_channels": managed_repacked,
             "bytes": path.stat().st_size,
             **({"sha256": digest.hexdigest()} if digest is not None else {}),
         }

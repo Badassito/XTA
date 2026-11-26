@@ -116,7 +116,70 @@ def axial_crop_geometry(edits, manifest, low, full):
         raise ValueError('Cropped bundle needs its original edits.json SHA256.')
     return crop
 
+def _preview_archive_store(path, *, expected_identity=None):
+    try:
+        from XTA.native_review_store import NativeReviewStore
+    except ModuleNotFoundError as error:
+        if error.name != 'XTA':
+            raise
+        checkout = Path(__file__).resolve().parents[1]
+        if not (checkout / 'XTA' / 'native_review_store.py').is_file():
+            raise ValueError('Install XTA to read a preview archive, or use the standalone NPZ edit bundle.') from error
+        sys.path.insert(0, str(checkout))
+        from XTA.native_review_store import NativeReviewStore
+    return NativeReviewStore(path, expected_identity=expected_identity)
+
+
+def _load_preview_archive(bundle_dir, stem, mask_source, allow_empty_global):
+    if mask_source != 'global':
+        raise ValueError('Preview archives supply an explicitly selected Global snapshot.')
+    path = child(bundle_dir, 'preview.xtareview')
+    sha = digest(path)
+    with _preview_archive_store(path) as store:
+        source = store.source_record
+        edit = source.get('preview_edit') if isinstance(source, dict) else None
+        if (store.grid_role != 'preview' or not isinstance(edit, dict) or len(store.cutoffs) != 1
+                or edit.get('cutoff_cent') != store.cutoffs[0]
+                or not isinstance(edit.get('archive_identity'), str)
+                or not re.fullmatch(r'[0-9a-f]{64}', edit['archive_identity'])
+                or len(store.layers) != 1 or store.global_layer_id is None):
+            raise ValueError('Expected an exported edited Global snapshot from a preview review.')
+        low, full = store.shape, store.native_shape_tyx
+        if not np.allclose(store.affine_ijk_to_ras, REFERENCE_RAS, rtol=0, atol=1e-7):
+            raise ValueError('Preview archive needs the XTA unit-LPS preview lattice.')
+        global_layer = store.layers[store.global_layer_id]
+        cutoff = store.cutoffs[0]
+        name = global_layer['name']
+        declared_stem = source.get('source_stem')
+        if (declared_stem is not None and declared_stem != stem
+                or declared_stem is None and not name.startswith(stem + '_')):
+            raise ValueError('Bundle contains a different volume stem.')
+        count = global_layer['segments_by_cutoff'][str(cutoff)]['foreground_voxels']
+        if not count and not allow_empty_global:
+            raise ValueError('Global is empty: update it in Slicer and export it again.')
+        crop = store.axial_crop
+        if crop is not None:
+            axial_crop_geometry({'axial_crop': crop},
+                                {'output_shape_tyx': crop.get('original_preview_shape_tyx'),
+                                 'full_quality_output_shape_tyx': crop.get('original_full_quality_shape_tyx')},
+                                low, full)
+        selected = dict(file=path.name, name=name, foreground_voxels=count, archive_identity=store.identity,
+                        cutoff_cent=cutoff, sha256=sha)
+        provenance = dict(bundle_format='xta-preview-archive-edits/1', archive_sha256=sha,
+                          archive_identity=store.identity, preview_edit=edit, preview_shape_tyx=list(low),
+                          source_shape_tyx=list(full), selected_segment_names=[name])
+        if crop is not None:
+            provenance['axial_crop'] = crop
+    if sha != digest(path):
+        raise ValueError('Preview export changed while loading.')
+    return low, full, [selected], provenance
+
+
 def load_bundle(bundle_dir, stem, mask_source='global', *, allow_empty_global=False):
+    if (bundle_dir / 'preview.xtareview').exists():
+        if (bundle_dir / 'edits.json').exists():
+            raise ValueError('Choose a single preview export or a standalone NPZ bundle.')
+        return _load_preview_archive(bundle_dir, stem, mask_source, allow_empty_global)
     edits_path = child(bundle_dir, 'edits.json')
     manifest_path = child(bundle_dir, 'source_manifest.json')
     e, m = read_json(edits_path), read_json(manifest_path)
@@ -241,6 +304,28 @@ def read_snapshot(path, entry, preview_shape_tyx, max_snapshot_bytes=512*MIB):
 
 
 def insert_snapshot(target, path, entry, max_snapshot_bytes):
+    if 'archive_identity' in entry:
+        with _preview_archive_store(path, expected_identity=entry['archive_identity']) as store:
+            cutoff = entry['cutoff_cent']
+            if store.axial_crop is not None and tuple(target.shape) == tuple(
+                    store.axial_crop['original_preview_shape_tyx']):
+                target = target[:, :, :store.shape[2]]
+            if tuple(target.shape) != store.shape or cutoff not in store.cutoffs:
+                raise ValueError('Edited archive does not match the target preview lattice.')
+            count = 0
+            for index in store.iter_blocks(store.global_layer_id, cutoff):
+                bounds = store.block_bounds(index)
+                if math.prod(b - a for a, b in bounds) > max_snapshot_bytes:
+                    raise ValueError('Preview archive chunk exceeds the snapshot workspace budget.')
+                block = store.read_block(store.global_layer_id, cutoff, index)
+                region = tuple(slice(a, b) for a, b in bounds)
+                np.bitwise_or(target[region], block, out=target[region])
+                count += int(np.count_nonzero(block))
+            if count != entry['foreground_voxels']:
+                raise ValueError('Edited archive foreground count does not match the receipt.')
+        if digest(path) != entry['sha256']:
+            raise ValueError('Preview export changed while reading its Global.')
+        return count
     mask, extent = read_snapshot(path, entry, target.shape, max_snapshot_bytes)
     if mask.size:
         region = tuple(slice(int(lo), int(hi) + 1) for lo, hi in zip(extent[::2][::-1], extent[1::2][::-1]))
@@ -700,6 +785,8 @@ def prepare(args, stem, log_dir):
     try:
         low,full,selected,bundle_prov=load_bundle(bundle,stem,args.mask_source)
         crop=bundle_prov.get('axial_crop')
+        if args.mode=='native' and bundle_prov.get('bundle_format')=='xta-preview-archive-edits/1':
+            raise ValueError('A preview edit archive has no original native masks for native transfer.')
         if crop is not None and args.mode=='native':
             raise ValueError('Derived cropped edit bundles support edited_shape, continuous_field or upscale preparation.')
         reconstruction_low=shape3(crop['original_preview_shape_tyx']) if crop else low
@@ -887,6 +974,8 @@ def validate_only(args,stem,log_dir):
     if bundle.is_symlink() or not bundle.is_dir():raise ValueError(f'Missing regular filtered bundle: {bundle}')
     low,full,selected,provenance=load_bundle(bundle,stem,args.mask_source)
     crop=provenance.get('axial_crop')
+    if args.mode=='native' and provenance.get('bundle_format')=='xta-preview-archive-edits/1':
+        raise ValueError('A preview edit archive has no original native masks for native transfer.')
     if crop is not None and args.mode=='native':
         raise ValueError('Derived cropped edit bundles support edited_shape, continuous_field or upscale preparation.')
     allocation_shape=shape3(crop['original_preview_shape_tyx']) if crop else low
@@ -945,7 +1034,8 @@ def main(argv=None):
     p.add_argument('--mode',choices=['upscale','native','edited_shape','continuous_field'],default='upscale')
     p.add_argument('--mask-source',choices=['global','components'],default='global')
     p.add_argument('--validate-only',action='store_true')
-    p.add_argument('--bundle-dir',type=Path,help='Explicit edited bundle for single-volume preparation or validation')
+    p.add_argument('--bundle-dir',type=Path,
+                   help='Edited bundle directory with preview.xtareview or legacy NPZs for one volume')
     p.add_argument('--skip-source-probe',action='store_true',help='Bundle-only validation; forbidden for preparation')
     p.add_argument('--native-filter')
     p.add_argument('--native-low-template',help='Explicit original low manifest path; {stem} substitution allowed')

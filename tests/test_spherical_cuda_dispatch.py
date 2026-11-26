@@ -1,4 +1,6 @@
 """Spherical CUDA admission, ordered compact publication and lease ownership."""
+
+from tests.native_stage_test_support import native_stage_context
 import contextlib
 import io
 from pathlib import Path
@@ -134,7 +136,7 @@ class SphericalCudaDispatchTests(unittest.TestCase):
         lease.release.assert_not_called()
 
     def test_normal_stage_inference_priority_applies(self):
-        coordinator = backprojection._MainProcessGpuStageCoordinator()
+        coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
         coordinator.configure_workers([0, 1])
         coordinator.set_pending_inference_backlog(True)
         torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 2, mem_get_info=mock.Mock()))

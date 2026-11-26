@@ -42,6 +42,22 @@ def _descriptor(layer, observer=None):
                           extent_xyz=reference_extent, source_layer=layer, observe_slab=observer)
 
 
+def test_group_releases_each_partial_decoder_before_the_next_channel(tmp_path):
+    shape = (6, 4, 5)
+    masks = np.zeros(shape, np.uint8)
+    masks[1:3] = 1
+    names = ["a.seg.nrrd", "b.seg.nrrd"]
+    for name in names:
+        _scalar_layer(tmp_path / name, masks, (0, 0, 0), shape)
+    catalogue = _catalogue(tmp_path, shape, names)
+    with read_layer_manifest(catalogue, workspace=tmp_path, include_all_layers=True, max_open=1) as layers:
+        result = write_grouped_seg_nrrd(tmp_path / "group.seg.nrrd", shape_tyx=shape,
+                                       segments=[_descriptor(layer) for layer in layers])
+        assert all(row["foreground_voxels"] == 40 for row in result["segments"])
+        assert layers._open_count == 0
+        np.testing.assert_array_equal(layers[0].read_slab(0, shape[0]), masks)
+
+
 @pytest.mark.parametrize("fast", [False, True])
 def test_copy_aligned_members_with_z_padding_and_reencode_mismatched_crops(tmp_path, fast):
     if fast:

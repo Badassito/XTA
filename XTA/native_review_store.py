@@ -20,6 +20,7 @@ from .native_review_overview import NativeOverviewAccumulator, native_ijk_to_ras
 
 
 _SCHEMA = "xta.native_review/1"
+_DIRECT_SCHEMA = "xta.review_archive/2"
 _DEFAULT_CHUNK = (32, 64, 64)
 _MAX_CHUNK_BYTES = 8 * 1024**2
 _PREPARATION_BYTES = 256 * 1024**2
@@ -66,6 +67,44 @@ def _file_stamp(path):
     return file.st_dev, file.st_ino, file.st_size, file.st_mtime_ns, file.st_ctime_ns
 
 
+def _archive_digest(value):
+    document = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(document.encode("utf-8")).hexdigest()
+
+
+def _direct_grid_role(grid_id, shape, native_shape, crop):
+    if grid_id == "native" and native_shape == shape and crop is None:
+        return "native"
+    if (not isinstance(grid_id, str) or not grid_id.startswith("low_quality/")
+            or any(a > b for a, b in zip(shape, native_shape))):
+        raise ValueError("Review archive grid role and geometry disagree")
+    if crop is not None:
+        if not isinstance(crop, dict):
+            raise ValueError("Invalid preview axial crop record")
+        original = _triple(crop.get("original_preview_shape_tyx"), "original preview dimensions", minimum=1)
+        original_native = _triple(crop.get("original_full_quality_shape_tyx"), "original native dimensions", minimum=1)
+        if (shape[:2] != original[:2] or native_shape[:2] != original_native[:2]
+                or not shape[2] <= original[2] or not native_shape[2] < original_native[2]
+                or shape[2] != crop.get("first_removed_preview_i")
+                or native_shape[2] != crop.get("first_removed_native_i")
+                or any(a > b for a, b in zip(original, original_native))):
+            raise ValueError("Cropped review dimensions differ from the original lattice and crop record")
+    return "preview"
+
+
+def _block_inventory(db):
+    digest = hashlib.sha256()
+    count = 0
+    for lid, cutoff, z, y, x, block_sha in db.execute(
+        "SELECT lid,cutoff,z,y,x,digest FROM blocks ORDER BY lid,cutoff,z,y,x"
+    ):
+        if not isinstance(block_sha, bytes) or len(block_sha) != 32:
+            raise ValueError("Invalid review block digest")
+        digest.update(bytes.fromhex(_archive_digest([lid, cutoff, z, y, x, block_sha.hex()])))
+        count += 1
+    return {"blocks": count, "sha256": digest.hexdigest()}
+
+
 class NativeReviewStore:
     """Open a read-only archive using NumPy and the Python standard library."""
 
@@ -85,8 +124,9 @@ class NativeReviewStore:
             if _file_stamp(self.path) != self.file_stamp:
                 raise ValueError("Native review archive changed while opening")
             metadata = json.loads(rows[0][0])
-            if metadata["schema"] != _SCHEMA:
+            if metadata["schema"] not in (_SCHEMA, _DIRECT_SCHEMA):
                 raise ValueError("Unsupported native review archive schema")
+            self.schema = metadata["schema"]
             self.shape = self.shape_zyx = _triple(metadata["shape"], "native dimensions", minimum=1)
             self.chunk_shape = self.chunk_shape_zyx = self.block_shape = _chunk_shape(metadata["chunk_shape"])
             self.cutoffs = tuple(metadata["cutoffs"])
@@ -104,6 +144,22 @@ class NativeReviewStore:
             self.identity = self.source_identity = metadata["identity"]
             if expected_identity is not None and self.identity != expected_identity:
                 raise ValueError("Archive belongs to a different native review")
+            self.grid_id = "native"
+            self.grid_role = "native"
+            self.native_shape_tyx = self.shape
+            self.axial_crop = None
+            if self.schema == _DIRECT_SCHEMA:
+                manifest = {key: value for key, value in metadata.items() if key not in ("identity", "manifest_sha256")}
+                if metadata["manifest_sha256"] != self.identity or _archive_digest(manifest) != self.identity:
+                    raise ValueError("Review catalogue failed its digest check")
+                if _block_inventory(self._db) != metadata["block_inventory"]:
+                    raise ValueError("Review archive block inventory changed or is incomplete")
+                self.grid_id = metadata["grid_id"]
+                self.grid_role = metadata["grid_role"]
+                self.native_shape_tyx = _triple(metadata["native_shape_tyx"], "native target dimensions", minimum=1)
+                self.axial_crop = metadata.get("axial_crop")
+                if self.grid_role != _direct_grid_role(self.grid_id, self.shape, self.native_shape_tyx, self.axial_crop):
+                    raise ValueError("Review archive grid role and geometry disagree")
             self.source_record = metadata.get("source_record")
             self.sweep_id = metadata["sweep_id"]
             self.review_manifest_sha256 = metadata["manifest_sha256"]
@@ -408,6 +464,8 @@ def _layer_catalogue(groups, cutoffs):
                 "segment_id": segment, "foreground_voxels": row["foreground_voxels"],
                 "view_name": row.get("view_name"), "layer_key": row.get("layer_key"),
                 "model_name": row.get("model_name"), "source_filename": row.get("source_filename"),
+                "layer_role": row.get("layer_role"), "recomposition_op": row.get("recomposition_op"),
+                "physical_view_name": row.get("physical_view_name"), "mask_kind": row.get("mask_kind"),
             }
     if not layers or sum(layer["role"] == "global" for layer in layers.values()) > 1:
         raise ValueError("Expected native review layers with at most one Global identity")

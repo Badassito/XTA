@@ -61,6 +61,7 @@ from .config import (
     GIB,
     NRRD_SPACE,
     SCRIPT_BASENAME,
+    SaveRequest,
     _parse_token_list,
     resolve_channel_format,
 )
@@ -99,7 +100,6 @@ from .media import (
     close_ffmpeg_writer,
     ffmpeg_ffv1_gray_writer,
     ffmpeg_ffv1_rgb_writer,
-    ffmpeg_rawvideo_writer,
     resize_binary_plane_to_output_xy,
 )
 from .geometry import (
@@ -544,34 +544,7 @@ DEFAULT_BINARY_PATTERN = "binary_masks/{Filename}_Binary_%04d.tiff"
 
 DEFAULT_SEMANTIC_PATTERN = "semantic_masks/{Filename}_%04d.png"
 
-def _resolve_output_pattern(pattern_value: Optional[str], default_pattern: str, out_dir: Path, stem: str) -> Optional[Path]:
-    if pattern_value is None:
-        return None
-    pattern = default_pattern if str(pattern_value) == "__DEFAULT__" else str(pattern_value)
-    pattern = pattern.replace("{Filename}", stem)
-    path = Path(pattern)
-    if not path.is_absolute():
-        path = out_dir / path
-    return path
 
-def _tag_frame_pattern(path: Path, tag: str) -> Path:
-    parent = path.parent
-    if parent.name:
-        parent = parent.with_name(f"{parent.name}_{tag.lower()}")
-
-    name = path.name
-    m = re.search(r"(%0\d+d)", name)
-    if m is not None:
-        prefix = name[:m.start()]
-        if prefix.endswith("_"):
-            name = prefix + f"{tag}_" + name[m.start():]
-        else:
-            name = prefix + f"_{tag}_" + name[m.start():]
-    else:
-        suffix = "".join(path.suffixes)
-        base = name[:-len(suffix)] if suffix else name
-        name = f"{base}_{tag}{suffix}"
-    return parent / name
 
 def _format_frame_path(pattern_path: Path, frame_idx_1based: int) -> Path:
     as_str = str(pattern_path)
@@ -2567,26 +2540,28 @@ class _GpuMirrorTee:
             pass
 
 def _acquire_output_gpu_stage(torch_mod: object, purpose: str) -> Optional[_MainProcessGpuStageLease]:
-    """Take an output-stage GPU lease; a later-cut sweep child waits for a busy one.
+    """Wait only for an occupied configured GPU in a later-cutoff sweep branch."""
+    from .backprojection import _main_process_gpu_output_stage_wait_state, _wait_main_process_gpu_stage_change
 
-    Inference-owning processes keep the non-blocking admission. A later-cut
-    confidence-sweep child has no inference to protect, and a busy lease there
-    belongs to another of its own short output stages. Falling back to the CPU
-    operator would change low-quality rounding relative to the GPU route a
-    scalar run's idle tail takes, so wait (bounded) instead.
-    """
-    lease = _try_acquire_main_process_gpu_stage(torch_mod, purpose)
-    if lease is not None or os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') != 'consume':
-        return lease
+    consume = os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') == 'consume'
     deadline = time.monotonic() + max(0.0, _env_float('XTA_YOLO_SWEEP_OUTPUT_STAGE_WAIT_SECONDS', 300.0))
-    delay = 0.05
-    while time.monotonic() < deadline:
-        time.sleep(delay)
-        delay = min(1.0, delay * 2)
-        lease = _try_acquire_main_process_gpu_stage(torch_mod, purpose)
-        if lease is not None:
-            return lease
-    return None
+    while True:
+        status, epoch = _main_process_gpu_output_stage_wait_state(torch_mod, purpose)
+        if status == 0:
+            return None
+        if status == 1:
+            lease = _try_acquire_main_process_gpu_stage(torch_mod, purpose)
+            if lease is not None or not consume:
+                return lease
+            # A failed CUDA probe on an otherwise eligible device cannot be
+            # resolved by waiting for a lease. A competing successful claim can.
+            status, epoch = _main_process_gpu_output_stage_wait_state(torch_mod, purpose)
+            if status != 2:
+                return None
+        remaining = deadline - time.monotonic()
+        if not consume or remaining <= 0:
+            return None
+        _wait_main_process_gpu_stage_change(epoch, remaining)
 
 def _try_create_gpu_mirror_tee(
     mirror_jobs: List[Dict[str, object]],
@@ -2650,6 +2625,10 @@ def write_layer_nrrd_with_low_quality_mirrors(
     raster_plan: Optional[NrrdRasterPlan] = None,
     mirror_raster_plans: Optional[Dict[str, NrrdRasterPlan]] = None,
     plan_receipt: Optional[Dict[str, NrrdRasterPlan]] = None,
+    write_native: bool = True,
+    native_review_path: Optional[Path] = None,
+    mirror_review_paths: Optional[Dict[str, Path]] = None,
+    mirror_nrrd_paths: Optional[Sequence[Path]] = None,
 ) -> Path:
     """Write a full-quality layer and all low-quality mirrors in one source pass.
 
@@ -2658,6 +2637,8 @@ def write_layer_nrrd_with_low_quality_mirrors(
     write_single_layer_nrrd_from_ref; ``mirror_raster_plans`` maps ``str(mirror_path)`` to
     a pinned mirror plan, and ``plan_receipt`` records every plan actually written."""
     out_t = int(output_shape[0])
+    review_paths = mirror_review_paths or {}
+    nrrd_paths = None if mirror_nrrd_paths is None else set(map(Path, mirror_nrrd_paths))
     resolved_layout = _normalized_nrrd_layer_layout(layout)
     # Resolve a live layer's deferred extent once so full-quality and mirror headers agree.
     ref = _resolve_live_ref_extent(ref)
@@ -2835,16 +2816,26 @@ def write_layer_nrrd_with_low_quality_mirrors(
             return
         _tee(int(z0), block)
 
-    result = write_single_layer_nrrd_from_ref(
-        ref, output_shape, out_path,
-        segment_name=segment_name, segment_color=segment_color,
-        block_consumer=(_consume_block if mirror_jobs and not sparse_mirror_tee else None),
-        sparse_consumer=(_tee_sparse if sparse_mirror_tee else None),
-        z_shards=int(resolved_z_shards),
-        layout=resolved_layout,
-        raster_plan=raster_plan,
-        plan_receipt=plan_receipt,
-    )
+    block_consumer = _consume_block if mirror_jobs and not sparse_mirror_tee else None
+    sparse_consumer = _tee_sparse if sparse_mirror_tee else None
+    try:
+        if write_native:
+            write_single_layer_nrrd_from_ref(
+                ref, output_shape, out_path,
+                segment_name=segment_name, segment_color=segment_color,
+                block_consumer=block_consumer, sparse_consumer=sparse_consumer,
+                z_shards=int(resolved_z_shards), layout=resolved_layout,
+                raster_plan=raster_plan, plan_receipt=plan_receipt,
+            )
+            if native_review_path is not None:
+                _stage_layer_raster(ref, output_shape, native_review_path)
+        else:
+            _stage_layer_raster(ref, output_shape, native_review_path,
+                                block_consumer=block_consumer, sparse_consumer=sparse_consumer)
+    except BaseException:
+        if gpu_tee is not None:
+            gpu_tee.discard()
+        raise
 
     # one small D2H per mirror replaces the per-block CPU resize/OR work.
     if gpu_tee is not None and not gpu_tee.finalize_into_jobs():
@@ -2891,50 +2882,52 @@ def write_layer_nrrd_with_low_quality_mirrors(
                     _finish_nrrd_payload_writer(stream_writer)
 
     def _encode_mirror(job: Dict[str, object]) -> None:
+        from .review_layer_sources import stage_review_volume
+
         m_t, m_h, m_w = job['shape']  # type: ignore[misc]
         m_path: Path = job['path']  # type: ignore[assignment]
+        review_path = review_paths.get(str(m_path))
+        write_nrrd = nrrd_paths is None or m_path in nrrd_paths
         mirror_shape = (int(m_t), int(m_h), int(m_w))
         mirror_plan = pinned_mirror_plans.get(str(m_path))
         if mirror_plan is None:
             mirror_plan = _nrrd_raster_plan(mirror_extent_ref, mirror_shape, layout=resolved_layout)
+        vol: Optional[np.ndarray] = job.get('volume')  # type: ignore[assignment]
         try:
-            if bool(job['failed']):
-                raise RuntimeError('mirror tee failed during full-quality streaming')
-            m_path.parent.mkdir(parents=True, exist_ok=True)
-            seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(m_path)
-            seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
-            vol: Optional[np.ndarray] = job.get('volume')  # type: ignore[assignment]
-            if vol is None:
-                raise RuntimeError('mirror tee produced no host payload')
             try:
-                _encode_mirror_volume(vol, m_path, mirror_shape, mirror_plan, seg_name, seg_color)
-            except NrrdCropExtentViolation as exc:
-                if _nrrd_plan_layout(mirror_plan) != NRRD_LAYER_LAYOUT_CROPPED:
-                    raise
-                _announce_nrrd_crop_violation(m_path, exc)
-                mirror_plan = _nrrd_raster_plan(
-                    mirror_extent_ref, mirror_shape, layout=NRRD_LAYER_LAYOUT_FULL,
-                )
-                _encode_mirror_volume(vol, m_path, mirror_shape, mirror_plan, seg_name, seg_color)
-            if plan_receipt is not None:
-                plan_receipt[str(m_path)] = mirror_plan
-        except Exception as exc:
-            print(
-                f'Warning: low-quality NRRD mirror tee failed for {m_path.name} ({exc}); '
-                're-encoding that mirror from the layer store.'
-            )
-            # The cropped fallback keeps the manifest's composed box; the full layout keeps
-            # its historical direct-extent header byte for byte.
-            write_single_layer_nrrd_from_ref(
-                ref, mirror_shape, m_path,
-                segment_name=segment_name, segment_color=segment_color,
-                layout=resolved_layout,
-                raster_plan=(
-                    mirror_plan
-                    if _nrrd_plan_layout(mirror_plan) == NRRD_LAYER_LAYOUT_CROPPED else None
-                ),
-                plan_receipt=plan_receipt,
-            )
+                if bool(job['failed']) or vol is None:
+                    raise RuntimeError('mirror tee produced no settled host payload')
+                if write_nrrd:
+                    m_path.parent.mkdir(parents=True, exist_ok=True)
+                    seg_name = str(segment_name) if segment_name else _slicer_segment_name_for_out_path(m_path)
+                    seg_color = segment_color if segment_color is not None else slicer_segment_palette_color(seg_name)
+                    try:
+                        _encode_mirror_volume(vol, m_path, mirror_shape, mirror_plan, seg_name, seg_color)
+                    except NrrdCropExtentViolation as exc:
+                        if _nrrd_plan_layout(mirror_plan) != NRRD_LAYER_LAYOUT_CROPPED:
+                            raise
+                        _announce_nrrd_crop_violation(m_path, exc)
+                        mirror_plan = _nrrd_raster_plan(
+                            mirror_extent_ref, mirror_shape, layout=NRRD_LAYER_LAYOUT_FULL,
+                        )
+                        _encode_mirror_volume(vol, m_path, mirror_shape, mirror_plan, seg_name, seg_color)
+            except Exception as exc:
+                print(f'Warning: low-quality mirror tee failed for {m_path.name} ({exc}); '
+                      'restoring that mirror from the layer store.')
+                if write_nrrd:
+                    write_single_layer_nrrd_from_ref(
+                        ref, mirror_shape, m_path,
+                        segment_name=segment_name, segment_color=segment_color, layout=resolved_layout,
+                        raster_plan=(mirror_plan if _nrrd_plan_layout(mirror_plan) == NRRD_LAYER_LAYOUT_CROPPED
+                                     else None), plan_receipt=plan_receipt,
+                    )
+                if review_path is not None:
+                    _stage_layer_raster(ref, mirror_shape, review_path)
+            else:
+                if review_path is not None:
+                    stage_review_volume(review_path, vol)
+                if plan_receipt is not None:
+                    plan_receipt[str(m_path)] = mirror_plan
         finally:
             job['volume'] = None
 
@@ -2961,7 +2954,25 @@ def write_layer_nrrd_with_low_quality_mirrors(
     else:
         for job in mirror_jobs:
             _encode_mirror(job)
-    return result
+    return out_path
+
+
+def _stage_layer_raster(ref, output_shape, review_path, *, block_consumer=None, sparse_consumer=None):
+    from .review_layer_sources import DiscardedRaster, PackedReviewRaster
+
+    writer = PackedReviewRaster(review_path, output_shape) if review_path is not None else DiscardedRaster()
+    out_t, out_h, out_w = output_shape
+    try:
+        _write_one_decomposed_nrrd_layer_payload(
+            ref, output_shape, writer, z_chunk=_nrrd_full_slice_z_chunk(1, out_w, out_h, out_t),
+            block_consumer=block_consumer, sparse_consumer=sparse_consumer,
+        )
+        if review_path is not None:
+            writer.finalize()
+    except BaseException:
+        if review_path is not None:
+            writer.discard()
+        raise
 
 def write_sink_layer_files(
     ref: 'NrrdLayerRef',
@@ -2976,6 +2987,10 @@ def write_sink_layer_files(
     raster_plan: NrrdRasterPlan,
     mirror_raster_plans: Dict[str, NrrdRasterPlan],
     plan_receipt: Dict[str, NrrdRasterPlan],
+    write_native: bool = True,
+    native_review_path: Optional[Path] = None,
+    mirror_review_paths: Optional[Dict[str, Path]] = None,
+    mirror_nrrd_paths: Optional[Sequence[Path]] = None,
 ) -> Path:
     """Write one NrrdLayerSink layer: its native file and every low-quality mirror.
 
@@ -2991,7 +3006,13 @@ def write_sink_layer_files(
             raster_plan=raster_plan,
             mirror_raster_plans=mirror_raster_plans,
             plan_receipt=plan_receipt,
+            write_native=write_native, native_review_path=native_review_path,
+            mirror_review_paths=mirror_review_paths, mirror_nrrd_paths=mirror_nrrd_paths,
         )
+    if native_review_path is not None:
+        _stage_layer_raster(ref, output_shape, native_review_path)
+    if not write_native:
+        return out_path
     return write_single_layer_nrrd_from_ref(
         ref, output_shape, Path(out_path),
         segment_name=segment_name,
@@ -3060,8 +3081,28 @@ class NrrdLayerSink:
         layer_layout: str = NRRD_LAYER_LAYOUT_CROPPED,
         relative_artifact_paths: bool = True,
         managed_review_root: Optional[Path] = None,
+        full_quality_formats: Sequence[str] = ('nrrd',),
+        cutoff: Optional[float] = None,
+        source_path: Optional[Path] = None,
+        output_root: Optional[Path] = None,
+        review_scratch_dir: Optional[Path] = None,
     ) -> None:
         self.nrrd_dir = Path(nrrd_dir)
+        self.output_root = Path(output_root) if output_root is not None else self.nrrd_dir.parent
+        self.full_quality_formats = frozenset(full_quality_formats) & {'nrrd', 'xtareview'}
+        self.write_native_nrrd = 'nrrd' in self.full_quality_formats
+        self.cutoff = 0.25 if cutoff is None else float(cutoff)
+        self.cutoff_cent = max(0, min(100, int(round(100 * self.cutoff))))
+        self._review_stage = os.environ.get('XTA_YOLO_SWEEP_XTAREVIEW_STAGE_ROOT')
+        self._review_sources_dir: Optional[Path] = None
+        self._review_temp = None
+        self._published_paths: Dict[str, Dict[str, Path]] = {}
+        self._staged_archives: List[str] = []
+        self._review_source_record: Dict[str, object] = {'confidence_threshold_exact': self.cutoff}
+        if source_path is not None:
+            source_file = Path(source_path)
+            self._review_source_record.update(path=str(source_file), source_stem=source_file.stem)
+        self._review_axial_crop = None
         self.run_id = run_id
         self.relative_artifact_paths = bool(relative_artifact_paths)
         self.managed_review_root = managed_review_root
@@ -3069,7 +3110,8 @@ class NrrdLayerSink:
         # writes eligible layer files outside this process's GIL. This sink keeps every
         # name, colour, manifest row and publication record either way.
         self.layer_file_processes = layer_file_processes
-        self.nrrd_dir.mkdir(parents=True, exist_ok=True)
+        if self.write_native_nrrd:
+            self.nrrd_dir.mkdir(parents=True, exist_ok=True)
         self.stem = str(stem)
         self.output_shape = (int(output_shape_tyx[0]), int(output_shape_tyx[1]), int(output_shape_tyx[2]))
         # ``cropped`` stores each layer's segment bounding box with a Slicer reference-extent
@@ -3097,7 +3139,9 @@ class NrrdLayerSink:
         # combined volume written at the tail. Each downbin spec gets its own
         # one-single-layer-NRRD-per-component decomposition under low_quality/<token>/nrrd/ restored
         # from the same NrrdLayerRef and submitted here as each view completes (identical scheduling).
-        self.low_quality_specs: List['LowQualityDownbinSpec'] = list(low_quality_specs or [])
+        self.low_quality_specs: List['LowQualityDownbinSpec'] = [
+            spec for spec in (low_quality_specs or ()) if self._layer_formats(spec)
+        ]
         self.low_quality_root = Path(low_quality_root) if low_quality_root is not None else None
         self._lq_manifests: Dict[str, List[Dict[str, object]]] = {}
         if self.low_quality_specs:
@@ -3106,7 +3150,22 @@ class NrrdLayerSink:
                     'low-quality NRRD specs require a low_quality_root'
                 )
             for spec in self.low_quality_specs:
-                self._lq_nrrd_dir(spec).mkdir(parents=True, exist_ok=True)
+                if 'nrrd' in self._layer_formats(spec):
+                    self._lq_nrrd_dir(spec).mkdir(parents=True, exist_ok=True)
+        if self.has_review_archives:
+            if self._review_stage:
+                self._review_sources_dir = Path(self._review_stage) / f'conf_{self.cutoff_cent:03d}' / '.layers'
+            else:
+                scratch = Path(review_scratch_dir) if review_scratch_dir is not None else None
+                if scratch is not None:
+                    scratch.mkdir(parents=True, exist_ok=True)
+                self._review_temp = tempfile.TemporaryDirectory(prefix='xta-review-layers-', dir=scratch)
+                self._review_sources_dir = Path(self._review_temp.name)
+            if 'xtareview' in self.full_quality_formats:
+                (self._review_sources_dir / 'native').mkdir(parents=True, exist_ok=True)
+            for spec in self.low_quality_specs:
+                if 'xtareview' in self._layer_formats(spec):
+                    (self._review_sources_dir / 'low_quality' / str(spec.token)).mkdir(parents=True, exist_ok=True)
         # Construct the executor only after every validating/construction-time filesystem
         # operation has succeeded. A failed mkdir can therefore never strand worker threads
         # in an object that the pipeline did not receive and cannot shut down.
@@ -3120,6 +3179,84 @@ class NrrdLayerSink:
         if self.low_quality_root is None:
             raise RuntimeError('low-quality NRRD directory requested without a low_quality_root')
         return self.low_quality_root / str(spec.token) / 'nrrd'
+
+    @staticmethod
+    def _layer_formats(spec):
+        return frozenset(getattr(spec, 'formats', ()) or ('nrrd',)) & {'nrrd', 'xtareview'}
+
+    @property
+    def has_review_archives(self):
+        return ('xtareview' in self.full_quality_formats
+                or any('xtareview' in self._layer_formats(spec) for spec in self.low_quality_specs))
+
+    def published_paths(self):
+        """Settled public output manifests and editable archives, grouped by grid."""
+        return {grid: dict(paths) for grid, paths in self._published_paths.items()}
+
+    def staged_review_grids(self):
+        return tuple(self._staged_archives)
+
+    def set_review_source(self, source_record, *, axial_crop=None):
+        if source_record is not None:
+            self._review_source_record.update(source_record)
+        self._review_axial_crop = axial_crop
+
+    def _review_layer_path(self, grid_id, basename):
+        if self._review_sources_dir is None:
+            raise RuntimeError('Review layer requested without a staging owner')
+        return self._review_sources_dir / grid_id / f'{basename}.cvol'
+
+    def _review_layer_paths(self, native, mirrors):
+        paths = {}
+        if 'xtareview' in self.full_quality_formats:
+            paths['native'] = self._review_layer_path('native', native['filename'])
+        for spec in self.low_quality_specs:
+            token = str(spec.token)
+            if token in mirrors and 'xtareview' in self._layer_formats(spec):
+                grid = f'low_quality/{token}'
+                paths[grid] = self._review_layer_path(grid, mirrors[token]['filename'])
+        return paths
+
+    def _write_review_archives(self, native, mirrors):
+        if not self.has_review_archives:
+            return
+        from .review_archive import write_review_archive
+        from .review_layer_sources import review_layers
+
+        grid_specs = []
+        if 'xtareview' in self.full_quality_formats:
+            grid_specs.append(('native', self.output_root, self.output_shape, native))
+        for spec in self.low_quality_specs:
+            if 'xtareview' in self._layer_formats(spec):
+                token = str(spec.token)
+                grid_specs.append((f'low_quality/{token}', self.low_quality_root / token,
+                                   tuple(spec.output_shape_t_y_x), mirrors.get(token, ())))
+        try:
+            for grid, public_dir, shape, entries in grid_specs:
+                if self._review_stage:
+                    path = Path(self._review_stage) / f'conf_{self.cutoff_cent:03d}' / f'{grid}.xtareview'
+                else:
+                    path = public_dir / f'{self.stem}.xtareview'
+                header = nrrd_slicer_header(shape)
+                geometry = dict(space=header['space'], directions_xyz=header['space directions'].tolist(),
+                                origin_xyz=header['space origin'].tolist())
+                review_id = self.run_id or self.stem
+                layers = review_layers(entries, [self._review_layer_path(grid, row['filename']) for row in entries],
+                                       shape, self.cutoff_cent, review_id, grid)
+                try:
+                    write_review_archive(path, review_id=review_id, grid_id=grid, shape_tyx=shape,
+                                         native_shape_tyx=self.output_shape, geometry=geometry,
+                                         cutoffs_cent=(self.cutoff_cent,), layers=layers,
+                                         source_record=self._review_source_record, axial_crop=self._review_axial_crop)
+                finally:
+                    layers.close()
+                if self._review_stage:
+                    self._staged_archives.append(grid)
+                else:
+                    self._published_paths.setdefault(grid, {})['xtareview'] = path
+        finally:
+            if self._review_temp is not None:
+                self._review_temp.cleanup()
 
     def _segment_color_for_suffix(self, unique_suffix: str) -> Tuple[float, float, float]:
         # Called with self._lock held. Deterministic palette pick keyed off the layer suffix
@@ -3244,6 +3381,7 @@ class NrrdLayerSink:
             # combined write task (write_layer_nrrd_with_low_quality_mirrors) instead of each
             # re-decoding the full-resolution layer store as an independent task.
             lq_mirror_args: List[Tuple[Tuple[int, int, int], Path]] = []
+            mirror_nrrd_paths: List[Path] = []
             lq_manifest_entries: List[Tuple[Tuple[int, int, int], Dict[str, object]]] = []
             for spec in self.low_quality_specs if mirror_low_quality else []:
                 if self.low_quality_root is None:
@@ -3255,6 +3393,8 @@ class NrrdLayerSink:
                 )
                 lq_path = self._lq_nrrd_dir(spec) / basename
                 lq_mirror_args.append((lq_shape, lq_path))
+                if 'nrrd' in self._layer_formats(spec):
+                    mirror_nrrd_paths.append(lq_path)
                 lq_manifest_entry: Dict[str, object] = {
                     'filename': lq_path.name,
                     'layer_key': getattr(ref, 'key', ''),
@@ -3293,6 +3433,9 @@ class NrrdLayerSink:
                 lq_manifest_entry.update(self._layer_provenance(ref, relative_to=self._lq_nrrd_dir(spec)))
                 self._lq_manifests.setdefault(str(spec.token), []).append(lq_manifest_entry)
                 lq_manifest_entries.append((lq_shape, lq_manifest_entry))
+            mirror_entries = {str(entry['downbin_token']): entry for _shape, entry in lq_manifest_entries}
+            review_paths = self._review_layer_paths(manifest_entry, mirror_entries)
+
             def _execute_layer_write() -> Path:
                 # This closure begins on the sink executor, so its count reflects execution
                 # time rather than submission-time queue occupancy. Record that exact value
@@ -3328,8 +3471,20 @@ class NrrdLayerSink:
                     segment_color=segment_color, z_shards=int(executed_z_shards),
                     layout=layout, raster_plan=full_plan, mirror_raster_plans=lq_plans,
                 )
+                if not self.write_native_nrrd:
+                    write_args['write_native'] = False
+                if 'native' in review_paths:
+                    write_args['native_review_path'] = review_paths['native']
+                if len(mirror_nrrd_paths) != len(lq_mirror_args):
+                    write_args['mirror_nrrd_paths'] = tuple(mirror_nrrd_paths)
+                if review_paths and lq_mirror_args:
+                    write_args['mirror_review_paths'] = {
+                        str(path): review_paths[grid]
+                        for (_shape, entry), (_mirror_shape, path) in zip(lq_manifest_entries, lq_mirror_args)
+                        if (grid := f"low_quality/{entry['downbin_token']}") in review_paths
+                    }
                 review_identity = None
-                if self.managed_review_root is not None and layout == NRRD_LAYER_LAYOUT_CROPPED:
+                if self.write_native_nrrd and self.managed_review_root is not None and layout == NRRD_LAYER_LAYOUT_CROPPED:
                     from .managed_review_source import capture_native_review_source, review_source_identity
 
                     review_identity = review_source_identity(resolved_ref, self.output_shape)
@@ -3339,7 +3494,7 @@ class NrrdLayerSink:
                 processes = self.layer_file_processes
                 remote_plans = (
                     processes.write_layer_files(write_args)
-                    if processes is not None and processes.accepts(resolved_ref, executed_z_shards)
+                    if processes is not None and not review_paths and processes.accepts(resolved_ref, executed_z_shards)
                     else None
                 )
                 if remote_plans is not None:
@@ -3377,8 +3532,7 @@ class NrrdLayerSink:
                 'run_id': self.run_id,
                 'output_shape_tyx': list(self.output_shape),
                 'native': manifest_entry,
-                'low_quality': {str(entry['downbin_token']): entry
-                                for _shape, entry in lq_manifest_entries},
+                'low_quality': mirror_entries,
                 'allocator': {
                     'requested_suffix': str(suffix),
                     'occurrence': seen + 1,
@@ -3458,12 +3612,21 @@ class NrrdLayerSink:
                         device=int(stat.st_dev), file_id=int(stat.st_ino))
         specs = {str(spec.token): spec for spec in self.low_quality_specs}
         snapshot['files'] = {
-            'native': file_identity(self.nrrd_dir / str(snapshot['native']['filename'])),
+            'native': (file_identity(self.nrrd_dir / str(snapshot['native']['filename']))
+                       if self.write_native_nrrd else None),
             'low_quality': {
                 token: file_identity(self._lq_nrrd_dir(specs[token]) / str(row['filename']))
                 for token, row in snapshot['low_quality'].items()
+                if 'nrrd' in self._layer_formats(specs[token])
             },
         }
+        if self.has_review_archives:
+            from .review_layer_sources import layer_file_identities
+
+            snapshot['files']['review'] = {
+                grid: layer_file_identities(path)
+                for grid, path in self._review_layer_paths(snapshot['native'], snapshot['low_quality']).items()
+            }
         return snapshot
 
     def wait_published_layer(
@@ -3617,10 +3780,15 @@ class NrrdLayerSink:
         with self._lock:
             manifest_layers = list(self._manifest)
             lq_manifests = {token: list(entries) for token, entries in self._lq_manifests.items()}
+        if self.has_review_archives:
+            self.wait()
+            self._write_review_archives(manifest_layers, lq_manifests)
         # one manifest per low-quality downbin decomposition, mirroring the full-quality
         # sidecar so each low-quality nrrd/ folder is self-describing and recomposable on its own.
         if self.low_quality_root is not None:
             for spec in self.low_quality_specs:
+                if 'nrrd' not in self._layer_formats(spec):
+                    continue
                 entries = lq_manifests.get(str(spec.token), [])
                 if not entries:
                     continue
@@ -3644,8 +3812,8 @@ class NrrdLayerSink:
                     'layer_count': len(entries),
                     'layers': entries,
                     'notes': [
-                        'Low-quality distribution: eligible component layers and complete checkpoints from the '
-                        'full-quality nrrd/ folder, isotropically downbinned to this spec.',
+                        'Low-quality distribution: eligible component layers and complete checkpoints '
+                        'downbinned to this grid from their full-quality logical raster.',
                         'Each NRRD is one uint8 binary mask in source output geometry (X, Y, t), downbinned.',
                         'Each file is a 3D Slicer segmentation (.seg.nrrd) sharing its full-quality layer\'s logical segment name and color; physical basenames longer than 120 characters are shortened.',
                         'Layer suffixes match the corresponding full-quality layers. Centerline removed-component and watershed-candidate audit layers are mirrored as non-recomposable downbins (diagnostic_only and none, respectively).',
@@ -3653,7 +3821,9 @@ class NrrdLayerSink:
                         *self._stored_layout_manifest_notes(),
                     ],
                 })
-        if not manifest_layers:
+                if self.relative_artifact_paths:
+                    self._published_paths.setdefault(f'low_quality/{spec.token}', {})['nrrd'] = lq_manifest_path
+        if not manifest_layers or not self.write_native_nrrd:
             return None
         manifest_path = self.nrrd_dir / f'{self.stem}_nrrd_manifest.json'
         manifest = {
@@ -3675,6 +3845,8 @@ class NrrdLayerSink:
             ],
         }
         _write_json_atomically(manifest_path, manifest)
+        if self.relative_artifact_paths:
+            self._published_paths.setdefault('native', {})['nrrd'] = manifest_path
         return manifest_path
 
 _NRRD_LAYER_SINK: Optional[NrrdLayerSink] = None
@@ -4498,6 +4670,7 @@ class LowQualityDownbinSpec:
     scale: float
     output_shape_t_y_x: Tuple[int, int, int]
     warning: str = ''
+    formats: Tuple[str, ...] = ()
 
 def _nearest_multiple_of_four(value: float) -> int:
     return max(4, int(math.floor(float(value) / 4.0 + 0.5)) * 4)
@@ -4568,7 +4741,7 @@ def resolve_low_quality_downbin_specs(
 
         # Round down when the nearest block would exceed the source dimension.
         shape = tuple(
-            min(_round_low_quality_dimension(dim * scale), max(4, dim // 4 * 4))
+            min(dim, _round_low_quality_dimension(dim * scale), max(4, dim // 4 * 4))
             for dim in (in_t, in_h, in_w)
         )
         if shape in seen_shapes:
@@ -4583,6 +4756,23 @@ def resolve_low_quality_downbin_specs(
         ))
 
     return specs, warnings
+
+
+def resolve_save_grids(
+    request: SaveRequest, source_shape_t_y_x: Tuple[int, int, int],
+) -> Tuple[List[LowQualityDownbinSpec], List[str]]:
+    """Merge requested formats when different downbins resolve to the same raster."""
+    grids: Dict[Tuple[int, int, int], LowQualityDownbinSpec] = {}
+    warnings: List[str] = []
+    for group in request.low_quality:
+        (candidate,), notes = resolve_low_quality_downbin_specs(
+            (group.downbin,), True, source_shape_t_y_x,
+        )
+        warnings.extend(notes)
+        grid = grids.get(candidate.output_shape_t_y_x, candidate)
+        formats = tuple(dict.fromkeys((*grid.formats, *group.formats)))
+        grids[candidate.output_shape_t_y_x] = dataclasses_replace(grid, formats=formats)
+    return list(grids.values()), warnings
 
 def low_quality_gpu_downbin_enabled() -> bool:
     return _env_flag('YOLO_TTA_LOW_QUALITY_GPU_DOWNBIN', True)
@@ -4825,266 +5015,165 @@ def resize_binary_mask_volume_to_shape(
     )
     return out_mm
 
-def x264_preset() -> str:
-    """The low-quality distribution contract always uses libx264 preset slow."""
-    return 'slow'
 
-def ffmpeg_h264_rgb_writer(out_path: Path, width: int, height: int, fps: float) -> subprocess.Popen:
-    return ffmpeg_rawvideo_writer(
-        out_path=out_path,
-        width=int(width),
-        height=int(height),
-        fps=float(fps),
-        pix_fmt_in='rgb24',
-        codec='libx264',
-        pix_fmt_out='yuv420p',
-        codec_args=['-preset', x264_preset()],
-    )
 
-def ffmpeg_h264_gray_writer(out_path: Path, width: int, height: int, fps: float) -> subprocess.Popen:
-    return ffmpeg_rawvideo_writer(
-        out_path=out_path,
-        width=int(width),
-        height=int(height),
-        fps=float(fps),
-        pix_fmt_in='gray',
-        codec='libx264',
-        pix_fmt_out='yuv420p',
-        codec_args=['-preset', x264_preset()],
-    )
+def _mask_grid_paths(out_dir: Path, stem: str, formats: Sequence[str]) -> Dict[str, Path]:
+    files = {
+        'images': out_dir / 'images' / f'{stem}_%04d.png',
+        'video': out_dir / f'{stem}_Overlay.mkv',
+        'binary_video': out_dir / f'{stem}_Binary.mkv',
+        'labels': out_dir / DEFAULT_LABEL_PATTERN.replace('{Filename}', stem),
+        'binary_images': out_dir / DEFAULT_BINARY_PATTERN.replace('{Filename}', stem),
+        'semantic': out_dir / DEFAULT_SEMANTIC_PATTERN.replace('{Filename}', stem),
+    }
+    return {name: files[name] for name in formats if name in files}
 
-def write_low_quality_overlay_video(
-    volume_gray: np.ndarray,
-    mask_u8: np.ndarray,
-    out_path: Path,
-    fps: float,
-    show_progress: bool = True,
-    publication_root: Optional[Path] = None,
-) -> Path:
-    t_dim, h_dim, w_dim = volume_gray.shape
-    assert mask_u8.shape == (t_dim, h_dim, w_dim)
-    stage_path, stage_dir = _atomic_publication_stage_path(
-        Path(out_path), publication_root=publication_root,
-    )
-    try:
-        proc = ffmpeg_h264_rgb_writer(stage_path, int(w_dim), int(h_dim), float(fps))
-        # reused RGB buffer + bbox-restricted blend + memoryview pipe writes.
-        frame_buf = np.empty((int(h_dim), int(w_dim), 3), dtype=np.uint8)
-        try:
-            assert proc.stdin is not None
-            for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality overlay ({out_path.name})', disable=not show_progress):
-                frame = _gray_frame_into_rgb_buffer(volume_gray[int(t)], frame_buf)
-                _overlay_blend_blue_inplace(frame, mask_u8[int(t)])
-                proc.stdin.write(memoryview(frame).cast('B'))
-        finally:
-            close_ffmpeg_writer(proc)
-        _publish_staged_file_atomically(stage_path, Path(out_path))
-    finally:
-        try:
-            stage_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        try:
-            stage_dir.rmdir()
-        except OSError:
-            pass
-    return out_path
 
-def write_low_quality_binary_video(
-    mask_u8: np.ndarray,
-    out_path: Path,
-    fps: float,
-    show_progress: bool = True,
-    publication_root: Optional[Path] = None,
-) -> Path:
-    t_dim, h_dim, w_dim = mask_u8.shape
-    stage_path, stage_dir = _atomic_publication_stage_path(
-        Path(out_path), publication_root=publication_root,
-    )
-    try:
-        proc = ffmpeg_h264_gray_writer(stage_path, int(w_dim), int(h_dim), float(fps))
-        # reused frame buffer + memoryview pipe writes; the mask volumes are
-        # 0/1, so multiply-by-255 into the buffer replaces compare+cast temporaries.
-        frame_buf = np.empty((int(h_dim), int(w_dim)), dtype=np.uint8)
-        try:
-            assert proc.stdin is not None
-            for t in tqdm(range(int(t_dim)), desc=f'Writing low-quality binary ({out_path.name})', disable=not show_progress):
-                np.multiply(np.asarray(mask_u8[int(t)]), 255, out=frame_buf)
-                proc.stdin.write(memoryview(frame_buf).cast('B'))
-        finally:
-            close_ffmpeg_writer(proc)
-        _publish_staged_file_atomically(stage_path, Path(out_path))
-    finally:
-        try:
-            stage_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        try:
-            stage_dir.rmdir()
-        except OSError:
-            pass
-    return out_path
+def _mask_grid_receipt(files: Dict[str, Path], prefix: str = '') -> Dict[str, Path]:
+    keys = {
+        'video': 'overlay', 'binary_video': 'binary_video', 'binary_images': 'binary_tiff_dir',
+        'labels': 'labels_dir', 'semantic': 'semantic_png_dir', 'images': 'images_dir',
+    }
+    return {
+        prefix + keys[name]: path if name in ('video', 'binary_video') else path.parent
+        for name, path in files.items()
+    }
 
-def low_quality_per_bin_output_workers(requested_workers: int) -> int:
-    """Number of output writer tasks launched inside one low-quality bin."""
-    default_value = max(1, min(3, int(requested_workers)))
-    return max(1, min(3, _env_int('YOLO_TTA_LOW_QUALITY_OUTPUT_WORKERS_PER_BIN', int(default_value))))
+
+def _submit_mask_grid_writers(
+    executor: ThreadPoolExecutor, files: Dict[str, Path], volume_gray: Optional[np.ndarray],
+    mask: Optional[np.ndarray], fps: float, workers: int, show_progress: bool, scratch: Path,
+    publication_root: Path,
+) -> List[Future]:
+    jobs = []
+    sequences = {
+        'binary_images': write_binary_tiff_sequence_from_pattern,
+        'labels': write_yolo_labels_from_pattern,
+        'semantic': write_semantic_png_sequence_from_pattern,
+    }
+    for name, path in files.items():
+        if name == 'images':
+            from .source_images import write_source_images_from_pattern
+            jobs.append(executor.submit(write_source_images_from_pattern, volume_gray, path, workers, show_progress))
+        elif name in sequences:
+            jobs.append(executor.submit(sequences[name], mask, path, workers, show_progress))
+        else:
+            kwargs = dict(show_progress=show_progress, scratch_dir=scratch, publication_root=publication_root)
+            if name == 'video':
+                jobs.append(executor.submit(write_overlay_video, volume_gray, mask, path, fps, **kwargs))
+            else:
+                jobs.append(executor.submit(write_binary_video_from_mask_volume, mask, path, fps, **kwargs))
+    return jobs
+
+
+def write_grid_voxel_count(mask: np.ndarray, destination: Path, *, grid: str, workers: int) -> int:
+    from .unification.tta_manifest import TTA_VOXEL_COUNT_SCHEMA
+
+    counts = np.zeros(mask.shape[0], dtype=np.int64)
+
+    def count_slice(z):
+        counts[z] = np.count_nonzero(mask[z])
+
+    parallel_for_indices(len(counts), count_slice,
+                         max_workers=choose_slice_parallel_workers(workers, len(counts)),
+                         desc='Counting voxel_volume')
+    count = int(np.sum(counts, dtype=np.int64))
+    write_json_atomic(destination, {
+        'schema': TTA_VOXEL_COUNT_SCHEMA,
+        'voxel_count': count,
+        'source_stage': 'final_output_after_all_postprocessing',
+        'target': ('native_input_space_final_binary_prediction' if grid == 'native'
+                   else 'downbinned_final_binary_prediction'),
+        'grid': grid, 'units': 'foreground_voxels', 'shape_t_y_x': list(map(int, mask.shape)),
+    })
+    return count
+
+
+def _low_quality_grid_outputs(out_dir, stem, spec, *, family_video, flat_output):
+    grid_dir = out_dir / 'low_quality' / spec.token
+    formats = tuple(f for f in spec.formats if f != 'video' or not family_video)
+    files = _mask_grid_paths(grid_dir, stem, formats)
+    if flat_output:
+        for name in ('video', 'binary_video'):
+            if name in files:
+                files[name] = out_dir / f'{files[name].stem}_LowQuality_{spec.token}.mkv'
+    prefix = f'low_quality_{spec.token}_'
+    paths = _mask_grid_receipt(files, prefix)
+    if 'voxel_volume' in formats:
+        paths[prefix + 'voxel_volume'] = grid_dir / f'{stem}_VoxelVolume.json'
+    return files, paths
+
 
 def save_single_low_quality_output(
-    *,
-    volume_gray: np.ndarray,
-    mask_u8: np.ndarray,
-    spec: LowQualityDownbinSpec,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    temp_dir: Path,
-    workers: int = 1,
+    *, volume_gray: np.ndarray, mask_u8: np.ndarray, spec: LowQualityDownbinSpec,
+    out_dir: Path, stem: str, fps: float, temp_dir: Path, workers: int = 1,
     show_progress: bool = True,
-    save_overlay: bool = True,
     stage_mask: Optional[Callable[[LowQualityDownbinSpec, np.ndarray], None]] = None,
     flat_output: bool = False,
 ) -> Dict[str, Path]:
-    """Write requested videos and optionally stage the same binary grid for a sweep."""
-    result_paths = planned_low_quality_output_paths(
-        out_dir=Path(out_dir), stem=stem, downbin_specs=(spec,),
-        save_overlay=save_overlay, flat_output=flat_output,
-    )
-    binary_path = result_paths[f'low_quality_{spec.token}_binary_video']
-    binary_path.parent.mkdir(parents=True, exist_ok=True)
-    source_t = max(1, int(mask_u8.shape[0]))
-    out_t, out_h, out_w = (
-        int(spec.output_shape_t_y_x[0]),
-        int(spec.output_shape_t_y_x[1]),
-        int(spec.output_shape_t_y_x[2]),
-    )
-    fps_lq = max(1e-6, float(fps) * float(out_t) / float(source_t))
-    print(
-        f'Low-quality downbin {spec.raw_value}: native (t,Y,X)=({source_t},{int(mask_u8.shape[1])},{int(mask_u8.shape[2])}) '
-        f'-> ({out_t},{out_h},{out_w}); playback fps adjusted {float(fps):g} -> {fps_lq:g}; '
-        f'per-bin output writer concurrency={low_quality_per_bin_output_workers(int(workers))}'
-    )
-
-    gray_lq = None
-    mask_lq = resize_binary_mask_volume_to_shape(
-        mask_u8,
-        (out_t, out_h, out_w),
-        Path(temp_dir) / 'low_quality' / spec.token / 'mask.u8.dat',
-        workers=int(workers),
-        prefer_memory=True,
-        desc=f'Low-quality mask resize {spec.token}',
-    )
+    """Resize once per requested grid and dispatch only its selected mask products."""
+    family_video = stage_mask is not None and 'video' in spec.formats
+    files, paths = _low_quality_grid_outputs(out_dir, stem, spec, family_video=family_video,
+                                           flat_output=flat_output)
+    if not paths and not family_video:
+        return {}
+    for path in files.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    shape = spec.output_shape_t_y_x
+    scratch = Path(temp_dir) / 'low_quality' / spec.token
+    gray = None
+    mask = None
     try:
-        if save_overlay:
-            gray_lq = resize_gray_volume_to_shape(
-                volume_gray,
-                (out_t, out_h, out_w),
-                Path(temp_dir) / 'low_quality' / spec.token / 'source.gray8.dat',
-                workers=int(workers),
-                prefer_memory=True,
-                desc=f'Low-quality source resize {spec.token}',
-            )
-        if stage_mask is not None:
-            stage_mask(spec, mask_lq)
-
-        def _write_lq_overlay() -> Path:
-            assert gray_lq is not None
-            return write_low_quality_overlay_video(
-                gray_lq, mask_lq, result_paths[f'low_quality_{spec.token}_overlay'], fps_lq,
-                show_progress=show_progress,
-                publication_root=out_dir,
-            )
-
-        def _write_lq_binary() -> Path:
-            return write_low_quality_binary_video(
-                mask_lq, binary_path, fps_lq,
-                show_progress=show_progress,
-                publication_root=out_dir,
-            )
-
-        # the low-quality NRRD decomposition is produced per component layer by the
-        # NrrdLayerSink as views complete, not here. Only the distribution videos are written below.
-        writer_thunks = [_write_lq_overlay, _write_lq_binary] if save_overlay else [_write_lq_binary]
-
-        writer_count = low_quality_per_bin_output_workers(int(workers))
-        if writer_count <= 1 or len(writer_thunks) == 1:
-            for thunk in writer_thunks:
-                thunk()
-        else:
-            with ThreadPoolExecutor(max_workers=int(writer_count), thread_name_prefix=f'lq-writer-{spec.token[:16]}') as executor:
-                futures = [executor.submit(thunk) for thunk in writer_thunks]
-                for fut in as_completed(futures):
-                    fut.result()
-
-        return result_paths
+        if family_video or set(files) - {'images'} or 'voxel_volume' in spec.formats:
+            mask = resize_binary_mask_volume_to_shape(mask_u8, shape, scratch / 'mask.u8.dat',
+                                                      workers=workers, desc=f'Low-quality mask {spec.token}')
+        if family_video:
+            stage_mask(spec, mask)
+        if 'video' in files or 'images' in files:
+            gray = resize_gray_volume_to_shape(volume_gray, shape, scratch / 'source.gray8.dat',
+                                                workers=workers, desc=f'Low-quality source {spec.token}')
+        if files:
+            count = max(1, min(len(files), _env_int('YOLO_TTA_LOW_QUALITY_OUTPUT_WORKERS_PER_BIN', min(workers, 3))))
+            with ThreadPoolExecutor(max_workers=count, thread_name_prefix='grid-output') as pool:
+                futures = _submit_mask_grid_writers(
+                    pool, files, gray, mask, fps * shape[0] / mask_u8.shape[0], workers,
+                    show_progress, scratch, out_dir,
+                )
+                for future in as_completed(futures):
+                    future.result()
+        if 'voxel_volume' in spec.formats:
+            write_grid_voxel_count(mask, paths[f'low_quality_{spec.token}_voxel_volume'],
+                                   grid=f'low_quality/{spec.token}', workers=workers)
+        return paths
     finally:
-        if gray_lq is not None and gray_lq is not volume_gray:
-            close_memmap_array(gray_lq)
-        if mask_lq is not mask_u8:
-            close_memmap_array(mask_lq)
+        if gray is not None and gray is not volume_gray:
+            close_memmap_array(gray)
+        if mask is not None and mask is not mask_u8:
+            close_memmap_array(mask)
+
 
 def collect_low_quality_output_futures(
-    executor: ThreadPoolExecutor,
-    *,
-    volume_gray: np.ndarray,
-    mask_u8: np.ndarray,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    downbin_specs: Sequence[LowQualityDownbinSpec],
-    temp_dir: Path,
-    workers: int = 1,
-    show_progress: bool = True,
-    save_overlay: bool = True,
+    executor: ThreadPoolExecutor, *, volume_gray: np.ndarray, mask_u8: np.ndarray,
+    out_dir: Path, stem: str, fps: float, downbin_specs: Sequence[LowQualityDownbinSpec],
+    temp_dir: Path, workers: int = 1, show_progress: bool = True,
     stage_mask: Optional[Callable[[LowQualityDownbinSpec, np.ndarray], None]] = None,
     flat_output: bool = False,
 ) -> Tuple[Dict[str, Path], List[Future]]:
-    """Submit each low-quality downbin as an independent background job."""
-    result_paths = planned_low_quality_output_paths(
-        out_dir=out_dir,
-        stem=stem,
-        downbin_specs=downbin_specs,
-        save_overlay=save_overlay,
-        flat_output=flat_output,
-    )
-    futures: List[Future] = []
-    for spec in list(downbin_specs):
-        futures.append(executor.submit(
-            save_single_low_quality_output,
-            volume_gray=volume_gray,
-            mask_u8=mask_u8,
-            out_dir=out_dir,
-            stem=stem,
-            fps=float(fps),
-            spec=spec,
-            temp_dir=temp_dir,
-            workers=int(workers),
-            show_progress=show_progress,
-            save_overlay=save_overlay,
-            stage_mask=stage_mask,
-            flat_output=flat_output,
-        ))
-    return result_paths, futures
-
-def planned_low_quality_output_paths(
-    *,
-    out_dir: Path,
-    stem: str,
-    downbin_specs: Sequence[LowQualityDownbinSpec],
-    save_overlay: bool = True,
-    flat_output: bool = False,
-) -> Dict[str, Path]:
-    """Return paths for per-bin low-quality video writers."""
-    low_root = out_dir / 'low_quality'
-    result_paths: Dict[str, Path] = {} if flat_output else {'low_quality_dir': low_root}
+    paths = {}
+    futures = []
     for spec in downbin_specs:
-        spec_dir = out_dir if flat_output else low_root / spec.token
-        overlay_path = spec_dir / f'{stem}_Overlay_LowQuality_{spec.token}.mp4'
-        binary_path = spec_dir / f'{stem}_Binary_LowQuality_{spec.token}.mp4'
-        if save_overlay:
-            result_paths[f'low_quality_{spec.token}_overlay'] = overlay_path
-        result_paths[f'low_quality_{spec.token}_binary_video'] = binary_path
-    return result_paths
+        family_video = stage_mask is not None and 'video' in spec.formats
+        _, selected = _low_quality_grid_outputs(out_dir, stem, spec, family_video=family_video,
+                                               flat_output=flat_output)
+        if selected or family_video:
+            futures.append(executor.submit(
+                save_single_low_quality_output, volume_gray=volume_gray, mask_u8=mask_u8,
+                spec=spec, out_dir=out_dir, stem=stem, fps=fps, temp_dir=temp_dir,
+                workers=workers, show_progress=show_progress, stage_mask=stage_mask,
+                flat_output=flat_output,
+            ))
+            paths.update(selected)
+    return paths, futures
 
 @dataclass
 class BackgroundOutputSubmission:
@@ -5148,82 +5237,17 @@ class BackgroundOutputManager:
             raise error
 
 def collect_pipeline_output_futures(
-    executor: ThreadPoolExecutor,
-    *,
-    volume_rgb: np.memmap,
-    mask_u8: np.ndarray,
-    out_dir: Path,
-    stem: str,
-    fps: float,
-    save_high_quality: bool,
-    save_binary_pattern_value: Optional[str],
-    save_labels_pattern_value: Optional[str],
-    save_semantic_pattern_value: Optional[str] = None,
-    tag: Optional[str] = None,
-    frame_workers: int = 1,
-    show_progress: bool = False,
-    nrrd_temp_dir: Optional[Path] = None,
+    executor: ThreadPoolExecutor, *, volume_rgb: np.ndarray, mask_u8: np.ndarray,
+    out_dir: Path, stem: str, fps: float, formats: Sequence[str], frame_workers: int,
+    scratch_dir: Path, show_progress: bool = False,
 ) -> Tuple[Dict[str, Path], List[Future]]:
-    futures: List[Future] = []
-    result_paths: Dict[str, Path] = {}
-    tag_suffix = f"_{tag}" if tag else ""
-
-    if bool(save_high_quality):
-        overlay_path = out_dir / f"{stem}_Overlay{tag_suffix}.mkv"
-        futures.append(executor.submit(
-            write_overlay_video,
-            volume_rgb,
-            mask_u8,
-            overlay_path,
-            fps,
-            show_progress=show_progress,
-            scratch_dir=nrrd_temp_dir,
-            publication_root=out_dir,
-        ))
-        result_paths["overlay"] = overlay_path
-
-    labels_pattern = _resolve_output_pattern(save_labels_pattern_value, DEFAULT_LABEL_PATTERN, out_dir, stem)
-    if labels_pattern is not None:
-        if tag is not None:
-            labels_pattern = _tag_frame_pattern(labels_pattern, tag)
-        futures.append(executor.submit(write_yolo_labels_from_pattern, mask_u8, labels_pattern, int(frame_workers), show_progress))
-        result_paths["labels_dir"] = labels_pattern.parent
-
-    binary_pattern = _resolve_output_pattern(save_binary_pattern_value, DEFAULT_BINARY_PATTERN, out_dir, stem)
-    if binary_pattern is not None:
-        if tag is not None:
-            binary_pattern = _tag_frame_pattern(binary_pattern, tag)
-        binary_video_path = out_dir / f"{stem}_Binary{tag_suffix}.mkv"
-        futures.append(executor.submit(write_binary_tiff_sequence_from_pattern, mask_u8, binary_pattern, int(frame_workers), show_progress))
-        futures.append(executor.submit(
-            write_binary_video_from_mask_volume,
-            mask_u8,
-            binary_video_path,
-            fps,
-            show_progress=show_progress,
-            scratch_dir=nrrd_temp_dir,
-            publication_root=out_dir,
-        ))
-        result_paths["binary_tiff_dir"] = binary_pattern.parent
-        result_paths["binary_video"] = binary_video_path
-
-    semantic_pattern = _resolve_output_pattern(
-        save_semantic_pattern_value, DEFAULT_SEMANTIC_PATTERN, out_dir, stem,
+    if volume_rgb.shape != mask_u8.shape:
+        raise ValueError('Source intensity and final label grids must have the same shape')
+    files = _mask_grid_paths(out_dir, stem, formats)
+    futures = _submit_mask_grid_writers(
+        executor, files, volume_rgb, mask_u8, fps, frame_workers, show_progress, scratch_dir, out_dir,
     )
-    if semantic_pattern is not None:
-        if tag is not None:
-            semantic_pattern = _tag_frame_pattern(semantic_pattern, tag)
-        futures.append(executor.submit(
-            write_semantic_png_sequence_from_pattern,
-            mask_u8,
-            semantic_pattern,
-            int(frame_workers),
-            show_progress,
-        ))
-        result_paths['semantic_png_dir'] = semantic_pattern.parent
-
-
-    return result_paths, futures
+    return _mask_grid_receipt(files), futures
 
 def _write_multichannel_tiff(path: Path, frame_hwc: np.ndarray, channel_count: int) -> None:
     """Write one uint8 grayscale TIFF page per model-input channel."""

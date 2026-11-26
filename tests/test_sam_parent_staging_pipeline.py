@@ -14,7 +14,7 @@ from XTA.view_prepare import ViewPrepareLeaseState
 from tests.test_terminal_component_refs import _function
 
 
-def submission(tmp_path, *, ready=False, staged=True, dispatch_error=False):
+def submission(tmp_path, *, ready=False, staged=True):
     view=ViewInfo(name='coronal__tta_a0',physical_view_name='coronal',family='orthogonal',
         num_slices=3,src_h=4,src_w=5,pad_mode='clamp')
     key=('model',view.name)
@@ -31,7 +31,6 @@ def submission(tmp_path, *, ready=False, staged=True, dispatch_error=False):
     executor.submit.return_value=future
     if stager is not None:
         stager.enqueue_ready.return_value=future
-    dispatch=mock.Mock(side_effect=RuntimeError('injected dispatch failure') if dispatch_error else None)
     namespace=dict(vars(pipeline))
     namespace.update(view_processing_submitted=set(),d1_view_shadow_path_by_parent={},
         baseline_union_by_model_view={key:mask},baseline_confmap_by_model_view={key:confidence},
@@ -61,17 +60,17 @@ def submission(tmp_path, *, ready=False, staged=True, dispatch_error=False):
         direct_union_backing_leases=leases.leases,
         projected_parent_output_memory={},
         view_prepare_leases=leases,parent_postprocess_executor=executor,view_processing_futures={},
-        gpu_worker_pending_task_ids=[123],_dispatch_inference_windows=dispatch,
+        gpu_worker_pending_task_ids=[123],
         view_processing_volume_shape=lambda *_args:(3,4,5),_view_uses_interpolation=lambda *_args:True)
     source=Path(pipeline.__file__).read_text(encoding='utf-8')
     _function(source,'_sam_parent_requires_staging',namespace)
     function=_function(source,
         '_submit_view_prepare',namespace)
-    return function,namespace,view,key,leases,captured,executor,future,dispatch
+    return function,namespace,view,key,leases,captured,executor,future
 
 
-def test_shared_sam_submission_defers_before_transient_prepare_and_refills(tmp_path):
-    function,ns,view,key,leases,captured,executor,_future,dispatch=submission(tmp_path)
+def test_shared_sam_submission_defers_before_transient_prepare(tmp_path):
+    function,ns,view,key,leases,captured,executor,_future=submission(tmp_path)
     function('model',view)
     task,required=captured[0]
     assert required==480  # Exact float32 confidence plus future tile/category canvases.
@@ -84,23 +83,11 @@ def test_shared_sam_submission_defers_before_transient_prepare_and_refills(tmp_p
     ns['parent_transient_admission'].reserve.assert_not_called()
     ns['_publish_parent_mask_ready'].assert_not_called()
     executor.submit.assert_not_called()
-    dispatch.assert_called_once()
-
-
-def test_dispatch_failure_after_staging_cannot_restore_or_roll_back_owned_input(tmp_path):
-    function,ns,view,key,leases,captured,executor,_future,_dispatch=submission(tmp_path,dispatch_error=True)
-    with pytest.raises(RuntimeError,match='injected dispatch failure'):
-        function('model',view)
-    assert len(captured)==1 and captured[0][0].union_mm is not None
-    assert not ns['baseline_union_by_model_view'] and not ns['baseline_confmap_by_model_view']
-    assert leases.leases[key].phase=='postprocess'
-    assert key in leases.postprocess_views and key not in leases.inference_views
-    executor.submit.assert_not_called()
 
 
 @pytest.mark.parametrize('ready,staged', [(True,True),(False,False)])
 def test_ready_parent_uses_bounded_queue_and_unstaged_parent_stays_direct(tmp_path,ready,staged):
-    function,ns,view,key,_leases,captured,executor,future,dispatch=submission(tmp_path,ready=ready,staged=staged)
+    function,ns,view,key,_leases,captured,executor,future=submission(tmp_path,ready=ready,staged=staged)
     function('model',view)
     assert not captured
     if staged:
@@ -112,11 +99,10 @@ def test_ready_parent_uses_bounded_queue_and_unstaged_parent_stays_direct(tmp_pa
     else:
         executor.submit.assert_called_once()
     assert ns['view_processing_futures']=={future:key}
-    dispatch.assert_called_once()
 
 
 def test_late_queue_failure_restores_original_dense_ownership(tmp_path):
-    function,ns,view,key,leases,_captured,executor,_future,_dispatch=submission(tmp_path,ready=True)
+    function,ns,view,key,leases,_captured,executor,_future=submission(tmp_path,ready=True)
     ns['sam_parent_staging'].enqueue_ready.side_effect = RuntimeError('queue refused')
     with pytest.raises(RuntimeError, match='queue refused'):
         function('model', view)

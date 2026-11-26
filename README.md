@@ -32,12 +32,24 @@ Use `--conf 0.50:0.10:1.00` for six operating points or
 renders each batch once and evaluates the cutoffs from one YOLO forward. With
 interpolation off, compatible view masks are backprojected together. With SDF or
 SAM, each cutoff runs its own interpolation from its own masks.
-With `--save nrrd low_quality:0.20`, open `review/manifest.json` for the
+With `--save nrrd low_quality:0.20:nrrd`, open `review/manifest.json` for the
 native and preview segmentations. Both resolutions have ordinary Slicer NRRDs
 grouped by cutoff. Each group preserves the individual layer masks.
 Requested overlay videos show how many final cutoff masks include each voxel.
 Binary outputs retain their cutoff, and `--save summary` combines the cutoff
 summaries in one file. See the [confidence sweep guide](docs/confidence_sweeps.md).
+
+TTA selects each output grid independently. For example,
+
+```text
+--save low_quality:0.20:nrrd,xtareview,video full_quality:images,labels,voxel_volume
+```
+
+This writes preview component NRRDs, an editable review archive and an overlay
+MKV. At full resolution it writes source-frame PNGs, matching YOLO label files
+and the final foreground voxel count. Bare formats select the full-resolution
+grid. Use `binary_images` for mask TIFFs and `binary_video` for a mask MKV.
+PTA and LTA use their mode-specific save options.
 
 TTA layer `.seg.nrrd` files store only each layer's segment bounding box, placed
 in the full output grid with Slicer's `Segmentation_ReferenceImageExtentOffset`
@@ -83,6 +95,7 @@ any forced label resizing.
 
 ## Guides
 
+- [Native TTA scheduler](docs/native_scheduler.md)
 - [Topology options, 2D hole filling and centerline views](docs/topology_and_cpr.md)
 - [SAM interpolation and extrapolation](docs/sam_interpolation.md)
 - [Dynamic LTA crops](docs/lta_dynamic_crops.md)

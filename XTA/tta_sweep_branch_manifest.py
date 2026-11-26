@@ -173,10 +173,24 @@ def _validated_record(sink, ref, record, *, basename_for_suffix, provenance_for_
     if set(mirrors)!=expected_tokens:
         raise ValueError('Prepublished mirrors differ from the scalar output selection')
     files=value.get('files')
-    if not isinstance(files,dict) or set(files.get('low_quality',{}))!=expected_tokens:
+    nrrd_tokens = {token for token in expected_tokens if 'nrrd' in sink._layer_formats(specs[token])}
+    if not isinstance(files,dict) or set(files.get('low_quality',{}))!=nrrd_tokens:
         raise ValueError('Prepublished layer file identities differ from its mirror rows')
     path=sink.nrrd_dir/filename
-    _check_file(path,files.get('native'))
+    if sink.write_native_nrrd:
+        _check_file(path,files.get('native'))
+    elif files.get('native') is not None:
+        raise ValueError('A native NRRD was published without a native NRRD product')
+    review_paths = sink._review_layer_paths(row, mirrors)
+    review_files = files.get('review', {})
+    if not isinstance(review_files, dict) or set(review_paths) != set(review_files):
+        raise ValueError('Prepublished layer review payloads differ from the selected grids')
+    for grid, source_path in review_paths.items():
+        identities = review_files[grid]
+        if not isinstance(identities, dict) or set(identities) != {'chunks.bin', 'index.bin', 'meta.json'}:
+            raise ValueError('Prepublished review layer is missing file identities')
+        for name, identity in identities.items():
+            _check_file(source_path / name, identity)
     for token,mirror in mirrors.items():
         _plain_token(token,'Published downbin token')
         spec=specs[token]
@@ -190,7 +204,8 @@ def _validated_record(sink, ref, record, *, basename_for_suffix, provenance_for_
                                 ('downbin_scale',float(spec.scale))):
             if mirror.get(field)!=expected:
                 raise ValueError(f'Prepublished mirror specification differs: {field}')
-        _check_file(sink._lq_nrrd_dir(spec)/filename,files['low_quality'][token])
+        if token in nrrd_tokens:
+            _check_file(sink._lq_nrrd_dir(spec)/filename,files['low_quality'][token])
     return value,path,base,occurrence,tuple(float(item) for item in color)
 
 

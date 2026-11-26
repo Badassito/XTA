@@ -237,8 +237,11 @@ def run_capture(output, targets, tta_arguments, *, pipeline=None):
     if any(not name.startswith(('azimuthal_', 'radial_')) or not name.endswith('__tta_a0')
            for name in target_set):
         raise ValueError('Capture supports only angle-zero fullframe Azimuthal/Radial runtime views')
-    if set(config.resolve_save_request(original.save).options) - {'low_quality', 'nrrd', 'summary'}:
-        raise ValueError('Capture supports only original low_quality, nrrd, summary output requests')
+    save = config.resolve_save_request(original.save)
+    if set(save.full_formats) - {'nrrd', 'summary'} or any(
+        set(grid.formats) - {'nrrd', 'video', 'binary_video'} for grid in save.low_quality
+    ):
+        raise ValueError('Capture supports native nrrd and summary, plus low-quality nrrd, video and binary_video')
     output = Path(output).expanduser().resolve()
     protected = [Path(original.input).expanduser().resolve(),
                  Path(original.output).expanduser().resolve(), ROOT]

@@ -119,6 +119,7 @@ def _qualification_environment(output: Path, *, cpu_only: bool) -> dict[str, str
         'cupy-cache': output / 'cupy-cache',
         'numba-cache': output / 'numba-cache',
         'cuda-cache': output / 'cuda-cache',
+        'native-cache': output / 'native-cache',
     }
     for directory in generated_dirs.values():
         directory.mkdir(parents=True, exist_ok=True)
@@ -128,6 +129,7 @@ def _qualification_environment(output: Path, *, cpu_only: bool) -> dict[str, str
                XTA_TEST_REPO=str(ROOT), TEMP=runtime_temp, TMP=runtime_temp,
                TMPDIR=runtime_temp, CUPY_CACHE_DIR=str(generated_dirs['cupy-cache']),
                NUMBA_CACHE_DIR=str(generated_dirs['numba-cache']),
+               XTA_NATIVE_SCHEDULER_CACHE=str(generated_dirs['native-cache']),
                CUDA_CACHE_PATH=str(generated_dirs['cuda-cache']))
     Path(env['YOLO_CONFIG_DIR']).mkdir(parents=True, exist_ok=True)
     if cpu_only:

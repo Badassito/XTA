@@ -31,7 +31,6 @@ _SWITCH_HELPERS = (
      'YOLO_TTA_GPU_SPHERICAL_BACKPROJECT', True, False),
     ('XTA.sweep_native_projection', '_tilted_row_spans_enabled', (),
      'YOLO_TTA_SWEEP_TILTED_ROW_SPANS', True, False),
-    ('XTA.tta_scheduler', '_spherical_pacing_enabled', (), 'YOLO_TTA_SPHERICAL_PACING', True, False),
 )
 # Spellings that every reader of one variable must parse the same way.
 _DIVERGENT_SPELLINGS = (('disabled', False), ('00', False), ('-0', False), ('off', False), ('1', True))

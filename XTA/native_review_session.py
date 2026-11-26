@@ -127,6 +127,8 @@ class NativeReviewSession:
         self._stale = None
         self._settled_update = None
         try:
+            if getattr(self.store, "grid_role", "native") != "native":
+                raise ValueError("Open preview archives with the full-field review editor.")
             self.shape = tuple(self.store.shape)
             self.block_shape = tuple(self.store.block_shape)
             self.chunk_shape = self.block_shape

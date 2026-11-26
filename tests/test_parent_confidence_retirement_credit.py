@@ -17,7 +17,8 @@ from XTA import assembly, confidence_evidence, pipeline
 from XTA.interpolation import _DirectUnionBackingLease
 from XTA.runtime import wait_for_retired_memmap_unlinks
 from XTA.view_prepare import AdmittedViewPrepare, ViewPrepareLeaseState
-from tests.test_tta_scheduler_boundary import _view, _scheduler, _state
+from tests.native_detector_test_support import detector_view
+from tests.native_scheduler_support import NativeRun
 from tests.test_terminal_component_refs import _function
 
 
@@ -29,7 +30,7 @@ def owned_prepare(tmp_path, callback, *, derived_alias=False):
     aliases = [scores[1:3, 2:4, 2:4]] if derived_alias else []
     task = AdmittedViewPrepare(
         admission=SimpleNamespace(reserve=lambda *_args:nullcontext()), transient_bytes=1,
-        model_name='model', view=_view(), union_mm=np.ones(shape, np.uint8),
+        model_name='model', view=detector_view(), union_mm=np.ones(shape, np.uint8),
         confmap_mm=scores, d1_shadow_path=None, union_path=tmp_path/'mask.dat',
         confmap_path=tmp_path/'scores.dat', temp_dir=tmp_path, dense_tiling_active=False,
         min_conf=0, min_radius=0, interpolation_distance=0, interpolation_walk_back=1,
@@ -104,11 +105,14 @@ def test_checkpoint_resume_rebinds_confidence_credit_to_restored_lease(tmp_path)
     state = ViewPrepareLeaseState({key:old_lease}, set(), {}, {key}, {key:2048})
     task.confidence_retired_callback_factory = lambda lease:lambda *values:events.append((lease, *values))
     task.rebind_confidence_retirement(old_lease)
+    from tests.native_sam_staging_support import NativeStagingOwner
+    native_owner = NativeStagingOwner(tmp_path, state, 4096)
     with ThreadPoolExecutor(max_workers=1) as writer:
         stage = DeferredSamParentQueue(temp_dir=tmp_path, output_dir=tmp_path/'output',
             checkpoint_executor=writer,
             prepare_executor=SimpleNamespace(submit=lambda fn,*args:queued.append((fn,args)) or Future()),
-            leases=state, dense_limit=4096, ready=lambda:ready[0])
+            leases=state, dense_limit=4096, ready=lambda:ready[0], dense_owner=native_owner)
+        native_owner.retain_for(stage)
         stage.defer(task, 2048)
         next(iter(stage.checkpoint_futures)).result()
         stage.pump()
@@ -137,19 +141,21 @@ def test_checkpoint_resume_rebinds_confidence_credit_to_restored_lease(tmp_path)
         stage.close()
 
 
-def test_early_confidence_callback_wakes_and_reopens_dense_admission(tmp_path):
+def test_early_confidence_callback_wakes_and_reopens_dense_admission():
     key = ('model', 'completed')
     lease = _DirectUnionBackingLease(key, 300, phase='postprocess')
-    state = _state()
-    state.direct_union_backing_leases[key] = lease
-    state.direct_union_postprocess_views.add(key)
-    state.direct_union_postprocess_bytes[key] = 300
-    scheduler = _scheduler(tmp_path, state=state,
-        input_overrides=dict(direct_union_total_dense_byte_limit=350))
-    pending = dict(kind='fullframe', model_name='model', view=_view(),
-        result_mode='direct_union', processing_shape=(100, 1, 1))
-    with mock.patch.object(confidence_evidence, 'confidence_evidence_enabled', return_value=False):
-        assert not scheduler.direct_union_task_admissible(pending)
+    credits = ViewPrepareLeaseState({key: lease}, set(), {}, {key}, {key: 300})
+    with NativeRun(capacity=350) as run:
+        run.declare(1, bytes=300)
+        run.prepare(1)
+        run.submit(1, 1)
+        completed, _ = run.take()
+        run.finish(completed)
+        generation = run.published(1)
+        run.consume_events()
+        run.retire(completed)
+        run.declare(2, bytes=100)
+        assert run.owner.wait_preparation(0.05) is None
         events, wake = queue.SimpleQueue(), Event()
         namespace = dict(vars(pipeline), parent_confidence_retired_events=events,
             scheduler_state=SimpleNamespace(scheduler_wake=wake))
@@ -158,11 +164,10 @@ def test_early_confidence_callback_wakes_and_reopens_dense_admission(tmp_path):
         callback(*key, 100, expected_lease=lease)
         assert wake.is_set()  # No local scheduler_wake alias has been bound.
         event_key, event_lease, nbytes = events.get_nowait()
-        credits = ViewPrepareLeaseState(state.direct_union_backing_leases,
-            state.direct_union_inference_views, state.direct_union_inference_bytes,
-            state.direct_union_postprocess_views, state.direct_union_postprocess_bytes)
         assert credits.retire_input_bytes(event_key, event_lease, nbytes, token='confidence')
-        assert scheduler.direct_union_task_admissible(pending)
+        run.owner.set_parent_remaining_bytes(1, generation, lease.nbytes)
+        run.prepare(2)
+        assert run.owner.snapshot()['bytes_used'] == 300
 
 
 @pytest.mark.parametrize('invalid_bytes', [0, -1, 300, 400])

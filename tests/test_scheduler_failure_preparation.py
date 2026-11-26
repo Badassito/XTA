@@ -1,4 +1,6 @@
 """A failed scheduler exposes its cause before joining active CPU preparation."""
+
+from tests.native_stage_test_support import native_stage_context
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, redirect_stderr
 import gc
@@ -86,7 +88,7 @@ def test_primary_error_is_flushed_before_join_and_queued_inputs_retire(tmp_path,
     alias = task.union_mm[:] if outside_alias else None
     owner = weakref.ref(task.union_mm._mmap)
     key, leases = lease_for(task)
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 1))
     monkeypatch.setattr(backprojection, 'gpu_worker_aux_interpolation_pool', lambda: None)
     resident = coordinator.try_acquire_specific_stage(torch, 0, 'SAM startup').promote_residency()

@@ -15,7 +15,8 @@ from unittest import mock
 
 import numpy as np
 
-from tests.test_tta_scheduler_boundary import _bind_callbacks, _scheduler, _state
+from tests.native_detector_test_support import detector_state
+from XTA.native_scheduler import PreparedWorkScheduler
 from tests.test_terminal_component_refs import _function
 from XTA import pipeline, publication_memory, runtime, workers
 from XTA.geometry import ViewInfo
@@ -58,104 +59,87 @@ class SphericalHostAdmissionTests(unittest.TestCase):
             self.assertIs(env['gpu_worker_direct_union_active'], enabled)
 
     def test_120_native_parents_finish_on_four_workers_with_retirement_backpressure(self):
-        state = _state()
-        tasks = native_tasks()
-        for task in tasks:
-            index = task['task_id']
-            key = ('model', task['view'].name)
-            state.gpu_worker_tasks_by_id[index] = task
-            state.fullframe_task_ids_by_parent.setdefault(key, []).append(index)
-            state.fullframe_remaining[key] = state.fullframe_remaining.get(key, 0) + 1
-        state.gpu_worker_pending_task_ids.extend(range(len(tasks)))
-        state.gpu_worker_total_tasks = len(tasks)
-        state.gpu_worker_next_dynamic_task_id = len(tasks)
-        state.gpu_task_queues.update({worker: queue.Queue() for worker in range(4)})
-        admissions, retired, used_workers, backlog = [], [], set(), []
-        peak_inference = peak_bytes = 0
+        from tests.native_scheduler_support import NativeRun
+        import time
 
-        def ensure(model, view):
-            key = (model, view.name)
-            if key in state.direct_union_backing_leases:
-                return
-            admissions.append(key)
-            state.baseline_union_paths[key] = Path('metadata-only') / view.name
-            state.direct_union_backing_leases[key] = _DirectUnionBackingLease(key, PARENT_BYTES)
-            state.direct_union_inference_views.add(key)
-            state.direct_union_inference_bytes[key] = PARENT_BYTES
-
-        def complete(task, stats):
-            key = ('model', task['view'].name)
-            state.fullframe_remaining[key] -= 1
-            if state.fullframe_remaining[key] == 0:
-                lease = state.direct_union_backing_leases[key]
-                lease.transition('inference', 'postprocess')
-                state.direct_union_inference_views.remove(key)
-                state.direct_union_inference_bytes.pop(key)
-                state.direct_union_postprocess_views.add(key)
-                state.direct_union_postprocess_bytes[key] = lease.nbytes
-
-        with tempfile.TemporaryDirectory() as td, contextlib.redirect_stdout(io.StringIO()):
-            scheduler = _scheduler(Path(td), state=state,
-                input_overrides=dict(gpu_device_count=4, imgsz=3072, v1613_d1_owner_active=True,
-                    ensure_baseline_workspaces=ensure, direct_union_inference_view_limit=4,
-                    direct_union_inference_byte_limit=128 * GIB,
-                    direct_union_total_dense_byte_limit=256 * GIB),
-                operation_overrides={'_set_main_process_gpu_pending_inference': backlog.append})
-            _bind_callbacks(scheduler, fullframe=mock.Mock(side_effect=complete))
-            scheduler.dispatch_gpu_worker_inference_window()
-            self.assertTrue(all(not q.empty() for q in state.gpu_task_queues.values()))
-            # Locality fills the same four-parent admission window with one
-            # trajectory per worker, avoiding four builds of the same QSC plan.
-            self.assertEqual(len({q.queue[0]['view'].name for q in state.gpu_task_queues.values()}), 4)
-            self.assertTrue(all(len({task['view'].name for task in q.queue}) == 1
-                                for q in state.gpu_task_queues.values()))
-            self.assertEqual(len(state.direct_union_inference_views), 4)
-            pressure_stops = 0
-            while state.gpu_worker_pending_task_ids or any(not q.empty() for q in state.gpu_task_queues.values()):
+        admitted, retired, completed = {}, set(), {}
+        seen, used_workers = set(), set()
+        peak_inference = peak_bytes = pressure_stops = 0
+        with NativeRun(capacity=256 * GIB, tickets=24, inference_capacity=128 * GIB,
+                       preparation_window=4, workers=4, window=4) as run:
+            for parent in range(120):
+                run.declare(parent, tasks=4, bytes=PARENT_BYTES)
+            deadline = time.monotonic() + 30
+            while len(seen) < 480:
+                self.assertLess(time.monotonic(), deadline, run.owner.snapshot())
                 progressed = False
-                for worker, q in state.gpu_task_queues.items():
-                    if q.empty():
-                        continue
-                    task = q.get_nowait()
-                    used_workers.add(worker)
-                    scheduler.process_one_worker_result(dict(type='result', gpu_index=worker,
-                        task_id=task['task_id'], ok=True, stats={}))
+                while (ready := run.owner.wait_preparation(0)) is not None:
+                    parent, generation = ready
+                    admitted[parent] = run.parents[parent] = generation
+                    for chunk in range(4):
+                        run.submit(parent * 4 + chunk, parent, descriptor={
+                            'family': 'spherical', 'view': parent,
+                            'slice_start': chunk * 303, 'slice_count': 303})
                     progressed = True
-                    peak_inference = max(peak_inference, len(state.direct_union_inference_views))
-                    live = sum(state.direct_union_inference_bytes.values()) + sum(state.direct_union_postprocess_bytes.values())
-                    peak_bytes = max(peak_bytes, live)
-                    self.assertLessEqual(len(state.direct_union_inference_views), 4)
-                    self.assertLessEqual(live, 256 * GIB)
+                for worker in range(4):
+                    packet = run.take(worker, timeout=0)
+                    if packet is None:
+                        continue
+                    lease, task = packet
+                    identity = (lease.parent_id, task['slice_start'], task['slice_count'])
+                    self.assertNotIn(identity, seen)
+                    seen.add(identity); used_workers.add(worker)
+                    run.finish(lease)
+                    progressed = True
+                for _kind, lease, _payload in run.consume_events():
+                    if _kind == 'final':
+                        run.owner.retire_task(lease.task_id, lease.generation)
+                while (published := run.owner.wait_publication(0)) is not None:
+                    parent, generation = published
+                    self.assertEqual(admitted[parent], generation)
+                    run.owner.adopt_postprocess(parent, generation)
+                    completed[parent] = generation
+                    progressed = True
+                state = run.owner.snapshot()
+                peak_inference = max(peak_inference, state['preparing_parents'])
+                peak_bytes = max(peak_bytes, state['bytes_used'])
+                self.assertLessEqual(state['preparing_parents'], 4)
+                self.assertLessEqual(state['bytes_used'], 256 * GIB)
                 if not progressed:
-                    pressure_stops += 1
-                    self.assertTrue(state.direct_union_postprocess_views)
-                    self.assertFalse(state.direct_union_inference_views)
-                    self.assertFalse(backlog[-1])
-                    # Finished inference does not free the native backing. Retirement
-                    # returns credit and the same scheduler can immediately dispatch.
-                    for key in list(state.direct_union_postprocess_views):
-                        lease = state.direct_union_backing_leases.pop(key)
-                        lease.release('postprocess')
-                        state.direct_union_postprocess_views.remove(key)
-                        state.direct_union_postprocess_bytes.pop(key)
-                        retired.append(key)
-                    scheduler.dispatch_gpu_worker_inference_window()
-                    self.assertTrue(any(not q.empty() for q in state.gpu_task_queues.values()))
-            for key in list(state.direct_union_postprocess_views):
-                state.direct_union_backing_leases.pop(key).release('postprocess')
-                state.direct_union_postprocess_views.remove(key)
-                state.direct_union_postprocess_bytes.pop(key)
-                retired.append(key)
-        self.assertGreater(pressure_stops, 0)
-        self.assertGreater(peak_bytes, 128 * GIB)
-        self.assertLessEqual(peak_inference, 4)
-        self.assertEqual(used_workers, set(range(4)))
-        self.assertEqual(state.gpu_worker_results_collected, 480)
-        self.assertEqual(len(set(admissions)), 120)
-        self.assertEqual(set(retired), set(admissions))
-        self.assertFalse(state.direct_union_backing_leases)
-        self.assertTrue(all(value == 0 for value in state.fullframe_remaining.values()))
-        self.assertEqual(scheduler.process_quiescence_issues(), {})
+                    if (state['blocked_parents'] and not state['active'] and not state['preparing_parents']
+                            and state['bytes_used'] + PARENT_BYTES > 256 * GIB):
+                        self.assertTrue(completed)
+                        pressure_stops += 1
+                        for parent, generation in completed.items():
+                            run.owner.retire_parent(parent, generation)
+                            retired.add(parent)
+                        completed.clear()
+                    else:
+                        time.sleep(.001)
+            # The last final can precede its publication notification.
+            while len(completed) + len(retired) < 120:
+                published = run.owner.wait_publication(2)
+                self.assertIsNotNone(published)
+                parent, generation = published
+                run.owner.adopt_postprocess(parent, generation)
+                completed[parent] = generation
+            for _kind, lease, _payload in run.consume_events():
+                if _kind == 'final':
+                    run.owner.retire_task(lease.task_id, lease.generation)
+            for parent, generation in completed.items():
+                run.owner.retire_parent(parent, generation)
+                retired.add(parent)
+            self.assertGreater(pressure_stops, 0)
+            self.assertGreater(peak_bytes, 128 * GIB)
+            self.assertLessEqual(peak_inference, 4)
+            self.assertEqual(used_workers, {0, 1, 2, 3})
+            self.assertEqual(run.owner.snapshot()['final'], 480)
+            self.assertEqual(len(admitted), 120)
+            self.assertEqual(retired, set(admitted))
+            self.assertEqual(seen, {(parent, chunk * 303, 303)
+                                   for parent in range(120) for chunk in range(4)})
+            self.assertEqual(run.owner.snapshot()['bytes_used'], 0)
+            self.assertEqual(run.owner.snapshot()['tickets_used'], 0)
 
     def test_native_dense_window_reduces_publication_budget_without_spherical_grants(self):
         reserve = publication_memory.native_fullframe_dense_reserve(native_tasks(), total_dense_limit=256 * GIB)
@@ -190,7 +174,7 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.state = _state()
+        self.state = detector_state()
         self.view = ViewInfo(name='spherical_test__tta_a0', family='spherical',
                              num_slices=4, src_h=5, src_w=6, pad_mode='clamp')
         self.shape = (4, 5, 6)
@@ -255,16 +239,21 @@ class SharedNativeWorkspaceTests(unittest.TestCase):
         gc.collect()
 
     def run_shared_worker_windows(self, memfd):
+        owner = PreparedWorkScheduler(77431, 2 * int(np.prod(self.shape)), 1)
+        self.addCleanup(owner.close)
         self.addCleanup(self.close_parent)
+        owner.declare_parent(1, 0, 2 * int(np.prod(self.shape)))
+        self.assertEqual(owner.wait_preparation(2)[0], 1)
         with mock.patch.object(runtime, 'should_use_in_memory_workspace', return_value=memfd), \
                 mock.patch.object(runtime, 'memfd_workspace_enabled', return_value=memfd), \
                 contextlib.redirect_stdout(io.StringIO()):
-            scheduler = _scheduler(self.root, state=self.state,
-                input_overrides={'ensure_baseline_workspaces': self.ensure, 'min_conf': 1.})
+            self.ensure('model', self.view)
             for start, fail in ((0, False), (2, True)):
                 task = dict(kind='fullframe', result_mode='direct_union', model_name='model',
                             view=self.view, processing_shape=self.shape, union_num_slices=4)
-                scheduler.activate_direct_union_task(task)
+                key = ('model', self.view.name)
+                task.update(result_mask_path=str(self.state.baseline_union_paths[key]),
+                            result_conf_path=str(self.state.baseline_confmap_paths[key]))
                 env = dict(vars(workers))
                 env.update(task=task, slice_count=2, slice_offset=start, processing_h=5, processing_w=6,
                     result_shape=(2, 5, 6), result_mask=None, result_conf=None, result_mask_full=None,

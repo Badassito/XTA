@@ -211,6 +211,49 @@ class SlicerEditsCutTests(unittest.TestCase):
         report = json.loads((log / "sample.result.json").read_text(encoding="utf-8"))
         self.assertEqual(report["status"], "validated_existing")
 
+    def test_archive_edits_cut_feeds_continuous_field_on_original_lattice(self):
+        from XTA.native_review_store import NativeReviewStore
+        from XTA.review_archive import ReviewLayer, write_review_archive
+        from XTA.slicer_preview_review import write_preview_edits
+
+        geometry = dict(space="left-posterior-superior", directions_xyz=np.eye(3).tolist(), origin_xyz=(0, 0, 0))
+        mask = self.canvases["sample_Global_final_output"]
+        layer = ReviewLayer(dict(logical_id="global", cutoff_cent=0, role="global",
+                                 segment_name="sample_Global_final_output"), lambda a, b: mask[a:b])
+        study = write_review_archive(
+            self.root / "study.xtareview", review_id="sample", grid_id="low_quality/test",
+            shape_tyx=self.preview_shape, native_shape_tyx=self.full_shape, geometry=geometry,
+            cutoffs_cent=(0,), layers=(layer,),
+            source_record={"source_stem": "sample", "confidence_threshold_exact": 0.333},
+        )
+        with NativeReviewStore(study) as store:
+            identity = store.identity
+        self.bundle = self.root / "archive_export"
+        write_preview_edits(self.bundle, study, identity, (layer,), edit_revision={"undo_entries": 0})
+        source_sha = digest(self.bundle / "preview.xtareview")
+        self.cut_successfully()
+        np.testing.assert_array_equal(self.read_video(), self.pixels[:, :, :6])
+        cropped = self.output / "edits" / "preview.xtareview"
+        with NativeReviewStore(cropped) as store:
+            self.assertEqual(store.shape, (4, 8, 2))
+            self.assertEqual(store.native_shape_tyx, (9, 12, 6))
+            self.assertEqual(store.axial_crop["original_preview_shape_tyx"], list(self.preview_shape))
+            self.assertEqual(store.axial_crop["original_full_quality_shape_tyx"], list(self.full_shape))
+            self.assertEqual(store.axial_crop["marker_preview_ras_exact"], ["-3/2", "-3", "1"])
+            self.assertEqual(store.axial_crop["source_edits_sha256"], source_sha)
+            self.assertEqual(store.source_record["confidence_threshold_exact"], 0.333)
+        result, _ = self.run_prepare("continuous_field")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = json.loads((self.root / "native_labels" / "preparation.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["mask"]["shape_tyx"], [9, 12, 6])
+        field = receipt["mask"]["pre_crop_mask"]["reference_provenance"]["field_manifest"]
+        self.assertEqual(field["low_shape_tyx"], list(self.preview_shape))
+        self.assertEqual(field["native_shape_tyx"], list(self.full_shape))
+        canonical = mask.copy()
+        canonical[:, :, 2:] = 0
+        self.assertEqual(field["source_binary_uint8_C_sha256"], hashlib.sha256(canonical.tobytes()).hexdigest())
+        self.assertEqual(digest(self.bundle / "preview.xtareview"), source_sha)
+
     def test_corrupt_member_does_not_publish_partial_output(self):
         path = self.bundle / self.edits["segments"][-1]["file"]
         path.write_bytes(path.read_bytes()[:-13])

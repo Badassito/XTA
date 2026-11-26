@@ -1,6 +1,8 @@
 """Untrusted completion packets cannot hand a resident model's GPU back early."""
 from __future__ import annotations
 
+from tests.native_stage_test_support import native_stage_context
+
 import json
 import queue
 from pathlib import Path
@@ -78,7 +80,7 @@ class _HostWorker:
 def _protocol(tmp_path, monkeypatch, mutate=lambda _receipt: None, *, refuse_shutdown=False):
     # Device 1 deliberately differs from the child's CUDA-local device 0.
     monkeypatch.setenv('LTA_EXECUTION_DEVICE_ID', '1')
-    coordinator = bp._MainProcessGpuStageCoordinator()
+    coordinator = bp._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     coordinator.configure_workers((0, 1))
     coordinator.set_inference_priority_active(False)
     aux = runtime._GpuWorkerAuxInterpolationPool({1: queue.SimpleQueue()})

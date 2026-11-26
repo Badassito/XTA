@@ -33,22 +33,20 @@ def _packed_path(root, cutoff, grid):
     return Path(root) / f"conf_{cutoff:03d}" / f"{grid}.packbits"
 
 
-def heatmap_input_contract(ownership, save_options, *, root, cutoff, source_shape):
+def heatmap_input_contract(ownership, expected_grids, *, root, cutoff):
     """Check the accepted scalar receipt for each requested video grid."""
     description = ownership.get("heatmap_inputs")
     grids = description.get("grids") if isinstance(description, dict) else None
     if not isinstance(grids, dict) or type(description.get("streaming_decode")) is not bool:
         raise ValueError("Scalar cutoff has no verified heatmap inputs")
-    if ("native" in grids) != ("high_quality" in save_options):
-        raise ValueError("Scalar cutoff heatmap native grid differs from --save high_quality")
-    if any(grid.startswith("low_quality/") for grid in grids) != ("low_quality" in save_options):
-        raise ValueError("Scalar cutoff heatmap preview grids differ from --save low_quality")
+    if grids.keys() != expected_grids.keys():
+        raise ValueError("Scalar cutoff heatmap grids differ from the requested video grids")
     for grid, shape in grids.items():
         path = _packed_path(root, cutoff, grid)
         if not isinstance(shape, list) or len(shape) != 3 or any(type(size) is not int or size <= 0 for size in shape):
             raise ValueError(f"Invalid dimensions for confidence heatmap grid {grid!r}")
-        if grid == "native" and shape != source_shape:
-            raise ValueError("The native confidence heatmap differs from the source geometry")
+        if tuple(shape) != expected_grids[grid]:
+            raise ValueError(f"Scalar cutoff heatmap geometry differs from the requested grid {grid!r}")
         frames, height, width = shape
         if path.is_symlink() or not path.is_file() or path.stat().st_size != frames * ((height * width + 7) // 8):
             raise ValueError(f"Scalar cutoff heatmap mask is incomplete: {path}")
@@ -198,9 +196,8 @@ def _render_heatmap(frame, gray, counts, color_contributions):
             np.copyto(frame[region], blended, where=(active != 0)[:, :, None])
 
 
-def _write_heatmap(path, packed_paths, work, inputs, shape, fps, palette, *, native, streaming_decode):
+def _write_heatmap(path, packed_paths, work, inputs, shape, fps, palette, *, streaming_decode):
     from .media import close_ffmpeg_writer, ffmpeg_rawvideo_writer
-    from .outputs import ffmpeg_h264_rgb_writer
 
     source_shape = tuple(inputs["source_shape_t_y_x"])
     frames, height, width = shape
@@ -217,12 +214,9 @@ def _write_heatmap(path, packed_paths, work, inputs, shape, fps, palette, *, nat
         ))
         frame = np.empty((height, width, 3), dtype=np.uint8)
         counts = np.empty((height, width), dtype=np.uint8)
-        if native:
-            writer = ffmpeg_rawvideo_writer(
-                path, width, height, fps, pix_fmt_in="rgb24", pix_fmt_out="bgr0",
-            )
-        else:
-            writer = ffmpeg_h264_rgb_writer(path, width, height, fps)
+        writer = ffmpeg_rawvideo_writer(
+            path, width, height, fps, pix_fmt_in="rgb24", pix_fmt_out="bgr0",
+        )
         try:
             assert writer.stdin is not None
             for gray in _gray_frames_for_grid(source, source_shape, shape):
@@ -275,11 +269,11 @@ def publish_sweep_heatmaps(root, work, inputs, grids, cutoffs, incomplete_cutoff
             else:
                 stem = Path(inputs["source"]["path"]).stem
                 token = grid.split("/", 1)[1]
-                name = f"{stem}_Heatmap_LowQuality_{token}.mp4"
+                name = f"{stem}_Heatmap_LowQuality_{token}.mkv"
             path = stage / name
             fps = max(1e-6, float(inputs["fps"]) * shape[0] / source_shape[0])
             _write_heatmap(path, paths, work, inputs, shape, fps, palette,
-                           native=native, streaming_decode=streaming_decode)
+                           streaming_decode=streaming_decode)
             with path.open("rb+") as stream:
                 os.fsync(stream.fileno())
             records.append({

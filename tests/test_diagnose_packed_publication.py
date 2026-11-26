@@ -65,9 +65,15 @@ def test_real_cold_warm_and_shared_cache_matrix(tmp_path):
         child = run['result']
         assert child['fixture_count'] == 27
         assert child['gpu_modules_imported'] == []
-        assert child['encoder_dispatcher']['signatures']
-        assert child['metadata_dispatcher']['signatures']
-        assert not any(row['objectmode'] for row in child['encoder_dispatcher']['overloads'])
+        for entry in ('encoder_callback', 'metadata_callback'):
+            callback = child[entry]
+            assert callback['compiled'] and callback['abi'] == 'cfunc'
+            assert callback['signature'] and callback['native_name']
+            if callback.get('definition_available'):
+                assert callback['unpack_tuple_occurrences'] == 0
+    cold = result['runs']['cold_threaded']['result']
+    assert cold['encoder_callback']['definition_available']
+    assert cold['metadata_callback']['definition_available']
     warm = result['runs']['warm_threaded']['result']
-    assert warm['encoder_dispatcher']['cache_hits'] != 'Counter()'
-    assert warm['metadata_dispatcher']['cache_hits'] != 'Counter()'
+    assert warm['encoder_callback']['cache_hits'] > 0
+    assert warm['metadata_callback']['cache_hits'] > 0

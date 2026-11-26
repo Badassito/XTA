@@ -5,6 +5,8 @@ task's Scratch directory before running this module on an available GPU.
 """
 from __future__ import annotations
 
+from tests.native_stage_test_support import native_stage_context
+
 import contextlib
 from dataclasses import replace
 import os
@@ -75,7 +77,7 @@ class SphericalCudaProjectionTests(unittest.TestCase):
             for packed, pressure in (
                     (packed, pressure) for packed in (False, True)
                     for pressure in (False, True)):
-                coordinator=bp._MainProcessGpuStageCoordinator()
+                coordinator=bp._MAIN_PROCESS_GPU_STAGE_COORDINATOR
                 coordinator.configure_workers([0])
                 coordinator.set_inference_priority_active(True)
                 coordinator.set_pending_inference_backlog(True)

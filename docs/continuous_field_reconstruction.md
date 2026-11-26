@@ -39,6 +39,13 @@ the compressed file hash again just before publication.
 
 ## Running it
 
+The full-field `.xtareview` editor exports an edited Global snapshot as
+`preview.xtareview` inside the edit bundle directory. Use that directory for
+`--bundle-dir` and run the helper with XTA installed or from this checkout.
+For an export of several cutoffs, select one `cut_NNN` subdirectory. The
+existing standalone NPZ bundle uses the same preparation command and can
+still run with only the helper and its field package installed.
+
 ```text
 python tools/prepare_pta_input.py SOURCE_STEM --mode continuous_field \
     --mask-source global --bundle-dir BUNDLE_DIR --source-video SOURCE_VIDEO \

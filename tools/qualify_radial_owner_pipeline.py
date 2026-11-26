@@ -39,7 +39,7 @@ def main():
         '--postprocessing','keep_objects:1','--enable_tilted','transverse','sagittal','coronal',
         '--enable_radial','transverse','sagittal','coronal','tilted_transverse','tilted_sagittal','tilted_coronal',
         '--output',str(args.output_dir),'--temp',str(args.output_dir.parent/(args.output_dir.name+'-temp')),
-        '--save','low_quality:0.20','nrrd','summary','--batch','gpu:1','--device','0',
+        '--save','low_quality:0.20:nrrd,video,binary_video','nrrd','summary','--batch','gpu:1','--device','0',
         '--quantize','gpu:fp16','--channel_format','grey','--interpolation_distance','0']
     with mock.patch.object(pipeline,'compile_physical_views',shell_views):
         pipeline.main()

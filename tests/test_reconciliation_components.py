@@ -103,6 +103,25 @@ class ReconciliationComponentTests(unittest.TestCase):
         self.assertFalse(mask.flags.c_contiguous)
         self.assert_matches_reference(mask, 1.1)
 
+    def test_wide_label_windows_preserve_absolute_frontier_coordinates(self):
+        shape = (17, 196, 210)
+        mask = np.zeros((*shape[:2], shape[2] * 2), dtype=np.uint8)[:, :, ::2]
+        for z in range(shape[0]):
+            if z not in (8, 9):
+                y, x = 20 + 4 * z, 90 - 3 * z
+                mask[z, y:y + 15, x:x + 18] = 255
+        mask[2:6, 114:121, 7:16] = 1
+
+        original_label = ndimage.label
+        with mock.patch.object(ndimage, "label", wraps=original_label) as label:
+            result = self.assert_matches_reference(mask, 7.4)
+
+        measured_label_calls = label.call_args_list[:-1]
+        self.assertEqual(result["slab_depth"], 2)
+        self.assertEqual(result["component_count"], 3)
+        self.assertEqual(len(measured_label_calls), result["slab_count"] - 1)
+        self.assertTrue(all(call.args[0].shape[1:] != shape[1:] for call in measured_label_calls))
+
     def test_counts_remain_exact_above_float_integer_precision(self):
         # Exercise the frontier's integer aggregation without allocating a
         # quadrillion-voxel fixture.

@@ -212,6 +212,28 @@ def test_final_native_connection_survives_with_actual_endpoint_masks(tmp_path):
     assert group['connectivity'] == 6
 
 
+@pytest.mark.parametrize('remove_endpoint', (True, False))
+def test_final_topology_labels_only_possible_surviving_paths(tmp_path, monkeypatch, remove_endpoint):
+    from scipy import ndimage
+    layer, final = final_fixture(tmp_path)
+    if remove_endpoint:
+        final[0] = 0
+    shapes = []
+    label = ndimage.label
+
+    def measured(array, **kwargs):
+        shapes.append(array.shape)
+        return label(array, **kwargs)
+
+    monkeypatch.setattr(ndimage, 'label', measured)
+    receipt = measure_bridge_output_survival([layer], final)[0]
+    assert shapes == ([] if remove_endpoint else [(5, 1, 1)])
+    assert receipt['connection_survival'] == ('connection_lost' if remove_endpoint else 'survived')
+    edge = receipt['group_connections'][0]['edges'][0]
+    assert edge['local_surviving_addition_voxels'] == 3
+    assert edge['endpoint_survival'][0]['retained_voxels'] == int(not remove_endpoint)
+
+
 def test_final_native_connection_handles_group_without_edges(tmp_path):
     layer, final = final_fixture(tmp_path, with_edge=False)
     receipt = measure_bridge_output_survival([layer], final)[0]

@@ -107,11 +107,14 @@ class _FakeLease:
 
 
 @pytest.fixture
-def overlap_coordinator(monkeypatch):
+def overlap_coordinator(monkeypatch, request):
     calls = []
     leases = []
-    coordinator = SimpleNamespace(_lock=__import__('threading').Lock(), _pending_inference_backlog=True,
-                                  _inference_inflight={0: 1})
+    from tests.native_stage_test_support import native_coordinator
+    coordinator = native_coordinator(request, monkeypatch)
+    coordinator.configure_workers((0,))
+    coordinator.set_pending_inference_backlog(True)
+    assert coordinator.begin_inference(0)
     def acquire(torch_mod, purpose, budget):
         calls.append((purpose, budget))
         lease = _FakeLease(budget=budget) if coordinator.free else None
@@ -120,8 +123,8 @@ def overlap_coordinator(monkeypatch):
         return lease
     coordinator.free = True
     coordinator.try_acquire_overlap_stage = acquire
-    coordinator.cancel_spherical_retirement_request = lambda purpose, failed=False: None
-    monkeypatch.setattr(backprojection, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR', coordinator)
+    # Only the GPU allocation result is controlled by these caller-budget tests;
+    # floor-priority and inference queries still read the actual native owner.
     monkeypatch.setenv('YOLO_TTA_GPU_PROJECTION_OVERLAP', '1')
     monkeypatch.setenv('YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB', '4')
     for name in ('XTA_YOLO_SWEEP_RANK_GPU_OVERLAP_GIB', 'XTA_YOLO_SWEEP_RANK_GPU_WAIT_SECONDS',
@@ -493,7 +496,7 @@ def test_radial_projector_refuses_residency_above_its_shared_slice():
 
 
 @pytest.fixture
-def pressured_coordinator(monkeypatch):
+def pressured_coordinator(monkeypatch, request):
     """A real coordinator on two fake GPUs, inference backlog and retirement pressure on."""
     monkeypatch.setattr(backprojection, 'gpu_worker_aux_interpolation_pool', lambda: None)
     for name in ('YOLO_TTA_GPU_PROJECTION_OVERLAP', 'YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB',
@@ -505,8 +508,10 @@ def pressured_coordinator(monkeypatch):
     torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 2,
         mem_get_info=lambda device: (free[int(str(device).split(':')[1])], 80 * GIB)),
         device=lambda name: name)
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    from tests.native_stage_test_support import native_coordinator, configure_stage_timing
+    coordinator = native_coordinator(request, monkeypatch)
     coordinator.configure_workers([0, 1])
+    configure_stage_timing(coordinator, expiry=1., age=.15)
     coordinator.set_pending_inference_backlog(True)
     coordinator.set_spherical_retirement_pressure(True)
     monkeypatch.setattr(backprojection, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR', coordinator)
@@ -523,7 +528,7 @@ def test_sibling_overlap_lease_never_parks_a_drained_inference_gpu(pressured_coo
     floor = 'Spherical source projection v2'
     assert coordinator.try_acquire_stage(torch, floor) is None  # device 1 is still inferring
     # Draining device 0 would park it: the floor cannot be granted it beside the sibling.
-    assert coordinator._reserved_spherical_device_locked() == 1
+    assert coordinator.snapshot()['spherical_retirement_reserved_device'] == 1
     assert coordinator.can_dispatch_inference(0) and not coordinator.can_dispatch_inference(1)
     coordinator.finish_inference(1)
     lease = coordinator.try_acquire_stage(torch, floor)
@@ -535,15 +540,20 @@ def test_sibling_overlap_lease_never_parks_a_drained_inference_gpu(pressured_coo
 
 def test_retirement_handoff_skips_an_overlap_leased_device(pressured_coordinator):
     coordinator, torch = pressured_coordinator
-    first = coordinator.try_acquire_stage(torch, 'Spherical source projection a')
-    assert first is not None
-    device = first.device_index
-    coordinator._request_spherical_retirement_turn([device], 'Spherical source projection b')
-    # Defensive: the handoff must not keep a device that holds a shared lease.
-    coordinator._overlap_leases[device] = ('Native source projection c sibling ranks', object())
+    sibling = coordinator.try_acquire_overlap_stage(torch, 'Native source projection c sibling ranks', 4 * GIB)
+    assert sibling is not None and sibling.device_index == 0
+    first = coordinator.try_acquire_specific_stage(torch, 1, 'Spherical source projection a')
+    assert first is not None and first.device_index == 1
+    # Use a valid competing owner; an exclusive and overlap lease can never
+    # coexist on one device in the native ledger.
+    assert coordinator.try_acquire_specific_stage(torch, 0, 'Spherical source projection b') is None
     first.release()
-    assert coordinator._reserved_spherical_device_locked() != device
-    assert coordinator.can_dispatch_inference(1 - device)
+    assert coordinator.snapshot()['spherical_retirement_reserved_device'] != 0
+    assert coordinator.can_dispatch_inference(0) and coordinator.can_dispatch_inference(1)
+    sibling.release()
+    following = coordinator.try_acquire_specific_stage(torch, 0, 'Spherical source projection b')
+    assert following is not None
+    following.release()
 
 
 def test_sibling_overlap_declines_while_a_floor_retirement_request_waits(pressured_coordinator):
@@ -570,17 +580,17 @@ def test_floor_too_large_for_the_slice_blocks_siblings_only_when_due_a_turn(pres
     coordinator.set_spherical_retirement_pressure(False)
     coordinator.decline_overlap(floor)
     coordinator.can_attempt_source_projection(floor)
-    assert floor in coordinator._spherical_retirement_requests
+    assert coordinator.snapshot()['spherical_retirement_request_count'] == 1
     assert not sweep_projection_cuda._floor_retirement_pending(sibling)  # not yet due a turn
     coordinator.set_spherical_retirement_pressure(True)
     assert sweep_projection_cuda._floor_retirement_pending(sibling)  # pressure: due a drain now
     coordinator.set_spherical_retirement_pressure(False)
-    expiry, devices, _first = coordinator._spherical_retirement_requests[floor]
-    coordinator._spherical_retirement_requests[floor] = (expiry, devices, __import__('time').monotonic() - 31)
+    from tests.native_stage_test_support import wait_stage
+    wait_stage(coordinator, lambda state: state['spherical_retirement_reserved_device'] is not None)
     assert sweep_projection_cuda._floor_retirement_pending(sibling)  # aged: due a drain now
-    monkeypatch.setenv('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', '0')
+    coordinator._owner.stage('policy', (1, 0))
     assert not sweep_projection_cuda._floor_retirement_pending(sibling)
-    monkeypatch.setenv('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', '0')
+    coordinator._owner.stage('policy', (0, 0))
     coordinator.set_spherical_retirement_pressure(True)
     assert not sweep_projection_cuda._floor_retirement_pending(sibling)
 
@@ -651,10 +661,11 @@ def _require_cuda():
 
 
 @pytest.fixture
-def live_inference(monkeypatch):
+def live_inference(monkeypatch, request):
     """A real coordinator with inference queued on device 0 (overlap leases only)."""
     _require_cuda()
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    from tests.native_stage_test_support import native_coordinator
+    coordinator = native_coordinator(request, monkeypatch)
     coordinator.configure_workers([0])
     coordinator.set_pending_inference_backlog(True)
     monkeypatch.setattr(backprojection, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR', coordinator)
@@ -730,9 +741,10 @@ def test_actual_medium_rank_projection_equals_cpu_sibling_path(tmp_path, monkeyp
 
 @_gpu
 @pytest.mark.parametrize('family', ['radial', 'tilted'])
-def test_actual_idle_device_uses_an_exclusive_turn(tmp_path, monkeypatch, family):
+def test_actual_idle_device_uses_an_exclusive_turn(tmp_path, monkeypatch, family, request):
     _require_cuda()
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    from tests.native_stage_test_support import native_coordinator
+    coordinator = native_coordinator(request, monkeypatch)
     coordinator.configure_workers([0])
     coordinator.set_pending_inference_backlog(False)
     coordinator.set_inference_priority_active(False)

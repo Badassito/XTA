@@ -1,4 +1,16 @@
-# Optional Intel native extensions
+# Native extensions
+
+## Required TTA scheduler
+
+`prepared_scheduler.cpp` and its headers build the required C++17
+`XTA._prepared_scheduler` extension. TTA has one native scheduler and no Python
+scheduler fallback. Wheels include the platform-specific extension; source
+launches build or reuse it in an authenticated cache outside the checkout.
+The [native scheduler guide](../docs/native_scheduler.md) describes supported
+configurations, preflight, build requirements, receipts and failure diagnostics.
+
+The Intel accelerators below remain optional and are independent of that
+required scheduler.
 
 ## QAT/QATzip gzip
 

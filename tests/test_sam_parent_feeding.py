@@ -258,10 +258,13 @@ def test_real_deferred_parent_queue_feeds_another_view_before_four_scopes_finish
     check = ManualExecutor()
     leases = lease_state()
     ready = [False]
+    from tests.native_sam_staging_support import NativeStagingOwner
+    native_owner = NativeStagingOwner(tmp_path, leases, 1000)
     with ThreadPoolExecutor(max_workers=workers) as prepare:
         stage = DeferredSamParentQueue(temp_dir=tmp_path/'temp', output_dir=tmp_path/'output',
             checkpoint_executor=check, prepare_executor=prepare, leases=leases,
-            dense_limit=1000, ready=lambda: ready[0])
+            dense_limit=1000, ready=lambda: ready[0], dense_owner=native_owner)
+        native_owner.retain_for(stage)
         tasks = [Task(index) for index in range(5)]
         for task in tasks:
             admit(leases, task, 60)

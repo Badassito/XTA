@@ -20,9 +20,9 @@ def publication(tmp_path, monkeypatch):
     calls = []
 
     @contextmanager
-    def observe(source, view, shape, work):
+    def observe(source, view, shape, work, **kwargs):
         calls.append(True)
-        with original(source, view, shape, work) as reader:
+        with original(source, view, shape, work, **kwargs) as reader:
             yield reader
 
     monkeypatch.setattr(confidence_projection, "score_projection_reader", observe)
@@ -31,7 +31,7 @@ def publication(tmp_path, monkeypatch):
     work.mkdir()
     output_shape = (2, 130, 131)
 
-    def publish(values, cutoff, *, reusable=True, streamed=False, budget=8 * 1024**2):
+    def publish(values, cutoff, *, reusable=True, streamed=False, budget=8 * 1024**2, native_boxes=None):
         cache = (SweepScoreProjection(work, sweep_id="fixture", cutoff=cutoff,
                                       floor=0, budget_bytes=budget) if reusable else None)
         run = len(list(tmp_path.glob("out-*")))
@@ -45,6 +45,7 @@ def publication(tmp_path, monkeypatch):
             return evidence.publish_confidence_scores(
                 source, view=view, model_name="model", temp_dir=tmp_path / f"scratch-{run}",
                 output_shape=output_shape, native_reader=values.__getitem__ if streamed else None,
+                native_boxes=native_boxes,
             )
         finally:
             evidence.configure_confidence_evidence(None)
@@ -72,6 +73,32 @@ def test_one_projection_and_identical_evidence_for_certified_family(publication,
             np.testing.assert_array_equal(expected.read(0, shape[0])[0], result.read(0, shape[0])[0])
     # One real projection for the family and one per baseline sibling.
     assert len(calls) == steps
+
+
+def test_telemetry_distinguishes_copies_thresholded_reuse_and_misses(publication, monkeypatch):
+    from collections import Counter
+    from XTA import runtime
+
+    _, _, publish, _ = publication
+    counters = Counter()
+    monkeypatch.setattr(runtime, "runtime_telemetry", lambda: SimpleNamespace(
+        add=lambda name, value: counters.update({name: value})))
+    floor = np.zeros((4, 260, 262), np.uint8)
+    floor[0, 3, 3] = 80
+    floor[0, 14, 16] = 190
+    publish(floor, 0)
+    publish(floor, 10)
+    stricter = floor.copy()
+    stricter[0, 3, 3] = 0
+    publish(stricter, 40)
+    stricter[0, 14, 16] = 220
+    publish(stricter, 60)
+    assert counters["confidence.floor_cache.stored.layers"] == 1
+    assert counters["confidence.score_reuse.copied.layers"] == 1
+    assert counters["confidence.score_reuse.thresholded.layers"] == 1
+    assert counters["confidence.score_reuse.native_scores_are_not_an_exact_threshold.layers"] == 1
+    assert counters["confidence.floor_cache.store_seconds"] > 0
+    assert counters["confidence.score_reuse.proof_seconds"] > 0
 
 
 @pytest.mark.parametrize("fault", ["score_changed", "ordering", "split_bin", "new_support", "missing", "modified",
@@ -129,6 +156,64 @@ def test_native_proof_reads_bounded_chunks_and_skips_empty_planes(tmp_path, monk
     assert sweep_score_reuse._threshold_for_native_scores(
         path, floor.shape, lambda z: None if z == 1 else strict[z]) == 81
     assert sweep_score_reuse._threshold_for_native_scores(path, floor.shape, lambda _: None) == 256
+
+
+def test_score_bounds_skip_proven_zero_chunks_without_changing_the_proof(tmp_path, monkeypatch):
+    monkeypatch.setattr(sweep_score_reuse, "_NATIVE_CHUNK_BYTES", 10)
+    floor = np.zeros((2, 8, 6), np.uint8)[..., ::-1]
+    floor[1, 3, 1:4] = [204, 230, 240]  # Raster offsets 19–21 straddle two chunks.
+    boxes = np.array([[0, 0, 0, 0], [3, 4, 1, 4]], np.int64)
+    reads = []
+
+    def read(z):
+        reads.append(z)
+        return floor[z]
+
+    chunks = list(sweep_score_reuse._native_chunks(floor.shape, read, boxes))
+    assert reads == [1]
+    assert [i for i, (_, values) in enumerate(chunks) if values is not None] == [6, 7]
+    original, bounded = tmp_path / 'original', tmp_path / 'bounded'
+    sweep_score_reuse._write_native_proof(original, floor.shape, read, 8192)
+    sweep_score_reuse._write_native_proof(bounded, floor.shape, read, 8192, boxes)
+    assert original.read_bytes() == bounded.read_bytes()
+
+    strict = floor.copy()
+    strict[1, 3, 1] = 0
+    for checked in (None, boxes):
+        assert sweep_score_reuse._threshold_for_native_scores(bounded, strict.shape, strict.__getitem__, checked) == 205
+    strict[0, 6, 1] = 255
+    strict_boxes = boxes.copy()
+    strict_boxes[0] = [6, 7, 1, 2]
+    assert sweep_score_reuse._threshold_for_native_scores(bounded, strict.shape, strict.__getitem__, strict_boxes) is None
+
+
+def test_bounded_score_certificate_preserves_published_evidence(publication, monkeypatch):
+    _, _, publish, calls = publication
+    visited = []
+    native_chunks = sweep_score_reuse._native_chunks
+
+    def record_bounds(shape, reader, native_boxes=None):
+        visited.append(native_boxes)
+        yield from native_chunks(shape, reader, native_boxes)
+
+    monkeypatch.setattr(sweep_score_reuse, '_native_chunks', record_bounds)
+    floor = np.zeros((4, 260, 262), np.uint8)
+    floor[1, 6, 2:4] = [180, 240]
+    strict = floor.copy()
+    strict[1, 6, 2] = 0
+    floor_bounds = np.zeros((4, 4), np.int64)
+    floor_bounds[1] = [6, 7, 2, 4]
+    strict_bounds = floor_bounds.copy()
+    strict_bounds[1, 2] = 3
+    expected = publish(strict, 90, reusable=False)
+    publish(floor, 0, native_boxes=floor_bounds)
+    count = len(calls)
+    result = publish(strict, 90, native_boxes=strict_bounds)
+    assert len(calls) == count
+    assert len(visited) == 2 and visited[0] is floor_bounds and visited[1] is strict_bounds
+    assert result.metadata == expected.metadata
+    for name in ('index.bin', 'scores.u8.zlib'):
+        assert (result.path / name).read_bytes() == (expected.path / name).read_bytes()
 
 
 @pytest.mark.parametrize("view_name", ["transverse", "sagittal", "coronal"])

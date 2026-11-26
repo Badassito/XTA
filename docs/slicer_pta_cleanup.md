@@ -3,7 +3,12 @@
 To edit native voxels directly with the same marker tools and export one cleaned
 native Global, see [Native-window cleanup in 3D Slicer](native_window_review.md).
 
-The cleanup tool transfers **deletion evidence** from edited low-quality (LQ)
+Preview `.xtareview` output opens in the full-field cutoff editor and can export
+an edited-preview archive for the `continuous_field --mask-source global`
+preparation workflow. It does not require original native layer NRRDs. See
+[review archives](native_window_review.md) and [continuous-field reconstruction](continuous_field_reconstruction.md).
+
+The legacy native-detail cleanup tool transfers **deletion evidence** from edited low-quality (LQ)
 segments onto their original full-quality (FQ) components. The original native
 voxels supply the detail. It publishes one cleaned native Global NRRD for PTA;
 it does not upscale the edited Global or regenerate the 300+ native layers.
@@ -13,7 +18,7 @@ training ground truth.
 
 ## Keep from the TTA run
 
-Preserve both original `nrrd/` and `low_quality/<bin>/nrrd/` directories,
+For native-detail deletion transfer, preserve both original `nrrd/` and `low_quality/<bin>/nrrd/` directories,
 including their `*_nrrd_manifest.json` files, and the original intensity source.
 Use FQ and LQ files from the same run. Keep the originals separate from the
 edited Slicer scene. The manifests alone cannot recover discarded FQ voxels.
@@ -139,10 +144,12 @@ Place normal **F**, **L** or **C/CC** markers over the structure and use
 **Remove Islands** or **Remove Slices** once. A marker must touch a visible
 layer at the displayed cutoff: a marker on voxels that only hidden layers or
 the Global show there changes nothing, and the status message names those
-layers. With **Scope: All Cutoffs** (the default) one click edits every cutoff
-of the visible layers:
+layers. Each visible layer qualifies through its own foreground at the marker.
+A marker can hit multiple layers. Overlap away from the marker does not select
+a layer. **Scope: All Cutoffs** (the default) can edit every cutoff of each
+layer the marker hits:
 
-- At the displayed cutoff each visible layer loses the 6-connected islands the
+- At the displayed cutoff each hit layer loses the 6-connected islands the
   marker touches, as on per-cutoff segments.
 - At stricter cutoffs it loses the same voxels.
 - At looser cutoffs, where the marked island usually joins larger regions, the
@@ -150,9 +157,10 @@ of the visible layers:
   over the union of the visible layers, ordered by the strictest cutoff that
   still shows each voxel, splits that region between the removed island and
   the foreground kept at the displayed cutoff (the union basin). Kept and
-  painted voxels win ties. This removes less than a click at that cutoff would,
-  which takes the whole island holding the marker there; display that cutoff
-  and click again to remove more.
+  painted voxels win ties. Within that basin, each hit layer can lose only
+  foreground connected to its own displayed removal through its shown or
+  looser masks. To remove the whole island that a marker hits at a looser
+  cutoff, display that cutoff and click again.
 
 **Scope: Displayed+Stricter** removes the displayed islands at the displayed
 and stricter cutoffs only. A store-backed review has no **Displayed** scope
@@ -178,8 +186,8 @@ visible layers' voxels at the displayed cutoff. The window blocks nothing;
 
 Large clicks ask first. When the islands found at the displayed cutoff,
 counted once across layers, pass 500,000 voxels, the click asks **Cancel
-(change nothing)**, the default, or **Remove them**. When the looser growth
-would remove more than 500,000 voxels beyond those, it asks **Displayed and
+(change nothing)**, the default, or **Remove them**. When the looser candidate
+region exceeds 500,000 voxels beyond those, it asks **Displayed and
 stricter cutoffs only** (the default; the Displayed+Stricter result), **Remove
 at every cutoff** or **Cancel (change nothing)**. Esc cancels. Without a main
 window the defaults apply.
@@ -340,6 +348,24 @@ store-backed review opens at the last scope chosen for a store-backed review
 open.
 
 ### Other toolbar actions
+
+**Reconcile Global** is a separate action for an editable full-field cutoff
+review. It runs Union or an explicitly selected trusted local reconciliation
+policy on the current review grid and all available cutoffs, shows added and
+removed voxel counts, and applies the result as one Global-only undo action
+after confirmation. Existing contributor masks and the meanings of **Update
+Global**, **Update Nonglobal** and **Update Both** are unchanged. Canceling the
+policy operation leaves its staged result unapplied.
+
+The initial frontend supports mask-based union and weighted/view-group
+policies. Policies requiring section geometry, observed numeric confidence or
+SAM proposal replay are refused when that frontend cannot supply the evidence.
+A preview-grid policy result is not claimed equal to native policy evaluation
+followed by downsampling. The operation checks its working-memory budget before
+copying the input snapshot; large studies may need an explicit larger budget.
+Programmatic entry is `ReconcileGlobal(policy_path, memory_mib=256)`; a headless
+caller must explicitly use `confirm=False` to apply without the count preview.
+
 
 The My Tools panel uses two rows of nine buttons. The first runs from
 **Importer** to **Remove Slices**; the second starts with **Remove Markers**,

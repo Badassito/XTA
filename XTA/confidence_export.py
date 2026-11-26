@@ -57,12 +57,15 @@ def _inside(base, relative, description):
     return path
 
 
-def retained_evidence_manifest(run_manifest):
-    path = Path(run_manifest).parent / "reconciliation_evidence" / "manifest.json"
-    if not path.is_file():
+def retained_evidence_manifest(run_manifest, *, run=None):
+    from .confidence_retention import published_confidence_manifest
+    run_manifest = Path(run_manifest)
+    run = json.loads(run_manifest.read_bytes()) if run is None else run
+    path = published_confidence_manifest(run_manifest.parent, run=run)
+    if path is None:
         raise FileNotFoundError(
-            f"Run has no retained observed-confidence catalogue at {path}. "
-            "Keep scores with --save confidence or use confidence-mode reconciliation."
+            f"Run has no retained observed-confidence catalogue in {run_manifest.parent}. "
+            "Use --save confidence to keep scores for export."
         )
     return path
 
@@ -208,7 +211,7 @@ def export_compact_evidence(run_manifest, compact_manifest, output, *, memory_mi
     if target_shape != expected:
         raise ValueError("Compact dimensions disagree with the declared pipeline downbin scale")
     plan = export_memory_plan(source_shape, target_shape, memory_mib)
-    evidence_manifest = retained_evidence_manifest(run_manifest)
+    evidence_manifest = retained_evidence_manifest(run_manifest, run=run)
     evidence = json.loads(evidence_manifest.read_text(encoding="utf-8"))
     if compact.get("run_id") != run.get("run_id") or evidence.get("run_id") != run.get("run_id"):
         raise ValueError("The compact masks, confidence evidence and run manifest come from different runs")

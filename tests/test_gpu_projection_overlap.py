@@ -9,18 +9,19 @@ import pytest
 
 from XTA import backprojection as bp
 from XTA import cuda_backend
+from tests.native_stage_test_support import native_coordinator, retire_inference_assets
 
 GIB = bp.GIB
 BUDGET = 4 * GIB
 
 
 @pytest.fixture
-def policy(monkeypatch):
+def policy(monkeypatch, request):
     monkeypatch.setattr(bp, 'gpu_worker_aux_interpolation_pool', lambda: None)
     monkeypatch.delenv('YOLO_TTA_GPU_PROJECTION_OVERLAP', raising=False)
     monkeypatch.delenv('YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB', raising=False)
     monkeypatch.delenv('YOLO_TTA_GPU_PROJECTION_OVERLAP_MARGIN_GIB', raising=False)
-    coordinator = bp._MainProcessGpuStageCoordinator()
+    coordinator = native_coordinator(request, monkeypatch)
     coordinator.configure_workers([0, 1])
     free = {0: 20 * GIB, 1: 30 * GIB}
     torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 2,
@@ -101,11 +102,20 @@ def test_resident_and_retiring_devices_are_not_shared(policy, blocker):
     coordinator, torch, _free = policy
     coordinator.set_pending_inference_backlog(True)
     if blocker == 'resident':
+        coordinator.set_pending_inference_backlog(False)
+        coordinator.set_inference_priority_active(False)
         for device in (0, 1):
-            coordinator._resident_owners[device] = dict(token=object(), purpose='TTA persistent SAM',
-                lendable=True, quarantined=False, reason='', aux_claim=None)
+            startup = coordinator.try_acquire_specific_stage(torch, device, 'TTA persistent SAM startup')
+            assert startup is not None
+            startup.promote_residency()
+        coordinator.set_pending_inference_backlog(True)
     elif blocker == 'retiring':
-        coordinator._retired_inference_devices.update({0: object(), 1: object()})
+        coordinator.set_pending_inference_backlog(False)
+        coordinator.set_inference_asset_retirement_pending(True)
+        for device in (0, 1):
+            retire_inference_assets(coordinator, device)
+        coordinator.set_inference_asset_retirement_pending(False)
+        coordinator.set_pending_inference_backlog(True)
     else:
         coordinator.set_inference_asset_retirement_pending(True)
     assert coordinator.try_acquire_overlap_stage(torch, 'Spherical source projection a', BUDGET) is None

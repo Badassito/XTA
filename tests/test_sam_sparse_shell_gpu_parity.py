@@ -1,4 +1,6 @@
 """Opt-in real GPU comparison; requires this process to own the shared GPU lock."""
+
+from tests.native_stage_test_support import native_stage_context
 import contextlib
 import hashlib
 import json
@@ -51,7 +53,7 @@ def real_gpu_owner(monkeypatch):
     assert torch.cuda.is_available(), 'Real GPU qualification cannot silently use CPU'
     for key in ('YOLO_TTA_GPU_BACKPROJECT', 'YOLO_TTA_GPU_RADIAL_BACKPROJECT', 'YOLO_TTA_GPU_SPHERICAL_BACKPROJECT'):
         monkeypatch.setenv(key, '1')
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     coordinator.configure_workers([0])
     coordinator.set_inference_priority_active(False)
     monkeypatch.setattr(backprojection, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR', coordinator)

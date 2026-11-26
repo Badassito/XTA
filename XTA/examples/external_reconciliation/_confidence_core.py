@@ -2,12 +2,8 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy import ndimage as ndi
 
-from ._morphology import candidate_window, disk
-
-
-CROSS = ndi.generate_binary_structure(2, 1)
+from ._morphology import candidate_window, grow_cores, open_disk
 
 
 def _decide_slice(candidate, score, support, direct, anchored, *, core_radius, rescue_radius):
@@ -19,12 +15,11 @@ def _decide_slice(candidate, score, support, direct, anchored, *, core_radius, r
         ((direct >= 2) & (support >= 2) & anchored & (score >= 1.1))
         | ((direct >= 3) & (support >= 3) & (score >= 2.1))
     )
-    cores = ndi.binary_opening(trusted, structure=disk(core_radius), border_value=0)
+    cores = open_disk(trusted, core_radius)
     if not np.any(cores):
         return cores
     eligible = candidate & (direct >= 1) & (support >= 1) & (score >= .65)
-    keep = ndi.binary_dilation(cores, structure=CROSS, iterations=rescue_radius, mask=eligible)
-    return keep & candidate
+    return grow_cores(cores, eligible, rescue_radius) & candidate
 
 
 def build_core_rescue():

@@ -242,7 +242,7 @@ def test_constructor_rejects_nonpositive_prepare_workers(tmp_path):
 
 @pytest.mark.parametrize('leased', [False, True])
 @pytest.mark.parametrize('cap', [1, 1000])
-def test_ready_parents_share_order_without_checkpointing_or_new_dense_grants(tmp_path, leased, cap):
+def test_ready_parents_reuse_existing_owners_or_fund_missing_ones(tmp_path, leased, cap):
     stage, writer, prepare, leases = mixed_queue(tmp_path, workers=2, cap=cap)
     parents = [ready_parent(stage, leases, tmp_path, name, family, leased=leased)
                for name, family in [('cpu', 'orthogonal'), ('gpu', 'radial'), ('later', 'spherical')]]
@@ -251,11 +251,20 @@ def test_ready_parents_share_order_without_checkpointing_or_new_dense_grants(tmp
     prior_dense = dict(leases.postprocess_bytes)
     results = []
     try:
+        if not leased and cap < owning_mask().nbytes:
+            with pytest.raises(RuntimeError, match='exceeds bounded dense limit'):
+                stage.pump(resumed_futures=caller)
+            assert not prepare.entries and not leases.leases
+            return
         resumed, _released = stage.pump(resumed_futures=caller)
         assert [key[1] for key in resumed.values()] == ['gpu', 'cpu']
         assert len(prepare.entries) == 2 and not writer.entries
         assert not stage.restore_futures and not stage.checkpoint_futures
-        assert dict(leases.postprocess_bytes) == prior_dense
+        if leased:
+            assert dict(leases.postprocess_bytes) == prior_dense
+        else:
+            assert leases.postprocess_bytes == {key: owning_mask().nbytes for key in resumed.values()}
+            assert stage._dense_owner.run.native.snapshot()['bytes_used'] == 2 * owning_mask().nbytes
         assert not parents[2][2].done() and stage.pending
         prepare.finish()
         results = [future.result() for future in resumed]

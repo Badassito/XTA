@@ -60,7 +60,8 @@ def resolve_reconciliation(args) -> ReconciliationSettings:
     return ReconciliationSettings(str(path), hashlib.sha256(content).hexdigest(), memory)
 
 
-def load_reconciliation_policy(settings: ReconciliationSettings) -> dict[str, Any]:
+def load_reconciliation_policy(settings: ReconciliationSettings, *, check_capability=None) -> dict[str, Any]:
+    """Load a trusted policy and optionally check frontend capability before validation."""
     settings.assert_unchanged()
     source = Path(settings.path).read_bytes()
     if hashlib.sha256(source).hexdigest() != settings.sha256:
@@ -79,6 +80,8 @@ def load_reconciliation_policy(settings: ReconciliationSettings) -> dict[str, An
             pass
     result = module.build_reconciliation()
     settings.assert_unchanged()
+    if check_capability is not None:
+        check_capability(result)
     validated = validate_policy(result)
     validated['proposal_policy_sha256'] = settings.sha256
     return validated

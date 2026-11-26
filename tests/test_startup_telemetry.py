@@ -4,7 +4,11 @@ import io
 import json
 import os
 from pathlib import Path
+import pickle
 import queue
+import shutil
+import subprocess
+import sys
 import weakref
 from types import SimpleNamespace
 from unittest import mock
@@ -14,6 +18,40 @@ import numpy as np
 
 from XTA import inference, media, runtime, workers
 from tests import test_worker_raster_plan_provenance as raster_helpers
+
+
+@pytest.mark.parametrize('kind, target', [
+    ('cpu', '_cpu_inference_worker_main'),
+    ('gpu', '_gpu_inference_worker_main'),
+])
+def test_bootstrap_measures_import_and_decodes_worker_config(kind, target, monkeypatch, capsys):
+    from XTA import tta_worker_bootstrap
+
+    entry = mock.Mock()
+    monkeypatch.setattr(workers, target, entry)
+    config = {'view': SimpleNamespace(name='transverse'), 'numa_affinity_cpus': (1, 3)}
+    task_channel, result_channel = object(), object()
+    tta_worker_bootstrap.start_detector_worker(
+        kind, 2, 'model', pickle.dumps(config), task_channel, result_channel)
+
+    assert entry.call_args.args == (2, 'model', config, task_channel, result_channel)
+    receipt = entry.call_args.kwargs['bootstrap_receipt']
+    assert receipt['bootstrap_wall_time_ns'] > 0 and receipt['bootstrap_monotonic_ns'] > 0
+    assert receipt['import_seconds'] >= 0 and receipt['init_decode_seconds'] >= 0
+    stdout = capsys.readouterr().out
+    assert stdout.index('bootstrap entered') < stdout.index('worker runtime imported')
+
+
+def test_runtime_versions_only_inspects_loaded_modules(monkeypatch):
+    from XTA.tta_worker_bootstrap import loaded_runtime_versions
+
+    monkeypatch.setitem(sys.modules, 'cupy', None)
+    monkeypatch.setitem(sys.modules, 'tensorrt', SimpleNamespace(__version__='0' * 200))
+    versions = loaded_runtime_versions()
+    assert versions['python'] == sys.version.split()[0]
+    assert versions['numpy'] == np.__version__
+    assert len(versions['tensorrt']) == 128
+    assert 'cupy' not in versions
 
 
 @pytest.fixture
@@ -30,6 +68,74 @@ def diagnostics(monkeypatch):
             monkeypatch.setattr(module, 'runtime_trace_event',
                                 lambda name, **fields: events.append((name, fields)))
     return telemetry, events
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_parent_kernel_reports_work_and_flush_visible_progress(diagnostics, monkeypatch, capsys, failed):
+    from XTA import pipeline
+
+    telemetry, events = diagnostics
+    monkeypatch.setattr(pipeline, 'runtime_telemetry', lambda: telemetry)
+    monkeypatch.setattr(pipeline, 'runtime_trace_event',
+                        lambda name, **fields: events.append((name, fields)))
+
+    def warm():
+        assert 'Warming parent kernel sample.' in capsys.readouterr().out
+        assert events == [('startup_parent_warmup_start', {'kernel': 'sample'})]
+        if failed:
+            raise OSError('compiler failed')
+        return {'signatures': 1}
+
+    if failed:
+        with pytest.raises(OSError, match='compiler failed'):
+            pipeline._warm_parent_kernel('sample', warm)
+    else:
+        assert pipeline._warm_parent_kernel('sample', warm)['signatures'] == 1
+    assert events[-1][0] == 'startup_parent_warmup_done'
+    assert events[-1][1]['failed'] is failed
+    outcome = 'failed' if failed else 'finished'
+    assert f'Parent kernel sample {outcome} in' in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not (shutil.which('ffmpeg') and shutil.which('ffprobe')), reason='Requires FFmpeg')
+def test_cpu_cli_warms_after_worker_registration_and_before_admission(tmp_path):
+    pytest.importorskip('openvino')
+    from tools.qualify_tta_reconciliation import create_cpu_fixtures, runtime_environment
+
+    fixture = tmp_path / 'fixture'
+    create_cpu_fixtures(fixture, size=64, frames=6)
+    telemetry = tmp_path / 'telemetry'
+    env = runtime_environment(tmp_path)
+    env.update(CUDA_VISIBLE_DEVICES='', YOLO_TTA_TASK_TRACE='1', YOLO_TTA_TELEMETRY='1',
+               YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER='0', YOLO_TTA_TELEMETRY_DIR=str(telemetry))
+    env.setdefault('XTA_NATIVE_SCHEDULER_CACHE', str(tmp_path / 'native-cache'))
+    output = tmp_path / 'output'
+    command = [sys.executable, '-X', 'utf8', '-B', '-m', 'XTA', '--mode', 'tta',
+               '--input', str(fixture / 'input.mkv'), '--model', f'cpu:{fixture / "model.xml"}',
+               '--device', 'cpu', '--quantize', 'cpu:fp32', '--batch', 'cpu:1', '--channel_format', 'gray',
+               '--imgsz', '64', '--cpu_threads', '2', '--cpu_streams', '1', '--cpu_infer_requests', '2',
+               '--conf', '.80', '--min_conf', '0', '--min_radius', '0', '--enable_cartesian', 'transverse',
+               '--output', str(output), '--temp', str(tmp_path / 'runtime'), '--save', 'voxel_volume']
+    log = tmp_path / 'startup.log'
+    with log.open('wb') as stream:
+        completed = subprocess.run(command, cwd=Path(__file__).resolve().parents[1], env=env,
+                                   stdout=stream, stderr=subprocess.STDOUT, timeout=120)
+    assert completed.returncode == 0, log.read_text(encoding='utf-8')[-4000:]
+    assert json.loads((output / 'manifest.json').read_bytes())['status'] == 'complete'
+
+    events = [event for path in telemetry.glob('*.jsonl')
+              for row in map(json.loads, path.read_bytes().splitlines()) for event in row['events']]
+    registered = next(event for event in events if event['event'] == 'startup_detector_workers_registered')
+    parent_events = sorted((event for event in events if event['pid'] == registered['pid']),
+                           key=lambda event: event['sequence'])
+    names = [event['event'] for event in parent_events]
+    assert names.index('startup_worker_spawn_done') < names.index('startup_detector_workers_registered')
+    assert names.index('startup_detector_workers_registered') < names.index('startup_parent_warmup_start')
+    assert max(i for i, name in enumerate(names) if name == 'startup_parent_warmup_done') < (
+        names.index('startup_detector_inventory_start'))
+    admission = parent_events[names.index('startup_detector_inventory_start')]['monotonic_ns']
+    dequeued = min(event['monotonic_ns'] for event in events if event['event'] == 'worker_dequeue')
+    assert admission <= dequeued
 
 
 @pytest.mark.parametrize('metadata_count', ['17', None])
@@ -107,7 +213,31 @@ def test_failed_backend_setup_preserves_fallback_and_marks_failure(diagnostics):
 
 
 @pytest.fixture
-def primed_worker(monkeypatch, diagnostics):
+def in_process_worker_io(monkeypatch):
+    """Supply descriptors to the model-startup unit without a separate actor process."""
+    from XTA import tta_worker_transport
+    from XTA.native_detector_handles import install_detector_handles
+
+    class WorkerIO:
+        def __init__(self, incoming, outgoing):
+            self.get = incoming.get
+            self.put = outgoing.put
+
+        @staticmethod
+        def materialize(task, persistent):
+            return install_detector_handles(task, persistent, {})
+
+        def installed(self, _task_id):
+            pass
+
+        def compute_done(self, _task_id):
+            pass
+
+    monkeypatch.setattr(tta_worker_transport, 'DetectorActorPort', WorkerIO)
+
+
+@pytest.fixture
+def primed_worker(monkeypatch, diagnostics, in_process_worker_io):
     telemetry, events = diagnostics
     replacements = dict(configure_pipeline_modes=None, initialize_runtime_observability=telemetry,
         set_retina_mask_processor=None, set_gpu_worker_fused_preflight_specs=None,
@@ -299,7 +429,8 @@ def test_backend_prime_channel_mismatch_is_fatal_before_ready(monkeypatch, diagn
 
 
 @pytest.mark.parametrize('fail_model', [False, True])
-def test_worker_ready_is_traced_before_send_and_never_sent_after_failed_initialization(diagnostics, fail_model):
+def test_worker_ready_is_traced_before_send_and_never_sent_after_failed_initialization(
+        diagnostics, in_process_worker_io, fail_model):
     telemetry, events = diagnostics
     incoming = queue.Queue()
     incoming.put(None)
@@ -375,25 +506,24 @@ def test_worker_ready_uuid_uses_initialized_local_device_and_keeps_logical_ident
 def test_parent_ready_identity_gauge_uses_registered_processes_and_preserves_all_devices(
         tmp_path, diagnostics, uuid):
     from XTA import tta_scheduler
-    from tests.test_tta_scheduler_boundary import _scheduler, _state
+    from tests.native_detector_test_support import DetectorRun
 
     telemetry, _events = diagnostics
-    state = _state()
-    state.gpu_task_queues.update({2: queue.Queue(), 7: queue.Queue()})
-    state.gpu_worker_processes.extend([
-        SimpleNamespace(name=f'gpu-worker-{index}', pid=1000 + index, exitcode=None)
-        for index in (2, 7)])
-    scheduler = _scheduler(tmp_path, state=state,
-                           operation_overrides={'runtime_telemetry': lambda: telemetry})
-    for index in (2, 7):
-        with mock.patch.object(tta_scheduler.time, 'monotonic_ns', return_value=100 + index):
-            scheduler.process_one_worker_result(dict(type='ready', gpu_index=index, pid=1000 + index,
-                                                     cuda_device_uuid=uuid))
-    gauge = telemetry.snapshot()['gauges']['gpu.device_identity']
-    assert gauge == dict(parent_pid=os.getpid(), sample_monotonic_ns=107, source='managed_worker_ready',
-        devices={f'cuda:{index}': dict(worker_pid=1000 + index,
-            cuda_device_uuid=uuid if isinstance(uuid, str) else None) for index in (2, 7)})
-    assert state.gpu_worker_results_collected == 0
+    with DetectorRun(tmp_path) as run, mock.patch.object(tta_scheduler, 'runtime_telemetry',
+                                                        return_value=telemetry):
+        for index in (2, 7):
+            run.worker(index, pid=1000 + index)
+        run.start_transport()
+        for index in (2, 7):
+            with mock.patch.object(tta_scheduler.time, 'monotonic_ns', return_value=100 + index):
+                run.state.gpu_result_queue.put(dict(type='ready', gpu_index=index, pid=1000 + index,
+                                                    cuda_device_uuid=uuid))
+                run.drain_until(lambda: index in run.state.gpu_worker_ready_details_by_id)
+        gauge = telemetry.snapshot()['gauges']['gpu.device_identity']
+        assert gauge == dict(parent_pid=os.getpid(), sample_monotonic_ns=107, source='managed_worker_ready',
+            devices={f'cuda:{index}': dict(worker_pid=1000 + index,
+                cuda_device_uuid=uuid if isinstance(uuid, str) else None) for index in (2, 7)})
+        assert run.state.gpu_worker_results_collected == 0
 
 
 @pytest.mark.parametrize('mutation,registered', [
@@ -402,20 +532,23 @@ def test_parent_ready_identity_gauge_uses_registered_processes_and_preserves_all
 ])
 def test_parent_ready_identity_cannot_authorize_unmanaged_or_mismatched_worker(
         tmp_path, diagnostics, mutation, registered):
-    from tests.test_tta_scheduler_boundary import _scheduler, _state
+    from XTA import tta_scheduler
+    from tests.native_detector_test_support import DetectorRun
 
     telemetry, _events = diagnostics
-    state = _state()
-    state.gpu_task_queues[2] = queue.Queue()
-    if registered:
-        state.gpu_worker_processes.append(SimpleNamespace(name='gpu-worker-2', pid=1002, exitcode=None))
-    scheduler = _scheduler(tmp_path, state=state,
-                           operation_overrides={'runtime_telemetry': lambda: telemetry})
-    message = dict(type='ready', gpu_index=2, pid=1002, cuda_device_uuid='GPU-foreign')
-    message.update(mutation)
-    scheduler.process_one_worker_result(message)
-    assert 'gpu.device_identity' not in telemetry.snapshot()['gauges']
-    assert state.gpu_worker_ready_details_by_id == {}
+    with DetectorRun(tmp_path) as run, mock.patch.object(tta_scheduler, 'runtime_telemetry',
+                                                        return_value=telemetry):
+        if registered:
+            run.worker(2, pid=1002)
+        run.start_transport()
+        message = dict(type='ready', gpu_index=2, pid=1002, cuda_device_uuid='GPU-foreign')
+        message.update(mutation)
+        run.state.gpu_result_queue.put(message)
+        assert run.state.scheduler_wake.wait(3)
+        with pytest.raises(RuntimeError, match='unregistered worker identity'):
+            run.scheduler.drain_process_inference_results()
+        assert 'gpu.device_identity' not in telemetry.snapshot()['gauges']
+        assert run.state.gpu_worker_ready_details_by_id == {}
 
 
 @pytest.mark.parametrize('fail_upload', [False, True])

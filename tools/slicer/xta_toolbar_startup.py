@@ -19,13 +19,13 @@ class XTANativeReviewIOFileReader:
         self.parent = parent
 
     def description(self):
-        return "XTA Native Review"
+        return "XTA Review"
 
     def fileType(self):
         return _FILE_TYPE
 
     def extensions(self):
-        return ["XTA Native Review (*.xtareview)"]
+        return ["XTA Review (*.xtareview)"]
 
     def canLoadFile(self, path):
         return Path(os.fsdecode(path)).suffix.lower() == ".xtareview"
@@ -41,11 +41,14 @@ class XTANativeReviewIOFileReader:
                 raise ValueError("Choose an .xtareview archive.")
             review = __main__._xta_current_native_window()
             if review is None:
-                review = __main__.OpenXTANativeReview(path)
+                review = __main__.OpenXTAReview(path)
             elif path != review.store.path:
                 raise RuntimeError("Close the current native review before opening another. "
                                    "Use CloseXTANativeReview() in the Slicer Python console.")
-            self.parent.loadedNodes = [review.node.GetID()]
+            if review is None:
+                return False
+            nodes = review.nodes if hasattr(review, "nodes") else (review.node,)
+            self.parent.loadedNodes = [node.GetID() for node in nodes]
             return True
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
             self.parent.userMessages().AddMessage(vtk.vtkCommand.ErrorEvent, str(error))

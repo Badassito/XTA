@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from XTA.native_review_flood import BasinTooLarge
+from XTA.native_review_edits import NativeReviewEdits
 from XTA.native_review_marker import stage_marker_removals
 from XTA.native_review_session import NativeReviewSession
 from tests import slicer_cutoff_store_support as support
@@ -63,6 +64,90 @@ def _baseline(module, kit, source, visible):
             visible=lid in visible, additive=meta["additive"],
         )
     return eager
+
+
+@pytest.mark.parametrize("slices", (False, True))
+@pytest.mark.parametrize("columns,transverse_hits", (([3], ()), ([9], (9,)), ([3, 17], (17,))))
+def test_marker_preserves_untouched_layer_support_and_compound_locality(tmp_path, monkeypatch, slices, columns,
+                                                                      transverse_hits):
+    module = support.load_store_module()
+    kit = support.StoreKit(module)
+    # The common priority flood is independent of the write-ownership rule.
+    def flood(priorities, markers, domain, engine="sitk"):
+        return support.flood_python(priorities, markers, domain)
+
+    monkeypatch.setattr(module, "_xta_store_flood", flood)
+    source = BranchStore(tmp_path / "review.native")
+    for i, cutoff in enumerate(source.cutoffs):
+        radial = source.masks["radial"][cutoff]
+        transverse = source.masks["cartesian"][cutoff]
+        hidden = source.masks["hidden"][cutoff]
+        derived = source.masks["derived"][cutoff]
+        radial.fill(False)
+        radial[4:7, 5:10, 2:12] = True
+        radial[4:7, 5:10, 17:22] = True
+        if not i:
+            radial[4:7, 5:10, 12:17] = True
+        transverse.fill(False)
+        transverse[4:7, 5:10, (8 if i else 5):12] = True
+        transverse[4:7, 5:10, 17:22] = True
+        hidden.fill(False)
+        hidden[5, 7, 3] = True
+        derived.fill(False)
+        source.masks["global"][cutoff] = radial | transverse | hidden
+    visible = ("radial", "cartesian")
+    eager = _baseline(module, kit, source, visible)
+    try:
+        points = np.asarray([[5, 7, x] for x in columns])
+        operation = module._xta_store_remove_slices if slices else module._xta_store_remove_islands
+        result = operation(eager, 1, points, scope="all")
+        expected_hits = ["radial", "cartesian"] if transverse_hits else ["radial"]
+        assert result["hit_layers"] == expected_hits
+        assert result["global_stale"]
+        assert kit.maps_consistent(eager) and kit.counts_consistent(eager)
+        expected = {lid: kit.full_masks(eager, lid) for lid in source.layers}
+        for i, cutoff in enumerate(source.cutoffs):
+            assert not expected["radial"][i][5, 7, columns].any()
+            assert expected["global"][i][5, 7, 3]  # Hidden support is still authoritative.
+            np.testing.assert_array_equal(expected["hidden"][i], source.masks["hidden"][cutoff])
+            if not transverse_hits:
+                np.testing.assert_array_equal(expected["cartesian"][i], source.masks["cartesian"][cutoff])
+            if 9 not in transverse_hits:
+                # The looser cutoff couples the two regions through Radial only.
+                # Hitting Transverse on the second region does not authorize a first-region write.
+                np.testing.assert_array_equal(expected["cartesian"][i][:, :, :13],
+                                              source.masks["cartesian"][cutoff][:, :, :13])
+                assert np.all(expected["global"][i][expected["cartesian"][i]])
+            for x in transverse_hits:
+                assert not expected["cartesian"][i][5, 7, x]
+        for staged in (False, True):
+            path = tmp_path / f"edit-{staged}.sqlite"
+            with NativeReviewSession(source, journal_path=path) as session:
+                if staged:
+                    got = stage_marker_removals(session, 90, points, visible_layer_ids=visible,
+                                                scope="all", editor=vars(module), remove_slices=slices)
+                else:
+                    native = NativeReviewEdits(session, editor=module)
+                    native_operation = native.remove_slices if slices else native.remove_islands
+                    got = native_operation(90, points, visible_layer_ids=visible, scope="all")
+                assert got["hit_layers"] == expected_hits and session.global_stale
+                for lid in expected:
+                    for i, cutoff in enumerate(source.cutoffs):
+                        actual = session.read_region(lid, cutoff, (0, 0, 0), source.shape)
+                        np.testing.assert_array_equal(actual, expected[lid][i])
+                assert session.undo()
+                for lid in expected:
+                    for cutoff in source.cutoffs:
+                        actual = session.read_region(lid, cutoff, (0, 0, 0), source.shape)
+                        np.testing.assert_array_equal(actual, source.masks[lid][cutoff])
+                assert session.redo()
+                for lid in expected:
+                    for i, cutoff in enumerate(source.cutoffs):
+                        actual = session.read_region(lid, cutoff, (0, 0, 0), source.shape)
+                        np.testing.assert_array_equal(actual, expected[lid][i])
+    finally:
+        eager.close()
+        support.unload_store_module(module)
 
 
 @pytest.mark.parametrize("slices,scope,k0", list(itertools.product((False, True), ("all", "stricter"), (0, 1))))

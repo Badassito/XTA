@@ -56,3 +56,24 @@ def test_frames_without_neighbors_skip_support_before_decoding(monkeypatch):
     assert not sam_policy._pair_contact(SimpleNamespace(scope={}), _group('A', range(20)), ['A'],
         _group('B', [10]), ['B'], 26)
     assert [frame for group, frame in calls if group == 'A'] == [9, 10, 11]
+
+
+@pytest.mark.parametrize('connectivity', (6, 18, 26))
+@pytest.mark.parametrize('start_y,start_x', ((4, 4), (1, 3), (9, 9), (9, 3), (0, 10)))
+def test_clipped_spatial_window_matches_canvas_with_adjacent_crops(monkeypatch, connectivity, start_y, start_x):
+    a = _group('A', [2])
+    b = _group('B', [1, 2, 3])
+    a['context_bbox_yx'] = [3, 3, 9, 9]
+    b['context_bbox_yx'] = [start_y, start_x, start_y+3, start_x+3]
+    rng = np.random.default_rng(23)
+    structure = ndimage.generate_binary_structure(3, {6: 1, 18: 2, 26: 3}[connectivity])
+    for _ in range(8):
+        first, second = np.zeros((5, 14, 14), bool), np.zeros((5, 14, 14), bool)
+        first[2, 3:9, 3:9] = rng.random((6, 6)) < .12
+        second[1:4, start_y:start_y+3, start_x:start_x+3] = rng.random((3, 3, 3)) < .16
+        def support(bundle, group, run_ids, frame, **kwargs):
+            y0, x0, y1, x1 = group['context_bbox_yx']
+            return (first if group is a else second)[frame, y0:y1, x0:x1]
+        monkeypatch.setattr(sam_policy, '_support_plane', support)
+        expected = bool(np.any(ndimage.binary_dilation(first, structure=structure) & second))
+        assert sam_policy._pair_contact(SimpleNamespace(scope={}), a, ['A'], b, ['B'], connectivity) is expected

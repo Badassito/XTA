@@ -1,6 +1,8 @@
 """Independent CPU-only checks for exact caches and concurrent SAM ownership."""
 from __future__ import annotations
 
+from tests.native_stage_test_support import native_stage_context
+
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import json
@@ -190,7 +192,7 @@ def test_compact_demands_from_different_scopes_remain_immutable_and_exact(tmp_pa
 
 
 def test_dedicated_sam_device_is_admissible_while_detector_device_stays_busy(tmp_path):
-    coordinator = backprojection._MainProcessGpuStageCoordinator()
+    coordinator = backprojection._MAIN_PROCESS_GPU_STAGE_COORDINATOR
     coordinator.configure_workers([0])
     assert coordinator.begin_inference(0)
     context = _context(tmp_path, detector_device_ids=('0',))

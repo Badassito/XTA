@@ -36,11 +36,19 @@ def _signature(path):
     }
 
 
-def _native_chunks(shape, read_native):
+def _native_chunks(shape, read_native, native_boxes=None):
     """Visit fixed-size native chunks in raster order with no dense copy."""
     plane_size = math.prod(shape[1:])
+    if native_boxes is not None:
+        from .sweep_projection import _certified_boxes
+        native_boxes = _certified_boxes(native_boxes, shape)
     for z in range(shape[0]):
-        plane = read_native(z)
+        first_possible, stop_possible = 0, plane_size
+        if native_boxes is not None:
+            top, bottom, left, right = map(int, native_boxes[z])
+            first_possible = top * shape[2] + left
+            stop_possible = (bottom - 1) * shape[2] + right if bottom > top else 0
+        plane = read_native(z) if stop_possible else None
         if plane is not None:
             plane = np.asarray(plane)
             if plane.shape != shape[1:] or plane.dtype != np.uint8:
@@ -48,14 +56,19 @@ def _native_chunks(shape, read_native):
             flat = plane.reshape(-1) if plane.flags.c_contiguous else plane.flat
         for first in range(0, plane_size, _NATIVE_CHUNK_BYTES):
             stop = min(plane_size, first + _NATIVE_CHUNK_BYTES)
-            yield stop - first, None if plane is None else flat[first:stop]
+            # The enclosing raster interval can include gaps between rows.
+            # Outside it the producer has already certified every score zero.
+            chunk = None
+            if plane is not None and first < stop_possible and first_possible < stop:
+                chunk = flat[first:stop]
+            yield stop - first, chunk
 
 
-def _write_native_proof(path, shape, read_native, limit):
+def _write_native_proof(path, shape, read_native, limit, native_boxes=None):
     """Stage a sequential certificate source optimized for whole-cutoff scans."""
     used = 0
     with path.open("wb") as stream:
-        for _, chunk in _native_chunks(shape, read_native):
+        for _, chunk in _native_chunks(shape, read_native, native_boxes):
             maximum = 0 if chunk is None else int(chunk.max(initial=0))
             minimum, encoded = 255, b""
             if maximum:
@@ -82,7 +95,7 @@ def _changed_scores(original, current):
     return largest_dropped, smallest_kept, mismatch
 
 
-def _threshold_for_native_scores(path, shape, read_native):
+def _threshold_for_native_scores(path, shape, read_native, native_boxes=None):
     """Return an exact threshold for the already masked native score arrays.
 
     Positive stricter bytes must equal the floor at the same coordinates. All
@@ -92,7 +105,7 @@ def _threshold_for_native_scores(path, shape, read_native):
     largest_dropped, smallest_kept = 0, 256
     with path.open("rb") as stream:
         file_size = os.fstat(stream.fileno()).st_size
-        for size, current in _native_chunks(shape, read_native):
+        for size, current in _native_chunks(shape, read_native, native_boxes):
             length, minimum, maximum = _NATIVE_RECORD.unpack(stream.read(_NATIVE_RECORD.size))
             if (bool(length) != bool(maximum) or (length and not 0 < minimum <= maximum)
                     or length > size + (size >> 8) + 64 or stream.tell() + length > file_size):
@@ -208,7 +221,7 @@ class SweepScoreProjection:
             self._reserved -= reserved
             self._retained += retained
 
-    def remember(self, native_shape, read_native, source, *, provenance, minimum_projected_score=1):
+    def remember(self, native_shape, read_native, source, *, provenance, minimum_projected_score=1, native_boxes=None):
         """Copy the already projected floor once, with its native score proof."""
         from .confidence_publication import copy_staged_blocks
 
@@ -240,7 +253,7 @@ class SweepScoreProjection:
                 stage.mkdir()
                 proof = stage / "native.scores"
                 proof_bytes = _write_native_proof(
-                    proof, native_shape, read_native, reserved - source_bytes - allowance)
+                    proof, native_shape, read_native, reserved - source_bytes - allowance, native_boxes)
                 copy_staged_blocks(source.path, projected)
                 if files != _signature(source.path):
                     return "floor_evidence_changed"
@@ -265,7 +278,7 @@ class SweepScoreProjection:
         return "stored"
 
     @contextmanager
-    def reuse(self, native_shape, read_native, shape, *, model_name, layer_key, provenance, metrics):
+    def reuse(self, native_shape, read_native, shape, *, model_name, layer_key, provenance, metrics, native_boxes=None):
         """Reuse numeric max only after establishing equal projected bytes."""
         from .confidence_evidence import ConfidenceEvidenceRef
 
@@ -298,7 +311,7 @@ class SweepScoreProjection:
                     or (projected.model_name, projected.layer_key) != (str(model_name), str(layer_key))):
                 raise ValueError("Floor score cache differs from the requested layer")
             started = time.perf_counter()
-            threshold = _threshold_for_native_scores(proof, native_shape, read_native)
+            threshold = _threshold_for_native_scores(proof, native_shape, read_native, native_boxes)
             metrics["score_reuse_proof_seconds"] = time.perf_counter() - started
             if proof_identity != _stamp(proof.stat()):
                 raise ValueError("Floor native scores changed during certification")

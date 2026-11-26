@@ -140,32 +140,40 @@ class RuntimeTaskTraceTests(unittest.TestCase):
         self.assertEqual([outgoing.get()['task_id'], outgoing.get()['task_id']], [8, 7])
         self.assertFalse(namespace['pending_publications'])
 
-    def test_scheduler_dispatch_receipt_and_compute_credit_have_distinct_events(self):
-        from XTA import tta_scheduler
-        from tests.test_tta_scheduler_boundary import _scheduler, _state, _view, _bind_callbacks
-        state, events = _state(), []
-        task = dict(task_id=3, view=_view(), kind='fullframe', model_name='model',
-                    slice_start=0, slice_count=3, result_mode='file', gpu_eligible=True)
-        state.gpu_worker_tasks_by_id[3] = task
-        state.gpu_worker_pending_task_ids.append(3)
-        state.gpu_task_queues[1] = queue.Queue()
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(tta_scheduler, 'runtime_trace_event',
-                    side_effect=lambda event, **fields: events.append((event, fields))):
-            scheduler = _scheduler(Path(directory), state=state)
-            _bind_callbacks(scheduler)
-            scheduler.dispatch_gpu_worker_inference_window()
-            dispatched = state.gpu_task_queues[1].get_nowait()
-            self.assertEqual(dispatched['task_id'], 3)
-            state.gpu_result_queue = queue.Queue()
-            state.gpu_result_queue.put(dict(type='compute_released', task_id=3, gpu_index=1, ok=True, stats={}))
-            state.gpu_result_queue.put(dict(type='result', task_id=3, gpu_index=1, ok=True, stats={}))
-            scheduler.drain_process_inference_results()
-        self.assertEqual([event for event, _ in events],
-            ['scheduler_dispatch', 'scheduler_compute_released', 'scheduler_result_received',
-             'scheduler_message_handled', 'scheduler_result_handled'])
-        self.assertTrue(all(fields['device'] == 'cuda:1' for _, fields in events))
-        self.assertEqual(state.gpu_worker_results_collected, 1)
+    def test_native_dispatch_and_compute_credit_precede_scientific_result_trace(self):
+        from tests.native_detector_test_support import DetectorRun, detector_view
+        first = dict(task_id=3, view=detector_view(), kind='fullframe', model_name='model',
+                     slice_start=0, slice_count=3, result_mode='file', gpu_eligible=True)
+        second = dict(first, task_id=4, slice_start=3)
+        with tempfile.TemporaryDirectory() as directory, DetectorRun(Path(directory)) as run:
+            telemetry = self.telemetry(directory)
+            with mock.patch.dict(os.environ, {'YOLO_TTA_TASK_TRACE': '1'}), \
+                    mock.patch.object(runtime, 'runtime_telemetry', return_value=telemetry):
+                actor = run.worker(1)
+                run.start_transport()
+                run.declare(first, second)
+
+                def submitted():
+                    snapshot = run.native.snapshot()
+                    return snapshot['ready'] or snapshot['dispatched']
+
+                run.drain_until(submitted)
+                self.assertEqual(run.take(1)['task_id'], 3)
+                actor.installed(3)
+                actor.compute_done(3)
+                self.assertEqual(run.take(1)['task_id'], 4)
+                self.assertEqual(run.native.snapshot()['final'], 0)
+                actor.installed(4)
+                actor.compute_done(4)
+                for task_id in (3, 4):
+                    actor.put(dict(type='result', task_id=task_id, gpu_index=1, ok=True, stats={}))
+                run.drain_until(lambda: run.state.gpu_worker_results_collected == 2)
+            stages = [event for event in telemetry.snapshot()['events']
+                      if event['event'] in {'scheduler_result_received', 'scheduler_result_handled'}]
+        self.assertEqual([(fields['event'], fields['task_id']) for fields in stages],
+            [('scheduler_result_received', 3), ('scheduler_result_handled', 3),
+             ('scheduler_result_received', 4), ('scheduler_result_handled', 4)])
+        self.assertTrue(all(fields['device'] == 'cuda:1' for fields in stages))
 
 
 class PipelineTraceJoinTests(unittest.TestCase):

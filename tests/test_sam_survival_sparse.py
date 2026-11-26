@@ -48,14 +48,14 @@ def test_native_crops_match_counts_without_dense_reads_and_validate_planes_once(
     final = np.ones_like(value)
     final[0, 2, 1] = 0
     reads = []
-    original_any = np.any
+    original_max = np.max
 
-    def observed_any(array, *args, **kwargs):
+    def observed_max(array, *args, **kwargs):
         if isinstance(array, np.ndarray) and array.shape == final.shape[1:]:
             reads.append(array.shape)
-        return original_any(array, *args, **kwargs)
+        return original_max(array, *args, **kwargs)
 
-    monkeypatch.setattr(np, 'any', observed_any)
+    monkeypatch.setattr(np, 'max', observed_max)
     monkeypatch.setattr(RuntimeLayer, 'read_slab', lambda *_a: pytest.fail('dense support read'))
     other = replace(layer, key='backward', interpolation_direction='backward')
     receipts = tta_outputs.measure_bridge_output_survival([layer, other, layer], final)
@@ -94,6 +94,20 @@ def test_empty_extent_preserves_untouched_validation_domain(tmp_path, monkeypatc
     assert item['selected_voxels'] == item['retained_voxels'] == 0
     assert item['source_grid_planes_read'] == item['final_binary_validation_planes'] == 0
     assert item['support_read_strategy'] == 'empty_extent'
+
+
+def test_strided_boolean_output_needs_no_binary_range_scan(tmp_path, monkeypatch):
+    layer, value = sparse_layer(tmp_path)
+    final = value.astype(bool)[:, :, ::-1]
+    original_max = np.max
+
+    def check(array, *args, **kwargs):
+        assert not (isinstance(array, np.ndarray) and array.shape == final.shape[1:])
+        return original_max(array, *args, **kwargs)
+    monkeypatch.setattr(np, 'max', check)
+    item = tta_outputs.measure_bridge_output_survival([layer], final)[0]
+    assert item['final_binary_validation_planes'] == final.shape[0]
+    assert item['retained_voxels'] == np.count_nonzero(value & final)
 
 
 @pytest.mark.parametrize('output_shape', ((7, 9, 13), (3, 4, 6)))
