@@ -125,7 +125,7 @@ def test_actual_submission_exclusions_never_reduce_the_reservation(production, m
         source_bytes=math.prod(output), capture_shape=native,
         input_T=output[0], input_H=output[1], input_W=output[2],
         capture_workspace_bytes=0,
-        component_layers_needed=True, dense_tiling_active=False,
+        component_layers_needed=True, tiling_active=False,
         preinterpolation_layer_already_published=False, key=key,
         direct_union_backing_leases={key: object()}, confmap_mm=object(),
         parent_slice_postprocess_workers=1, angle_variant_streaming_cleanup_active=True,
@@ -134,7 +134,7 @@ def test_actual_submission_exclusions_never_reduce_the_reservation(production, m
         terminal_native_source_packing_eligible=terminal_native_source_packing_eligible,
         _parent_prepare_transient_bytes=helper,
         _view_uses_interpolation=lambda view, distance: distance > 0)
-    if change == 'tiles': namespace['dense_tiling_active'] = True
+    if change == 'tiles': namespace['tiling_active'] = True
     if change == 'prepublished': namespace['preinterpolation_layer_already_published'] = True
     if change == 'no_layers': namespace['component_layers_needed'] = False
     if change == 'no_callback': namespace['direct_union_backing_leases'] = {}
@@ -159,7 +159,7 @@ def test_actual_submission_reduces_only_the_shared_predicate_terminal_path(produ
     namespace = dict(math=math, view=view(), processing_bytes=math.prod(native), source_bytes=math.prod(output),
         capture_shape=native, input_T=output[0], input_H=output[1], input_W=output[2],
         capture_workspace_bytes=117, component_layers_needed=True,
-        dense_tiling_active=False, preinterpolation_layer_already_published=False,
+        tiling_active=False, preinterpolation_layer_already_published=False,
         key=key, direct_union_backing_leases={key: object()}, confmap_mm=object(),
         parent_slice_postprocess_workers=1, angle_variant_streaming_cleanup_active=True,
         interpolation_settings=SimpleNamespace(extrapolation_enabled=False, extrapolation_distance=0),

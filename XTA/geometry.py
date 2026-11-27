@@ -1637,7 +1637,7 @@ def resolve_tile_configs(
     return list(resolve_tile_groups(values))
 
 @dataclass(frozen=True)
-class DenseTileJob:
+class TileJob:
     view: str
     aug_id: str
     config_id: str
@@ -1652,7 +1652,7 @@ class DenseTileJob:
     # the tile's fixed footprint in the parent processing grid, as (py0, py1, px0, px1),
     # plus the same output->parent affine rebased into crop-local pixels. Every per-tile
     # artifact is sized to this window instead of the whole parent grid. Populated by
-    # build_dense_tile_jobs_for_aug; the zero default only survives in synthetic jobs.
+    # build_tile_jobs_for_aug; the zero default only survives in synthetic jobs.
     parent_crop: Tuple[int, int, int, int] = (0, 0, 0, 0)
     M_out_to_crop: Optional[np.ndarray] = None
 
@@ -3064,7 +3064,7 @@ def _center_preserving_scale_matrix(src_w: int, src_h: int, out_w: int, out_h: i
         dtype=np.float64,
     )
 
-def dense_tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
+def tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
     length = int(length)
     tile_size = int(tile_size)
     stride = int(stride)
@@ -3081,14 +3081,14 @@ def dense_tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
         starts.append(last)
     return [int(x) for x in starts]
 
-def build_dense_tile_jobs_for_aug(
+def build_tile_jobs_for_aug(
     view: ViewInfo,
     aug_job: AugJob,
     tile_cfg: TileConfig,
     out_size: int,
-) -> List[DenseTileJob]:
-    xs = dense_tile_positions(int(aug_job.aff.canvas_w), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
-    ys = dense_tile_positions(int(aug_job.aff.canvas_h), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
+) -> List[TileJob]:
+    xs = tile_positions(int(aug_job.aff.canvas_w), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
+    ys = tile_positions(int(aug_job.aff.canvas_h), int(tile_cfg.tile_size), int(tile_cfg.tile_stride))
 
     M_src_to_canvas3 = _affine2x3_to_3x3(aug_job.aff.M_src_to_canvas)
     # Depends only on tile_size/out_size, so it is the same matrix for every tile of this
@@ -3121,8 +3121,8 @@ def build_dense_tile_jobs_for_aug(
     M_src_to_out_stack = np.stack(forward_mats, axis=0)
     M_out_to_src_stack = np.linalg.inv(M_src_to_out_stack)
 
-    jobs: List[DenseTileJob] = [
-        DenseTileJob(
+    jobs: List[TileJob] = [
+        TileJob(
             view=view.name,
             aug_id=aug_job.aug_id,
             config_id=tile_cfg.config_id,
@@ -3141,7 +3141,7 @@ def build_dense_tile_jobs_for_aug(
     # Each tile is admitted independently and retains only its own minimal
     # parent-grid footprint.
     if jobs:
-        resolved: List[DenseTileJob] = []
+        resolved: List[TileJob] = []
         for job in jobs:
             window, M_out_to_crop = tile_parent_crop_window(
                 view, job.M_out_to_src, int(out_size),
@@ -3887,10 +3887,10 @@ def render_fullframe_frame_for_job(
         mirror_azimuthal_u=bool(mirror_azimuthal_u),
     )
 
-def render_dense_tile_frame_for_job(
+def render_tile_frame_for_job(
     volume_rgb: np.ndarray,
     view: ViewInfo,
-    tile_job: DenseTileJob,
+    tile_job: TileJob,
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
     *,
@@ -3915,16 +3915,16 @@ def render_dense_tile_frame_for_job(
     )
 
 
-def render_categorical_dense_tile_for_job(
+def render_categorical_tile_for_job(
     mask_u8: np.ndarray,
     view: ViewInfo,
-    tile_job: DenseTileJob,
+    tile_job: TileJob,
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
     *,
     mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
-    """Render one categorical ground-truth tile for a ``DenseTileJob``."""
+    """Render one categorical ground-truth tile for a ``TileJob``."""
     return render_categorical_frame_on_grid(
         mask_u8,
         view,
@@ -3975,10 +3975,10 @@ def make_fullframe_channel_renderer(
         mirrored_plane_renderer=_render_mirrored_plane if is_azimuthal_view(view) else None,
     )
 
-def make_dense_tile_channel_renderer(
+def make_tile_channel_renderer(
     volume_rgb: np.ndarray,
     view: ViewInfo,
-    tile_job: DenseTileJob,
+    tile_job: TileJob,
     *,
     channel_format: ChannelFormat,
     view_frames: Optional[np.ndarray] = None,
@@ -3986,7 +3986,7 @@ def make_dense_tile_channel_renderer(
 ) -> ChannelFormattedFrameRenderer:
     """Create a center-indexed tile renderer for gray/RGB/2.5D inputs."""
     def _render_plane(source_idx: int) -> np.ndarray:
-        return render_dense_tile_frame_for_job(
+        return render_tile_frame_for_job(
             volume_rgb=volume_rgb,
             view=view,
             tile_job=tile_job,
@@ -3995,7 +3995,7 @@ def make_dense_tile_channel_renderer(
         )
 
     def _render_mirrored_plane(source_idx: int) -> np.ndarray:
-        return render_dense_tile_frame_for_job(
+        return render_tile_frame_for_job(
             volume_rgb=volume_rgb,
             view=view,
             tile_job=tile_job,
@@ -4046,9 +4046,9 @@ def build_fullframe_raster_plan(
     )
 
 
-def build_dense_tile_raster_plan(
+def build_tile_raster_plan(
     view: ViewInfo,
-    tile_job: DenseTileJob,
+    tile_job: TileJob,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> RasterPlan:
     """Build the canonical TTA plan consumed by one collapsed tile job."""

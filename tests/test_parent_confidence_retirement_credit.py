@@ -32,7 +32,7 @@ def owned_prepare(tmp_path, callback, *, derived_alias=False):
         admission=SimpleNamespace(reserve=lambda *_args:nullcontext()), transient_bytes=1,
         model_name='model', view=detector_view(), union_mm=np.ones(shape, np.uint8),
         confmap_mm=scores, d1_shadow_path=None, union_path=tmp_path/'mask.dat',
-        confmap_path=tmp_path/'scores.dat', temp_dir=tmp_path, dense_tiling_active=False,
+        confmap_path=tmp_path/'scores.dat', temp_dir=tmp_path, tiling_active=False,
         min_conf=0, min_radius=0, interpolation_distance=0, interpolation_walk_back=1,
         interpolation_candidates=1, interpolation_passes=1, interpolation_min_radius=0,
         interpolation_search_angle=15, slice_workers=1,

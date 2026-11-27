@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from XTA import pipeline, yolo_cpu_input
+from XTA import confidence_evidence, pipeline, yolo_cpu_input
+from XTA.config import GIB
+from tests.native_detector_test_support import DetectorRun
+from tests.native_scheduler_cases import detector_task
 
 
 @pytest.fixture(autouse=True)
@@ -45,36 +48,41 @@ def test_invalid_overrides_are_reported(name, value, monkeypatch):
         pipeline._cpu_input_prefetch_policy(4, 128)
 
 
-def test_actual_pipeline_constructor_passes_limits_and_keeps_shared_executor(monkeypatch):
+def test_actual_pipeline_constructor_passes_limits_and_keeps_shared_executor(tmp_path, monkeypatch):
     captured = {}
     owner = SimpleNamespace()
+
     def construct(*args, **kwargs):
         captured.update(args=args, kwargs=kwargs)
         return owner
+
     monkeypatch.setattr(yolo_cpu_input, 'CpuInputPrefetch', construct)
+    monkeypatch.setattr(confidence_evidence, 'confidence_evidence_enabled', lambda: False)
     monkeypatch.setenv('YOLO_TTA_CPU_INPUT_BUILDERS', '20')
     render_executor = object()
     tracked, gauges = [], []
-    notify = lambda: None
     source = object()
-    namespace = dict(vars(pipeline), cpu_input_prefetch_requested=True,
-        gpu_task_queues={i: object() for i in range(4)}, worker_budget=3,
-        scheduler=SimpleNamespace(notify_gpu_stage_admission_change=notify),
-        gpu_worker_tasks_by_id={}, input_volume_rgb=source, volume_rgb=object(),
-        native_resize_task_spec={}, prediction_render_executor=render_executor,
-        cpu_input_budget=64 * 1024**3,
-        gpu_device_count=4, args=SimpleNamespace(imgsz=2048),
-        available_anon_work_bytes=lambda:64*1024**3,
-        runtime_telemetry=lambda:SimpleNamespace(gauge=lambda *args:gauges.append(args)),
-        _run_resources=lambda:SimpleNamespace(track_executor=tracked.append))
+    task = detector_task(0, mode='direct_union', processing_shape=(5120, 4096, 3072))
     tree = ast.parse(Path(pipeline.__file__).read_text())
     block = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
                  and isinstance(node.test, ast.Name) and node.test.id == 'cpu_input_prefetch_requested')
-    exec(compile(ast.Module(body=[block], type_ignores=[]), '<pipeline CPU input>', 'exec'), namespace)
-    assert captured['args'][1:3] == (source, render_executor)
-    assert captured['kwargs']['max_builders'] == 3
-    assert captured['kwargs']['max_packets'] == 8
-    assert captured['kwargs']['on_capacity_change'] is notify
-    assert tracked == [owner]
-    assert gauges == [('yolo.cpu_input.policy', dict(max_builders=3, max_packets=8))]
-    assert namespace['scheduler'].cpu_input_prefetch is owner
+    with DetectorRun(tmp_path) as run:
+        namespace = dict(vars(pipeline), cpu_input_prefetch_requested=True,
+            gpu_task_queues={i: object() for i in range(4)}, worker_budget=3,
+            scheduler=run.scheduler, gpu_worker_tasks_by_id={0: task},
+            input_volume_rgb=source, volume_rgb=object(), native_resize_task_spec={},
+            prediction_render_executor=render_executor, cpu_input_budget=8 * GIB,
+            direct_union_total_dense_byte_limit=64 * GIB,
+            gpu_device_count=4, args=SimpleNamespace(imgsz=2048),
+            available_anon_work_bytes=lambda: 64 * GIB,
+            runtime_telemetry=lambda: SimpleNamespace(gauge=lambda *args: gauges.append(args)),
+            _run_resources=lambda: SimpleNamespace(track_executor=tracked.append))
+        exec(compile(ast.Module(body=[block], type_ignores=[]), '<pipeline CPU input>', 'exec'), namespace)
+        assert captured['args'][1:3] == (source, render_executor)
+        assert captured['kwargs']['max_bytes'] == 4 * GIB
+        assert captured['kwargs']['max_builders'] == 3
+        assert captured['kwargs']['max_packets'] == 8
+        assert captured['kwargs']['on_capacity_change'] == run.scheduler.notify_gpu_stage_admission_change
+        assert tracked == [owner]
+        assert gauges == [('yolo.cpu_input.policy', dict(max_builders=3, max_packets=8))]
+        assert run.scheduler.cpu_input_prefetch is owner

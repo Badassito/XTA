@@ -217,9 +217,9 @@ def _bounded_score_projection_reader(source, view, shape, workspace):
                 return _pull_radial_chunk_compiled(source, view, radii, shape, z, first, stop, scalar_max=True)
         else:
             from .spherical_projection import _validate_spherical_projection
-            from .spherical_projection_cpu import prepare_spherical_chunk_numba
+            from .spherical_projection_cpu import prepare_spherical_chunk_native
             radii, rotation, _, _ = _validate_spherical_projection(source, view, shape, None)
-            compiled_pull = prepare_spherical_chunk_numba(source, view, radii, rotation, shape)
+            compiled_pull = prepare_spherical_chunk_native(source, view, radii, rotation, shape)
             def pull(z, first, stop):
                 return compiled_pull(source, view, radii, rotation, shape, z, first, stop, scalar_max=True)
         def read(z):
@@ -339,18 +339,18 @@ def score_projection_reader(source, view, output_shape, work_dir, *, memory_byte
                 from .spherical_projection import _validate_spherical_projection
                 from .spherical_projection_bounds import spherical_output_bounds
                 from .spherical_projection_cpu import (
-                    prepare_spherical_chunk_numba, pull_spherical_rectangle_numba,
+                    prepare_spherical_chunk_native, pull_spherical_rectangle_native,
                 )
                 radii, rotation, resolved_shape, boxes = _validate_spherical_projection(source, view, shape, boxes)
                 if tuple(resolved_shape) != shape:
                     raise ValueError('Spherical confidence projection changed the output grid')
                 bounds = spherical_output_bounds(view, shape, boxes)
-                compiled_pull = prepare_spherical_chunk_numba(source, view, radii, rotation, shape, boxes)
+                compiled_pull = prepare_spherical_chunk_native(source, view, radii, rotation, shape, boxes)
                 def pull(z, first, stop):
                     return compiled_pull(source, view, radii, rotation, shape, z, first, stop,
                                          boxes, scalar_max=True)
                 def rectangular_pull(z, first, stop):
-                    return pull_spherical_rectangle_numba(source, view, radii, rotation, shape,
+                    return pull_spherical_rectangle_native(source, view, radii, rotation, shape,
                         z, first, stop, boxes, bounds_yx=(bounds.y0, bounds.y1, bounds.x0, bounds.x1),
                         scalar_max=True)
             def read(z):

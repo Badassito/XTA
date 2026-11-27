@@ -15,7 +15,7 @@ scalar child's scheduler for its detector work.
 | CUDA only, for example `--device 0` or `--device 0,1` | Full-frame detector work uses the selected CUDA actors. Each ordinary D1 parent has one resident detector worker. |
 | OpenVINO and CUDA together, for example `--device 0:cpu` | Preflight rejects hybrid detector dispatch. |
 | OpenVINO CPU only with requested Azimuthal or Tilted Azimuthal views | Preflight rejects those detector views. |
-| Dense detector tiles selected by `--enable_tile` | Preflight rejects the tile ownership route. |
+| Detector tiles selected by `--enable_tile` | Preflight rejects the tile ownership route. |
 | Multiple detector GPUs with `YOLO_TTA_D1_OWNER_GROUPS=1` | Preflight rejects multi-worker D1 owner groups. |
 
 The full-frame inventory includes direct unions, file-backed results, and

@@ -52,28 +52,22 @@ def test_repository_output_is_rejected():
     assert not (SCRIPT.parent / 'forbidden-probe-output').exists()
 
 
-def test_real_cold_warm_and_shared_cache_matrix(tmp_path):
+def test_real_serial_threaded_and_concurrent_native_matrix(tmp_path):
     output = tmp_path / 'matrix'
     done = invoke(output, '--mode', 'matrix', '--workers', '2', '--repeat', '28', '--processes', '2')
     assert done.returncode == 0, done.stdout + done.stderr
     result = json.loads((output / 'result.json').read_text())
     assert result['status'] == 'passed'
-    assert result['exact_checks'] == 224
-    assert set(result['runs']) == {'cold_threaded', 'warm_threaded', 'shared_cold_0', 'shared_cold_1'}
+    assert result['exact_checks'] == 196
+    assert set(result['runs']) == {'serial', 'threaded', 'concurrent_0', 'concurrent_1'}
     for run in result['runs'].values():
         assert run['returncode'] == 0
         child = run['result']
         assert child['fixture_count'] == 27
         assert child['gpu_modules_imported'] == []
-        for entry in ('encoder_callback', 'metadata_callback'):
-            callback = child[entry]
-            assert callback['compiled'] and callback['abi'] == 'cfunc'
-            assert callback['signature'] and callback['native_name']
-            if callback.get('definition_available'):
-                assert callback['unpack_tuple_occurrences'] == 0
-    cold = result['runs']['cold_threaded']['result']
-    assert cold['encoder_callback']['definition_available']
-    assert cold['metadata_callback']['definition_available']
-    warm = result['runs']['warm_threaded']['result']
-    assert warm['encoder_callback']['cache_hits'] > 0
-    assert warm['metadata_callback']['cache_hits'] > 0
+        assert child['runtime_compilers_imported'] == []
+        assert set(child['native_symbols']) == {'bitset_mask_fields', 'bitset_mask_encode'}
+        assert child['native_abi'] > 0
+        assert len(child['build_source_sha256']) == 64
+        assert len(child['native_binary']['sha256']) == 64
+    assert len({r['result']['native_binary']['sha256'] for r in result['runs'].values()}) == 1

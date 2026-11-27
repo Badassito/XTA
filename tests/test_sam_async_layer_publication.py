@@ -65,7 +65,7 @@ def prepare(root, view, context, submitter=None):
     return assembly.prepare_view_volume_after_fullframe(
         model_name='detector', view=view, union_mm=volume, confmap_mm=None,
         union_path=root / 'union.dat', confmap_path=None, temp_dir=root,
-        dense_tiling_active=False, min_conf=0, min_radius=0, interpolate=2,
+        tiling_active=False, min_conf=0, min_radius=0, interpolate=2,
         interpolation_walk_back=1, interpolation_candidates=1, interpolate_passes=1,
         interpolate_min_radius=0, interpolation_search_angle=0,
         slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,
@@ -327,7 +327,7 @@ def owned_task(root, view, context, submitter, admission):
     return AdmittedViewPrepare(admission=admission, transient_bytes=GIB,
         model_name='detector', view=view, union_mm=volume, confmap_mm=None,
         d1_shadow_path=None, union_path=path, confmap_path=None, temp_dir=root,
-        dense_tiling_active=False, min_conf=0, min_radius=0, interpolation_distance=2,
+        tiling_active=False, min_conf=0, min_radius=0, interpolation_distance=2,
         interpolation_walk_back=1, interpolation_candidates=1, interpolation_passes=1,
         interpolation_min_radius=0, interpolation_search_angle=0,
         slice_workers=1, interpolation_task_workers=1,

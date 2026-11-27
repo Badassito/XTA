@@ -15,10 +15,12 @@ from XTA import spherical_projection as sp
 from XTA import spherical_projection_cpu as compiled
 from tests.reference_backends import spherical as oracle
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
+from XTA.spherical_projection_bounds import spherical_output_bounds
+from tests.test_spherical_cpu_compact import EncodedSink, decode
 
 
 class SparseShellSkipsTests(unittest.TestCase):
-    def test_empty_shell_skips_qsc_and_compiled_trigonometry(self):
+    def test_empty_shell_skips_oracle_qsc_and_native_dispatch(self):
         shape = (17, 19, 21)
         view = build_spherical_view_infos(*shape, targets=('transverse',),
             min_radius=.5, patch_size=15, tilted_views=())[0]
@@ -29,9 +31,22 @@ class SparseShellSkipsTests(unittest.TestCase):
         args = (source, view, radii, rotation, shape, shape[0] // 2, 0, shape[1] * shape[2])
         with mock.patch.object(oracle, 'qsc_forward_face', side_effect=AssertionError('QSC of empty shell')):
             self.assertFalse(oracle.pull_spherical_chunk(*args, boxes).any())
-        kernel_args = compiled._spherical_cpu_kernel_arguments(*args, boxes)
-        with mock.patch.object(compiled.math, 'atan2', side_effect=AssertionError('QSC of empty shell')):
-            self.assertFalse(compiled._pull_spherical_f64(*kernel_args).any())
+        np.testing.assert_array_equal(compiled.pull_spherical_chunk_native(*args, boxes),
+                                      np.zeros(shape[1] * shape[2], np.uint8))
+
+        # The native math itself is opaque to Python mocks. The production
+        # empty-range route must avoid entering either projection backend.
+        sink = EncodedSink(shape, packed=True)
+        with mock.patch.object(compiled, 'prepare_spherical_chunk_native') as prepare, \
+                mock.patch.object(sp, '_try_spherical_cuda_stage') as try_cuda:
+            sp.backproject_spherical_volume_to_volume(source, view, Path('unused'),
+                'empty shell', known_slice_bboxes=boxes, sink_only=True,
+                projection_block_callback=sink)
+        prepare.assert_not_called()
+        try_cuda.assert_not_called()
+        self.assertEqual(sink.seen, list(range(shape[0])))
+        self.assertEqual(sink.kinds, ['empty'])
+        np.testing.assert_array_equal(sink.result, np.zeros(shape, np.uint8))
 
     def test_interior_shell_gaps_preserve_binary_scores_and_restored_geometry(self):
         shape = (23, 25, 27)
@@ -39,6 +54,7 @@ class SparseShellSkipsTests(unittest.TestCase):
         views = build_spherical_view_infos(*shape, targets=('transverse',),
             min_radius=.5, patch_size=19, tilted_views=())
         qsc_points = [0, 0]
+        native_pull_voxels = total_voxels = 0
         original = oracle.qsc_forward_face
         for initial in views:
             view = replace(initial, spherical_rotation_xyz=cube_rotation('horizontal', -23))
@@ -51,6 +67,7 @@ class SparseShellSkipsTests(unittest.TestCase):
             radii = np.asarray(view.spherical_radii)
             rotation = np.asarray(view.spherical_rotation_xyz).reshape(3, 3)
             restored = (19, 29, 23)
+            expected_binary = np.empty(restored, np.uint8)
             for scalar_max in (False, True):
                 for z in range(restored[0]):
                     args = (source, view, radii, rotation, restored, z, 0, restored[1] * restored[2])
@@ -64,11 +81,27 @@ class SparseShellSkipsTests(unittest.TestCase):
                     with mock.patch.object(oracle, 'qsc_forward_face', side_effect=count_qsc(1)):
                         actual = oracle.pull_spherical_chunk(*args, boxes, scalar_max=scalar_max)
                     np.testing.assert_array_equal(actual, expected)
-                    kernel_args = compiled._spherical_cpu_kernel_arguments(*args, boxes)
                     np.testing.assert_array_equal(
-                        compiled._pull_spherical_f64(*kernel_args[:-1], scalar_max), expected)
+                        compiled.pull_spherical_chunk_native(*args, boxes, scalar_max=scalar_max),
+                        expected)
+                    if not scalar_max:
+                        expected_binary[z] = expected.reshape(restored[1:])
+
+            # The real compact route exposes the rectangular work scheduled
+            # to the native kernel, distinct from the oracle's QSC call count.
+            bounds = spherical_output_bounds(view, restored, boxes)
+            block = sp._project_spherical_encoded_block(
+                source, view, radii, rotation, restored, 0, restored[0],
+                boxes, output_bounds=bounds, packed=True)
+            np.testing.assert_array_equal(decode(block, restored), expected_binary)
+            self.assertEqual(block.pull_voxels, bounds.voxel_count)
+            self.assertEqual(block.scan_voxels, bounds.voxel_count)
+            native_pull_voxels += block.pull_voxels
+            total_voxels += expected_binary.size
         self.assertGreater(qsc_points[0], 0)
         self.assertLess(qsc_points[1], qsc_points[0] * .7)
+        self.assertGreater(native_pull_voxels, 0)
+        self.assertLess(native_pull_voxels, total_voxels)
 
     def test_empty_outer_shell_does_not_steal_exact_inward_midpoint(self):
         view = build_spherical_view_infos(9, 9, 9, targets=('transverse',),
@@ -80,8 +113,7 @@ class SparseShellSkipsTests(unittest.TestCase):
         boxes = np.array(((0, 17, 0, 17), (0, 0, 0, 0)), np.int64)
         args = (source, view, np.asarray(view.spherical_radii), np.eye(3), (9, 9, 9), 4, 4 * 9 + 6, 4 * 9 + 7)
         self.assertEqual(oracle.pull_spherical_chunk(*args, boxes, scalar_max=True)[0], 203)
-        kernel_args = compiled._spherical_cpu_kernel_arguments(*args, boxes)
-        self.assertEqual(compiled._pull_spherical_f64(*kernel_args[:-1], True)[0], 203)
+        self.assertEqual(compiled.pull_spherical_chunk_native(*args, boxes, scalar_max=True)[0], 203)
 
 
 class PendingCpuAdmissionTests(unittest.TestCase):
@@ -104,7 +136,6 @@ class PendingCpuAdmissionTests(unittest.TestCase):
         self._run_pending_handoff(3, 0, fail_admission=True)
 
     def test_compact_promotion_discards_unpublished_dense_or_encoded_cpu_block(self):
-        from tests.test_spherical_cpu_compact import EncodedSink
         radii, rotation, _, _ = sp._validate_spherical_projection(
             self.source, self.view, self.shape, None)
         original_encoded = sp._project_spherical_encoded_block
@@ -137,7 +168,7 @@ class PendingCpuAdmissionTests(unittest.TestCase):
                         stack.enter_context(redirect_stdout(io.StringIO()))
                         stack.enter_context(mock.patch.object(sp, '_try_spherical_cuda_stage', side_effect=admit))
                         stack.enter_context(mock.patch.object(sp, '_select_spherical_cpu_pull',
-                            return_value=compiled.pull_spherical_chunk_numba))
+                            return_value=compiled.pull_spherical_chunk_native))
                         stack.enter_context(mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=True))
                         stack.enter_context(mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, 1)))
                         stack.enter_context(mock.patch.object(sp, '_project_spherical_block', side_effect=pending))
@@ -210,7 +241,7 @@ class PendingCpuAdmissionTests(unittest.TestCase):
             stack.enter_context(redirect_stdout(output))
             stack.enter_context(mock.patch.object(sp, '_try_spherical_cuda_stage', side_effect=admit))
             stack.enter_context(mock.patch.object(sp, '_select_spherical_cpu_pull',
-                return_value=compiled.pull_spherical_chunk_numba))
+                return_value=compiled.pull_spherical_chunk_native))
             stack.enter_context(mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=True))
             stack.enter_context(mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, workers)))
             stack.enter_context(mock.patch.object(sp, '_project_spherical_block', side_effect=project))

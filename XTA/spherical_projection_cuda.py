@@ -181,7 +181,7 @@ class SphericalCudaProjector:
                  block_bytes=None, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES,
                  max_device_bytes=None, scalar_max=False):
         from .spherical_projection import _validate_spherical_projection
-        from .spherical_projection_cpu import prepare_spherical_chunk_numba
+        from .spherical_projection_cpu import prepare_spherical_chunk_native
 
         started = time.perf_counter()
         self.scalar_max = bool(scalar_max)
@@ -207,7 +207,7 @@ class SphericalCudaProjector:
         self.output_bounds = spherical_output_bounds(view, shape, boxes if self.use_bboxes else None)
         plane_bytes = shape[1] * shape[2]
         # Preflight must have an exact CPU oracle before owning device memory.
-        compiled_pull = prepare_spherical_chunk_numba(
+        compiled_pull = prepare_spherical_chunk_native(
             source, view, radii, rotation, shape, boxes if self.use_bboxes else None,
         )
         self.device_index = operator.index(device_index)

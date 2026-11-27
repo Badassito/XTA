@@ -5,6 +5,12 @@ from pathlib import Path
 import numpy as np
 
 from .interpolation import INTERNAL_PACKED_CVOL_FORMAT, IncrementalRawBBoxMaskStoreWriter, RawBBoxMaskStore
+from .packed_dense_source import DENSE_PACKED_CONTROL_BYTES, MAX_DENSE_PACKED_BLOCK_SLICES, encode_dense_fields
+
+
+# The input belongs to the caller. Bound the extra packed payload and control
+# arrays together, including the writer's private snapshot of the numeric rows.
+_REVIEW_PACK_PAYLOAD_BYTES = 1024**2 - DENSE_PACKED_CONTROL_BYTES
 
 
 class DiscardedRaster:
@@ -26,6 +32,9 @@ class PackedReviewRaster:
             raise FileExistsError(f'Review layer staging already exists: {path}')
         self.shape = tuple(shape)
         self.slice_bytes = self.shape[1] * self.shape[2]
+        plane_bound = int(self.shape[1]) * ((int(self.shape[2]) + 7) // 8)
+        self._batch_slices = min(MAX_DENSE_PACKED_BLOCK_SLICES,
+                                 _REVIEW_PACK_PAYLOAD_BYTES // max(1, plane_bound))
         self.position = 0
         self.writer = IncrementalRawBBoxMaskStoreWriter(
             shape=self.shape, store_dir=path, format_name=INTERNAL_PACKED_CVOL_FORMAT,
@@ -34,8 +43,26 @@ class PackedReviewRaster:
 
     def write(self, payload):
         data = np.frombuffer(payload, dtype=np.uint8).reshape(-1, *self.shape[1:])
-        self.writer.consume(self.position, data)
-        self.position += len(data)
+        start = self.position
+        stop = start + len(data)
+        if start < 0 or stop > self.shape[0]:
+            raise ValueError(f'{self.writer.desc}: projection callback block [{start},{stop}) is out of range')
+        if not self._batch_slices or not len(data) or self.writer.failed:
+            self.writer.consume(start, data)
+        else:
+            try:
+                for first in range(0, len(data), self._batch_slices):
+                    count = min(self._batch_slices, len(data) - first)
+                    fields, packed = encode_dense_fields(
+                        data, first, count, output_first=start + first,
+                        max_payload_bytes=_REVIEW_PACK_PAYLOAD_BYTES,
+                    )
+                    self.writer.consume_encoded_fields(start + first, fields, packed, packed=True)
+                    del fields, packed  # Release this batch before allocating the next.
+            except Exception as error:
+                self.writer.abort(error)
+                raise
+        self.position = stop
         return data.nbytes
 
     def write_zeros(self, size):

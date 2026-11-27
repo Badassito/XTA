@@ -7,6 +7,7 @@ from functools import lru_cache
 import inspect
 from itertools import permutations
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -14,6 +15,8 @@ from unittest import mock
 from XTA import confidence_evidence, pipeline
 from XTA.geometry import ViewInfo
 from XTA.interpolation import NrrdLayerRef
+from XTA.tta_scheduler import TtaScheduler, TtaSchedulerCallbacks
+from tests.native_detector_test_support import DetectorRun
 
 
 @lru_cache(maxsize=2)
@@ -29,7 +32,7 @@ def _handler_program(source_text):
 class _HandlerHarness:
     """Execute the production handler with its scheduler-owned closure state."""
 
-    def __init__(self, *, confidence=True, shadow=False, source_text=None):
+    def __init__(self, *, confidence=True, shadow=False, scheduler=None, source_text=None):
         self.view = ViewInfo(name='transverse__tta_a0', num_slices=3, src_h=4, src_w=5,
                              pad_mode='clamp', full_t=3, full_h=4, full_w=5)
         self.key = ('best', self.view.name)
@@ -43,8 +46,10 @@ class _HandlerHarness:
             self.executor.submit.return_value = self.future
         self.prepare = mock.Mock()
         self.terminal = mock.Mock()
+        self.scheduler = scheduler if scheduler is not None else mock.Mock(spec_set=TtaScheduler)
         self.env = dict(vars(pipeline))
         self.env.update(
+            scheduler=self.scheduler,
             _consume_policy_result_records=mock.Mock(),
             _accumulate_fullframe_slice_metadata=mock.Mock(),
             view_prediction_stats={}, view_device_hole_filled_slices={},
@@ -88,6 +93,7 @@ class D1ResultOrderingTests(unittest.TestCase):
                             harness.deliver(index)
                             self.assertEqual(harness.env['fullframe_remaining'][harness.key], 2 - position)
                             if position < 2:
+                                harness.scheduler.track_publication.assert_not_called()
                                 harness.prepare.assert_not_called()
                                 harness.terminal.assert_not_called()
                                 self.assertNotIn(harness.key, harness.env['view_processing_submitted'])
@@ -108,7 +114,10 @@ class D1ResultOrderingTests(unittest.TestCase):
                             self.assertEqual(call.kwargs['output_shape'], (3, 4, 5))
                             self.assertIs(call.kwargs['view'], harness.view)
                             self.assertEqual(harness.env['d1_confidence_futures'], [harness.future])
+                            harness.scheduler.track_publication.assert_called_once_with(harness.key, harness.future)
                             self.assertNotIn(harness.key, harness.env['pending_d1_confidence_by_parent'])
+                        else:
+                            harness.scheduler.track_publication.assert_not_called()
                         if shadow:
                             harness.prepare.assert_called_once_with('best', harness.view)
                             harness.terminal.assert_not_called()
@@ -119,6 +128,45 @@ class D1ResultOrderingTests(unittest.TestCase):
                             harness.terminal.assert_called_once_with('best', harness.view.name)
                             self.assertIn(harness.key, harness.env['view_processing_submitted'])
                             self.assertNotIn(harness.key, harness.env['view_slice_meta'])
+
+    def test_deferred_confidence_holds_parent_ticket_after_shadow_handoff(self):
+        with TemporaryDirectory() as directory, DetectorRun(Path(directory)) as run:
+            actor = run.worker(0)
+            harness = _HandlerHarness(shadow=True, scheduler=run.scheduler)
+            run.scheduler.bind_result_callbacks(TtaSchedulerCallbacks(
+                harness.handle, None, lambda: None, lambda: None))
+            run.start_transport()
+            run.declare(*(dict(task, gpu_eligible=True, job_id='d1', union_num_slices=3)
+                          for task in harness.tasks), ticket_limit=1)
+            run.drain_until(lambda: run.native.snapshot()['dispatched'] > 0)
+            for _ in harness.tasks:
+                task = run.take(0)
+                actor.installed(task['task_id'])
+                actor.compute_done(task['task_id'])
+
+            # The actor has finished computing all ranges. The final layer and
+            # shadow arrive before the two outstanding scientific receipts.
+            for received, index in enumerate((2, 0, 1), 1):
+                actor.put(dict(type='result', task_id=index, ok=True, gpu_index=0,
+                               stats=harness.results[index]))
+                run.drain_until(lambda: run.state.gpu_worker_results_collected == received)
+                self.assertEqual(run.native.snapshot()['tickets_used'], 1)
+                if received < 3:
+                    harness.prepare.assert_not_called()
+                    harness.executor.submit.assert_not_called()
+            harness.prepare.assert_called_once_with('best', harness.view)
+            harness.terminal.assert_not_called()
+            harness.sink.submit_layer.assert_called_once()
+            harness.executor.submit.assert_called_once()
+            self.assertEqual(harness.env['d1_confidence_futures'], [harness.future])
+            # Observe the native publication event before testing that the
+            # still-running confidence write is the remaining ticket owner.
+            run.drain_until(lambda: bool(run.scheduler._published) or not run.scheduler.publication_outstanding())
+            self.assertTrue(run.scheduler.publication_outstanding())
+            self.assertEqual(run.native.snapshot()['tickets_used'], 1)
+            harness.future.set_result(None)
+            run.drain_until(lambda: not run.scheduler.publication_outstanding())
+            self.assertEqual(run.native.snapshot()['tickets_used'], 0)
 
     def test_every_receipt_must_retain_confidence_even_after_final_reference(self):
         for missing_index in range(3):

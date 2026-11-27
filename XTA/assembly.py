@@ -26,7 +26,8 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import _numba, cv2, ndi, tqdm
+from ._deps import cv2, ndi, tqdm
+from .native_cpu import kernels as _native_cpu
 from .gaussian import binary_gaussian_pass
 from .sweep_backprojection import project_sweep_view
 from .artifact_archive import artifact_directory, artifact_size, open_artifact, split_reference
@@ -999,49 +1000,17 @@ def materialize_nrrd_view_layer(
     return layer_ref
 
 
-@_numba.njit(cache=True, nogil=True)
 def _numba_sparse_component_accumulate_bounds(crop, source_slice, first_t, first_x, coronal, bounds):
-    count = 0
-    for row in range(crop.shape[0]):
-        left = crop.shape[1]
-        right = -1
-        for col in range(crop.shape[1]):
-            if crop[row, col] != 0:
-                left = min(left, col)
-                right = col
-                count += 1
-        if right < 0:
-            continue
-        t = first_t + row
-        if coronal:
-            y0, y1 = first_x + left, first_x + right + 1
-            x0, x1 = source_slice, source_slice + 1
-        else:
-            y0, y1 = source_slice, source_slice + 1
-            x0, x1 = first_x + left, first_x + right + 1
-        bounds[t, 0] = min(bounds[t, 0], y0)
-        bounds[t, 1] = min(bounds[t, 1], x0)
-        bounds[t, 2] = max(bounds[t, 2], y1)
-        bounds[t, 3] = max(bounds[t, 3], x1)
-    return count
+    return _native_cpu.sparse_component_accumulate_bounds(
+        crop, source_slice, first_t, first_x, coronal, bounds,
+    )
 
-@_numba.njit(cache=True, nogil=True)
 def _numba_sparse_component_scatter_crop(crop, source_slice, first_t, first_x, coronal, bounds, offsets, payload):
-    for row in range(crop.shape[0]):
-        t = first_t + row
-        out_width = bounds[t, 3] - bounds[t, 1]
-        for col in range(crop.shape[1]):
-            if crop[row, col] == 0:
-                continue
-            if coronal:
-                y = first_x + col
-                x = source_slice
-            else:
-                y = source_slice
-                x = first_x + col
-            local_x = x - bounds[t, 1]
-            at = offsets[t] + (y - bounds[t, 0]) * ((out_width + 7) // 8) + local_x // 8
-            payload[at] |= np.uint8(1 << (local_x % 8))
+    return _native_cpu.sparse_component_scatter_crop(
+        crop, source_slice, first_t, first_x, coronal, bounds, offsets, payload,
+    )
+
+
 def _iter_sparse_component_decoded_slabs(
     store: RawBBoxMaskStore, source_slice: int, maximum_bytes: int = 8 * 1024 * 1024,
 ) -> Iterator[Tuple[int, int, np.ndarray]]:
@@ -1829,7 +1798,7 @@ def prepare_view_volume_after_fullframe(
     union_path: Path,
     confmap_path: Optional[Path],
     temp_dir: Path,
-    dense_tiling_active: bool,
+    tiling_active: bool,
     min_conf: float,
     min_radius: float,
     interpolate: int,
@@ -1899,7 +1868,7 @@ def prepare_view_volume_after_fullframe(
         and not bool(view.augmentation_base_view)
         and nrrd_layers_enabled
         and str(view.family) == 'azimuthal'
-        and not bool(dense_tiling_active)
+        and not bool(tiling_active)
         and not bool(preinterpolation_layer_already_published)
         and int(extrapolation_distance) <= 0
         and not (
@@ -1917,7 +1886,7 @@ def prepare_view_volume_after_fullframe(
     # mutable destination.
     d1_component_refs_only = bool(
         d1_delta_only
-        and not bool(dense_tiling_active)
+        and not bool(tiling_active)
         and bool(nrrd_layers_enabled)
         and (
             not _view_uses_interpolation(view, int(interpolate))
@@ -1937,7 +1906,7 @@ def prepare_view_volume_after_fullframe(
     from .packed_tilted_projection import terminal_native_source_packing_eligible
     terminal_packed = bool(union_owner is not None and terminal_native_source_packing_eligible(view,
         native_bytes=int(baseline_native_volume.nbytes), retire_dense=retire_dense_after_prepare,
-        component_layers=nrrd_layers_enabled, tiled=dense_tiling_active,
+        component_layers=nrrd_layers_enabled, tiled=tiling_active,
         prepublished=preinterpolation_layer_already_published,
         interpolate=interpolate, interpolation_passes=interpolate_passes,
         extrapolate=extrapolation_distance, mask_callback_available=mask_retired_callback is not None,
@@ -2094,7 +2063,7 @@ def prepare_view_volume_after_fullframe(
     # Per-tile gating always needs the immutable same-angle parent YOLO support, even
     # when NRRD output is disabled. Keep it as a sparse slice-chunked cvol so the new
     # two-stage gate can classify each original tile component before any cross-tile OR.
-    if bool(dense_tiling_active):
+    if bool(tiling_active):
         parent_mask_support_path = temp_dir / 'tile_support' / model_name / view.name / 'fullframe_yolo_support.cvol'
         write_raw_bbox_mask_store(
             baseline_native_volume,
@@ -2366,7 +2335,7 @@ def prepare_view_volume_after_fullframe(
             old_volume = baseline_native_volume
             existing_backing = _interpolation_array_backing_path(old_volume)
             if (existing_backing is None and bool(retire_dense_after_prepare)
-                    and not bool(dense_tiling_active)):
+                    and not bool(tiling_active)):
                 # The scheduler will consume the independent projected refs and retire
                 # this original canvas. A second multi-GiB native backing would be
                 # discarded immediately; keep the original owner alive until then.
@@ -2453,7 +2422,7 @@ def prepare_view_volume_after_fullframe(
                     f'projection pass ({int(fused_added_voxels)} bridge voxel(s)).'
                 )
 
-        if bool(dense_tiling_active) and parent_mask_support_mm is not None:
+        if bool(tiling_active) and parent_mask_support_mm is not None:
             parent_bridge_support_path = temp_dir / 'tile_support' / model_name / view.name / 'fullframe_bridge_support.cvol'
             bridge_desc = f'NRRD support fullframe bridges {model_name}/{view.name}'
             if interpolation_stats:
@@ -2524,7 +2493,7 @@ def prepare_view_volume_after_fullframe(
 
         if (
             bool(internal_final_layer_enabled)
-            and not bool(dense_tiling_active)
+            and not bool(tiling_active)
             and not bool(d1_component_refs_only)
         ):
             internal_ref = materialize_internal_final_view_layer(
@@ -2607,8 +2576,8 @@ def prepare_view_volume_after_fullframe(
         # Every other configuration retains the established dense continuation.
         final_view_volume: Optional[np.ndarray] = baseline_native_volume
 
-        returned_parent_mask_support = parent_mask_support_mm if bool(dense_tiling_active) else None
-        returned_parent_bridge_support = parent_bridge_support_mm if bool(dense_tiling_active) else None
+        returned_parent_mask_support = parent_mask_support_mm if bool(tiling_active) else None
+        returned_parent_bridge_support = parent_bridge_support_mm if bool(tiling_active) else None
         if parent_mask_support_mm is not None and returned_parent_mask_support is None:
             close_raw_store_or_memmap_volume(parent_mask_support_mm)
         if parent_bridge_support_mm is not None and returned_parent_bridge_support is None:

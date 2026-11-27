@@ -5,107 +5,14 @@ import operator
 import math
 
 import numpy as np
-from ._deps import _numba
 from .file_hashing import source_sha256
+from .native_cpu import kernels
 
 IMPLEMENTATION_SHA256 = source_sha256(__file__)
 
 
-def _render_spherical_gray8(source, face, intervals, origin_u, origin_v, rotation, radius,
-               native_y0, native_x0, native_y1, native_x1):
-    output = np.zeros((native_y1-native_y0, native_x1-native_x0), np.uint8)
-    center_x, center_y, center_t = ((source.shape[2]-1)/2., (source.shape[1]-1)/2.,
-                                 (source.shape[0]-1)/2.)
-    inv_sqrt2 = 1. / np.sqrt(2.)
-    for row in range(native_y0, native_y1):
-        chart_row = row+origin_v
-        if chart_row < 0 or chart_row > intervals:
-            continue
-        v = 1.-2.*chart_row/intervals
-        for column in range(native_x0, native_x1):
-            chart_column = column+origin_u
-            if chart_column < 0 or chart_column > intervals:
-                continue
-            u = -1.+2.*chart_column/intervals
-            if abs(u) >= abs(v):
-                area = 0 if u >= 0. else 2
-            else:
-                area = 1 if v >= 0. else 3
-            p = max(abs(u), abs(v))
-            minor = v if area == 0 else (-u if area == 1 else (-v if area == 2 else u))
-            ratio = minor/p if p != 0. else 0.
-            tau = (math.pi/12.)*ratio
-            numerator, denominator = np.sin(tau), np.cos(tau)-inv_sqrt2
-            norm = np.hypot(numerator, denominator)
-            cosine, sine = denominator/norm, numerator/norm
-            diagonal = abs(ratio) == 1.
-            if diagonal:
-                cosine, sine = inv_sqrt2, (inv_sqrt2 if ratio > 0. else -inv_sqrt2)
-            d = 1.-cosine/np.sqrt(1.+cosine*cosine)
-            normal = 1.-p*p*d
-            tangent = p*np.sqrt(d*(2.-p*p*d))
-            major, minor = tangent*cosine, tangent*sine
-            if p == 1.:
-                major = normal
-                if diagonal:
-                    minor = normal if ratio > 0. else -normal
-            if area == 0:
-                right, up = major, minor
-            elif area == 1:
-                right, up = -minor, major
-            elif area == 2:
-                right, up = -major, -minor
-            else:
-                right, up = minor, -major
-            if face == 0:
-                lx, ly, lz = normal, right, up
-            elif face == 1:
-                lx, ly, lz = -right, normal, up
-            elif face == 2:
-                lx, ly, lz = -normal, -right, up
-            elif face == 3:
-                lx, ly, lz = right, -normal, up
-            elif face == 4:
-                lx, ly, lz = -up, right, normal
-            else:
-                lx, ly, lz = up, right, -normal
-            lx, ly, lz = lx+0., ly+0., lz+0.
-            xx = center_x+radius*((lx*rotation[0, 0]+ly*rotation[0, 1])+lz*rotation[0, 2])
-            yy = center_y+radius*((lx*rotation[1, 0]+ly*rotation[1, 1])+lz*rotation[1, 2])
-            tt = center_t+radius*((lx*rotation[2, 0]+ly*rotation[2, 1])+lz*rotation[2, 2])
-            if not (-1. < tt < source.shape[0] and -1. < yy < source.shape[1]
-                    and -1. < xx < source.shape[2]):
-                continue
-            t0, y0, x0 = int(np.floor(tt)), int(np.floor(yy)), int(np.floor(xx))
-            dt, dy, dx = np.float32(tt-t0), np.float32(yy-y0), np.float32(xx-x0)
-            acc = np.float32(0.)
-            for it in (0, 1):
-                ti = t0+it
-                wt = dt if it else np.float32(1.)-dt
-                if ti < 0 or ti >= source.shape[0]:
-                    continue
-                for iy in (0, 1):
-                    yi = y0+iy
-                    wy = dy if iy else np.float32(1.)-dy
-                    if yi < 0 or yi >= source.shape[1]:
-                        continue
-                    for ix in (0, 1):
-                        xi = x0+ix
-                        wx = dx if ix else np.float32(1.)-dx
-                        if xi < 0 or xi >= source.shape[2]:
-                            continue
-                        weight = np.float32(np.float32(wt*wy)*wx)
-                        term = np.float32(np.float32(source[ti, yi, xi])*weight)
-                        acc = np.float32(acc+term)
-            output[row-native_y0, column-native_x0] = np.uint8(min(255., max(0., np.rint(acc))))
-    return output
-
-
-try:
-    _compiled_render = _numba.njit(cache=True, nogil=True, fastmath=False)(_render_spherical_gray8)
-except RuntimeError:
-    # Read-only installations may lack a disk cache; compilation stays required.
-    _compiled_render = _numba.njit(cache=False, nogil=True, fastmath=False)(_render_spherical_gray8)
+def _compiled_render(*args):
+    return kernels.render_spherical_gray8(*args)
 
 
 def render_spherical_gray8_crop(source, view, index, bbox_yx):
@@ -145,12 +52,13 @@ def render_spherical_gray8_crop(source, view, index, bbox_yx):
 
 
 def spherical_gray8_sampling_identity():
-    """Bind the actual compiler and CPU target into SAM's numerical cache key."""
-    import llvmlite
-    from llvmlite import binding
-    return dict(backend='numba_nogil_f64_qsc_f32_trilinear', implementation_sha256=IMPLEMENTATION_SHA256,
-        numba_version=_numba.__version__, llvmlite_version=llvmlite.__version__,
-        llvm_version=list(binding.llvm_version_info), using_svml=bool(_numba.config.USING_SVML),
-        configured_cpu_name=_numba.config.CPU_NAME, configured_cpu_features=_numba.config.CPU_FEATURES,
-        host_cpu_name=binding.get_host_cpu_name(), host_cpu_features=binding.get_host_cpu_features().flatten(),
-        fastmath=False, accumulator_dtype='float32', coordinate_dtype='float64')
+    """Bind the native implementation and build into SAM's numerical cache key."""
+    return _gray8_sampling_identity('cpp_nogil_f64_qsc_f32_trilinear', IMPLEMENTATION_SHA256)
+
+
+def _gray8_sampling_identity(backend, wrapper_sha256):
+    from .native_cpu import native_cpu_provenance
+
+    return dict(backend=backend, implementation_sha256=wrapper_sha256,
+        native_kernel=native_cpu_provenance('rendering'), fastmath=False,
+        accumulator_dtype='float32', coordinate_dtype='float64')

@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from XTA import outputs, nrrd_compression, reconciliation_runtime as runtime
+from XTA.finalization import PackedFinalUnion
 from XTA.interpolation import CVOL_FORMAT, NrrdLayerRef, write_raw_bbox_mask_store
 from XTA.reconciliation_policy import load_reconciliation_policy, resolve_reconciliation
 
@@ -63,11 +64,12 @@ def pipeline_block():
     return compile(ast.Module(body=matches, type_ignores=[]), '<pipeline-reconciliation-tail>', 'exec')
 
 
-def execute_pipeline_block(tmp_path, sink, array, ref, cfg, policy):
+def execute_pipeline_block(tmp_path, sink, array, ref, cfg, policy, *, packed=False):
+    receipt = PackedFinalUnion(array, int(np.count_nonzero(array))) if packed else None
     namespace = dict(__name__='XTA.pipeline', __package__='XTA', reconciliation_settings=cfg,
         reconciliation_policy=policy, nrrd_layer_sink=lambda: sink,
         runtime_telemetry=lambda: SimpleNamespace(gauge=lambda *args: None, span=lambda *args: nullcontext()),
-        final_union_mm=array, streamed_final_union_mm=array,
+        final_union_mm=array, streamed_final_union_mm=array, packed_final_union=receipt,
         streaming_final_union_holder={'model': array}, model_name='model',
         nrrd_layer_refs=[ref], inference_views=[], source_output_shape_tyx=array.shape,
         T=array.shape[0], H=array.shape[1], W=array.shape[2], out_dir=tmp_path, temp_dir=tmp_path,
@@ -77,9 +79,10 @@ def execute_pipeline_block(tmp_path, sink, array, ref, cfg, policy):
     return namespace
 
 
+@pytest.mark.parametrize('packed', [False, True])
 @pytest.mark.parametrize('failure', [False, True])
 def test_delayed_independent_export_allows_union_mutation_and_keeps_final_failure_join(
-        tmp_path, monkeypatch, component, failure):
+        tmp_path, monkeypatch, component, failure, packed):
     original, ref = component
     assembled = original.copy()
     cfg, policy = policy_settings(tmp_path)
@@ -102,10 +105,16 @@ def test_delayed_independent_export_allows_union_mutation_and_keeps_final_failur
         # Run the actual pipeline reconciliation block while the writer cannot
         # finish. It must return the same array without allocating a new union.
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(execute_pipeline_block, tmp_path, sink, assembled, ref, cfg, policy)
+            future = pool.submit(execute_pipeline_block, tmp_path, sink, assembled, ref, cfg, policy,
+                                 packed=packed)
             try:
                 result = future.result(timeout=3)
                 assert result['final_union_mm'] is assembled
+                assert result['packed_final_union'] is None
+                report = result['reconciliation_report']
+                assert report['counts']['retained_voxels'] == int(np.count_nonzero(original))
+                assert report['execution']['count_source'] == (
+                    'packed_union_expansion' if packed else 'bounded_assembled_union_count')
                 assembled[:] = 0  # in-place final keep_objects/other cleanup
             finally:
                 release.set()
@@ -126,8 +135,9 @@ def test_delayed_independent_export_allows_union_mutation_and_keeps_final_failur
     assert not sink._source_refs
 
 
+@pytest.mark.parametrize('packed', [False, True])
 @pytest.mark.parametrize('custom', [False, True])
-def test_live_alias_or_custom_policy_keeps_export_barrier(tmp_path, monkeypatch, component, custom):
+def test_live_alias_or_custom_policy_keeps_export_barrier(tmp_path, monkeypatch, component, custom, packed):
     original, raw_ref = component
     assembled = original.copy()
     ref = raw_ref if custom else replace(raw_ref, storage_format='live_u8', live_array=assembled,
@@ -154,7 +164,8 @@ def test_live_alias_or_custom_policy_keeps_export_barrier(tmp_path, monkeypatch,
         sink.submit_layer(ref, 'alias')
         assert entered.wait(5)
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(execute_pipeline_block, tmp_path, sink, assembled, ref, cfg, policy)
+            future = pool.submit(execute_pipeline_block, tmp_path, sink, assembled, ref, cfg, policy,
+                                 packed=packed)
             try:
                 assert wait_called.wait(3)
                 assert not future.done()
@@ -221,14 +232,15 @@ def test_mapped_union_backing_alias_is_detected_even_through_hardlink(tmp_path, 
         independent._mmap.close()
 
 
-def test_overlap_does_not_bypass_policy_file_identity(tmp_path, component):
+@pytest.mark.parametrize('packed', [False, True])
+def test_overlap_does_not_bypass_policy_file_identity(tmp_path, component, packed):
     original, ref = component
     cfg, policy = policy_settings(tmp_path)
     sink = SimpleNamespace(pending_layer_refs=lambda: (ref,),
                            wait=mock.Mock(side_effect=AssertionError('independent export should overlap')))
     Path(cfg.path).write_text(Path(cfg.path).read_text() + '# changed\n')
     with pytest.raises(RuntimeError, match='policy changed'):
-        execute_pipeline_block(tmp_path, sink, original.copy(), ref, cfg, policy)
+        execute_pipeline_block(tmp_path, sink, original.copy(), ref, cfg, policy, packed=packed)
     assert not (tmp_path / 'reconciliation/manifest.json').exists()
 
 

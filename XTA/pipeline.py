@@ -171,15 +171,16 @@ from .media import (
 )
 from .geometry import (
     AugJob,
-    DenseTileJob,
+    TileJob,
     ViewInfo,
     build_aug_job_for_variant,
-    build_dense_tile_jobs_for_aug,
-    build_dense_tile_raster_plan,
+    build_tile_jobs_for_aug,
+    build_tile_raster_plan,
     build_fullframe_raster_plan,
     delayed_native_expansion_enabled,
     expand_views_into_tta_variants,
     is_azimuthal_view,
+    is_spherical_view,
     is_tilted_azimuthal_view,
     is_tilted_view,
     iter_aug_jobs_round_robin,
@@ -214,6 +215,8 @@ from .inference import (
 )
 from .cuda_backend import (
     build_fused_renderer_preflight_specs,
+    gpu_worker_render_enabled,
+    gpu_worker_render_resident_enabled,
     open_existing_gray_memmap,
     union_conf_volume_into_volume_inplace,
 )
@@ -236,9 +239,10 @@ from .cuda_d1 import (
     _nrrd_layer_key,
     close_raw_store_or_memmap_volume,
     retire_temporary_binary_volume_storage,
-    tile_dense_worker_result_limit_bytes,
-    tile_dense_worker_result_limit_tasks,
-    tile_dense_worker_result_warn_seconds,
+    tile_environment_name,
+    tile_worker_result_limit_bytes,
+    tile_worker_result_limit_tasks,
+    tile_worker_result_warn_seconds,
     tile_intermediate_accumulator_reserve_bytes,
     tile_intermediate_accumulators_prefer_memory,
 )
@@ -805,23 +809,6 @@ def main() -> None:
         if cleanup_error is not None and primary_error is None:
             raise cleanup_error
 
-def _warm_parent_kernel(name, warm):
-    print(f'[startup] Warming parent kernel {name}.', flush=True)
-    runtime_trace_event('startup_parent_warmup_start', kernel=name)
-    started = time.perf_counter()
-    failed = True
-    try:
-        with runtime_telemetry().span(f'startup.parent_warmup.{name}'):
-            receipt = dict(warm())
-        failed = False
-    finally:
-        elapsed = time.perf_counter() - started
-        runtime_trace_event('startup_parent_warmup_done', kernel=name, wall_seconds=elapsed, failed=failed)
-        status = 'failed' if failed else 'finished'
-        print(f'[startup] Parent kernel {name} {status} in {elapsed:.3f}s.', flush=True)
-    receipt['wall_seconds'] = elapsed
-    runtime_telemetry().gauge(f'gil_kernels.warmup.{name}', receipt)
-    return receipt
 
 
 def _main_impl() -> None:
@@ -2083,7 +2070,7 @@ def _main_impl() -> None:
     # Array-backed GPU-worker tile results must never wait behind parent interpolation or sparse
     # gate work in the shared tile executor. A small dedicated outer pool performs cleanup
     # plus CTILE conversion; each task still uses the configured slice-parallel workers.
-    tile_dense_retirement_workers_default = max(
+    tile_result_retirement_workers_default = max(
         1,
         min(
             8,
@@ -2091,22 +2078,22 @@ def _main_impl() -> None:
             max(2, 2 * max(1, int(gpu_device_count))),
         ),
     )
-    tile_dense_retirement_workers = max(
+    tile_result_retirement_workers = max(
         1,
         _env_int(
-            'YOLO_TTA_TILE_DENSE_RETIREMENT_WORKERS',
-            int(tile_dense_retirement_workers_default),
+            tile_environment_name('RETIREMENT_WORKERS'),
+            int(tile_result_retirement_workers_default),
         ),
     )
-    tile_dense_retirement_slice_workers_default = max(
+    tile_result_retirement_slice_workers_default = max(
         1,
-        int(worker_budget) // max(1, int(tile_dense_retirement_workers)),
+        int(worker_budget) // max(1, int(tile_result_retirement_workers)),
     )
-    tile_dense_retirement_slice_workers = max(
+    tile_result_retirement_slice_workers = max(
         1,
         _env_int(
-            'YOLO_TTA_TILE_DENSE_RETIREMENT_SLICE_WORKERS',
-            int(tile_dense_retirement_slice_workers_default),
+            tile_environment_name('RETIREMENT_SLICE_WORKERS'),
+            int(tile_result_retirement_slice_workers_default),
         ),
     )
     tile_slice_postprocess_workers_default = max(
@@ -2225,7 +2212,7 @@ def _main_impl() -> None:
     print(
         'Tile postprocess workers: '
         f'{tile_postprocess_workers} (dedicated tile-result cleanup/CTILE retirement workers: '
-        f'{tile_dense_retirement_workers} x {tile_dense_retirement_slice_workers} slice workers, '
+        f'{tile_result_retirement_workers} x {tile_result_retirement_slice_workers} slice workers, '
         f'gate/consolidation per-tile slice workers: '
         f'{tile_slice_postprocess_workers}, consolidated-tile interpolation workers: '
         f'{tile_interpolation_task_workers})'
@@ -2266,7 +2253,7 @@ def _main_impl() -> None:
     else:
         set_interpolation_process_executor(None, 0)
 
-    dense_tiling_active = len(tile_configs) > 0
+    tiling_active = len(tile_configs) > 0
 
     view_infos_by_name: Dict[str, ViewInfo] = {view.name: view for view in views}
     view_infos_by_name.update({view.name: view for view in physical_views})
@@ -2296,8 +2283,8 @@ def _main_impl() -> None:
 
     aug_jobs_by_view: Dict[str, List[AugJob]] = {}
     aug_job_lookup_by_view: Dict[str, Dict[str, AugJob]] = {}
-    tile_jobs_by_view_config: Dict[str, Dict[str, List[DenseTileJob]]] = {view.name: {} for view in views}
-    tile_jobs_by_aug: Dict[Tuple[str, str], List[DenseTileJob]] = {}
+    tile_jobs_by_view_config: Dict[str, Dict[str, List[TileJob]]] = {view.name: {} for view in views}
+    tile_jobs_by_aug: Dict[Tuple[str, str], List[TileJob]] = {}
     view_prediction_stats: Dict[str, int] = {}
     view_prediction_labels: Dict[str, str] = {}
     for _view_for_stats in views:
@@ -2383,12 +2370,12 @@ def _main_impl() -> None:
         )]
         aug_jobs_by_view[view.name] = jobs
         aug_job_lookup_by_view[view.name] = {job.aug_id: job for job in jobs}
-        if dense_tiling_active and view.name in inference_view_names:
-            jobs_by_config: Dict[str, List[DenseTileJob]] = {}
+        if tiling_active and view.name in inference_view_names:
+            jobs_by_config: Dict[str, List[TileJob]] = {}
             for tile_cfg in tile_configs:
-                cfg_jobs: List[DenseTileJob] = []
+                cfg_jobs: List[TileJob] = []
                 for aug_job in jobs:
-                    built_jobs = build_dense_tile_jobs_for_aug(
+                    built_jobs = build_tile_jobs_for_aug(
                         view=view,
                         aug_job=aug_job,
                         tile_cfg=tile_cfg,
@@ -2426,7 +2413,7 @@ def _main_impl() -> None:
             full_record["plan_digest"] = str(full_plan.digest)
             tta_raster_plan_records.append(full_record)
             for tile_job in tile_jobs_by_aug.get((view.name, aug_job.aug_id), ()):
-                tile_plan = build_dense_tile_raster_plan(
+                tile_plan = build_tile_raster_plan(
                     view, tile_job, channel_format
                 )
                 tile_record = tile_plan.canonical_record()
@@ -2441,7 +2428,7 @@ def _main_impl() -> None:
     tile_expected_by_parent: Dict[Tuple[str, str], int] = {}
     tile_expected_by_set: Dict[Tuple[str, str, str], int] = {}
     tile_config_ids_by_parent: Dict[Tuple[str, str], Tuple[str, ...]] = {}
-    if dense_tiling_active:
+    if tiling_active:
         for view in inference_views:
             jobs_by_config = tile_jobs_by_view_config.get(view.name, {})
             expected_for_variant = int(sum(len(jobs) for jobs in jobs_by_config.values()))
@@ -2506,6 +2493,17 @@ def _main_impl() -> None:
     (direct_union_inference_byte_limit, direct_union_total_dense_byte_limit,
      _parent_transient_bytes) = resolve_parent_memory_limits(_parent_startup_headroom,
         sam_enabled=interpolation_settings.sam_enabled, policy_enabled=policy_settings.enabled)
+    spherical_host_cache_budget = 0
+    if (gpu_worker_process_active and any(is_spherical_view(view) for view in scheduled_inference_views)
+            and gpu_worker_render_enabled() and gpu_worker_render_resident_enabled()
+            and _env_flag('YOLO_TTA_SPHERICAL_HOST_CACHE', True)):
+        from .spherical_host_cache import tta_spherical_host_cache_budget
+        spherical_host_cache_budget = tta_spherical_host_cache_budget(
+            available_bytes=publication_ram_headroom(),
+            reserved_bytes=direct_union_total_dense_byte_limit + _parent_transient_bytes + 64 * GIB,
+            worker_count=gpu_device_count,
+        )
+    spherical_host_cache_reserve = spherical_host_cache_budget * gpu_device_count
     parent_transient_admission = _ByteAdmissionPool(
         _parent_transient_bytes,
         'Parent view postprocess admission',
@@ -2519,7 +2517,7 @@ def _main_impl() -> None:
         eligible_confidence_parents = sum(terminal_native_source_packing_eligible(candidate,
             native_bytes=math.prod(view_processing_volume_shape(candidate, int(args.imgsz))),
             retire_dense=True, component_layers=component_layers_needed,
-            tiled=dense_tiling_active, prepublished=False,
+            tiled=tiling_active, prepublished=False,
             interpolate=int(args.interpolation_distance),
             interpolation_passes=int(args.interpolation_passes),
             extrapolate=interpolation_settings.extrapolation_distance) for candidate in views)
@@ -2542,37 +2540,6 @@ def _main_impl() -> None:
             print(f"Terminal confidence capture: slots={capture_budget['slots']}, "
                   f"independent workspace={capture_budget['capture_workspace_bytes']/GIB:.2f}GiB, "
                   f"numeric staging={capture_budget['numeric_stage_bytes']/GIB:.2f}GiB.")
-    def _warm_publication_kernels():
-        if fully_preprojected:
-            runtime_telemetry().gauge('sweep.prepublished_consumer.skipped_kernel_warmups', True)
-            print('Using prepublished views; final output kernels initialize on demand.', flush=True)
-            return
-
-        if capture_owner:
-            from .confidence_capture_cpu import warm_terminal_score_kernels
-            receipt = _warm_parent_kernel('terminal_score', warm_terminal_score_kernels)
-            runtime_telemetry().gauge('confidence.terminal_score_only.kernel_warmup', receipt)
-        from .nrrd_sparse_kernels import warm_nrrd_producer_kernels
-        from .interpolation import warm_encoded_block_kernels
-        from .confidence_native_inflate import warm_confidence_inflate_kernels
-        kernel_warmups = [('nrrd_producer', warm_nrrd_producer_kernels),
-                          ('encoded_block', warm_encoded_block_kernels),
-                          ('confidence_inflate', warm_confidence_inflate_kernels)]
-        if args.reconciliation_retain_confidence and not defer_score_projection and any(
-                str(candidate.family) in ('radial', 'spherical', 'azimuthal') or is_tilted_view(candidate)
-                for candidate in inference_views):
-            from .confidence_capture_cpu import warm_eager_confidence_masking
-            kernel_warmups.append(('eager_confidence_masking', warm_eager_confidence_masking))
-        if any(is_azimuthal_view(candidate) for candidate in views):
-            from .projection_coverage_cpu import warm_angular_key_kernels
-            kernel_warmups.append(('angular_keys', warm_angular_key_kernels))
-        if os.environ.get('XTA_YOLO_SWEEP_NATIVE_ROLE') == 'produce':
-            # Sibling journal rows are decoded by publisher threads under load;
-            # load and probe the row kernels here so the first open_view does not.
-            from .sweep_view_decode import warm_native_view_decode_kernels
-            kernel_warmups.append(('native_view_decode', warm_native_view_decode_kernels))
-        for warm_name, warm in kernel_warmups:
-            _warm_parent_kernel(warm_name, warm)
 
     sam_dynamic_memory_partition_enabled = False
     if sam_context is not None:
@@ -2628,17 +2595,17 @@ def _main_impl() -> None:
     gpu_worker_tasks_by_id = scheduler_state.gpu_worker_tasks_by_id
     gpu_worker_dispatched_by_id = scheduler_state.gpu_worker_dispatched_by_id
     gpu_worker_results_by_id = scheduler_state.gpu_worker_results_by_id
-    gpu_worker_tile_dense_result_reservations = (
-        scheduler_state.gpu_worker_tile_dense_result_reservations
+    gpu_worker_tile_result_reservations = (
+        scheduler_state.gpu_worker_tile_result_reservations
     )
-    gpu_worker_tile_dense_result_memfd_reservations = (
-        scheduler_state.gpu_worker_tile_dense_result_memfd_reservations
+    gpu_worker_tile_result_memfd_reservations = (
+        scheduler_state.gpu_worker_tile_result_memfd_reservations
     )
-    gpu_worker_tile_dense_result_reserved_at = (
-        scheduler_state.gpu_worker_tile_dense_result_reserved_at
+    gpu_worker_tile_result_reserved_at = (
+        scheduler_state.gpu_worker_tile_result_reserved_at
     )
-    gpu_worker_tile_dense_result_workspaces = (
-        scheduler_state.gpu_worker_tile_dense_result_workspaces
+    gpu_worker_tile_result_workspaces = (
+        scheduler_state.gpu_worker_tile_result_workspaces
     )
     gpu_worker_tile_task_id_by_key = scheduler_state.gpu_worker_tile_task_id_by_key
     gpu_worker_tile_pending_result_ids_by_task = (
@@ -2695,9 +2662,9 @@ def _main_impl() -> None:
           f'initial working allowance={component_projection_queue.snapshot()["max_working_bytes"] / GIB:.1f} GiB '
           '(updated from live physical/cgroup/SLURM headroom)')
     _run_resources().track_executor(component_projection_queue)
-    tile_dense_retirement_executor = _create_tracked_thread_pool(
-        max_workers=int(tile_dense_retirement_workers),
-        thread_name_prefix='tile-dense-retire',
+    tile_result_retirement_executor = _create_tracked_thread_pool(
+        max_workers=int(tile_result_retirement_workers),
+        thread_name_prefix='tile-result-retire',
     )
     tile_postprocess_executor = _create_tracked_thread_pool(
         max_workers=int(tile_postprocess_workers),
@@ -2723,7 +2690,7 @@ def _main_impl() -> None:
         _run_resources().track_closeable(sweep_fanout_plan)
     for view, aug_job in iter_aug_jobs_round_robin(scheduled_inference_views, aug_jobs_by_view):
         prediction_build_jobs.append(('fullframe', view, aug_job))
-        if dense_tiling_active:
+        if tiling_active:
             for tile_job in tile_jobs_by_aug.get((view.name, aug_job.aug_id), []):
                 prediction_build_jobs.append(('tile', view, tile_job))
 
@@ -2924,7 +2891,7 @@ def _main_impl() -> None:
         shape = tuple(view_processing_volume_shape(view, int(args.imgsz)))
         volume_count = (2 if float(args.min_conf) > 0
             or bool(getattr(args, 'reconciliation_retain_confidence', False)) else 1)
-        if dense_tiling_active:
+        if tiling_active:
             volume_count += 1 + (2 if component_layers_needed else 0)
         logical_bytes = int(array_nbytes(shape, np.uint8)) * volume_count
         sam_blocked = _sam_parent_requires_staging(view)
@@ -3296,7 +3263,7 @@ def _main_impl() -> None:
         packed_source_eligible = terminal_native_source_packing_eligible(view,
             native_bytes=math.prod(capture_shape),
             retire_dense=True,
-            component_layers=component_layers_needed, tiled=dense_tiling_active,
+            component_layers=component_layers_needed, tiled=tiling_active,
             prepublished=preinterpolation_layer_already_published,
             interpolate=int(args.interpolation_distance), interpolation_passes=int(args.interpolation_passes),
             extrapolate=interpolation_settings.extrapolation_distance,
@@ -3320,7 +3287,7 @@ def _main_impl() -> None:
             union_mm=union_mm, confmap_mm=confmap_mm,
             d1_shadow_path=d1_shadow_path,
             union_path=union_path, confmap_path=confmap_path, temp_dir=temp_dir,
-            dense_tiling_active=bool(dense_tiling_active),
+            tiling_active=bool(tiling_active),
             min_conf=float(args.min_conf), min_radius=float(args.min_radius),
             interpolation_distance=int(args.interpolation_distance),
             interpolation_walk_back=int(args.interpolation_walk_back),
@@ -3374,7 +3341,7 @@ def _main_impl() -> None:
                 dense_inputs = int(np.asarray(union_mm).nbytes) if union_mm is not None else processing_bytes
                 if confmap_mm is not None:
                     dense_inputs += int(np.asarray(confmap_mm).nbytes)
-                future_canvases = (1 + (2 if component_layers_needed else 0)) if dense_tiling_active else 0
+                future_canvases = (1 + (2 if component_layers_needed else 0)) if tiling_active else 0
                 required_bytes = dense_inputs + int(processing_bytes) * int(future_canvases)
                 # The checkpoint task is the sole dense owner. Do not leave
                 # aliases in this submission frame when its writer can start.
@@ -3394,7 +3361,7 @@ def _main_impl() -> None:
                 dense_inputs = int(np.asarray(union_mm).nbytes) if union_mm is not None else processing_bytes
                 if confmap_mm is not None:
                     dense_inputs += int(np.asarray(confmap_mm).nbytes)
-                future_canvases = (1 + (2 if component_layers_needed else 0)) if dense_tiling_active else 0
+                future_canvases = (1 + (2 if component_layers_needed else 0)) if tiling_active else 0
                 required_bytes = (int(task.backing_lease.nbytes) if task.backing_lease is not None else
                     dense_inputs + int(processing_bytes) * int(future_canvases))
                 fut = sam_parent_staging.enqueue_ready(task, required_bytes)
@@ -4015,7 +3982,7 @@ def _main_impl() -> None:
         if isinstance(result, TilePostprocessResult) and result.tile_mask_mm is not None:
             close_memmap_array(result.tile_mask_mm)
         _delete_tile_result_storage(result)
-        _release_tile_dense_result_for_key(
+        _release_tile_result_for_key(
             str(result.model_name), str(result.view_name), str(result.tile_id),
             reason='tile result storage retired',
         )
@@ -4041,7 +4008,7 @@ def _main_impl() -> None:
                     temp_dir,
                     workers=int(tile_slice_postprocess_workers),
                 )
-            _release_tile_dense_result_for_key(
+            _release_tile_result_for_key(
                 str(result.model_name), str(result.view_name), str(result.tile_id),
                 reason='sparse retirement while waiting for parent mask',
             )
@@ -4111,7 +4078,7 @@ def _main_impl() -> None:
                     temp_dir,
                     workers=int(tile_slice_postprocess_workers),
                 )
-                _release_tile_dense_result_for_key(
+                _release_tile_result_for_key(
                     str(result.model_name), str(result.view_name), str(result.tile_id),
                     reason='sparse retirement while waiting for parent bridge',
                 )
@@ -4227,7 +4194,7 @@ def _main_impl() -> None:
         *,
         model_name: str,
         view: ViewInfo,
-        tile_job: DenseTileJob,
+        tile_job: TileJob,
         padding_mask_mm: np.ndarray,
         padding_conf_mm: Optional[np.ndarray],
         padding_mask_path: Path,
@@ -4290,7 +4257,7 @@ def _main_impl() -> None:
                         tile_id=auxiliary_id, parent_crop=crop, threshold_plane_shape=threshold_shape,
                         precleaned=bool(angle_variant_streaming_cleanup_active),
                         min_conf=float(args.min_conf), min_radius=float(args.min_radius),
-                        workers=int(tile_dense_retirement_slice_workers), work_dir=temp_dir,
+                        workers=int(tile_result_retirement_slice_workers), work_dir=temp_dir,
                     )
                 _retire_compact_sink()
             except BaseException as error:
@@ -4312,7 +4279,7 @@ def _main_impl() -> None:
             return results
 
         try:
-            future = tile_dense_retirement_executor.submit(_cleanup_padding)
+            future = tile_result_retirement_executor.submit(_cleanup_padding)
         except BaseException:
             _retire_compact_sink()
             raise
@@ -4537,8 +4504,8 @@ def _main_impl() -> None:
             for tile_id, tile_result in results.items():
                 # Both main tiles and seam groups return their inference credit at CTILE retirement.
                 if tile_result is None or isinstance(tile_result, DeferredTilePostprocessResult):
-                    _release_tile_dense_result_for_key(
-                        model_name, view_name, tile_id, reason='tile dense result retired after cleanup',
+                    _release_tile_result_for_key(
+                        model_name, view_name, tile_id, reason='tile result retired after cleanup',
                     )
                 if tile_result is None:
                     _mark_tile_complete(model_name, view_name, config_id, tile_id)
@@ -4554,7 +4521,7 @@ def _main_impl() -> None:
             model_name, view_name, config_id, tile_id = tile_parent_gate_futures.pop(fut)
             parent_gate_result = fut.result()
             if parent_gate_result.residual_result is None:
-                _release_tile_dense_result_for_key(
+                _release_tile_result_for_key(
                     str(model_name), str(view_name), str(tile_id),
                     reason='parent gate consumed array-backed tile result',
                 )
@@ -4572,7 +4539,7 @@ def _main_impl() -> None:
                 continue
             model_name, view_name, config_id, tile_id = tile_bridge_gate_futures.pop(fut)
             fut.result()
-            _release_tile_dense_result_for_key(
+            _release_tile_result_for_key(
                 str(model_name), str(view_name), str(tile_id),
                 reason='bridge gate consumed array-backed tile residual',
             )
@@ -4777,10 +4744,10 @@ def _main_impl() -> None:
             f'{sum(direct_union_inference_bytes.values()) / GIB:.1f}GiB, '
             f'direct_union_postprocess={len(direct_union_postprocess_views)}/'
             f'{sum(direct_union_postprocess_bytes.values()) / GIB:.1f}GiB, '
-            f'tile_dense_results={len(gpu_worker_tile_dense_result_reservations)}/'
-            f'{gpu_worker_tile_dense_result_task_limit} task(s), '
-            f'{scheduler_state.gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
-            f'{gpu_worker_tile_dense_result_limit / GIB:.1f}GiB, '
+            f'tile_results={len(gpu_worker_tile_result_reservations)}/'
+            f'{gpu_worker_tile_result_task_limit} task(s), '
+            f'{scheduler_state.gpu_worker_tile_result_bytes_reserved / GIB:.1f}/'
+            f'{gpu_worker_tile_result_limit / GIB:.1f}GiB, '
             f'tile_cleanup={len(tile_cleanup_futures)}, '
             f'tile_parent_gate={len(tile_parent_gate_futures)}, '
             f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
@@ -4812,9 +4779,9 @@ def _main_impl() -> None:
     # cleanup. Those files must not form a producer/consumer queue behind interpolation or
     # component gates. Reserve their logical uint8 bytes at dispatch and release the credit
     # immediately when the dedicated cleanup pool publishes a crop-local CTILE store.
-    gpu_worker_tile_dense_result_limit = int(tile_dense_worker_result_limit_bytes())
-    gpu_worker_tile_dense_result_task_limit = int(tile_dense_worker_result_limit_tasks())
-    gpu_worker_tile_dense_result_memory_safe_limit: Optional[int] = None
+    gpu_worker_tile_result_limit = int(tile_worker_result_limit_bytes())
+    gpu_worker_tile_result_task_limit = int(tile_worker_result_limit_tasks())
+    gpu_worker_tile_result_memory_safe_limit: Optional[int] = None
     if scratch_dir_is_memory_backed():
         # A pathname fallback on tmpfs consumes the same cgroup/anonymous-memory budget as
         # memfd. Keep the live array-backed-result cap below current headroom after a fixed safety reserve;
@@ -4824,10 +4791,10 @@ def _main_impl() -> None:
         explicit_anon_cap = int(workspace_anon_cap_bytes())
         if int(explicit_anon_cap) > 0:
             safe_headroom = min(int(safe_headroom), int(explicit_anon_cap))
-        gpu_worker_tile_dense_result_memory_safe_limit = int(safe_headroom)
-        gpu_worker_tile_dense_result_limit = min(
-            int(gpu_worker_tile_dense_result_limit),
-            int(gpu_worker_tile_dense_result_memory_safe_limit),
+        gpu_worker_tile_result_memory_safe_limit = int(safe_headroom)
+        gpu_worker_tile_result_limit = min(
+            int(gpu_worker_tile_result_limit),
+            int(gpu_worker_tile_result_memory_safe_limit),
         )
 
     # One read of the experimental environment feeds the scheduler and the
@@ -4845,14 +4812,14 @@ def _main_impl() -> None:
             interpolation_distance=int(args.interpolation_distance),
             min_conf=float(args.min_conf),
             min_radius=float(args.min_radius),
-            dense_tiling_active=bool(dense_tiling_active),
+            tiling_active=bool(tiling_active),
             nrrd_layers_needed=bool(component_layers_needed),
             direct_union_inference_view_limit=int(direct_union_inference_view_limit),
             direct_union_inference_byte_limit=int(direct_union_inference_byte_limit),
             direct_union_total_dense_byte_limit=int(direct_union_total_dense_byte_limit),
-            gpu_worker_tile_dense_result_limit=int(gpu_worker_tile_dense_result_limit),
-            gpu_worker_tile_dense_result_task_limit=int(
-                gpu_worker_tile_dense_result_task_limit
+            gpu_worker_tile_result_limit=int(gpu_worker_tile_result_limit),
+            gpu_worker_tile_result_task_limit=int(
+                gpu_worker_tile_result_task_limit
             ),
             gpu_worker_process_active=bool(gpu_worker_process_active),
             inference_worker_process_active=True,
@@ -4873,9 +4840,9 @@ def _main_impl() -> None:
     )
 
     _tile_task_azimuthal_padding_count = scheduler.tile_task_azimuthal_padding_count
-    _tile_dense_result_task_bytes = scheduler.tile_dense_result_task_bytes
-    _release_tile_dense_result_task_id = scheduler.release_tile_dense_result_task_id
-    _release_tile_dense_result_for_key = scheduler.release_tile_dense_result_for_key
+    _tile_result_task_bytes = scheduler.tile_result_task_bytes
+    _release_tile_result_task_id = scheduler.release_tile_result_task_id
+    _release_tile_result_for_key = scheduler.release_tile_result_for_key
     _gpu_worker_fullframe_parent_key = scheduler.gpu_worker_fullframe_parent_key
     _describe_hybrid_cpu_idle_reason = scheduler.describe_hybrid_cpu_idle_reason
     from .detector_workspaces import DetectorWorkspacePreparation
@@ -4912,9 +4879,6 @@ def _main_impl() -> None:
         # Fanout-only and SAM stages need the selected devices without detector priority.
         _set_main_process_gpu_inference_priority_active(False)
         _set_main_process_gpu_asset_retirement_pending(False)
-
-    if not scheduled_inference_views:
-        _warm_publication_kernels()
 
     if scheduled_inference_views:
         gpu_worker_result_dir.mkdir(parents=True, exist_ok=True)
@@ -4966,7 +4930,7 @@ def _main_impl() -> None:
             'radial_owner_preflight': any(radial_owner_eligible(
                 view, d1_active=v1613_d1_owner_active, cpu_workers=cpu_worker_process_active,
                 kind='fullframe', interpolation=max(args.interpolation_distance,
-                    interpolation_settings.extrapolation_distance), tiled=dense_tiling_active,
+                    interpolation_settings.extrapolation_distance), tiled=tiling_active,
                 angle_count=len(angles), min_conf=args.min_conf, min_radius=args.min_radius,
                 batch=args.gpu_batch, gray=channel_format.kind == 'gray' and channel_format.channel_count == 1,
                 retain_native=bool(save_labels_enabled or save_binary_enabled),
@@ -4976,6 +4940,8 @@ def _main_impl() -> None:
             'angle_variant_gpu_fastpath_min_conf': angle_variant_gpu_fastpath_min_conf_value,
             'angle_variant_gpu_fastpath_min_radius': angle_variant_gpu_fastpath_min_radius_value,
             'fused_preflight_specs': tuple(fused_preflight_specs),
+            'spherical_host_cache_budget_bytes': spherical_host_cache_budget,
+            'spherical_host_cache_owner_count': gpu_device_count,
         }
         if gpu_worker_process_active:
             if v1613_d1_owner_active:
@@ -5119,11 +5085,9 @@ def _main_impl() -> None:
                 flush=True,
             )
 
-        # The spawned actors own independent compiler state. Keep parent
-        # compilation serial while they initialize, before any detector work is admitted.
+        # All detector actors are registered before source work is admitted.
         runtime_trace_event('startup_detector_workers_registered', gpu_workers=len(gpu_worker_processes),
                             cpu_workers=len(cpu_worker_processes))
-        _warm_publication_kernels()
 
         # Warm GPU workers double as interpolation hosts whenever their targeted inference queue is idle.
         if gpu_worker_process_active and gpu_worker_aux_interpolation_enabled() and bool(interpolation_process_backend_active):
@@ -5280,7 +5244,7 @@ def _main_impl() -> None:
             else:
                 tile_job = job_obj
                 worker_raster_plan_spec = raster_plan_spawn_spec(
-                    build_dense_tile_raster_plan(view, tile_job, channel_format)
+                    build_tile_raster_plan(view, tile_job, channel_format)
                 )
                 m_out = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
                 out_size = int(tile_job.out_size)
@@ -5353,7 +5317,7 @@ def _main_impl() -> None:
                     view, d1_active=v1613_d1_owner_active, cpu_workers=cpu_worker_process_active,
                     kind=kind, interpolation=max(args.interpolation_distance,
                         interpolation_settings.extrapolation_distance),
-                    tiled=bool(dense_tiling_active), angle_count=len(angles),
+                    tiled=bool(tiling_active), angle_count=len(angles),
                     min_conf=args.min_conf, min_radius=args.min_radius, batch=args.gpu_batch,
                     gray=channel_format.kind == 'gray' and channel_format.channel_count == 1,
                     retain_native=bool(save_labels_enabled or save_binary_enabled),
@@ -5604,10 +5568,10 @@ def _main_impl() -> None:
                 # Parent resource profiles also spend extra SAM credit from
                 # this pool; reserving only their base omits that commitment.
                 parent_reserve = max(parent_working, parent_transient_admission.capacity)
-            worker_buffers = confidence_worker_reserve + gray_capture_reserve_bytes + int(gpu_device_count) * max(
-                256 * 1024**2,
-                int(args.gpu_batch) * int(args.imgsz)**2
-                * (16 * int(channel_format.channel_count) + 64))
+            worker_buffers = (confidence_worker_reserve + gray_capture_reserve_bytes
+                              + spherical_host_cache_reserve + int(gpu_device_count) * max(
+                                  256 * 1024**2, int(args.gpu_batch) * int(args.imgsz)**2
+                                  * (16 * int(channel_format.channel_count) + 64)))
             if gpu_union_flush_overlap_enabled():
                 worker_buffers += int(gpu_device_count) * gpu_union_retirement_lane_count() * (
                     2 * gpu_union_retirement_chunk_slices() * int(args.imgsz)**2 + 16)
@@ -5626,7 +5590,7 @@ def _main_impl() -> None:
             for task in gpu_worker_tasks_by_id.values():
                 if str(task['kind']) != 'tile':
                     continue
-                size = int(scheduler.tile_dense_result_task_bytes(task))
+                size = int(scheduler.tile_result_task_bytes(task))
                 tile_sizes.append(size)
                 if policy_settings.coverage != 'none' and size > 0:
                     count = int(task['slice_count']) + scheduler.tile_task_azimuthal_padding_count(task)
@@ -5639,8 +5603,8 @@ def _main_impl() -> None:
             # exclusive oversized task. A 96 GiB configured ceiling is not a
             # 96 GiB commitment for a tiny set of tile masks.
             tile_reserve = max(max(tile_sizes, default=0), min(
-                int(gpu_worker_tile_dense_result_limit),
-                sum(sorted(tile_sizes, reverse=True)[:int(gpu_worker_tile_dense_result_task_limit)])))
+                int(gpu_worker_tile_result_limit),
+                sum(sorted(tile_sizes, reverse=True)[:int(gpu_worker_tile_result_task_limit)])))
             tile_reserve += (tile_reserve * tile_support_numerator + tile_support_denominator - 1) // tile_support_denominator
             policy_memory_plan = policy_parent_memory_plan(
                 gpu_worker_tasks_by_id.values(),
@@ -5655,6 +5619,7 @@ def _main_impl() -> None:
             )
             policy_memory_plan.update(cpu_worker_buffer_plan=cpu_buffer_plan,
                                       gray_capture_host_reserve_bytes=gray_capture_reserve_bytes,
+                                      spherical_host_cache_reserve_bytes=spherical_host_cache_reserve,
                                       confidence_host_reserve_bytes=confidence_worker_reserve,
                                       confidence_stage_reserve_bytes=confidence_stage_reserve,
                                       gpu_worker_buffer_reserve_bytes=gpu_worker_buffers,
@@ -5683,7 +5648,7 @@ def _main_impl() -> None:
         native_dense_reserve_bytes = native_fullframe_dense_reserve(
             gpu_worker_tasks_by_id.values(),
             total_dense_limit=int(direct_union_total_dense_byte_limit),
-            min_conf=float(args.min_conf), dense_tiling=bool(dense_tiling_active),
+            min_conf=float(args.min_conf), tiling=bool(tiling_active),
             nrrd_layers=bool(component_layers_needed),
             retain_confidence=bool(getattr(args, 'reconciliation_retain_confidence', False)),
         )
@@ -5692,7 +5657,7 @@ def _main_impl() -> None:
             gpu_worker_tasks_by_id.values(), temp_dir=temp_dir,
             source_shape=(int(input_T), int(input_H), int(input_W)),
             retire_dense=True,
-            component_layers=component_layers_needed, tiled=dense_tiling_active,
+            component_layers=component_layers_needed, tiled=tiling_active,
             interpolate=int(args.interpolation_distance),
             interpolation_passes=int(args.interpolation_passes),
             extrapolate=interpolation_settings.extrapolation_distance)
@@ -5702,7 +5667,8 @@ def _main_impl() -> None:
             publication_pending=d1_publication_max_pending_per_worker(),
             unpack_bytes=d1_unpack_target_mib() * 1024 * 1024,
             native_dense_reserve_bytes=int(native_dense_reserve_bytes),
-            worker_buffer_reserve_bytes=confidence_worker_reserve + gray_capture_reserve_bytes,
+            worker_buffer_reserve_bytes=(confidence_worker_reserve + gray_capture_reserve_bytes
+                                         + spherical_host_cache_reserve),
             output_reserve_bytes=publication_output_reserve(
                 nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()) + confidence_stage_reserve,
             projected_parent_outputs=projected_parent_outputs,
@@ -5803,7 +5769,7 @@ def _main_impl() -> None:
         if (interpolation_settings.sam_enabled and sam_parent_staging is not None
                 and gpu_worker_process_active and not cpu_worker_process_active
                 and not policy_settings.enabled and not bounded_policy_parent_keys
-                and not dense_tiling_active
+                and not tiling_active
                 and not any(name in os.environ for name in (
                     'YOLO_TTA_DIRECT_UNION_TOTAL_GIB', 'YOLO_TTA_PARENT_TRANSIENT_GIB'))
                 and gpu_worker_tasks_by_id
@@ -5877,38 +5843,38 @@ def _main_impl() -> None:
                 'Unavailable CPU inputs retain GPU rendering. YOLO_TTA_CPU_INPUT_PREFETCH=0 disables this route.', flush=True)
 
         tile_result_sizes = [
-            int(_tile_dense_result_task_bytes(task_obj))
+            int(_tile_result_task_bytes(task_obj))
             for task_obj in gpu_worker_tasks_by_id.values()
             if str(task_obj.get('kind', '')) == 'tile'
         ]
         if tile_result_sizes:
             largest_tile_result = int(max(tile_result_sizes))
             if (
-                gpu_worker_tile_dense_result_memory_safe_limit is not None
-                and int(largest_tile_result) > int(gpu_worker_tile_dense_result_memory_safe_limit)
+                gpu_worker_tile_result_memory_safe_limit is not None
+                and int(largest_tile_result) > int(gpu_worker_tile_result_memory_safe_limit)
             ):
                 raise RuntimeError(
                     'One array-backed crop-local tile result requires '
                     f'{largest_tile_result / GIB:.2f} GiB, but the memory-backed scratch '
                     'root has only '
-                    f'{gpu_worker_tile_dense_result_memory_safe_limit / GIB:.2f} GiB of '
+                    f'{gpu_worker_tile_result_memory_safe_limit / GIB:.2f} GiB of '
                     'safe live-result headroom after reserve. Use a disk-backed --temp root, '
                     'reduce the tile footprint, or disable the confidence result by setting '
                     '--min_conf 0.'
                 )
             print(
                 'Cleanup-boundary tile-result retirement active: '
-                f'live array-backed result budget={gpu_worker_tile_dense_result_limit / GIB:.1f} GiB / '
-                f'{gpu_worker_tile_dense_result_task_limit} task(s), '
+                f'live array-backed result budget={gpu_worker_tile_result_limit / GIB:.1f} GiB / '
+                f'{gpu_worker_tile_result_task_limit} task(s), '
                 f'largest tile result={largest_tile_result / GIB:.2f} GiB; '
                 'shared memfd RAM is preferred so gpu_worker_results is a bounded pathname fallback. '
                 'Stale worker-result scratch was purged before dispatch; full-frame parents and '
                 'P-ready tiles are scheduled ahead of P-not-ready tiles. '
-                f'every nonempty tile retires to CTILE on {tile_dense_retirement_workers} dedicated '
-                f'cleanup task(s) x {tile_dense_retirement_slice_workers} slice worker(s) before '
+                f'every nonempty tile retires to CTILE on {tile_result_retirement_workers} dedicated '
+                f'cleanup task(s) x {tile_result_retirement_slice_workers} slice worker(s) before '
                 'parent interpolation or component gates can retain its array backing. '
-                'YOLO_TTA_TILE_DENSE_RESULT_MAX_GIB / _MAX_TASKS adjust admission; '
-                'YOLO_TTA_TILE_DENSE_RETIREMENT_WORKERS / _SLICE_WORKERS adjust retirement throughput.'
+                'YOLO_TTA_TILE_RESULT_MAX_GIB / _MAX_TASKS adjust admission; '
+                'YOLO_TTA_TILE_RETIREMENT_WORKERS / _SLICE_WORKERS adjust retirement throughput.'
             )
 
         runtime_trace_event('startup_detector_inventory_start')
@@ -6327,7 +6293,7 @@ def _main_impl() -> None:
         assert isinstance(view, ViewInfo)
         model_name_s = str(task['model_name'])
         tile_job = task['job']
-        assert isinstance(tile_job, DenseTileJob)
+        assert isinstance(tile_job, TileJob)
         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
         expected_padding_count = int(_tile_task_azimuthal_padding_count(task))
         processed_padding_count = int(stats.get('azimuthal_padding_processed', 0) or 0)
@@ -6402,7 +6368,7 @@ def _main_impl() -> None:
                         Path(str(pth)).unlink(missing_ok=True)
                     except Exception:
                         pass
-            _release_tile_dense_result_for_key(
+            _release_tile_result_for_key(
                 model_name_s, str(view.name), str(tile_job.tile_id),
                 reason='inference worker reported an empty tile result',
             )
@@ -6433,10 +6399,10 @@ def _main_impl() -> None:
                 'threshold_plane_shape', view_processing_volume_shape(view, int(task.get('out_size', args.imgsz)))[-2:]
             )),
         )
-        fut = tile_dense_retirement_executor.submit(
+        fut = tile_result_retirement_executor.submit(
             postprocess_tile_volume_after_inference, ptask,
             view=view, min_conf=float(args.min_conf), min_radius=float(args.min_radius),
-            slice_workers=int(tile_dense_retirement_slice_workers),
+            slice_workers=int(tile_result_retirement_slice_workers),
             sparse_retire_dir=temp_dir,
         )
         tile_cleanup_futures[fut] = (model_name_s, str(view.name), str(tile_job.config_id), str(tile_job.tile_id))
@@ -6543,10 +6509,10 @@ def _main_impl() -> None:
             f'hybrid contracts D1={int(hybrid_contract_counts.get("d1_owner", 0))}, '
             f'direct_union={int(hybrid_contract_counts.get("direct_union", 0))}; '
             f'parent_postprocess={len(view_processing_futures)}, '
-            f'tile_dense_results={len(gpu_worker_tile_dense_result_reservations)}/'
-            f'{gpu_worker_tile_dense_result_task_limit} task(s), '
-            f'{scheduler_state.gpu_worker_tile_dense_result_bytes_reserved / GIB:.1f}/'
-            f'{gpu_worker_tile_dense_result_limit / GIB:.1f}GiB, '
+            f'tile_results={len(gpu_worker_tile_result_reservations)}/'
+            f'{gpu_worker_tile_result_task_limit} task(s), '
+            f'{scheduler_state.gpu_worker_tile_result_bytes_reserved / GIB:.1f}/'
+            f'{gpu_worker_tile_result_limit / GIB:.1f}GiB, '
             f'tile_cleanup={len(tile_cleanup_futures)}, '
             f'tile_parent_gate={len(tile_parent_gate_futures)}, '
             f'tile_bridge_gate={len(tile_bridge_gate_futures)}, '
@@ -6862,7 +6828,7 @@ def _main_impl() -> None:
         component_projection_queue.shutdown(cancel_futures=sys.exc_info()[0] is not None)
         runtime_telemetry().gauge('projection.component_queue', component_projection_queue.snapshot())
         runtime_telemetry().gauge('projection.component_replay_capture', component_replay_capture_status())
-        tile_dense_retirement_executor.shutdown(wait=True)
+        tile_result_retirement_executor.shutdown(wait=True)
         tile_postprocess_executor.shutdown(wait=True)
         if sam_context is not None:
             _close_sam_context_after_scheduler(sam_context, scheduler_error)
@@ -6919,13 +6885,13 @@ def _main_impl() -> None:
         # tile-postprocess future is quiescent now, so release any parent-owned memfd/disk
         # mappings that never reached sparse retirement without racing an active consumer.
         for tile_task_id in list(
-            set(gpu_worker_tile_dense_result_reservations)
-            | set(gpu_worker_tile_dense_result_memfd_reservations)
-            | set(gpu_worker_tile_dense_result_reserved_at)
-            | set(gpu_worker_tile_dense_result_workspaces)
+            set(gpu_worker_tile_result_reservations)
+            | set(gpu_worker_tile_result_memfd_reservations)
+            | set(gpu_worker_tile_result_reserved_at)
+            | set(gpu_worker_tile_result_workspaces)
             | set(gpu_worker_tile_pending_result_ids_by_task)
         ):
-            _release_tile_dense_result_task_id(
+            _release_tile_result_task_id(
                 int(tile_task_id), reason='scheduler teardown', refill=False,
             )
         if gpu_worker_result_dir.exists():

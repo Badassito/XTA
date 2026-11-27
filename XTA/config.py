@@ -1091,6 +1091,25 @@ class ConfidenceSweepSpec:
         return self.end_hundredths / 100.0
 
 
+@dataclass(frozen=True)
+class _GroupedConfidenceSweep:
+    """The sorted union of cutoffs from multiple confidence groups."""
+
+    levels_hundredths: Tuple[int, ...]
+
+    @property
+    def values(self) -> Tuple[float, ...]:
+        return tuple(level / 100.0 for level in self.levels_hundredths)
+
+    @property
+    def floor(self) -> float:
+        return self.levels_hundredths[0] / 100.0
+
+    @property
+    def highest(self) -> float:
+        return self.levels_hundredths[-1] / 100.0
+
+
 def _confidence_hundredths(value: str, field: str) -> int:
     try:
         number = Decimal(value)
@@ -1116,21 +1135,41 @@ def _confidence_hundredths(value: str, field: str) -> int:
     return coefficient * 10 ** shift
 
 
+def _parse_confidence_range(value: str) -> ConfidenceSweepSpec:
+    parts = value.split(':')
+    if len(parts) != 3 or any(not part.strip() for part in parts):
+        raise ValueError("confidence sweep must be START:STEP:END")
+    return ConfidenceSweepSpec(*(
+        _confidence_hundredths(part, field)
+        for part, field in zip(parts, ('START', 'STEP', 'END'))
+    ))
+
+
+def _parse_grouped_confidence(values: Sequence[str]) -> _GroupedConfidenceSweep:
+    levels = set()
+    for value in values:
+        try:
+            if ':' in value:
+                levels.update(_parse_confidence_range(value).levels_hundredths)
+            else:
+                levels.add(_confidence_hundredths(value, 'cutoff'))
+        except ValueError as exc:
+            raise ValueError(f"{value!r}: {exc}") from exc
+    return _GroupedConfidenceSweep(tuple(sorted(levels)))
+
+
 class _ConfidenceArgument(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
-        text = str(values)
         try:
-            if ':' in text:
-                parts = text.split(':')
-                if len(parts) != 3 or any(not part.strip() for part in parts):
-                    raise ValueError("confidence sweep must be START:STEP:END")
-                spec = ConfidenceSweepSpec(*(
-                    _confidence_hundredths(part, field)
-                    for part, field in zip(parts, ('START', 'STEP', 'END'))
-                ))
+            first = values[0]
+            if len(values) > 1:
+                spec = _parse_grouped_confidence(values)
+                confidence = spec.floor
+            elif ':' in first:
+                spec = _parse_confidence_range(first)
                 confidence = spec.floor
             else:
-                confidence = _bounded_number(float, minimum=0, maximum=1)(text)
+                confidence = _bounded_number(float, minimum=0, maximum=1)(first)
                 spec = None
         except (argparse.ArgumentTypeError, ValueError) as exc:
             raise argparse.ArgumentError(self, str(exc)) from exc
@@ -1147,7 +1186,8 @@ def parse_confidence_sweep_options(parser, parsed, mode_arguments: Sequence[str]
     a sweep disables the independent component/instance gate instead of silently
     applying the scalar default of 0.30. Call after each mode-local reparse.
     """
-    if not isinstance(getattr(parsed, 'conf_sweep', None), ConfidenceSweepSpec):
+    spec = getattr(parsed, 'conf_sweep', None)
+    if not isinstance(spec, (ConfidenceSweepSpec, _GroupedConfidenceSweep)):
         return parsed
     explicit = any(
         str(token) == '--min_conf' or str(token).startswith('--min_conf=')
@@ -1269,11 +1309,13 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.set_defaults(conf_sweep=None)
     p.add_argument(
-        "--conf", default=0.15, action=_ConfidenceArgument, metavar="SCALAR|START:STEP:END",
+        "--conf", default=0.15, action=_ConfidenceArgument, nargs='+', metavar="CUTOFF|START:STEP:END",
         help=(
             "Detector confidence, or semantic foreground pixel probability, in [0,1]. "
             "START:STEP:END runs independent cutoffs in exact hundredths, including both endpoints "
-            "(for example 0.50:0.10:0.70). Sweep defaults --min_conf to 0 unless explicitly supplied."
+            "(for example 0.50:0.10:0.70). Multiple ranges or hundredth cutoffs after one --conf "
+            "form one ascending sweep with duplicates removed. "
+            "Sweep defaults --min_conf to 0 unless explicitly supplied."
         ),
     )
     p.add_argument(

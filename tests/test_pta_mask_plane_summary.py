@@ -295,7 +295,7 @@ def test_video_load_attaches_reader_summary_on_serial_and_parallel_paths(tmp_pat
 
 
 @pytest.mark.parametrize('target, span, calls', [((9, 14, 19), 'pta.mask.nrrd_normalize', 1),
-                                                  ((10, 14, 21), 'pta.mask.nrrd_resample', 10)])
+                                                  ((10, 14, 21), 'pta.mask.nrrd_resample', 9)])
 def test_mask_write_stages_have_spans(tmp_path, monkeypatch, target, span, calls):
     from XTA import runtime
     monkeypatch.setenv('YOLO_TTA_TELEMETRY', '1')
@@ -304,8 +304,15 @@ def test_mask_write_stages_have_spans(tmp_path, monkeypatch, target, span, calls
     recorder.flush_seconds = 1e9
     monkeypatch.setattr(pta_inputs, 'runtime_telemetry', lambda: recorder)
     source = (np.random.default_rng(0).random((9, 14, 19)) < 0.2).astype(np.uint8)
-    pta_inputs.load_nrrd_mask_for_volume(write_mask(tmp_path, source), target,
-                                         warnings=pta.WarningLog(), force=True)
+    mask = pta_inputs.load_nrrd_mask_for_volume(write_mask(tmp_path, source), target,
+                                                warnings=pta.WarningLog(), force=True)
+    expected = source
+    if target != source.shape:
+        # The endpoint-aligned map writes target planes 4 and 5 in one source-plane span.
+        source_z = [0, 1, 2, 3, 4, 4, 5, 6, 7, 8]
+        source_x = [0, 1, 2, 3, 4, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 14, 15, 16, 17, 18]
+        expected = source[np.ix_(source_z, range(source.shape[1]), source_x)]
+    assert_same_mask(mask, expected)
     phases = recorder.snapshot()['phases']
     assert phases['pta.mask.nrrd_payload_read']['calls'] == 1
     assert phases[span]['calls'] == calls

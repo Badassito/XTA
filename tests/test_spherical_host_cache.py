@@ -9,7 +9,7 @@ import time
 import numpy as np
 import pytest
 
-from XTA.spherical_host_cache import HostDirectionCache
+from XTA.spherical_host_cache import HostDirectionCache, tta_spherical_host_cache_budget
 from XTA.spherical_cuda import _build_host_direction_block
 
 
@@ -207,6 +207,21 @@ def test_headroom_is_rechecked_after_cached_owner_eviction():
     cache.clear()
     gc.collect()
     assert cache.snapshot()['live_bytes'] == 0
+
+
+@pytest.mark.parametrize(('available', 'reserved', 'workers', 'per_worker'), [
+    (32, 32, 4, 0),
+    (31, 32, 4, 0),
+    (47, 32, 4, 3),
+    (64, 32, 0, 0),
+    (4 << 30, 1 << 30, 4, 672 << 20),
+])
+def test_tta_cache_grant_does_not_spend_existing_host_commitments(available, reserved, workers, per_worker):
+    budget = tta_spherical_host_cache_budget(
+        available_bytes=available, reserved_bytes=reserved, worker_count=workers,
+    )
+    assert budget == per_worker
+    assert budget * workers <= max(0, available - reserved)
 
 
 def test_more_gpu_owners_reduce_each_cache_share_of_physical_headroom():

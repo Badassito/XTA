@@ -117,7 +117,6 @@ def _qualification_environment(output: Path, *, cpu_only: bool) -> dict[str, str
     generated_dirs = {
         'runtime-temp': output / 'runtime-temp',
         'cupy-cache': output / 'cupy-cache',
-        'numba-cache': output / 'numba-cache',
         'cuda-cache': output / 'cuda-cache',
         'native-cache': output / 'native-cache',
     }
@@ -128,7 +127,6 @@ def _qualification_environment(output: Path, *, cpu_only: bool) -> dict[str, str
                PYTHONPATH=str(ROOT), YOLO_CONFIG_DIR=str(output / 'ultralytics-config'),
                XTA_TEST_REPO=str(ROOT), TEMP=runtime_temp, TMP=runtime_temp,
                TMPDIR=runtime_temp, CUPY_CACHE_DIR=str(generated_dirs['cupy-cache']),
-               NUMBA_CACHE_DIR=str(generated_dirs['numba-cache']),
                XTA_NATIVE_SCHEDULER_CACHE=str(generated_dirs['native-cache']),
                CUDA_CACHE_PATH=str(generated_dirs['cuda-cache']))
     Path(env['YOLO_CONFIG_DIR']).mkdir(parents=True, exist_ok=True)
@@ -168,6 +166,12 @@ def qualify(output: Path, *, snapshot: bool, gpu_lock_timeout: float,
     if receipt_path.exists():
         raise FileExistsError(f'Use a new output directory; qualification already exists: {receipt_path}')
     env = _qualification_environment(output, cpu_only=cpu_only)
+    # This gate builds from the exact checkout. Other probes reuse the CPU
+    # artifact selected by their caller through the shared environment helper.
+    native_cpu_artifacts = output / 'native-cpu'
+    native_cpu_artifacts.mkdir(exist_ok=True)
+    env.pop('XTA_NATIVE_CPU_BINARY', None)
+    env['XTA_NATIVE_CPU_ARTIFACTS'] = str(native_cpu_artifacts)
     if not cpu_only:
         env.update(CUDA_COVERAGE_ENVIRONMENT,
                    XTA_SPHERICAL_TEST_ROOT=str(output))
@@ -175,6 +179,8 @@ def qualify(output: Path, *, snapshot: bool, gpu_lock_timeout: float,
     gap_arguments = ([] if acknowledge_gap is None else
                      [f'--acknowledge-gap={acknowledge_gap}', f'--reason={reason}'])
     steps = [
+        ('native-cpu-build', [sys.executable, '-B', 'tools/build_native_cpu.py',
+                              '--artifacts-dir', env['XTA_NATIVE_CPU_ARTIFACTS']]),
         ('full-tests', [sys.executable, '-B', '-m', 'pytest', '-p', 'no:cacheprovider',
                         '--maxfail=1',
                         '--basetemp', str(output / 'pytest-tmp'),

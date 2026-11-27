@@ -103,7 +103,7 @@ def main():
     output = fixture((4, 3064, 3022), 737)
     started = time.perf_counter()
     dense.encode_dense_u8_packed_block(source, 0, 1)
-    jit_seconds = time.perf_counter()-started
+    native_first_encode_seconds = time.perf_counter()-started
     slot = np.empty(dense.DENSE_PACKED_PAYLOAD_BYTES, np.uint8)
     started = time.perf_counter()
     heat_calls = 0
@@ -114,7 +114,7 @@ def main():
             print(f'CPU heat soak {time.perf_counter()-started:.1f}s', flush=True)
     heat_seconds = time.perf_counter()-started
     report = dict(platform=platform.platform(), processor=platform.processor(),
-        python=sys.version, numpy=np.__version__, jit_seconds=jit_seconds,
+        python=sys.version, numpy=np.__version__, native_first_encode_seconds=native_first_encode_seconds,
         started_wall_time=started_wall_time,
         started_utc=datetime.fromtimestamp(started_wall_time, timezone.utc).isoformat(),
         cpu_heatsoak_seconds=heat_seconds, heatsoak_calls=heat_calls,

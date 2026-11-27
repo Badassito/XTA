@@ -660,7 +660,8 @@ def test_scalar_processes_are_independent_and_live_output_is_inherited(harness, 
     for name in product_stages:
         monkeypatch.setenv(name, str(tmp_path / 'unowned-stage'))
     original = [*harness.arguments, '--task','semantic','--interpolation','sam',
-        '--conf=.10:.10:1.00','--conf','.20', '--output=ignored', '--output','ignored-too',
+        '--conf=.10:.10:1.00', '--conf', '.50:.25:1', '.75:.25:1',
+        '--output=ignored', '--output','ignored-too',
         '--min_conf=.9','--temp=old-root',
         '--capture_component_replay',str(tmp_path/'capture')]
     untouched = list(original)
@@ -683,6 +684,7 @@ def test_scalar_processes_are_independent_and_live_output_is_inherited(harness, 
         args = item['arguments']
         assert args.count('--conf') == args.count('--output') == args.count('--temp') == args.count('--min_conf') == 1
         assert args[args.index('--conf')+1] == f'{cent/100:.2f}'
+        assert {'--conf=.10:.10:1.00', '.50:.25:1', '.75:.25:1'}.isdisjoint(args)
         assert args[args.index('--task')+1] == 'semantic'
         assert args[args.index('--interpolation')+1] == 'sam'
         assert args[args.index('--min_conf')+1] == '.13' or args[args.index('--min_conf')+1] == '0.13'

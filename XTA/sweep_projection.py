@@ -489,11 +489,11 @@ def _curved_reader(source, view, shape, boxes, workspace, diagnostics, *, radial
     if str(view.family) == "spherical":
         from .spherical_projection import _validate_spherical_projection
         from .spherical_projection_bounds import spherical_output_bounds
-        from .spherical_projection_cpu import prepare_spherical_chunk_numba, pull_spherical_rectangle_numba
+        from .spherical_projection_cpu import prepare_spherical_chunk_native, pull_spherical_rectangle_native
         radii, rotation, resolved, boxes = _validate_spherical_projection(source, view, shape, boxes)
         if tuple(resolved) != shape:
             raise ValueError("Spherical projection changed output geometry")
-        prepare_spherical_chunk_numba(source, view, radii, rotation, shape, boxes)
+        prepare_spherical_chunk_native(source, view, radii, rotation, shape, boxes)
         bound = spherical_output_bounds(view, shape, boxes)
         bounds = (bound.z0, bound.y0, bound.x0, bound.z1, bound.y1, bound.x1)
         plane_rectangle = (bound.y0, bound.y1, bound.x0, bound.x1)
@@ -501,7 +501,7 @@ def _curved_reader(source, view, shape, boxes, workspace, diagnostics, *, radial
             inside = (bound.z0 <= z < bound.z1 and bound.y0 < bound.y1 and bound.x0 < bound.x1)
             return (plane_rectangle, (plane_rectangle,)) if inside else None
         def pull(z, first, stop, _rectangle):
-            return pull_spherical_rectangle_numba(source, view, radii, rotation, shape,
+            return pull_spherical_rectangle_native(source, view, radii, rotation, shape,
                 z, first, stop, boxes, bounds_yx=plane_rectangle, scalar_max=True)
         diagnostics["backend"] = "cpu_spherical_rank_rectangle"
     else:
@@ -636,6 +636,7 @@ def sweep_rank_projection_reader(source_rank_u8,view,output_shape_tyx,work_dir,*
     lanes=[]
     pool=queue.SimpleQueue()
     final_state=None
+    cuda_diagnostics={}
     def snapshot():
         with condition:
             if final_state is not None:
@@ -716,7 +717,6 @@ def sweep_rank_projection_reader(source_rank_u8,view,output_shape_tyx,work_dir,*
                             diagnostics["native_bounds_decline"]="unsupported_contract"
                     else:
                         diagnostics["native_bounds_decline"]="metadata_credit_or_bounds_dtype"
-            cuda_diagnostics={}
             with cuda_rank_projection_reader(source,view,shape,private,
                     level_count=int(level_count),memory_bytes=available,
                     source_max_rank=maximum,known_native_boxes=boxes,
@@ -789,6 +789,10 @@ def sweep_rank_projection_reader(source_rank_u8,view,output_shape_tyx,work_dir,*
     finally:
         with condition:
             closing=closed=True
+            # The Radial stage fence is measured as the CUDA context exits,
+            # after the ordinary lane snapshot. Keep that final receipt too.
+            if final_state is not None and "radial_device_timing" in cuda_diagnostics:
+                final_state = {**final_state, "lane_diagnostics": [dict(cuda_diagnostics)]}
         lanes.clear()
         pool=None
         source=boxes=None

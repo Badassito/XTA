@@ -6,6 +6,7 @@ from bisect import bisect_right
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from itertools import zip_longest
+from queue import Empty, SimpleQueue
 import threading
 import time
 import errno
@@ -162,6 +163,14 @@ class _Packet:
     retirement_fd: object = None
 
 
+@dataclass(frozen=True)
+class _FallbackWindow:
+    packet: _Packet
+    task_id: int
+    start: int
+    count: int
+
+
 class CpuInputPrefetch:
     """Prepare bounded leases; split siblings share one original coverage owner."""
     def __init__(self, tasks, volume, executor: Executor, *, max_bytes, headroom,
@@ -193,6 +202,9 @@ class CpuInputPrefetch:
         self.pending = deque(packet for row in zip_longest(*self.index.values())
                              for packet in row if packet is not None)
         self.retiring = deque()
+        # None wakes the controller; a fallback batch also carries accepted
+        # input decisions. Both use its same existing pump and retirement deque.
+        self._control_messages = SimpleQueue()
         self.pump_scheduled = self.pump_requested = False
         self.completed_task_ids = set()
         # Executor.submit can start a thread under a process-wide lock. Keep it
@@ -377,7 +389,7 @@ class CpuInputPrefetch:
     def _retirement_ready(self, _reference):
         with self.condition:
             if not self.closed:
-                self.pump_requested = self.pump_scheduled = True
+                self._request_pump_locked()
             self.condition.notify_all()
 
     def _build(self, packet):
@@ -470,22 +482,53 @@ class CpuInputPrefetch:
         with self.condition:
             if self.closed:
                 return
-            self.pump_requested = True
-            self.pump_scheduled = True
+            self._request_pump_locked()
             self.condition.notify_all()
+
+    def _request_pump_locked(self):
+        if not self.pump_requested:
+            self._control_messages.put(None)
+        self.pump_requested = self.pump_scheduled = True
+
+    def release_submitted_fallbacks(self, windows):
+        """The native owner accepted these immutable descriptors without CPU input."""
+        # Do not wait for the optional owner's metadata lock on the dispatch thread.
+        if self.closed:
+            return  # Shutdown already drains every builder, mapping and FD.
+        self._control_messages.put(windows)
+
+    def _settle_submitted_fallbacks(self, windows, cancelled):
+        """Called by the controller under its metadata lock, before choosing new builds."""
+        released = 0
+        for window in windows:
+            packet = window.packet
+            if window.task_id in self.completed_task_ids or window.task_id in packet.borrowers:
+                continue
+            self._retire_window(packet, window.task_id, window.start, window.count)
+            released += window.count
+            if (not packet.remaining and not packet.borrowers and packet.building
+                    and not packet.running and packet.future is not None):
+                cancelled.append(packet.future)
+        return released
 
     def _control(self):
         while True:
+            with self.lock:
+                if self.closed:
+                    return
+                timeout = .05 if self.retiring else None
+            # Mapping death and immutable fallback submissions wake this controller.
+            # The timeout also covers a keepalive FD settling after its mapping.
+            try:
+                message = self._control_messages.get(timeout=timeout)
+            except Empty:
+                message = None
             with self.condition:
-                # Mapping death normally wakes us. The bounded retry also covers
-                # a keepalive-FD finalizer that finishes after that notification.
-                self.condition.wait_for(lambda: self.closed or self.pump_requested,
-                    timeout=.05 if self.retiring else None)
                 if self.closed:
                     return
                 self.pump_scheduled = True
             try:
-                self._pump()
+                self._pump(message)
                 self._report()
             except Exception as error:
                 if not self.closed:
@@ -496,7 +539,7 @@ class CpuInputPrefetch:
                     self.pump_scheduled = self.pump_requested
                     self.condition.notify_all()
 
-    def _pump(self):
+    def _pump(self, message):
         while True:
             with self.lock:
                 if self.closed:
@@ -505,6 +548,17 @@ class CpuInputPrefetch:
                 cancelled = [packet.future for packet in self.packets
                              if packet.revoked and packet.building and not packet.running
                              and packet.future is not None]
+                released = 0
+                while True:
+                    if message is not None:
+                        released += self._settle_submitted_fallbacks(message, cancelled)
+                    try:
+                        message = self._control_messages.get_nowait()
+                    except Empty:
+                        message = None
+                        break
+            if released:
+                self._record('released_fallback_frames', released)
             # Cancellation can invoke adoption callbacks. Keep it on the existing
             # controller and outside the owner lock, just like array retirement.
             for future in cancelled:
@@ -528,6 +582,8 @@ class CpuInputPrefetch:
             available = None
             while True:
                 with self.lock:
+                    if not self._control_messages.empty():
+                        break
                     while self.pending and (self.pending[0].revoked or not self.pending[0].remaining):
                         self.pending.popleft()
                     if self.closed or not self.pending:
@@ -551,6 +607,8 @@ class CpuInputPrefetch:
                 if available < size:
                     break
                 with self.lock:
+                    if not self._control_messages.empty():
+                        break
                     if self.closed or self.pending[0] is not packet or packet.revoked or not packet.remaining:
                         continue
                     if not self._build_slot_available():
@@ -569,7 +627,7 @@ class CpuInputPrefetch:
                     with self.condition:
                         packet.building = False
                         self._queue_retirement(packet)
-                        self.pump_requested = True  # Settle this failed submission without another GPU event.
+                        self._request_pump_locked()  # Settle this failure without another GPU event.
                         self.condition.notify_all()
                     raise
                 with self.lock:
@@ -580,7 +638,7 @@ class CpuInputPrefetch:
                 if packet.revoked:
                     self.pump()
             with self.lock:
-                if not self.pump_requested:
+                if not self.pump_requested and self._control_messages.empty():
                     return
 
     def _build_slot_available(self):
@@ -622,44 +680,49 @@ class CpuInputPrefetch:
             self.lock.release()
 
     def attach_ready(self, task):
+        """Attach immediately if ready; a missed eligible window can be released after send."""
         packet = self._packet(task)
         if packet is None:
             return
         attached = False
-        if not self.lock.acquire(blocking=False):
-            self._record('gpu_fallback_frames', int(task['slice_count']))
-            return
-        try:
-            if (not self.closed and packet.input_path is not None and not packet.retiring
-                    and not packet.revoked and int(task['task_id']) not in self.completed_task_ids):
-                packet.borrowers.add(int(task['task_id']))
-                task.update(cpu_input_path=packet.input_path, cpu_input_shape=packet.input_shape,
-                    cpu_input_offset=int(task['slice_start']) - int(packet.task['slice_start']))
-                attached = True
-        finally:
-            self.lock.release()
+        if self.lock.acquire(blocking=False):
+            try:
+                if (not self.closed and packet.input_path is not None and not packet.retiring
+                        and not packet.revoked and int(task['task_id']) not in self.completed_task_ids):
+                    packet.borrowers.add(int(task['task_id']))
+                    task.update(cpu_input_path=packet.input_path, cpu_input_shape=packet.input_shape,
+                        cpu_input_offset=int(task['slice_start']) - int(packet.task['slice_start']))
+                    attached = True
+            finally:
+                self.lock.release()
         self._record('offloaded_frames' if attached else 'gpu_fallback_frames', int(task['slice_count']))
+        if not attached:
+            return _FallbackWindow(packet, int(task['task_id']), int(task['slice_start']), int(task['slice_count']))
+
+    def _retire_window(self, packet, task_id, start, count):
+        self.completed_task_ids.add(task_id)
+        packet.borrowers.discard(task_id)
+        packet.remaining.difference_update(range(start, start + count))
+        if not packet.remaining and not packet.borrowers and not packet.building:
+            self._queue_retirement(packet)
 
     def retire(self, task):
         with self.lock:
             task_id = int(task['task_id'])
             if task_id in self.completed_task_ids:
                 return
-            self.completed_task_ids.add(task_id)
             packet = self._packet(task)
             if packet is None:
+                self.completed_task_ids.add(task_id)
                 return
-            packet.borrowers.discard(task_id)
-            packet.remaining.difference_update(range(int(task['slice_start']),
-                int(task['slice_start']) + int(task['slice_count'])))
-            if not packet.remaining and not packet.borrowers and not packet.building:
-                self._queue_retirement(packet)
+            self._retire_window(packet, task_id, int(task['slice_start']), int(task['slice_count']))
         self.pump()
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         with self.condition:
             self.closed = True
             self.pump_requested = False
+            self._control_messages.put(None)
             futures = [packet.future for packet in self.packets if packet.future is not None]
             self.condition.notify_all()
         for future in futures:

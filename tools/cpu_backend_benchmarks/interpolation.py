@@ -1,10 +1,7 @@
 """Bounded, real interpolation projection-candidate planner cases.
 
-The same warmed component/SDF cache is passed to the explicit Python and Numba
-entry points. Benchmark trials therefore measure candidate scanning, not table
-construction or first-call compilation. A compiled refusal is an error here:
-the production dispatcher may fall back, but timing that fallback as Numba
-would mislabel the result.
+The Python reference and native scan share the same prepared component/SDF
+cache, so timing excludes component table construction and backend setup.
 """
 from __future__ import annotations
 
@@ -55,8 +52,6 @@ def _fixture(workload: str, *, fragmented: bool) -> tuple[np.ndarray, interpolat
 
 
 def _case(workload: str, *, fragmented: bool) -> Case:
-    if interpolation._numba_find_projection_candidates_kernel is None:
-        raise RuntimeError('Interpolation compiled CPU benchmark requires Numba')
     labels, seed, max_distance, max_candidates = _fixture(workload, fragmented=fragmented)
     cache = interpolation.SliceComponentTableCache(labels)
     source, _anchor = cache.find_record_for_point(seed.point[0], seed.label, seed.point[1:])
@@ -75,7 +70,7 @@ def _case(workload: str, *, fragmented: bool) -> Case:
         return _rows(_find_slice_projection_candidates_python(**kwargs))
 
     def compiled() -> np.ndarray:
-        candidates = interpolation._find_slice_projection_candidates_numba(**kwargs)
+        candidates = interpolation._find_slice_projection_candidates_native(**kwargs)
         if candidates is None:
             raise RuntimeError(
                 'Interpolation compiled projection-candidate planner declined this fixture; '
@@ -83,15 +78,14 @@ def _case(workload: str, *, fragmented: bool) -> Case:
             )
         return _rows(candidates)
 
-    # Warm the actual signature and reject any accidentally empty or inequivalent
-    # fixture before the runner starts timing trials.
+    # Verify the fixture and load the native module before timing begins.
     expected = reference()
     observed = compiled()
     if expected.shape[0] != max_candidates or not np.array_equal(expected, observed):
         raise RuntimeError('Interpolation projection-candidate benchmark fixture is invalid')
 
     return Case(
-        name=f'interpolation_{workload}_{"fragmented" if fragmented else "coherent"}_python_vs_numba',
+        name=f'interpolation_{workload}_{"fragmented" if fragmented else "coherent"}_python_vs_native',
         reference=reference,
         compiled=compiled,
         work_units=int(sdf.sdf.size),
@@ -99,7 +93,7 @@ def _case(workload: str, *, fragmented: bool) -> Case:
         metadata={
             'family': 'interpolation', 'workload': workload,
             'reference_oracle': 'tests.reference_backends.interpolation._find_slice_projection_candidates_python',
-            'production_compiled': 'XTA.interpolation._find_slice_projection_candidates_numba',
+            'production_compiled': 'XTA.interpolation._find_slice_projection_candidates_native',
             'setup_included_in_trials': False,
             'labels_shape': list(labels.shape), 'labels_dtype': str(labels.dtype),
             'seed_point': list(seed.point), 'source_component_area': int(source.area),
@@ -107,7 +101,7 @@ def _case(workload: str, *, fragmented: bool) -> Case:
             'scan_steps': 1,
             'search_angle_deg': 20.0, 'max_candidates': int(max_candidates),
             'candidate_count': int(expected.shape[0]), 'fragmented': bool(fragmented),
-            'numba_workspace_cap': int(interpolation.interpolation_projection_numba_max_tracked()),
+            'native_workspace_cap': int(interpolation.interpolation_projection_max_tracked()),
         },
     )
 

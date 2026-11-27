@@ -34,7 +34,7 @@ class Inputs:
     direct_union_total_dense_byte_limit: int = 454*GIB
     direct_union_inference_byte_limit: int = 128*GIB
     min_conf: float = 0
-    dense_tiling_active: bool = False
+    tiling_active: bool = False
     nrrd_layers_needed: bool = True
     imgsz: int = 2048
 
@@ -49,7 +49,7 @@ def actual_partition(monkeypatch):
     namespace.update(scheduler=scheduler,GIB=GIB,replace=replace,_env_flag=runtime._env_flag,
         interpolation_settings=SimpleNamespace(sam_enabled=True),sam_parent_staging=object(),
         policy_settings=SimpleNamespace(enabled=False),bounded_policy_parent_keys=set(),
-        dense_tiling_active=False,gpu_worker_process_active=True,
+        tiling_active=False,gpu_worker_process_active=True,
         cpu_worker_process_active=False,channel_format=SimpleNamespace(kind='gray'),
         args=SimpleNamespace(gpu_batch=1),memfd_workspace_enabled=lambda:True,
         available_anon_work_bytes=lambda:1400*GIB,
@@ -92,7 +92,7 @@ def test_unsupported_or_already_owned_run_keeps_original_partition(monkeypatch,r
     elif reason=='no_gpu': ns['gpu_worker_process_active']=False
     elif reason=='policy': ns['policy_settings'].enabled=True
     elif reason=='policy_parent': ns['bounded_policy_parent_keys'].add('parent')
-    elif reason=='tiles': ns['dense_tiling_active']=True
+    elif reason=='tiles': ns['tiling_active']=True
     elif reason.endswith('_override'):
         monkeypatch.setenv('YOLO_TTA_DIRECT_UNION_TOTAL_GIB' if reason=='dense_override'
             else 'YOLO_TTA_PARENT_TRANSIENT_GIB','454')

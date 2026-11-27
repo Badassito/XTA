@@ -119,7 +119,8 @@ builds a smoother label from the same edited Global; keep its
 | `verify_package_inventory.py` | Check maintained paths, versions, and canonical digests |
 | `check_release_version.py` | Validate release-number transitions and local tag identities |
 | `build_source_release.py` | Build an identified complete-source bundle |
-| `qualify_release.py` | Run complete checkout qualification and preserve evidence |
+| `build_native_cpu.py` | Prepare the required native CPU extension for source launches and tests |
+| `qualify_release.py` | Build native CPU kernels, run complete checkout qualification, and preserve evidence |
 
 The [maintenance guide](../docs/maintenance.md) explains these boundaries and
 the difference between source identity, packaging, and numerical qualification.

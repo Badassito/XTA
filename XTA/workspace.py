@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import io
+import locale
 import os
 import re
 import sys
 from pathlib import Path
-from time import perf_counter as _perf_counter
 from typing import (
     Dict,
     Optional,
@@ -15,162 +16,57 @@ import numpy as np
 
 from .env_flags import env_flag as _env_flag, env_float as _env_float, env_int as _env_int
 
-# RAM headroom probe reads (/proc/meminfo, /proc/self/{cgroup,mountinfo} and
-# each cgroup level's limit/usage/memory.stat). Path.read_text releases the GIL
-# around open/fstat/read/close; in the busy main process (hundreds of threads,
-# few cores) each release costs about one switch interval, so one probe took
-# 12-131 ms (seconds with 6 busy Python threads) and ~1,600 probes per run add
-# up to minutes. On Linux the probe reads these kernel-generated files through
-# libc with the GIL held (_gil_holding_text_reader): same text and errors, no
-# convoy. Every probe stays fresh: it starts after its caller's call, which
-# memfd_ram_headroom's "block sample before headroom" rule and every admission
-# check rely on, so limits, usage and memory.stat are read on every probe. Only
-# the process cgroup membership and the cgroupfs mount verification are resolved
-# once per process (and again after fork); unreadable files are not cached.
-#
-# Kernel-side waits. /proc/meminfo and the cgroup page-counter files only load
-# counters. Three files can wait on kernel locks: /proc/self/cgroup
-# (cgroup_mutex before Linux 6.8, held across cgroup create/destroy/attach),
-# /proc/self/mountinfo (namespace_sem, O(mounts)) and memory.stat (rstat
-# flush). With the GIL held such a wait stalls every Python thread, so each read
-# class is timed: once one GIL-held read of a class takes longer than the hold
-# limit (default: the interpreter switch interval, the time any thread may
-# already hold the GIL between forced switches), that class is demoted to the
-# GIL-releasing Path.read_text for the rest of the process. A process therefore
-# sees at most one over-limit stall per class. YOLO_TTA_RAM_PROBE_GIL_READS=
-# counters never holds the GIL for the three lock-prone classes; =0 never holds
-# it at all. Releasing every lock-prone read costs ~3 s per two probes with 6
-# busy threads (measured), so it is not the default.
-_GIL_READER_UNRESOLVED = object()
-# The reader in use, None for Path.read_text, or _GIL_READER_UNRESOLVED.
-_GIL_READER = _GIL_READER_UNRESOLVED
-_PATH_READ_TEXT_ORIGINAL = Path.read_text
-_CGROUP_FS_PREFIX = '/sys/fs/cgroup/'
-# Counter files whose read handlers only load page_counter/flag fields.
-_CGROUP_COUNTER_NAMES = frozenset((
-    'memory.max', 'memory.current', 'memory.limit_in_bytes', 'memory.usage_in_bytes',
-    'memory.use_hierarchy'))
-_LOCK_FREE_PROBE_CLASSES = frozenset(('meminfo', 'cgroup_counter'))
-_LOCK_PRONE_PROBE_CLASSES = frozenset(('cgroup_membership', 'mountinfo', 'memory_stat'))
-# Classes still read with the GIL held (demotion removes one; set when resolved).
-_GIL_HELD_CLASSES = set(_LOCK_FREE_PROBE_CLASSES | _LOCK_PRONE_PROBE_CLASSES)
-_GIL_HOLD_LIMIT_SECONDS = 0.005
-# Per class: GIL-held read count and longest duration (updated under the GIL;
-# a racy max is benign), and the classes demoted in this process.
-_GIL_HELD_READ_CALLS: Dict[str, int] = {}
-_GIL_HELD_READ_MAX_SECONDS: Dict[str, float] = {}
-_GIL_HELD_DEMOTED: Dict[str, float] = {}
-# (pid, entries, unresolved_scope); entries are (is_v2, base, limit_name,
-# usage_name, leaf) tuples parsed from /proc/self/cgroup.
+# Membership and canonical mount proofs are stable for this process. Every
+# pressure observation below reads fresh counters. A fork discovers its own scope.
+_MEMINFO_PATH = Path('/proc/meminfo')
+_CGROUP_MEMBERSHIP_PATH = Path('/proc/self/cgroup')
+_MOUNTINFO_PATH = Path('/proc/self/mountinfo')
+_CGROUP_V1_BASE = Path('/sys/fs/cgroup/memory')
+_CGROUP_V2_BASE = Path('/sys/fs/cgroup')
 _CGROUP_LAYOUT: Optional[tuple] = None
-# (pid, base_posix, is_v2) -> canonical cgroupfs mount verified.
 _CGROUP_MOUNT_VERIFIED: Dict[tuple, bool] = {}
 
 
-def _probe_read_class(posix: str) -> Optional[str]:
-    """Classify a probe pseudo-file; None means never read with the GIL held."""
-    if posix == '/proc/meminfo':
-        return 'meminfo'
-    if posix == '/proc/self/cgroup':
-        return 'cgroup_membership'
-    if posix == '/proc/self/mountinfo':
-        return 'mountinfo'
-    if posix.startswith(_CGROUP_FS_PREFIX):
-        name = posix.rpartition('/')[2]
-        if name == 'memory.stat':
-            return 'memory_stat'
-        if name in _CGROUP_COUNTER_NAMES:
-            return 'cgroup_counter'
-    return None
+def _default_encoding():
+    encoding = io.text_encoding(None)
+    if encoding == 'locale':
+        return locale.getencoding() if hasattr(locale, 'getencoding') else locale.getpreferredencoding(False)
+    return encoding
 
 
-def _gil_releasing_read_text(path: Path) -> str:
-    """Plain Path.read_text (releases the GIL); a module hook for tests."""
-    return path.read_text()
+def _text(raw, encoding):
+    if isinstance(raw, bytes):
+        return raw.decode(encoding).replace('\r\n', '\n').replace('\r', '\n')
+    return raw
 
 
-def ram_probe_gil_read_stats() -> Dict[str, object]:
-    """Process-wide GIL-held probe read counts, longest reads and demotions."""
-    calls, longest = dict(_GIL_HELD_READ_CALLS), dict(_GIL_HELD_READ_MAX_SECONDS)
-    return {'ram_probe_gil_held_reads': int(sum(calls.values())),
-            'ram_probe_gil_held_max_seconds': float(max(longest.values(), default=0.0)),
-            'ram_probe_gil_held_reads_by_class': calls,
-            'ram_probe_gil_held_max_seconds_by_class': longest,
-            'ram_probe_gil_held_demoted': dict(_GIL_HELD_DEMOTED),
-            'ram_probe_gil_hold_limit_seconds': float(_GIL_HOLD_LIMIT_SECONDS)}
-
-
-def _probe_read_text(path: Path) -> str:
-    # A replaced Path.read_text (tests) always wins over the reader.
-    if Path.read_text is _PATH_READ_TEXT_ORIGINAL:
-        reader = _GIL_READER
-        if reader is _GIL_READER_UNRESOLVED:
-            reader = _resolve_gil_holding_reader()
-        kind = _probe_read_class(path.as_posix()) if reader is not None else None
-        if kind is not None and kind in _GIL_HELD_CLASSES:
-            started = _perf_counter()
-            try:
-                return reader(path)
-            finally:
-                elapsed = _perf_counter() - started
-                _GIL_HELD_READ_CALLS[kind] = _GIL_HELD_READ_CALLS.get(kind, 0) + 1
-                if elapsed > _GIL_HELD_READ_MAX_SECONDS.get(kind, 0.0):
-                    _GIL_HELD_READ_MAX_SECONDS[kind] = elapsed
-                if elapsed > _GIL_HOLD_LIMIT_SECONDS:
-                    _GIL_HELD_CLASSES.discard(kind)
-                    _GIL_HELD_DEMOTED.setdefault(kind, elapsed)
-        return _gil_releasing_read_text(path)
-    return path.read_text()
-
-
-def _read_meminfo_bytes() -> Dict[str, int]:
-    info: Dict[str, int] = {}
+def _meminfo(raw, encoding):
+    info = {}
     try:
-        for line in _probe_read_text(Path('/proc/meminfo')).splitlines():
+        for line in _text(raw, encoding).splitlines():
             parts = line.split(':', 1)
-            if len(parts) != 2:
-                continue
-            key = parts[0].strip()
-            raw_val = parts[1].strip().split()[0]
-            info[key] = int(raw_val) * 1024
-    except Exception:
+            if len(parts) == 2:
+                info[parts[0].strip()] = int(parts[1].strip().split()[0]) * 1024
+    except (AttributeError, UnicodeError, ValueError, IndexError):
         pass
     return info
 
-def _cgroup_read_int(path: Path) -> Optional[int]:
-    """Read a nonnegative counter; zero differs from an unreadable counter."""
-    try:
-        raw = _probe_read_text(path).strip()
-    except Exception:
-        return None
-    if not raw.isascii() or not raw.isdigit():
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
 
-def _cgroup_reclaimable_file_bytes(node: Path, *, v2: bool) -> int:
-    """Return clean inactive file-cache bytes reclaimable by this cgroup."""
-    if v2:
-        keys = ('inactive_file', 'file_dirty', 'file_writeback')
-    else:
-        keys = ('total_inactive_file', 'total_dirty', 'total_writeback')
-    found: Dict[str, int] = {}
+def _reclaimable(raw, v2, encoding):
+    keys = ('inactive_file', 'file_dirty', 'file_writeback') if v2 else (
+        'total_inactive_file', 'total_dirty', 'total_writeback')
+    found = {}
     try:
-        for line in _probe_read_text(node / 'memory.stat').splitlines():
+        for line in _text(raw, encoding).splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[0] in keys:
-                if (parts[0] in found or not parts[1].isascii()
-                        or not parts[1].isdigit()):
+                if parts[0] in found or not parts[1].isascii() or not parts[1].isdigit():
                     return 0
                 found[parts[0]] = int(parts[1])
-    except Exception:
+        return max(0, found[keys[0]] - found[keys[1]] - found[keys[2]])
+    except (AttributeError, UnicodeError, KeyError, ValueError):
         return 0
-    # Missing dirty/writeback counters do not prove that file pages are clean.
-    if any(key not in found for key in keys):
-        return 0
-    return max(0, found[keys[0]] - found[keys[1]] - found[keys[2]])
+
 
 def _cgroup_canonical_mount_verified(mountinfo: str, base: Path, *, v2: bool) -> bool:
     """Authenticate the simple membership-to-path mapping used below.
@@ -209,7 +105,7 @@ def _cgroup_layout() -> tuple:
     layout = _CGROUP_LAYOUT
     if layout is not None and layout[0] == pid:
         return layout[1], layout[2]
-    cgroup_text = _probe_read_text(Path('/proc/self/cgroup'))
+    cgroup_text = _CGROUP_MEMBERSHIP_PATH.read_text()
     entries = []
     unresolved_scope = False
     for line in cgroup_text.splitlines():
@@ -220,240 +116,191 @@ def _cgroup_layout() -> tuple:
         if hierarchy_id == '0' and not controllers:
             # cgroup unified hierarchy.
             is_v2 = True
-            base = Path('/sys/fs/cgroup')
-            limit_name, usage_name = 'memory.max', 'memory.current'
+            base = _CGROUP_V2_BASE
         elif 'memory' in controllers.split(','):
             # cgroup memory controller.
             is_v2 = False
-            base = Path('/sys/fs/cgroup/memory')
-            limit_name, usage_name = 'memory.limit_in_bytes', 'memory.usage_in_bytes'
+            base = _CGROUP_V1_BASE
         else:
             continue
         if (not cg_path.startswith('/') or '\\' in cg_path or '//' in cg_path
                 or any(part in ('.', '..') for part in cg_path.split('/'))):
             unresolved_scope = True
             continue
-        entries.append((is_v2, base, limit_name, usage_name, base / cg_path.lstrip('/')))
+        node = base / cg_path.lstrip('/')
+        ancestors = []
+        while node == base or base in node.parents:
+            ancestors.append(str(node))
+            if node == base:
+                break
+            node = node.parent
+        entries.append((is_v2, base, tuple(ancestors)))
     _CGROUP_LAYOUT = (pid, tuple(entries), unresolved_scope)
     return _CGROUP_LAYOUT[1], unresolved_scope
 
 
-def _cgroup_mount_verified_cached(base: Path, is_v2: bool) -> bool:
-    """Verify the canonical cgroupfs mount once per process; failures are not cached."""
-    key = (os.getpid(), base.as_posix(), bool(is_v2))
-    verified = _CGROUP_MOUNT_VERIFIED.get(key)
-    if verified is None:
-        try:
-            mountinfo = _probe_read_text(Path('/proc/self/mountinfo'))
-        except Exception:
-            return False
-        verified = _cgroup_canonical_mount_verified(mountinfo, base, v2=is_v2)
-        _CGROUP_MOUNT_VERIFIED[key] = verified
-    return verified
-
-
 def _reset_cgroup_layout_cache() -> None:
-    """Forget the cached cgroup membership and mount verification (test hook)."""
     global _CGROUP_LAYOUT
     _CGROUP_LAYOUT = None
     _CGROUP_MOUNT_VERIFIED.clear()
 
 
-def _cgroup_memory_budget(*, verify_enforcement: bool = True) -> tuple[Optional[int], Optional[int]]:
-    """Return (tightest headroom, verified enforcing cap) for this process.
-
-    All finite ancestors bound headroom. The second value additionally requires
-    a verified canonical mount and hierarchical accounting, so callers can use
-    it to prove that a separate allocation cap is already enforced. Unknown
-    scope never supplies that proof. Unreadable usage under a known finite cap
-    grants zero headroom, rather than treating missing usage as zero bytes.
-    Headroom-only callers skip mount discovery and never receive a cap proof.
-    Limits, usage and memory.stat are read on every call; only the membership
-    and mount verification are resolved once per process.
-    """
+def _read_optional(path):
     try:
-        entries, unresolved_scope = _cgroup_layout()
+        return path.read_text()
     except Exception:
-        return None, None
-    headroom: Optional[int] = None
-    enforcing_cap: Optional[int] = None
-    for is_v2, base, limit_name, usage_name, node in entries:
-        verified = verify_enforcement and _cgroup_mount_verified_cached(base, is_v2)
-        while node == base or base in node.parents:
+        return None
+
+
+def _portable_capture(meminfo, plan, mountinfo, encoding, digit_limit):
+    """Portable acquisition with the same ordered file and failure semantics."""
+    info = _read_optional(meminfo) if meminfo is not None else None
+    groups = []
+    mounts = {}
+    if callable(plan):
+        plan = plan()
+    for v2, need_mount, nodes in plan:
+        levels = []
+        mount = None
+        if need_mount:
+            key = (v2, nodes[-1] if nodes else None)
+            mount = mounts.get(key)
+            if mount is None:
+                mount = _read_optional(mountinfo)
+                if mount is not None:
+                    mounts[key] = mount
+        groups.append((mount, levels))
+        for path in nodes:
+            node = Path(path)
             try:
-                raw_limit = _probe_read_text(node / limit_name).strip()
+                raw = (node / ('memory.max' if v2 else 'memory.limit_in_bytes')).read_text().strip()
             except FileNotFoundError:
-                # A controller need not expose a limit at every ancestry level.
-                raw_limit = None
+                continue
             except Exception:
-                return 0, None
-            limit = None
-            if raw_limit is not None and not (is_v2 and raw_limit == 'max'):
-                if not raw_limit.isascii() or not raw_limit.isdigit():
-                    return 0, None
+                return info, groups, True
+            if v2 and raw == 'max':
+                continue
+            if not raw.isascii() or not raw.isdigit():
+                return info, groups, True
+            try:
+                cap = int(raw)
+            except ValueError:
+                return info, groups, True
+            if not v2 and cap >= 1 << 60:
+                continue
+            usage = (_read_optional(node / ('memory.current' if v2 else 'memory.usage_in_bytes')) or '').strip()
+            if not usage.isascii() or not usage.isdigit():
+                return info, groups, True
+            try:
+                int(usage)
+            except ValueError:
+                return info, groups, True
+            hierarchical = v2
+            if not v2:
+                flag = (_read_optional(node / 'memory.use_hierarchy') or '').strip()
                 try:
-                    limit = int(raw_limit)
+                    hierarchical = flag.isascii() and flag.isdigit() and int(flag) == 1
                 except ValueError:
-                    return 0, None
-                # v1 reports unlimited as a huge page-rounded sentinel (~2^63).
-                if not is_v2 and limit >= (1 << 60):
-                    limit = None
-            if limit is not None:
-                usage = _cgroup_read_int(node / usage_name)
-                if usage is None:
-                    return 0, None
-                hierarchical = is_v2 or _cgroup_read_int(node / 'memory.use_hierarchy') == 1
-                # v1 total_* stats cover descendants; do not subtract those
-                # from a non-hierarchical local usage counter.
-                reclaimable = (min(usage, _cgroup_reclaimable_file_bytes(node, v2=is_v2))
-                               if hierarchical else 0)
-                level_headroom = max(0, limit - (usage - reclaimable))
-                headroom = level_headroom if headroom is None else min(headroom, level_headroom)
-                if verified and hierarchical:
-                    enforcing_cap = limit if enforcing_cap is None else min(enforcing_cap, limit)
-            if node == base:
-                break
-            node = node.parent
-    return headroom, None if unresolved_scope else enforcing_cap
+                    hierarchical = False
+            levels.append((raw, usage, hierarchical,
+                           _read_optional(node / 'memory.stat') if hierarchical else None))
+    return info, groups, False
+
+
+def _sample_with(capture, *, include_meminfo, include_cgroup, verify_enforcement):
+    pid = os.getpid()
+    entries = ()
+    proofs = ()
+    unresolved = False
+
+    def prepare():
+        nonlocal entries, proofs, unresolved
+        try:
+            entries, unresolved = _cgroup_layout()
+        except Exception:
+            return ()
+        proofs = tuple(_CGROUP_MOUNT_VERIFIED.get((pid, base, v2)) if verify_enforcement else False
+                       for v2, base, _ in entries)
+        return tuple((v2, proof is None, nodes) for (v2, _, nodes), proof in zip(entries, proofs))
+
+    # On first use, discover membership after reading meminfo, exactly where
+    # the cgroup-only portion of the original probe started. Ordinary samples
+    # use the cached paths and make one uninterrupted native I/O transaction.
+    plan = ()
+    if include_cgroup:
+        plan = prepare() if _CGROUP_LAYOUT is not None and _CGROUP_LAYOUT[0] == pid else prepare
+    encoding = _default_encoding()
+    digit_limit = getattr(sys, 'get_int_max_str_digits', lambda: 0)()
+    meminfo, observations, failed = capture(
+        _MEMINFO_PATH if include_meminfo else None, plan, _MOUNTINFO_PATH, encoding, digit_limit)
+    info = _meminfo(meminfo, encoding) if include_meminfo else {}
+    headroom = enforcing = None
+    for (v2, base, _), previous, (mount, levels) in zip(entries, proofs, observations):
+        key = (pid, base, v2)
+        verified = bool(previous)
+        if mount is not None:
+            try:
+                verified = _cgroup_canonical_mount_verified(_text(mount, encoding), base, v2=v2)
+                _CGROUP_MOUNT_VERIFIED[key] = verified
+            except UnicodeError:
+                pass  # A failed read/decoding never becomes a cached proof.
+        if failed:
+            continue  # Preserve completed immutable discovery even on a failed pressure read.
+        for cap_raw, usage_raw, hierarchical, stat in levels:
+            try:
+                cap = int(_text(cap_raw, encoding).strip())
+                usage = int(_text(usage_raw, encoding).strip())
+            except (UnicodeError, ValueError):
+                return info, 0, None
+            reclaimable = min(usage, _reclaimable(stat, v2, encoding)) if hierarchical else 0
+            remaining = max(0, cap - (usage - reclaimable))
+            headroom = remaining if headroom is None else min(headroom, remaining)
+            if verified and hierarchical:
+                enforcing = cap if enforcing is None else min(enforcing, cap)
+    return (info, 0, None) if failed else (info, headroom, None if unresolved else enforcing)
+
+
+def _portable_memory_sample(*, include_meminfo, include_cgroup, verify_enforcement=False):
+    return _sample_with(_portable_capture, include_meminfo=include_meminfo, include_cgroup=include_cgroup,
+                        verify_enforcement=verify_enforcement)
+
+
+def _native_memory_sample(*, include_meminfo, include_cgroup, verify_enforcement=False):
+    from .native_cpu import kernels
+    return _sample_with(kernels.sample_memory_files, include_meminfo=include_meminfo,
+                        include_cgroup=include_cgroup, verify_enforcement=verify_enforcement)
+
+
+def _memory_sample(*, include_meminfo, include_cgroup, verify_enforcement=False):
+    capture = _native_memory_sample if sys.platform.startswith('linux') else _portable_memory_sample
+    return capture(include_meminfo=include_meminfo, include_cgroup=include_cgroup,
+                   verify_enforcement=verify_enforcement)
+
+
+def _read_meminfo_bytes() -> Dict[str, int]:
+    return _memory_sample(include_meminfo=True, include_cgroup=False)[0]
+
+
+def _cgroup_memory_budget(*, verify_enforcement: bool = True) -> tuple[Optional[int], Optional[int]]:
+    """Fresh minimum across all finite cgroups, with an independently verified enforcing cap."""
+    return _memory_sample(include_meminfo=False, include_cgroup=True, verify_enforcement=verify_enforcement)[1:]
 
 
 def _cgroup_memory_headroom_bytes() -> Optional[int]:
-    """Return tightest cgroup headroom, excluding reclaimable clean file cache."""
     return _cgroup_memory_budget(verify_enforcement=False)[0]
 
+
+def _anon_headroom(info, cgroup_headroom):
+    node = max(0, int(info.get('MemAvailable', 0)) + int(info.get('SwapFree', 0)))
+    return node if cgroup_headroom is None else min(node, cgroup_headroom)
+
+
 def available_anon_work_bytes(*, meminfo: Optional[Dict[str, int]] = None) -> int:
-    """Read current allocation headroom, optionally sharing this call's meminfo.
-
-    A caller already reading physical availability can supply that same snapshot
-    to avoid a duplicate proc read. Cgroup limits and usage are always read anew.
-    """
-    info = _read_meminfo_bytes() if meminfo is None else meminfo
-    mem_avail = int(info.get('MemAvailable', 0))
-    swap_free = int(info.get('SwapFree', 0))
-    node_avail = max(0, mem_avail + swap_free)
-    cgroup_headroom = _cgroup_memory_headroom_bytes()
-    if cgroup_headroom is None:
-        return node_avail
-    # Under a cgroup limit do not count node-wide swap: the cgroup charge is what the OOM killer
-    # enforces (cluster cgroups commonly run with memory.swap.max=0 / memsw==mem), and blowing it
-    # is an uncatchable SIGKILL that bypasses the MemoryError -> disk-memmap fallback, so err on
-    # the tight side.
-    return min(node_avail, int(cgroup_headroom))
-
-
-# In-kernel pseudo filesystems whose reads never wait on storage or a daemon.
-_KERNEL_PSEUDO_FSTYPES = frozenset((
-    'proc', 'sysfs', 'cgroup', 'cgroup2', 'tmpfs', 'devtmpfs', 'devpts', 'binfmt_misc',
-    'securityfs', 'debugfs', 'tracefs', 'bpf', 'pstore', 'configfs', 'fusectl', 'efivarfs',
-    'hugetlbfs', 'mqueue', 'autofs', 'rpc_pipefs', 'nsfs', 'selinuxfs'))
-
-
-def _probe_mounts_kernel_backed(mountinfo: str) -> bool:
-    """True when /proc and /sys carry only in-kernel filesystems.
-
-    lxcfs (FUSE) commonly overlays /proc/meminfo in containers; a read there
-    waits on a userspace daemon, so it must not run with the GIL held.
-    """
-    found_proc = False
-    for line in mountinfo.splitlines():
-        before, separator, after = line.partition(' - ')
-        fields, filesystem = before.split(), after.split()
-        if not separator or len(fields) < 5 or not filesystem:
-            continue
-        mountpoint = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4])
-        if mountpoint in ('/proc', '/sys') or mountpoint.startswith(('/proc/', '/sys/')):
-            if filesystem[0] not in _KERNEL_PSEUDO_FSTYPES:
-                return False
-            found_proc = found_proc or (mountpoint == '/proc' and filesystem[0] == 'proc')
-    return found_proc
-
-
-def _gil_holding_text_reader(libc=None):
-    """Return a Linux reader for small /proc and cgroupfs files that keeps the GIL.
-
-    _probe_read_text uses it only for files whose _probe_read_class is still in
-    _GIL_HELD_CLASSES. These pseudo-files are generated in memory and never
-    wait on storage, so the reader calls libc through ctypes.PyDLL (which does
-    not release the GIL). The text and errors match Path.read_text: locale
-    encoding with strict decoding, universal newlines, and the errno-specific
-    OSError subclass. It is
-    reentrant (one buffer per call), so any thread may use it. Returns None (use
-    Path.read_text) when unavailable or disabled by YOLO_TTA_RAM_PROBE_GIL_READS=0
-    or when /proc or /sys carries a non-kernel (e.g. lxcfs/FUSE) mount. ``libc``
-    is a test hook for a GIL-holding C runtime on other platforms.
-    """
-    if libc is None and (not sys.platform.startswith('linux')
-                         or not _env_flag('YOLO_TTA_RAM_PROBE_GIL_READS', True)):
-        return None
-    if libc is None:
-        try:
-            mountinfo = Path('/proc/self/mountinfo').read_text()
-        except Exception:
-            return None
-        if not _probe_mounts_kernel_backed(mountinfo):
-            return None
-    try:
-        import ctypes
-        import errno
-        import io
-        import locale
-        if libc is None:
-            libc = ctypes.PyDLL(None, use_errno=True)
-        c_open, c_read, c_close = libc.open, libc.read, libc.close
-        c_open.argtypes, c_open.restype = (ctypes.c_char_p, ctypes.c_int), ctypes.c_int
-        c_read.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t)
-        c_read.restype = ctypes.c_ssize_t
-        c_close.argtypes, c_close.restype = (ctypes.c_int,), ctypes.c_int
-        encoding = io.text_encoding(None)
-        if encoding == 'locale':
-            encoding = (locale.getencoding() if hasattr(locale, 'getencoding')
-                        else locale.getpreferredencoding(False))
-        ''.encode(encoding)  # validate the codec once
-    except Exception:
-        return None
-    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0)
-    size = 65536
-    create_buffer, string_at, get_errno = ctypes.create_string_buffer, ctypes.string_at, ctypes.get_errno
-
-    def read(path: Path) -> str:
-        fd = c_open(os.fsencode(path), flags)
-        if fd < 0:
-            err = get_errno()
-            raise OSError(err, os.strerror(err), str(path))
-        try:
-            buffer = create_buffer(size)
-            chunks = []
-            while True:
-                count = c_read(fd, buffer, size)
-                if count < 0:
-                    err = get_errno()
-                    if err == errno.EINTR:
-                        continue
-                    raise OSError(err, os.strerror(err), str(path))
-                if count == 0:
-                    break
-                chunks.append(string_at(buffer, count))
-        finally:
-            c_close(fd)
-        text = b''.join(chunks).decode(encoding)
-        return text.replace('\r\n', '\n').replace('\r', '\n') if '\r' in text else text
-    return read
-
-
-def _resolve_gil_holding_reader():
-    """Pick the probe reader once per process (a benign race may build it twice)."""
-    global _GIL_READER, _GIL_HOLD_LIMIT_SECONDS
-    reader = _GIL_READER
-    if reader is _GIL_READER_UNRESOLVED:
-        reader = _gil_holding_text_reader()
-        if reader is not None:
-            limit_ms = _env_float('YOLO_TTA_RAM_PROBE_GIL_HOLD_LIMIT_MS', 0.0)
-            _GIL_HOLD_LIMIT_SECONDS = (limit_ms / 1e3 if limit_ms > 0
-                                       else float(sys.getswitchinterval()))
-            if os.environ.get('YOLO_TTA_RAM_PROBE_GIL_READS', '').strip().lower() == 'counters':
-                _GIL_HELD_CLASSES.difference_update(_LOCK_PRONE_PROBE_CLASSES)
-        _GIL_READER = reader
-    return reader
+    """Sample meminfo and cgroups together unless this caller already owns the meminfo observation."""
+    if meminfo is not None:
+        return _anon_headroom(meminfo, _cgroup_memory_headroom_bytes())
+    info, headroom, _ = _memory_sample(include_meminfo=True, include_cgroup=True)
+    return _anon_headroom(info, headroom)
 
 
 _V1613_FAST_BUNDLE_ACTIVE = False

@@ -309,6 +309,77 @@ def _block_crop_reader(project_block, depth, shape, output_bbox, update, snapsho
     return read_plane, cache
 
 
+class _RadialRankTiming:
+    """Measure request gaps and close time without changing CUDA ownership.
+
+    Event and host fence times are nested in block request time. The caller
+    serializes block requests and joins its readers before closing the stage.
+    """
+
+    _PROJECTOR_COUNTERS = (
+        'constructor_seconds', 'contract_validation_seconds', 'module_setup_seconds',
+        'buffer_setup_seconds', 'source_pack_seconds', 'source_upload_seconds',
+        'geometry_upload_seconds', 'preflight_seconds', 'cuda_graph_setup_seconds',
+        'kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds',
+        'cuda_graph_seconds', 'output_metadata_fence_seconds', 'output_payload_fence_seconds',
+        'output_offset_plan_seconds', 'output_host_detach_seconds',
+    )
+
+    def __init__(self, stage):
+        self.stage = stage
+        self.ready_at = time.perf_counter()
+        self.block_finished_at = None
+        self.timing = dict(block_requests=0, failed_blocks=0,
+                           first_request_wait_seconds=0.0, inter_block_wait_seconds=0.0,
+                           max_inter_block_wait_seconds=0.0, block_request_seconds=0.0)
+
+    def project(self, first, count):
+        started = time.perf_counter()
+        timing = self.timing
+        if self.block_finished_at is None:
+            timing['first_request_wait_seconds'] = started - self.ready_at
+        else:
+            gap = started - self.block_finished_at
+            timing['inter_block_wait_seconds'] += gap
+            timing['max_inter_block_wait_seconds'] = max(timing['max_inter_block_wait_seconds'], gap)
+        timing['block_requests'] += 1
+        try:
+            return self.stage.project_rank_crops(first, count)
+        except BaseException:
+            timing['failed_blocks'] += 1
+            raise
+        finally:
+            self.block_finished_at = time.perf_counter()
+            timing['block_request_seconds'] += self.block_finished_at - started
+
+    def close(self, publish):
+        started = time.perf_counter()
+        failed = False
+        try:
+            self.stage.close()
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            close_seconds = time.perf_counter() - started
+            timing = self.timing
+            try:
+                timings = {name: float(getattr(self.stage.projector, name, 0.0))
+                           for name in self._PROJECTOR_COUNTERS}
+                publish(radial_device_timing={
+                    **timing, **timings, 'close_failures': int(failed), 'close_seconds': close_seconds,
+                    'reader_open_seconds': started - self.ready_at,
+                    'post_block_wait_seconds': (started - self.block_finished_at
+                                                if self.block_finished_at is not None else 0.0),
+                })
+            except Exception:
+                pass  # A diagnostic failure cannot replace a fence failure.
+            if timing['failed_blocks']:
+                _telemetry('sweep.rank_gpu.radial.failed_blocks', timing['failed_blocks'])
+            if failed:
+                _telemetry('sweep.rank_gpu.radial.close_failures')
+
+
 def _certificate_is_empty(output_bbox):
     return output_bbox is not None and any(output_bbox[i] == output_bbox[i + 3] for i in range(3))
 
@@ -492,7 +563,9 @@ def _shell_rank_projection_reader(source, view, shape, budget, boxes, output_bbo
         return
     closed = False
     cache = {}
+    timing = None
     try:
+        timing = _RadialRankTiming(stage) if family == 'radial' else None
         projector = stage.projector
         if output_bbox is None and family == 'spherical':
             bounds = projector.output_bounds
@@ -519,13 +592,17 @@ def _shell_rank_projection_reader(source, view, shape, budget, boxes, output_bbo
             update(shell_blocks=int(snapshot().get('shell_blocks', 0)) + 1,
                    payload_d2h_bytes=int(snapshot().get('payload_d2h_bytes', 0)) + block.payload.nbytes,
                    metadata_d2h_bytes=int(getattr(projector, 'metadata_d2h_bytes', 0)))
-        read_plane, cache = _block_crop_reader(stage.project_rank_crops, int(stage.max_block_depth), shape,
+        project_block = timing.project if timing is not None else stage.project_rank_crops
+        read_plane, cache = _block_crop_reader(project_block, int(stage.max_block_depth), shape,
                                                output_bbox, update, snapshot, lambda: closed, on_block)
         yield read_plane
     finally:
         closed = True
         update(closed=True)
-        stage.close()
+        if timing is None:
+            stage.close()
+        else:
+            timing.close(update)
         cache.clear()
         stage = plan = metadata = source = None
 

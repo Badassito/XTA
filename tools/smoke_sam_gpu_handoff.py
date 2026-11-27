@@ -318,8 +318,7 @@ def run(args):
             stack.enter_context(mock.patch.dict(os.environ, {
                 'YOLO_TTA_SAM_IMAGE_CACHE_MAX_BYTES': str(protocol['mode_records']['whole']['control_cap_bytes']),
                 'YOLO_TTA_GPU_SPHERICAL_BACKPROJECT': '1',
-                'CUPY_CACHE_DIR': str(args.output / 'cupy-cache'),
-                'NUMBA_CACHE_DIR': str(args.output / 'numba-cache')}))
+                'CUPY_CACHE_DIR': str(args.output / 'cupy-cache')}))
             for arm in protocol['arms']:
                 destination = args.output / arm
                 destination.mkdir()

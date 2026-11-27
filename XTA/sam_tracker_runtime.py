@@ -510,7 +510,7 @@ def _execute_interpolation_tracker_task(context, kind, payload):
         packed[index] = np.packbits(mask)
         scores[index] = np.nan if item.frame_tracker_score is None else float(item.frame_tracker_score)
         removed[index] = item.status == "removed"
-        foreground_pixels += np.count_nonzero(mask)
+        foreground_pixels += int(np.count_nonzero(mask))
         owners.append(weakref.ref(mask))
         observed_frames.add(frame)
 

@@ -104,9 +104,13 @@ def test_thread_count_override(monkeypatch):
 @pytest.mark.parametrize('metadata', [True, False])
 @pytest.mark.parametrize('threads', ['1', '5'])
 @pytest.mark.parametrize('boolean', [False, True])
-def test_prepare_terminal_scores_matches_previous_result(tmp_path, monkeypatch, metadata, threads, boolean):
+@pytest.mark.parametrize('readonly_mask', [False, True])
+def test_prepare_terminal_scores_matches_previous_result(tmp_path, monkeypatch, metadata, threads,
+                                                        boolean, readonly_mask):
     monkeypatch.setenv('YOLO_TTA_TERMINAL_SCORE_PREPARE_THREADS', threads)
     mask, scores, active, boxes = _inputs(91, boolean=boolean)
+    if readonly_mask:
+        mask.setflags(write=False)
     expected = _reference(mask, scores, active, boxes) if metadata else _reference(mask, scores)
     evidence.configure_confidence_evidence(tmp_path, enabled=True, defer_projection=True)
     plan = plan_confidence_capture(mask.shape, 2, workspace_bytes=32 * 1024**2)
@@ -121,32 +125,6 @@ def test_prepare_terminal_scores_matches_previous_result(tmp_path, monkeypatch, 
                 assert prepared.reader.mask is prepared.reader.scores
     finally:
         evidence.configure_confidence_evidence(None, enabled=False)
-
-
-@pytest.mark.parametrize('metadata', [True, False])
-@pytest.mark.parametrize('readonly_mask', [False, True])
-@pytest.mark.parametrize('boolean', [False, True])
-def test_startup_warmup_covers_every_production_signature(tmp_path, metadata, readonly_mask, boolean):
-    """No terminal view may compile in the busy main process after startup warmup."""
-    receipt = cpu.warm_terminal_score_kernels()
-    assert receipt['boxes_signatures'] >= 4 and receipt['flat_signatures'] >= 4
-    before = (len(cpu.zero_unmasked_scores_flat.nopython_signatures),
-              len(cpu.zero_unmasked_scores_boxes.nopython_signatures))
-    mask, scores, active, boxes = _inputs(33, boolean=boolean)
-    expected = _reference(mask, scores, active, boxes) if metadata else _reference(mask, scores)
-    if readonly_mask:
-        mask.setflags(write=False)
-    evidence.configure_confidence_evidence(tmp_path, enabled=True, defer_projection=True)
-    plan = plan_confidence_capture(mask.shape, 2, workspace_bytes=32 * 1024**2)
-    try:
-        with confidence_capture_resources(plan):
-            kwargs = dict(known_slice_any=active, known_slice_bboxes=boxes) if metadata else {}
-            assert evidence.prepare_terminal_confidence_scores(mask, scores, **kwargs) is not None
-    finally:
-        evidence.configure_confidence_evidence(None, enabled=False)
-    np.testing.assert_array_equal(scores, expected)
-    assert (len(cpu.zero_unmasked_scores_flat.nopython_signatures),
-            len(cpu.zero_unmasked_scores_boxes.nopython_signatures)) == before
 
 
 @pytest.mark.parametrize('metadata', [True, False])

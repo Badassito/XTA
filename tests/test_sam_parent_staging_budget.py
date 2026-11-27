@@ -50,7 +50,7 @@ def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
     unreachable = frozenset('''
         _dispatch_inference_windows _mark_tile_complete _publish_parent_dense_retired
         _mark_view_variant_terminal _maybe_finalize_tile_parent
-        _maybe_submit_tile_consolidations_for_parent _release_tile_dense_result_for_key
+        _maybe_submit_tile_consolidations_for_parent _release_tile_result_for_key
         _retire_parent_dense_view _submit_physical_view_union_reduction _submit_tile_bridge_gate
         _submit_tile_parent_gate azimuthal_native_output_by_model
         interpolation_stats native_view_support_by_model nrrd_layer_refs

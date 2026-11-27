@@ -263,7 +263,7 @@ def make_task(tmp_path, pool, context, *, base=4*GIB, allowance=4*GIB, view=None
     return AdmittedViewPrepare(admission=pool, transient_bytes=base,
         model_name='model', view=view or SimpleNamespace(name='view'), union_mm=None, confmap_mm=None,
         d1_shadow_path=None, union_path=tmp_path/'unused.dat', confmap_path=None, temp_dir=tmp_path,
-        dense_tiling_active=False, min_conf=0, min_radius=0, interpolation_distance=interpolation_distance,
+        tiling_active=False, min_conf=0, min_radius=0, interpolation_distance=interpolation_distance,
         interpolation_walk_back=1, interpolation_candidates=1, interpolation_passes=1,
         interpolation_min_radius=0, interpolation_search_angle=0,
         slice_workers=1, interpolation_task_workers=1, component_layers_needed=False,

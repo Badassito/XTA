@@ -1,5 +1,13 @@
 # Native extensions
 
+## Required CPU kernels
+
+The CPU domains build the C++17 `_xta_cpu_kernels` CPython extension.
+Platform wheels include it. Build from a source checkout ahead of time with
+`python -B tools/build_native_cpu.py`. The
+[native CPU guide](../docs/native_cpu.md) explains the artifact layout, loader
+checks, and build requirements.
+
 ## Required TTA scheduler
 
 `prepared_scheduler.cpp` and its headers build the required C++17

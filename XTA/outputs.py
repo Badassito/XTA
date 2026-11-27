@@ -52,7 +52,8 @@ from .nrrd_compression import (
     shutdown_nrrd_gzip_executors,
 )
 
-from ._deps import _numba, cv2, tifffile, tqdm
+from ._deps import cv2, tifffile, tqdm
+from .native_cpu import kernels as _native_cpu
 from .polygon_keyholes import holes_by_parent, splice_holes
 
 from .config import (
@@ -998,13 +999,12 @@ def _nrrd_output_z_extent_for_source_extent(
     source_hi = max(0, min(int(source_z1), in_t_i - 1))
     if source_hi < source_lo:
         return None
-    # Every output z reads a nonempty source interval; the cached per-z bounds are the
-    # restore map itself, so this mask selects exactly the z whose interval meets the
-    # extent. Each sink layer plans several extents; the per-z Python walk held the
-    # GIL for ~70 ms per full-resolution plan.
-    first_source, last_source = _nrrd_restore_source_bounds(int(in_t_i), int(out_t_i))
-    hits = np.flatnonzero((last_source >= int(source_lo)) & (first_source <= int(source_hi)))
-    return None if hits.size == 0 else (int(hits[0]), int(hits[-1]))
+    # Both cached bounds are nondecreasing. Their searches delimit the output
+    # slices whose inclusive restore intervals intersect the source extent.
+    first_source, last_source = _nrrd_restore_source_bounds(in_t_i, out_t_i)
+    start = int(np.searchsorted(last_source, source_lo, side="left"))
+    stop = int(np.searchsorted(first_source, source_hi, side="right"))
+    return (start, stop - 1) if start < stop else None
 
 @lru_cache(maxsize=64)
 def _nrrd_restore_source_bounds(in_t: int, out_t: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -2661,6 +2661,24 @@ def write_layer_nrrd_with_low_quality_mirrors(
             1,
             min(int(out_t), int(z_shards), int(_nrrd_zshard_capacity())),
         )
+    if not write_native and native_review_path is None and len(mirrors) == 1 and nrrd_paths is not None:
+        mirror_shape, mirror_path = mirrors[0]
+        mirror_path = Path(mirror_path)
+        review_path = review_paths.get(str(mirror_path))
+        full_shape = tuple(int(v) for v in output_shape)
+        mirror_shape = tuple(int(v) for v in mirror_shape)
+        if (review_path is not None and mirror_path not in nrrd_paths
+                and all(v > 0 for v in (*full_shape, *mirror_shape))
+                and tuple(ref.shape) == full_shape and getattr(ref, 'live_array', None) is None
+                and _nrrd_layer_ref_is_raw_bbox_store(ref)):
+            mirror_plan = pinned_mirror_plans.get(str(mirror_path))
+            if mirror_plan is None:
+                mirror_plan = _nrrd_raster_plan(mirror_extent_ref, mirror_shape, layout=resolved_layout)
+            if _try_stage_identity_review_mirror(ref, full_shape, mirror_shape, review_path):
+                if plan_receipt is not None:
+                    plan_receipt[str(mirror_path)] = mirror_plan
+                return out_path
+
     mirror_jobs: List[Dict[str, object]] = []
     for m_shape, m_path in mirrors:
         m_t, m_h, m_w = (int(m_shape[0]), int(m_shape[1]), int(m_shape[2]))
@@ -2957,7 +2975,22 @@ def write_layer_nrrd_with_low_quality_mirrors(
     return out_path
 
 
-def _stage_layer_raster(ref, output_shape, review_path, *, block_consumer=None, sparse_consumer=None):
+def _try_stage_identity_review_mirror(ref, full_shape, mirror_shape, review_path):
+    # The backing-to-full stage must be the identity. Area thresholding can
+    # give different results if a non-identity restore is collapsed away.
+    source = _open_nrrd_layer_ref(ref)
+    try:
+        if not isinstance(source, RawBBoxMaskStore) or source.shape != full_shape:
+            return False
+        _stage_layer_raster(ref, mirror_shape, review_path, opened_source=source)
+        return True
+    finally:
+        _close_nrrd_layer_source(source)
+        _drop_nrrd_raw_store_chunks_ram_cache(source)
+
+
+def _stage_layer_raster(ref, output_shape, review_path, *, block_consumer=None, sparse_consumer=None,
+                        opened_source=None):
     from .review_layer_sources import DiscardedRaster, PackedReviewRaster
 
     writer = PackedReviewRaster(review_path, output_shape) if review_path is not None else DiscardedRaster()
@@ -2965,7 +2998,7 @@ def _stage_layer_raster(ref, output_shape, review_path, *, block_consumer=None, 
     try:
         _write_one_decomposed_nrrd_layer_payload(
             ref, output_shape, writer, z_chunk=_nrrd_full_slice_z_chunk(1, out_w, out_h, out_t),
-            block_consumer=block_consumer, sparse_consumer=sparse_consumer,
+            block_consumer=block_consumer, sparse_consumer=sparse_consumer, opened_source=opened_source,
         )
         if review_path is not None:
             writer.finalize()
@@ -4071,178 +4104,14 @@ def _nrrd_sparse_resize_axis_map(
     stops.setflags(write=False)
     return starts, stops
 
-@_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
-def _numba_nrrd_continuous_integral_at(
-    integral: np.ndarray,
-    crop: np.ndarray,
-    y_coord: float,
-    x_coord: float,
-) -> float:  # pragma: no cover - compiled implementation
-    crop_h = int(crop.shape[0])
-    crop_w = int(crop.shape[1])
-    yy = min(float(crop_h), max(0.0, float(y_coord)))
-    xx = min(float(crop_w), max(0.0, float(x_coord)))
-    yy_round = round(yy)
-    xx_round = round(xx)
-    if abs(yy - yy_round) < 1e-12:
-        yy = float(yy_round)
-    if abs(xx - xx_round) < 1e-12:
-        xx = float(xx_round)
-    iy = int(math.floor(yy))
-    ix = int(math.floor(xx))
-    fy = float(yy - iy)
-    fx = float(xx - ix)
-    iy_cell = min(int(iy), int(crop_h - 1))
-    ix_cell = min(int(ix), int(crop_w - 1))
-    value = float(integral[int(iy), int(ix)])
-    value += float(
-        integral[int(iy), int(ix_cell + 1)]
-        - integral[int(iy), int(ix_cell)]
-    ) * fx
-    value += float(
-        integral[int(iy_cell + 1), int(ix)]
-        - integral[int(iy_cell), int(ix)]
-    ) * fy
-    value += float(crop[int(iy_cell), int(ix_cell)]) * fy * fx
-    return float(value)
-
-@_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
-def _numba_opencv_area_axis_tab(
-    out_i: int,
-    in_n: int,
-    out_n: int,
-) -> Tuple[float, float, float, int, int]:  # pragma: no cover - compiled implementation
-    """cv::computeResizeAreaTab bounds ``(fs1, fs2, cellWidth, s1, s2)`` of one output pixel."""
-    scale = 1.0 / (float(out_n) / float(in_n))
-    fs1 = float(out_i) * scale
-    fs2 = fs1 + scale
-    cell = min(scale, float(in_n) - fs1)
-    s2 = min(int(math.floor(fs2)), int(in_n) - 1)
-    s1 = min(int(math.ceil(fs1)), s2)
-    return fs1, fs2, cell, s1, s2
-
-@_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
-def _numba_opencv_area_axis_span(
-    out_i: int,
-    in_n: int,
-    out_n: int,
-) -> Tuple[float, float, float]:  # pragma: no cover - compiled implementation
-    """Global source interval ``[lo, hi)`` and cellWidth of one INTER_AREA output pixel.
-
- Mirrors cv::computeResizeAreaTab: a leading or trailing fractional source pixel counts
- only when its sliver exceeds 1e-3 px, and weights are normalized by cellWidth."""
-    fs1, fs2, cell, s1, s2 = _numba_opencv_area_axis_tab(out_i, in_n, out_n)
-    lo = fs1 if float(s1) - fs1 > 1e-3 else float(s1)
-    hi = float(s2)
-    if fs2 - float(s2) > 1e-3:
-        hi += min(fs2 - float(s2), 1.0, cell)
-    return lo, hi, cell
-
-@_numba.njit(cache=True, nogil=True, inline='always')  # type: ignore[misc]
-def _numba_opencv_area_axis_alpha(
-    source_i: int,
-    fs1: float,
-    fs2: float,
-    cell: float,
-    s1: int,
-    s2: int,
-) -> np.float32:  # pragma: no cover - compiled implementation
-    """computeResizeAreaTab's float32 alpha of source pixel ``source_i`` in ``[s1-1, s2]``; 0 if no tap."""
-    if source_i == s1 - 1:
-        if float(s1) - fs1 > 1e-3:
-            return np.float32((float(s1) - fs1) / cell)
-        return np.float32(0.0)
-    if source_i == s2:
-        if fs2 - float(s2) > 1e-3:
-            return np.float32(min(fs2 - float(s2), 1.0, cell) / cell)
-        return np.float32(0.0)
-    return np.float32(1.0 / cell)
-
-@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-def _numba_opencv_area_binary_value(
-    crop: np.ndarray,
-    in_h: int,
-    in_w: int,
-    out_h: int,
-    out_w: int,
-    source_y0: int,
-    source_x0: int,
-    out_y: int,
-    out_x: int,
-) -> float:  # pragma: no cover - compiled implementation
-    """cv2's float32 INTER_AREA value of one output pixel of the 255-scaled binary frame.
-
- Replays cv::resize's taps in OpenCV's order and float32 precision: each source row is
- reduced along X, then rows accumulate along Y. Source pixels outside the crop are zero
- and would only add exact zeros, so they are skipped."""
-    fy1, fy2, cell_y, y1, y2 = _numba_opencv_area_axis_tab(out_y, in_h, out_h)
-    fx1, fx2, cell_x, x1, x2 = _numba_opencv_area_axis_tab(out_x, in_w, out_w)
-    total = np.float32(0.0)
-    for sy in range(max(y1 - 1, source_y0), min(y2 + 1, source_y0 + crop.shape[0])):
-        beta = _numba_opencv_area_axis_alpha(sy, fy1, fy2, cell_y, y1, y2)
-        if beta == np.float32(0.0):
-            continue
-        row = sy - source_y0
-        buf = np.float32(0.0)
-        for sx in range(max(x1 - 1, source_x0), min(x2 + 1, source_x0 + crop.shape[1])):
-            if crop[row, sx - source_x0] == 0:
-                continue
-            alpha = _numba_opencv_area_axis_alpha(sx, fx1, fx2, cell_x, x1, x2)
-            buf = np.float32(buf + np.float32(np.float32(255.0) * alpha))
-        total = np.float32(total + np.float32(beta * buf))
-    return float(total)
-
-@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-def _numba_nrrd_area_crop_resize_kernel(
-    integral: np.ndarray,
-    crop: np.ndarray,
-    in_h: int,
-    in_w: int,
-    out_h: int,
-    out_w: int,
-    source_y0: int,
-    source_x0: int,
-    source_y1: int,
-    source_x1: int,
-    out_y0: int,
-    out_x0: int,
-    restored: np.ndarray,
-) -> None:  # pragma: no cover - compiled implementation
-    # Column spans are row-invariant; compute them once instead of once per pixel.
-    width = int(restored.shape[1])
-    sx0s = np.empty(width, dtype=np.float64)
-    sx1s = np.empty(width, dtype=np.float64)
-    cells_x = np.empty(width, dtype=np.float64)
-    for local_x in range(width):
-        lo_x, hi_x, cell_x = _numba_opencv_area_axis_span(int(out_x0 + local_x), in_w, out_w)
-        sx0s[local_x] = max(lo_x, float(source_x0)) - float(source_x0)
-        sx1s[local_x] = max(sx0s[local_x], min(hi_x, float(source_x1)) - float(source_x0))
-        cells_x[local_x] = cell_x
-    for local_y in range(int(restored.shape[0])):
-        out_y = int(out_y0 + local_y)
-        lo_y, hi_y, cell_y = _numba_opencv_area_axis_span(out_y, in_h, out_h)
-        sy0 = max(lo_y, float(source_y0)) - float(source_y0)
-        sy1 = max(sy0, min(hi_y, float(source_y1)) - float(source_y0))
-        for local_x in range(width):
-            out_x = int(out_x0 + local_x)
-            sx0 = sx0s[local_x]
-            sx1 = sx1s[local_x]
-            cell_x = cells_x[local_x]
-            weighted = _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx1)
-            weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx1)
-            weighted -= _numba_nrrd_continuous_integral_at(integral, crop, sy1, sx0)
-            weighted += _numba_nrrd_continuous_integral_at(integral, crop, sy0, sx0)
-            # cv2 rounds the 255-scaled float32 value half-to-even, so a tie stays 0. Near
-            # the threshold the float64 integral cannot tell which side cv2's float32 sum
-            # lands on (exact ties occur, e.g. 1020 -> 1019), so replay that sum there.
-            threshold = cell_y * cell_x / 510.0
-            if abs(float(weighted) - threshold) > 1e-4 * threshold:
-                inside = float(weighted) > threshold
-            else:
-                inside = _numba_opencv_area_binary_value(
-                    crop, in_h, in_w, out_h, out_w, source_y0, source_x0, out_y, out_x,
-                ) > 0.5
-            restored[int(local_y), int(local_x)] = np.uint8(1 if inside else 0)
+def _nrrd_area_crop_resize_kernel(
+    integral, crop, in_h, in_w, out_h, out_w,
+    source_y0, source_x0, source_y1, source_x1, out_y0, out_x0, restored,
+):
+    _native_cpu.nrrd_area_crop_resize(
+        integral, crop, in_h, in_w, out_h, out_w,
+        source_y0, source_x0, source_y1, source_x1, out_y0, out_x0, restored,
+    )
 
 
 def _resize_sparse_binary_crop_to_output_region(
@@ -4314,7 +4183,7 @@ def _resize_sparse_binary_crop_to_output_region(
         restored = np.empty(
             (int(out_y1 - out_y0), int(out_x1 - out_x0)), dtype=np.uint8,
         )
-        _numba_nrrd_area_crop_resize_kernel(
+        _nrrd_area_crop_resize_kernel(
             integral, crop_u8,
             int(in_h), int(in_w), int(out_h), int(out_w),
             int(y0), int(x0), int(y1), int(x1),
@@ -4414,6 +4283,7 @@ def _write_one_decomposed_nrrd_layer_payload(
     z_start: int = 0,
     z_stop: Optional[int] = None,
     fill_workers_override: Optional[int] = None,
+    opened_source: Optional[RawBBoxMaskStore] = None,
 ) -> None:
     """Stream one restored NRRD layer in bounded output-z blocks.
     
@@ -4425,9 +4295,10 @@ def _write_one_decomposed_nrrd_layer_payload(
         return
     z_chunk_i = max(1, int(z_chunk))
     madvise_interval = nrrd_madvise_dontneed_interval()
-    src: Optional[object] = None
+    src: Optional[object] = opened_source
     try:
-        src = _open_nrrd_layer_ref(ref)
+        if src is None:
+            src = _open_nrrd_layer_ref(ref)
         _madvise_array_mmap(src, 'MADV_SEQUENTIAL')
         in_t, in_h, in_w = _volume_shape_tuple(src)
         direct_native_stream = (
@@ -4660,8 +4531,9 @@ def _write_one_decomposed_nrrd_layer_payload(
     finally:
         if src is not None:
             _madvise_array_mmap(src, 'MADV_DONTNEED')
-            _close_nrrd_layer_source(src)
-            _drop_nrrd_raw_store_chunks_ram_cache(src)
+            if opened_source is None:
+                _close_nrrd_layer_source(src)
+                _drop_nrrd_raw_store_chunks_ram_cache(src)
 
 @dataclass(frozen=True)
 class LowQualityDownbinSpec:

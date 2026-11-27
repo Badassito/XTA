@@ -87,7 +87,7 @@ def packed_job(monkeypatch, tmp_path):
     return path, view, shape, expected
 
 
-def test_immediate_gpu_admission_skips_cpu_jit_and_reports_phase_timings(packed_job, monkeypatch, tmp_path):
+def test_immediate_gpu_admission_skips_cpu_projection_and_reports_phase_timings(packed_job, monkeypatch, tmp_path):
     source, view, shape, expected = packed_job
     class Stage:
         max_output_voxels = shape[1] * shape[2]
@@ -98,7 +98,7 @@ def test_immediate_gpu_admission_skips_cpu_jit_and_reports_phase_timings(packed_
             pass
     monkeypatch.setattr(bp, '_try_native_pull_encoded_cuda_stage', lambda *args, **kwargs: Stage())
     monkeypatch.setattr(packed, '_pull_tilted_encoded',
-        lambda *args, **kwargs: pytest.fail('CUDA-admitted parent compiled an unused CPU kernel'))
+        lambda *args, **kwargs: pytest.fail('CUDA-admitted parent ran CPU projection'))
     result = packed.project_tilted_sparse_store(source, view, tmp_path/'output.cvol', out_shape_tyx=shape)
     store = RawBBoxMaskStore.open(tmp_path/'output.cvol', mmap_payload=True)
     try:
@@ -106,7 +106,6 @@ def test_immediate_gpu_admission_skips_cpu_jit_and_reports_phase_timings(packed_
     finally:
         store.close()
     timing = result['timings_seconds']
-    assert timing['cpu_warmup_calls'] == 0 and timing['cpu_warmup'] == 0.
     assert timing['gpu_projection'] > 0. and timing['writer_consume'] > 0.
     assert timing['plan_preparation'] > 0. and timing['gpu_producer_wait'] > 0.
     assert result['gpu_pipeline_plane_bytes'] == 2 * shape[1] * shape[2]
@@ -150,7 +149,6 @@ def test_empty_encoded_parent_requires_no_cpu_or_gpu_kernel(packed_job, monkeypa
     monkeypatch.setattr(bp, '_try_native_pull_encoded_cuda_stage',
         lambda *args, **kwargs: pytest.fail('Empty parent attempted CUDA admission'))
     monkeypatch.setattr(packed, '_pull_tilted_encoded',
-        lambda *args, **kwargs: pytest.fail('Empty parent compiled unused CPU kernel'))
+        lambda *args, **kwargs: pytest.fail('Empty parent ran CPU projection'))
     stats = packed.project_tilted_sparse_store(source, view, tmp_path/'empty-output.cvol', out_shape_tyx=shape)
     assert stats['foreground_voxels'] == 0
-    assert stats['timings_seconds']['cpu_warmup_calls'] == 0

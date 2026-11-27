@@ -155,7 +155,7 @@ class TerminalReferenceTests(unittest.TestCase):
             union_path.touch()
             args = dict(model_name='model', view=view, union_mm=volume, confmap_mm=None,
                         union_path=union_path, confmap_path=None, temp_dir=root,
-                        dense_tiling_active=False, min_conf=0, min_radius=0,
+                        tiling_active=False, min_conf=0, min_radius=0,
                         interpolate=interpolate, interpolation_walk_back=walk,
                         interpolation_candidates=candidates, interpolate_passes=passes,
                         interpolate_min_radius=0, interpolation_search_angle=0,
@@ -212,7 +212,7 @@ class TerminalReferenceTests(unittest.TestCase):
     def test_unqualified_modes_keep_dense_fallback(self):
         for overrides in (
             {'walk': 0}, {'candidates': 0}, {'nrrd_layers_enabled': False},
-            {'dense_tiling_active': True},
+            {'tiling_active': True},
         ):
             with self.subTest(overrides=overrides), self.assertRaises(DenseAllocationSelected):
                 self.run_prepare(stop_on_alloc=True, **overrides)

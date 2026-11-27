@@ -14,54 +14,15 @@ import threading
 import zlib
 
 import numpy as np
-from numba import types
-from numba.extending import intrinsic
 
-from ._deps import _numba
+from .native_cpu import kernels
+from .native_cpu_build import NativeCpuBuildError
 from .confidence_capture import COPY_BATCH_MAX_BYTES,COPY_BATCH_MAX_CELLS
 
 
 _LOCK=threading.Lock()
 _CACHE={}
 _MAX_BLOCK=128
-
-
-@intrinsic
-def _void_pointer(typingctx,address):
-    signature=types.voidptr(address)
-    def codegen(context,builder,signature,args):
-        return builder.inttoptr(args[0],context.get_value_type(types.voidptr))
-    return signature,codegen
-
-
-def _make_kernel(compressor,ulong_dtype):
-    @_numba.njit(nogil=True,cache=False)
-    def encode(mask,scores,z,bounds,cell_bytes,output_bytes,block):
-        scratch=np.empty(cell_bytes,np.uint8)
-        output=np.empty(output_bytes,np.uint8)
-        offsets=np.empty(bounds.shape[0]+1,np.int64)
-        length=np.empty(1,ulong_dtype)
-        offsets[0]=0
-        used=0
-        for item in range(bounds.shape[0]):
-            y0,y1,x0,x1=bounds[item,:4]
-            if (not (0<=y0<y1<=mask.shape[1] and 0<=x0<x1<=mask.shape[2])
-                    or y1-y0>block or x1-x0>block or (y1-y0)*(x1-x0)>cell_bytes):
-                raise ValueError('Native confidence crop exceeds its bounded cell')
-            at=0
-            for row in range(y0,y1):
-                for column in range(x0,x1):
-                    scratch[at]=scores[z,row,column] if mask[z,row,column]!=0 else 0
-                    at+=1
-            length[0]=output_bytes-used
-            status=compressor(_void_pointer(output.ctypes.data+np.uintp(used)),
-                _void_pointer(length.ctypes.data),_void_pointer(scratch.ctypes.data),at,3)
-            if status!=0:
-                return output,offsets,item,int(status)
-            used+=int(length[0])
-            offsets[item+1]=used
-        return output,offsets,bounds.shape[0],0
-    return encode
 
 
 class NativeConfidenceCodec:
@@ -84,8 +45,9 @@ class NativeConfidenceCodec:
         compressor.restype=ctypes.c_int
         self._compressor=compressor
         self._bounds_cache={}
-        self._kernel=_make_kernel(compressor,np.uint32 if ctypes.sizeof(ctypes.c_ulong)==4 else np.uint64)
+        self._address = ctypes.cast(compressor, ctypes.c_void_p).value
         self._probe()
+        self._probe_batch()
 
     def _probe(self):
         fixtures=(b'',b'\0',bytes(range(256)),b'\0'*16384,
@@ -140,12 +102,13 @@ class NativeConfidenceCodec:
                 raise RuntimeError('Native zlib bound exceeds its admitted codec workspace')
             self._bounds_cache[cell_bytes]=bound
         output_bytes=max(1,len(bounds))*bound
-        output,offsets,count,status=self._kernel(mask,scores,int(z),bounds,cell_bytes,output_bytes,block)
+        output,offsets,count,status=kernels.encode_confidence_cells(
+            self._address, mask, scores, int(z), bounds, cell_bytes, output_bytes, block)
         if status or count!=len(bounds):
             raise RuntimeError(f'Native confidence compression failed: status={status}, cells={count}/{len(bounds)}')
         return output,offsets
 
-    def warm(self):
+    def _probe_batch(self):
         mask=np.asarray([[[1,1,0],[1,0,1]]],np.uint8)
         scores=np.asarray([[[17,29,41],[53,67,79]]],np.uint8)
         mask.setflags(write=False)
@@ -175,9 +138,10 @@ def _load_backend(key):
     for filename,source in candidates:
         try:
             codec=NativeConfidenceCodec(ctypes.CDLL(filename),source=source)
-            codec.warm()
             return codec,dict(backend='native_compress2',codec_version=codec.version,
                 python_zlib_version=zlib.ZLIB_RUNTIME_VERSION,library_source=source,fallback_reason=None)
+        except NativeCpuBuildError:
+            raise
         except Exception as exc:
             errors.append(f'{source}:{type(exc).__name__}:{str(exc)[:160]}')
     reason=';'.join(errors) if errors else 'native_zlib_library_not_available'

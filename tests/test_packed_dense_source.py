@@ -143,7 +143,7 @@ def test_results_do_not_retain_source_mapping_with_gc_disabled(tmp_path):
 
 def test_worst_case_and_control_bounds_are_checked_before_scanning():
     virtual = np.broadcast_to(np.uint8(0), (64, 32768, 32768))
-    with mock.patch.object(dense, '_dense_strided_metadata', side_effect=AssertionError('scanned unadmitted volume')):
+    with mock.patch.object(dense.kernels, 'dense_mask_fields', side_effect=AssertionError('scanned unadmitted volume')):
         with pytest.raises(MemoryError, match='workspace'):
             dense.encode_dense_u8_packed_block(virtual, 0, 64)
     with pytest.raises(ValueError, match='allowance'):
@@ -175,3 +175,22 @@ def test_empty_block_and_readonly_source_preserve_caller_flags():
     records, payload = dense.encode_dense_u8_packed_block(source, 3, 0, max_payload_bytes=0)
     assert records == () and payload.size == 0
     assert not source.flags.writeable
+
+
+def test_native_encoders_validate_all_crops_before_writing_the_payload():
+    volume = np.ones((2, 1, 8), np.uint8)
+    words = np.array([0xffff], np.uint32)
+    outside = np.array([[0, 1, 0, 8, 8], [0, 1, 0, 9, 9]], np.int64)
+    valid = np.array([[0, 1, 0, 8, 8], [0, 1, 0, 8, 8]], np.int64)
+    for encode, args in ((dense.kernels.dense_mask_encode, (volume, 0)),
+                         (dense.kernels.bitset_mask_encode, (words, 1, 8, 0))):
+        for metadata, size in ((outside, 2), (valid, 1)):
+            payload = np.full(size, 0xC9, np.uint8)
+            with pytest.raises(ValueError):
+                encode(*args, metadata, payload)
+            np.testing.assert_array_equal(payload, 0xC9)
+
+
+@pytest.mark.parametrize('shape', [(0, 3), (2, 0), (0, 0)])
+def test_empty_owned_projection_has_no_crop(shape):
+    assert dense.encode_owned_u8_projection_plane(np.empty(shape, np.uint8), 0, packed=True) is None

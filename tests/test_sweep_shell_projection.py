@@ -106,8 +106,8 @@ def shell_stage(monkeypatch):
                     cylindrical_projection._pull_radial_range_into(out, args[0], args[1], z, 0, *args[2:], True)
                     values.append(out.reshape(shape[1:]))
             else:
-                from XTA.spherical_projection_cpu import pull_spherical_chunk_numba
-                values = [pull_spherical_chunk_numba(source, view, np.asarray(view.spherical_radii),
+                from XTA.spherical_projection_cpu import pull_spherical_chunk_native
+                values = [pull_spherical_chunk_native(source, view, np.asarray(view.spherical_radii),
                     np.asarray(view.spherical_rotation_xyz).reshape(3,3), shape, z, 0,
                     shape[1]*shape[2], boxes, scalar_max=True).reshape(shape[1:])
                     for z in range(first, first+count)]
@@ -156,6 +156,38 @@ def test_shell_rank_crops_equal_frozen_independent_binary_geometry(tmp_path, she
         assert state['dense_plane_allocations'] == 0
         assert state['source_h2d_bytes'] == view.num_slices*9 < source.nbytes
     assert shell_stage[0][0].closed and shell_stage[0][1].released
+
+
+def test_radial_publication_keeps_exact_crops_and_closed_phase_receipt(tmp_path, monkeypatch, shell_stage):
+    from contextlib import closing
+    from XTA import sweep_projection_cuda
+    from XTA.interpolation import RawBBoxMaskStore
+    from XTA.sweep_backprojection import project_sweep_view
+
+    monkeypatch.setattr(sweep_projection_cuda, '_inference_active', lambda: False)
+    view = _views()[0]
+    shape = (9, 12, 15)
+    source = np.zeros((view.num_slices, 7, 7), np.uint8)
+    source[:, 2:5, 2:5] = np.random.default_rng(891).integers(1, 3, (view.num_slices, 3, 3), dtype=np.uint8)
+    masks = {cutoff: (source >= rank).astype(np.uint8) for rank, cutoff in enumerate((50, 60), 1)}
+    metrics = {}
+    refs = project_sweep_view(view=view, model_name='m', cutoffs_hundredths=(50, 60),
+        native_shape=source.shape, output_shape=shape, work_dir=tmp_path,
+        read_mask_plane=lambda cutoff, z: masks[cutoff][z], workers=4, metrics=metrics)
+    receipt, = metrics['projectors']
+    lane, = receipt['lane_diagnostics']
+    device, host = lane['radial_device_timing'], receipt['radial_host_timing']
+    assert lane['closed'] and shell_stage[0][0].closed and shell_stage[0][1].released
+    assert device['block_requests'] == lane['shell_blocks'] > 1
+    assert device['failed_blocks'] == device['close_failures'] == 0
+    assert device['reader_open_seconds'] == pytest.approx(device['first_request_wait_seconds']
+        + device['inter_block_wait_seconds'] + device['block_request_seconds'] + device['post_block_wait_seconds'])
+    assert host['encode_planes'] == receipt['rank_crop_reads']
+    assert 0 <= host['commit_capacity_poll_seconds'] <= host['ordered_commit_seconds']
+    for cutoff, ref in refs.items():
+        with closing(RawBBoxMaskStore.open(ref.path)) as store:
+            result = np.stack([store.decode_slice(z) for z in range(shape[0])])
+        np.testing.assert_array_equal(result, _binary_oracle(masks[cutoff], view, shape))
 
 
 def test_sparse_crop_consumption_never_allocates_full_job_shaped_output(tmp_path, monkeypatch, shell_stage):

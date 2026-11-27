@@ -44,7 +44,7 @@ def _task(root, *, restored=False):
         admission=SimpleNamespace(reserve=lambda *_a:nullcontext()), transient_bytes=1,
         model_name='model', view=view, union_mm=original, confmap_mm=None,
         d1_shadow_path=shadow, union_path=path, confmap_path=None, temp_dir=root,
-        dense_tiling_active=False, min_conf=0, min_radius=0, interpolation_distance=0,
+        tiling_active=False, min_conf=0, min_radius=0, interpolation_distance=0,
         interpolation_walk_back=1, interpolation_candidates=1, interpolation_passes=1,
         interpolation_min_radius=0, interpolation_search_angle=0,
         slice_workers=1, interpolation_task_workers=1, component_layers_needed=True,

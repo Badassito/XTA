@@ -240,7 +240,7 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         default=None,
         metavar="TILE_SIZE:TILE_STRIDE",
         help=(
-            "Dense overlapping tile groups applied to selected parent views; production "
+            "Overlapping tile groups applied to selected parent views; production "
             "currently requires 1008-pixel tiles"
         ),
     )

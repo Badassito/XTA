@@ -42,6 +42,7 @@ def fake_procfs(monkeypatch, *, v2=True, limit=600*GIB, usage=200*GIB):
         return original_read(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, 'read_text', read)
+    monkeypatch.setattr(workspace, '_memory_sample', workspace._portable_memory_sample)
     return files, node, reads
 
 

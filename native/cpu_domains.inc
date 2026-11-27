@@ -1,0 +1,17 @@
+// Each registered domain owns a matching cpu_<domain>.cpp source file.
+// This file is included for public declarations and for module registration calls.
+XTA_CPU_DOMAIN(codec)
+XTA_CPU_DOMAIN(components)
+XTA_CPU_DOMAIN(confidence)
+XTA_CPU_DOMAIN(coverage)
+XTA_CPU_DOMAIN(interpolation)
+XTA_CPU_DOMAIN(journal)
+XTA_CPU_DOMAIN(nrrd)
+XTA_CPU_DOMAIN(packing)
+XTA_CPU_DOMAIN(radial)
+XTA_CPU_DOMAIN(rendering)
+XTA_CPU_DOMAIN(retina)
+XTA_CPU_DOMAIN(sparse_inverse)
+XTA_CPU_DOMAIN(spherical)
+XTA_CPU_DOMAIN(topology)
+XTA_CPU_DOMAIN(memory)

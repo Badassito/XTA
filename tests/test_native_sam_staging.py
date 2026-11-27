@@ -122,10 +122,10 @@ def staged_runtime(tmp_path, request):
         )
         inputs = TtaSchedulerInputs(
             batch=1, conf=0.25, cpu_batch=1, cpu_precision="fp32", gpu_batch=1, gpu_quantize=None,
-            imgsz=1, interpolation_distance=0, min_conf=0.0, min_radius=0.0, dense_tiling_active=False,
+            imgsz=1, interpolation_distance=0, min_conf=0.0, min_radius=0.0, tiling_active=False,
             nrrd_layers_needed=False, direct_union_inference_view_limit=2,
             direct_union_inference_byte_limit=capacity, direct_union_total_dense_byte_limit=capacity,
-            gpu_worker_tile_dense_result_limit=0, gpu_worker_tile_dense_result_task_limit=1,
+            gpu_worker_tile_result_limit=0, gpu_worker_tile_result_task_limit=1,
             gpu_worker_process_active=False, inference_worker_process_active=True, gpu_device_count=0,
             v1613_d1_owner_active=False, gpu_worker_result_dir=tmp_path, ensure_baseline_workspaces=None,
             gib=1 << 30, hybrid_deferred_result_mode="hybrid_deferred",

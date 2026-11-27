@@ -124,20 +124,39 @@ class RuntimeTaskTraceTests(unittest.TestCase):
         definitions = [node for node in tree.body[0].body if isinstance(node, ast.FunctionDef) and node.name in names]
         program = ast.Module(body=ast.parse('from __future__ import annotations').body + definitions, type_ignores=[])
         events, outgoing = [], queue.Queue()
+
+        def trace(event, **fields):
+            events.append((event, fields))
+
         namespace = dict(Future=Future, threading=threading, pending_publications=set(),
             publication_condition=threading.Condition(), result_queue=outgoing, gpu_index=2,
-            runtime_trace_event=lambda event, **fields: events.append((event, fields)))
+            runtime_trace_event=trace,
+            _publish_detector_result=workers._publish_detector_result)
         exec(compile(ast.fix_missing_locations(program), '<worker-deferred-trace>', 'exec'), namespace)
         first, second = Future(), Future()
         one = SimpleNamespace(flush_future=first, finish=lambda: first.result())
         two = SimpleNamespace(flush_future=second, finish=lambda: second.result())
         namespace['_schedule_deferred_publication'](7, one, {'view': 'first', 'family': 'radial'})
         namespace['_schedule_deferred_publication'](8, two, {'view': 'second', 'family': 'spherical'})
-        second.set_result({'done': True})
-        first.set_exception(RuntimeError('failed first publication'))
+        render = dict(render_path='gpu_resident', render_frames=6, render_recovered_on_cpu=False)
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry = self.telemetry(directory)
+            with mock.patch.object(workers, 'runtime_trace_event', trace), \
+                    mock.patch.object(workers, 'runtime_telemetry', return_value=telemetry):
+                second.set_result(dict(done=True, **render))
+                first.set_exception(RuntimeError('failed first publication'))
+            counters = telemetry.snapshot()['counters']
+        self.assertEqual(counters, {
+            'worker.render.spherical.gpu_resident.completed_tasks': 1,
+            'worker.render.spherical.gpu_resident.completed_frames': 6,
+        })
         self.assertEqual([(name, fields['task_id'], fields['view']) for name, fields in events],
                          [('worker_publication_done', 8, 'second'), ('worker_error', 7, 'first')])
-        self.assertEqual([outgoing.get()['task_id'], outgoing.get()['task_id']], [8, 7])
+        self.assertEqual({name: events[0][1][name] for name in render}, render)
+        succeeded, failed = outgoing.get(), outgoing.get()
+        self.assertEqual([succeeded['task_id'], failed['task_id']], [8, 7])
+        self.assertEqual({name: succeeded['stats'][name] for name in render}, render)
+        self.assertFalse(failed['ok'])
         self.assertFalse(namespace['pending_publications'])
 
     def test_native_dispatch_and_compute_credit_precede_scientific_result_trace(self):

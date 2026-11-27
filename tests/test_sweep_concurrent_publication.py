@@ -60,7 +60,9 @@ def _schedule(monkeypatch, tmp_path, *, publishers="2", backlog="3", fake_journa
         monkeypatch.setattr(sweep_views, "seal_view_family",
                             Mock(return_value=dict(status="ready", prediction_counts={50: 1, 60: 1})))
         monkeypatch.setattr(sweep_views, "retire_view_payloads", Mock())
-        monkeypatch.setattr(sweep_views, "open_view", lambda *a, **k: nullcontext(SimpleNamespace()))
+        family = SimpleNamespace(readers={60: SimpleNamespace()}, native_crops=Mock(),
+                                 metadata={"prediction_counts": {"50": 1, "60": 1}})
+        monkeypatch.setattr(sweep_views, "open_sibling_views", lambda *a, **k: nullcontext(family))
     return plan
 
 
@@ -574,9 +576,10 @@ def test_publication_future_waits_for_reader_exit_and_payload_retirement(monkeyp
     release_retirement = threading.Event()
 
     @contextmanager
-    def open_view(*_args, **_kwargs):
+    def open_family(*_args, **_kwargs):
         try:
-            yield SimpleNamespace()
+            yield SimpleNamespace(readers={60: SimpleNamespace()}, native_crops=Mock(),
+                                  metadata={"prediction_counts": {"50": 1, "60": 1}})
         finally:
             reader_closed.set()
 
@@ -585,7 +588,7 @@ def test_publication_future_waits_for_reader_exit_and_payload_retirement(monkeyp
         retirement_entered.set()
         assert release_retirement.wait(10)
 
-    monkeypatch.setattr(sweep_views, "open_view", open_view)
+    monkeypatch.setattr(sweep_views, "open_sibling_views", open_family)
     monkeypatch.setattr(sweep_views, "retire_view_payloads", retire)
     publication = Mock()
     publication.publish_view_family.return_value = {60: "ref"}

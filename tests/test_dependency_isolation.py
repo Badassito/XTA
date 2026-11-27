@@ -87,29 +87,24 @@ def test_test_imports_preserve_numerical_dependencies(numerical_first):
     assert "real SciPy/OpenCV operations and dependency identities preserved" in completed.stdout
 
 
-def test_mock_gpu_finalization_preserves_lazy_numba_registrations():
-    pytest.importorskip("numba", reason="Numba-specific lazy import registration check")
+def test_mock_gpu_finalization_preserves_native_cpu_kernels():
     program = textwrap.dedent("""
         import sys
         import unittest
         import numpy as np
-        import numba
-        from numba.core import pythonapi, types
         from tests.test_cuda_finalization import CudaFinalizationContractTests
+        from XTA.confidence_capture_cpu import zero_unmasked_scores_flat
 
         case = CudaFinalizationContractTests(
             'test_blockwise_3d_ccl_matches_independent_reference_across_layouts')
         result = unittest.TextTestRunner().run(unittest.TestSuite((case,)))
         assert result.wasSuccessful()
-        if types.PolynomialType in pythonapi._unboxers.functions:
-            assert 'numba.np.polynomial.polynomial_core' in sys.modules
-
-        @numba.njit
-        def add_one(values):
-            return values + 1
-
-        np.testing.assert_array_equal(add_one(np.arange(5)), np.arange(1, 6))
-        print('Numba compilation succeeds after mocked GPU finalization')
+        mask = np.array([True, False, True])
+        scores = np.array([10, 20, 30], dtype=np.uint8)
+        zero_unmasked_scores_flat(mask, scores, 0, len(scores))
+        np.testing.assert_array_equal(scores, [10, 0, 30])
+        assert not {'numba', 'llvmlite'} & set(sys.modules)
+        print('Native CPU masking succeeds after mocked GPU finalization')
     """)
     completed = subprocess.run(
         [sys.executable, "-X", "utf8", "-B", "-c", program], cwd=ROOT,
@@ -117,4 +112,4 @@ def test_mock_gpu_finalization_preserves_lazy_numba_registrations():
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, check=False,
     )
     assert completed.returncode == 0, completed.stdout
-    assert "Numba compilation succeeds after mocked GPU finalization" in completed.stdout
+    assert "Native CPU masking succeeds after mocked GPU finalization" in completed.stdout

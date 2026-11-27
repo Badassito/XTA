@@ -34,6 +34,7 @@ from XTA.confidence_publication import ConfidencePublicationQueue,copy_staged_bl
 from XTA.confidence_storage import write_blocks
 from XTA.native_pull_scheduling import configure_native_pull_scheduler,shutdown_native_pull_scheduler
 from tools.benchmark_native_pull_projection import heatsoak,PeakRss
+from tools.native_cpu_provenance import native_cpu_provenance
 
 
 class LegacyCellReader(_MaskedNativeScoreReader):
@@ -69,7 +70,8 @@ class LegacyCellReader(_MaskedNativeScoreReader):
 
 SOURCES=('XTA/confidence_capture.py','XTA/confidence_capture_cpu.py',
     'XTA/confidence_native_codec.py','XTA/confidence_evidence.py','XTA/confidence_storage.py',
-    'XTA/confidence_publication.py','XTA/native_pull_scheduling.py','tools/benchmark_confidence_producer.py')
+    'XTA/confidence_publication.py','XTA/native_pull_scheduling.py','tools/benchmark_confidence_producer.py',
+    'tools/native_cpu_provenance.py')
 FILES=('scores.u8.zlib','index.bin','metadata.json')
 
 
@@ -208,10 +210,11 @@ def main():
     os.environ['YOLO_TTA_CONFIDENCE_NATIVE_CODEC']='auto'
     before=fingerprints()
     started=time.perf_counter()
-    cpu.warm_confidence_capture_kernels()
+    native_cpu = native_cpu_provenance('masked_cell_bounds', 'copy_masked_cell',
+                                       'copy_masked_cells_batch', 'encode_confidence_cells')
     codec,receipt=native_confidence_codec()
     if codec is None:raise RuntimeError('Native comparison requires an actual backend: '+str(receipt))
-    # Match actual readonly C-layout signatures and a complete-cell bound size.
+    # Check the real codec with readonly input and a complete-cell bound size.
     tiny=np.ones((1,129,131),np.uint8);tiny.setflags(write=False)
     bounds=cpu.masked_cell_bounds(tiny,tiny,0,0,129,0,131,128)
     cpu.copy_masked_cells_batch(tiny,tiny,0,bounds,256*1024)
@@ -237,11 +240,7 @@ def main():
         native_receipt=receipt,linux_loader_executed=os.name!='nt',
         setup_seconds_excluded=setup_seconds,source_before=before,input_before=identity,
         legacy_encode_frame_sha256=hashlib.sha256(inspect.getsource(LegacyCellReader.encode_frame).encode()).hexdigest(),
-        records=[],warmup_records=[],compiler_signatures=dict(
-            bounds=list(map(str,cpu.masked_cell_bounds.nopython_signatures)),
-            cell_copy=list(map(str,cpu.copy_masked_cell.nopython_signatures)),
-            batch_copy=list(map(str,cpu.copy_masked_cells_batch.nopython_signatures)),
-            native_codec=list(map(str,codec._kernel.nopython_signatures))))
+        records=[],warmup_records=[],native_cpu=native_cpu)
     scheduler=configure_native_pull_scheduler(workers=args.cpu_budget,max_workers=args.cpu_budget)
     try:
         report['heatsoak']=heatsoak(args.heatsoak_seconds,args.cpu_budget)

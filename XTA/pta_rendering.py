@@ -329,7 +329,7 @@ def extract_padded_tile(frame: np.ndarray, x0: int, y0: int, tile_size: int) -> 
         and int(y0) + int(tile_size) <= int(arr.shape[0])
     ):
         # cv2.resize accepts non-contiguous ROI views, avoiding a tile-sized
-        # zero-fill and copy for every normal dense_tile_positions() result.
+        # zero-fill and copy for every normal tile_positions() result.
         return arr[int(y0):int(y0) + int(tile_size), int(x0):int(x0) + int(tile_size), ...]
     tile_shape = (int(tile_size), int(tile_size)) + tuple(int(x) for x in arr.shape[2:])
     tile = np.zeros(tile_shape, dtype=arr.dtype)
@@ -358,7 +358,7 @@ class RenderTileItem:
     overlay_path: Optional[Path]
     label_enabled: bool
     channel_kind: str = "gray"
-    shared_job: Optional[shared_geometry.DenseTileJob] = None
+    shared_job: Optional[shared_geometry.TileJob] = None
     canonical_plan: Optional[RasterPlan] = None
     publish_images: bool = True
     publish_labels: bool = True
@@ -600,7 +600,7 @@ def render_shared_tile_images(
 
     def _plane(source_idx: int, mirror_u: bool = False) -> np.ndarray:
         return np.ascontiguousarray(
-            shared_geometry.render_dense_tile_frame_for_job(
+            shared_geometry.render_tile_frame_for_job(
                 volume,
                 plan.view.shared_view,
                 tile.shared_job,
@@ -690,7 +690,7 @@ def render_plan_frame_source(
             tile_image = render_shared_tile_images(volume=volume, plan=plan, tile=tile, idx=int(idx))
         else:
             _require_pta_canonical_plan(plan, "categorical_ground_truth", tile=tile)
-        tile_mask = shared_geometry.render_categorical_dense_tile_for_job(
+        tile_mask = shared_geometry.render_categorical_tile_for_job(
             mask,
             plan.view.shared_view,
             tile.shared_job,

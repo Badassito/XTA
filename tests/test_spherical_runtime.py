@@ -2,19 +2,21 @@
 from __future__ import annotations
 
 import ast
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr
 from dataclasses import replace
 import importlib.util
 import inspect
+import io
 from itertools import product
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 import numpy as np
 
-from XTA import config, cuda_backend, cuda_d1, geometry, pipeline, workers
+from XTA import cli, config, cuda_backend, cuda_d1, geometry, pipeline, workers
 from XTA.azimuthal_coverage import requires_native_pull
 from XTA.spherical_geometry import render_shell_frame
 from XTA.unification.runtime import compile_physical_views
@@ -69,22 +71,29 @@ class SphericalSchedulerContracts(unittest.TestCase):
         self.assertEqual(record['frames_per_angle'], sum(v.num_slices for v in views))
 
     def test_early_request_resolution_rejects_nonpositive_patch_size(self):
-        # Execute the production early-resolution block without opening models,
-        # decoding sources, or initializing the pipeline's worker infrastructure.
-        tree = ast.parse(inspect.getsource(pipeline._main_impl))
-        block = next(node for node in ast.walk(tree) if isinstance(node, ast.Try)
-                     and any(_assigned(statement, 'spherical_requests') for statement in node.body))
-        program = compile(ast.fix_missing_locations(ast.Module(body=[block], type_ignores=[])), '<view-request-resolution>', 'exec')
-        for size in (0, -8, 8):
-            env = {**vars(pipeline), 'parser': SimpleNamespace(error=lambda error: (_ for _ in ()).throw(ValueError(error))),
-                   'args': SimpleNamespace(enable_cartesian=None, enable_tilted=None, enable_azimuthal=None,
-                                           enable_radial=None, enable_spherical=['transverse'], enable_tile=None, imgsz=size)}
-            if size <= 0:
-                with self.subTest(size=size), self.assertRaisesRegex(ValueError, 'imgsz > 0'):
-                    exec(program, env)
-            else:
-                exec(program, env)
-                self.assertEqual(env['spherical_requests'][0].view, 'transverse')
+        arguments = [
+            '--mode', 'tta', '--input', 'input.mkv', '--model', 'cpu:model.xml',
+            '--device', 'cpu', '--enable_spherical', 'transverse',
+        ]
+        runtime = SimpleNamespace(run=mock.Mock())
+        with (mock.patch.dict(sys.modules, {'XTA.tta_mode': runtime}),
+              mock.patch('XTA.scheduler_preflight.preflight_tta_scheduler') as preflight):
+            for size in (0, -8):
+                with self.subTest(size=size):
+                    stderr = io.StringIO()
+                    with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                        cli.run([*arguments, '--imgsz', str(size)])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn('argument --imgsz: must be >= 1', stderr.getvalue())
+                    preflight.assert_not_called()
+                    runtime.run.assert_not_called()
+
+            with mock.patch.object(config, 'resolve_spherical_view_requests',
+                                   wraps=config.resolve_spherical_view_requests) as resolve_spherical:
+                cli.run([*arguments, '--imgsz', '8'])
+            resolve_spherical.assert_called_once_with(['transverse'])
+            preflight.assert_called_once_with(gpu_device_count=0, cpu_enabled=True, tile_configs=())
+            runtime.run.assert_called_once_with()
 
     def test_production_result_mode_branch_keeps_spherical_native_across_backend_flags(self):
         # Isolate the actual scheduler branch rather than reproducing its

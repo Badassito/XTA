@@ -70,8 +70,18 @@ def test_actual_native_batch_has_exact_decoded_cells_and_local_python_bytes(real
                 # currently emit identical bytes. Format compatibility, rather
                 # than universal cross-version byte identity, is the contract.
                 assert actual==zlib.compress(raw,3)
-    assert real_codec._kernel.targetoptions['nogil']
-    assert real_codec._kernel.nopython_signatures
+
+
+def test_noncanonical_bool_mask_and_unaligned_bounds(real_codec):
+    mask = np.array([[[0, 2, 255], [3, 4, 0]]], np.uint8).view(np.bool_)
+    scores = np.arange(10, 16, dtype=np.uint8).reshape(mask.shape)
+    storage = bytearray(1 + 5 * 8)
+    bounds = np.ndarray((1, 5), np.int64, buffer=storage, offset=1)
+    bounds[0] = (0, 2, 0, 3, 4)
+    bounds.setflags(write=False)
+    output, offsets = real_codec.encode_batch(mask, scores, 0, bounds, 8)
+    expected = bytes([0, 11, 12, 13, 14, 0])
+    assert output[:offsets[-1]].tobytes() == zlib.compress(expected, 3)
 
 
 def _reader(mask,scores):

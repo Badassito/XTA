@@ -1,4 +1,4 @@
-"""GIL fix #3 (azimuthal-keys): nogil angular key plane is bit-identical.
+"""Native azimuthal key planes match the frozen sampler bit for bit.
 
 ``legacy_angular_keys`` and ``legacy_fill`` below are the pre-fix
 ``projection_coverage_cpu._angular_keys`` body and cached-plane loop copied
@@ -7,12 +7,14 @@ verbatim from HEAD. They still call the unchanged NumPy reference
 identical key dtype and bytes, and identical plan accounting fields.
 """
 from dataclasses import replace
+from inspect import isbuiltin
 
 import numpy as np
 import pytest
 
 from XTA import geometry
 from XTA import projection_coverage_cpu as fast
+from XTA.native_cpu import load_native_cpu
 
 
 @pytest.fixture(autouse=True)
@@ -201,38 +203,38 @@ def test_exact_boundary_points_take_hypot_pass_and_match(monkeypatch):
     assert sum(pending) > 0
 
 
-def test_warm_compiles_production_signatures_and_kernels_are_nogil_without_fma():
-    info = fast.warm_angular_key_kernels()
-    kernels = (fast._angular_coordinates, fast._angular_keys_kernel,
-               fast._ambiguous_offsets, fast._ambiguous_keys)
-    before = [len(kernel.nopython_signatures) for kernel in kernels]
-    assert info['signatures'] == {'_angular_coordinates': 1, '_angular_keys_kernel': 2,
-                                  '_ambiguous_offsets': 1, '_ambiguous_keys': 2}
+def test_native_angular_keys_match_for_unaligned_reversed_readonly_indices(monkeypatch):
+    native = load_native_cpu()
+    for name in ('_angular_coordinates', '_angular_keys_kernel', '_ambiguous_offsets', '_ambiguous_keys'):
+        assert isbuiltin(getattr(native, name))
+
+    monkeypatch.setattr(fast, '_ROI_MARGIN', 1.)
     for view in azimuthal_views((9, 13, 17), 7, 45.)[:2]:
-        for cache in (True, False):
-            plan = fast.prepare_native_pull_plan(view, (view.num_slices, 5, 5), (11, 19, 23),
-                                                 max_plan_bytes=8 * 1024**2, cache_plane=cache)
-            index = np.arange(7)
-            fast._angular_keys(plan, index, index)
-            fast._angular_keys(replace(plan, invalid_key=np.uint64(np.iinfo(np.uint64).max)),
-                               index, index)
-            readonly = index.copy()
-            readonly.setflags(write=False)
-            fast._angular_keys(plan, readonly, readonly.astype(np.int32))
-    with pytest.MonkeyPatch.context() as patch:  # every point through the hypot pass
-        patch.setattr(fast, '_ROI_MARGIN', 1.)
         plan = fast.prepare_native_pull_plan(view, (view.num_slices, 5, 5), (11, 19, 23),
-                                             max_plan_bytes=8 * 1024**2)
-        fast._angular_keys(replace(plan, invalid_key=np.uint64(np.iinfo(np.uint64).max)),
-                           np.arange(7), np.arange(7))
-    assert [len(kernel.nopython_signatures) for kernel in kernels] == before
-    for kernel in kernels:
-        assert kernel.targetoptions.get('nogil') is True
-        assert not kernel.targetoptions.get('fastmath')
-        for assembly in kernel.inspect_asm().values():
-            assembly = assembly.lower()
-            assert 'vfmadd' not in assembly and 'vfmsub' not in assembly
-            assert 'vfnmadd' not in assembly and 'vfnmsub' not in assembly
+                                             max_plan_bytes=8 * 1024**2, cache_plane=False)
+        height, width = fast._plane_shape(plan.integers)
+        size = height * width
+        buffer = np.empty(1 + 2 * size * np.dtype(np.int64).itemsize, np.uint8)
+        indices = np.ndarray((2, size), dtype=np.int64, buffer=buffer, offset=1)
+        indices[0], indices[1] = np.divmod(np.arange(size), width)
+        indices.setflags(write=False)
+        vertical, horizontal = indices[:, ::-1]
+        assert not vertical.flags.aligned and not horizontal.flags.aligned
+
+        for candidate in (plan, replace(plan, invalid_key=np.uint64(np.iinfo(np.uint64).max))):
+            expected = legacy_angular_keys(candidate, vertical, horizontal)
+            output_buffer = np.empty(1 + expected.nbytes, np.uint8)
+            actual = np.ndarray(expected.shape, dtype=expected.dtype, buffer=output_buffer, offset=1)
+            assert not actual.flags.aligned
+            pending = fast._angular_keys_into(
+                candidate, fast._angular_tables(candidate), actual,
+                0, width, vertical, horizontal, True,
+            )
+            assert pending > 0
+            np.testing.assert_array_equal(actual, expected)
+            np.testing.assert_array_equal(
+                fast._angular_keys(candidate, vertical, horizontal.astype(np.int32)), expected,
+            )
 
 def _numpy_premises():
     from tests import gil_azimuthal_numpy_premises

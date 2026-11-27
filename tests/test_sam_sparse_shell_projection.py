@@ -123,9 +123,11 @@ def test_preflight_workspace_refusal_never_publishes(tmp_path,monkeypatch):
     assert not target.exists()
 
 
-@pytest.mark.parametrize('route',('implicit','implicit_gpu','availability_error','explicit_cpu','explicit_gpu','full_bbox','preflight','corrupt'))
+@pytest.mark.parametrize('route',('implicit','implicit_gpu','availability_error','explicit_cpu','explicit_gpu','full_bbox',
+                                     'preflight','corrupt','missing_artifact'))
 def test_sam_dispatch_preserves_explicit_gpu_and_only_preflight_can_fallback(tmp_path,monkeypatch,route):
     from XTA import assembly, sam_sparse_shell_projection as module
+    from XTA.native_cpu_build import NativeCpuBuildError
     import torch
     family='spherical'
     view=next(view for view in VIEWS if view.family==family and not view.spherical_tilted_source)
@@ -138,6 +140,10 @@ def test_sam_dispatch_preserves_explicit_gpu_and_only_preflight_can_fallback(tmp
     monkeypatch.delenv(flag,raising=False)
     if route=='explicit_cpu':monkeypatch.setenv(flag,'0')
     if route=='explicit_gpu':monkeypatch.setenv(flag,'1')
+    if route=='missing_artifact':
+        def missing():
+            raise NativeCpuBuildError('controlled missing CPU artifact')
+        monkeypatch.setattr('XTA.native_cpu.load_native_cpu',missing)
     calls=[]
     def cuda_available():
         assert route not in ('explicit_cpu','explicit_gpu'), 'Explicit policy must not probe CUDA during route selection'
@@ -165,6 +171,9 @@ def test_sam_dispatch_preserves_explicit_gpu_and_only_preflight_can_fallback(tmp
             with pytest.raises(LookupError,match='legacy dense'):
                 invoke()
             assert calls==(['compact','dense'] if route=='preflight' else ['dense'])
+        elif route=='missing_artifact':
+            with pytest.raises(NativeCpuBuildError,match='missing CPU artifact'):invoke()
+            assert calls==['compact'] and not (root/'projected.cvol').exists()
         elif route=='corrupt':
             with pytest.raises(ValueError,match='corrupt data'):invoke()
             assert calls==['compact']

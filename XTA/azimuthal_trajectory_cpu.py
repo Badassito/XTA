@@ -8,30 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._deps import _numba
-
-
-@_numba.njit(nogil=True, cache=False)
-def _nearest_sources(targets, sources, indices, reverses):
-    for target_index in range(targets.size):
-        target = targets[target_index]
-        best_index = 0
-        best_distance = np.inf
-        best_raw = 0.0
-        for source_index in range(sources.size):
-            raw = target - sources[source_index]
-            wrapped = ((raw + 90.0) % 180.0) - 90.0
-            distance = abs(wrapped)
-            if distance < best_distance or np.isnan(distance):
-                best_index = source_index
-                best_distance = distance
-                best_raw = raw
-                # Finite endpoints can overflow their subtraction. NumPy
-                # argmin returns the first NaN, even after a finite minimum.
-                if np.isnan(distance):
-                    break
-        indices[target_index] = best_index
-        reverses[target_index] = abs(best_raw) > 90.0
+from .native_cpu import kernels
 
 
 def nearest_azimuthal_sources(targets, sources):
@@ -49,18 +26,7 @@ def nearest_azimuthal_sources(targets, sources):
         raise ValueError('No azimuthal source angles are available for backprojection')
     if sources.size > np.iinfo(np.int32).max:
         raise ValueError('Azimuthal trajectory exceeds int32 source addressing')
-    indices = np.empty(targets.size, np.int32)
-    reverses = np.empty(targets.size, bool)
-    if np.isfinite(targets).all() and np.isfinite(sources).all():
-        _nearest_sources(targets, sources, indices, reverses)
-    else:
-        for target_index, target in enumerate(targets):
-            raw = float(target) - sources
-            wrapped = ((raw + 90.0) % 180.0) - 90.0
-            source_index = int(np.argmin(np.abs(wrapped)))
-            indices[target_index] = source_index
-            reverses[target_index] = abs(float(raw[source_index])) > 90.0
-    return indices, reverses
+    return kernels.nearest_azimuthal_sources(targets, sources)
 
 
 def prepare_azimuthal_backprojection_arrays(view):

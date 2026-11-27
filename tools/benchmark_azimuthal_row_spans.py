@@ -6,7 +6,6 @@ rasters/angle counts are bounded synthetic witnesses, not cluster workloads.
 from __future__ import annotations
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,6 +21,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference-source', type=Path, required=True)
     parser.add_argument('--reference-sha256', required=True)
+    parser.add_argument('--reference-package', type=Path,
+                        help='Matching historical XTA directory (default: reference source parent)')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--heatsoak-seconds', type=float, default=60.)
     parser.add_argument('--repetitions', type=int, default=3)
@@ -43,17 +44,23 @@ def main():
     from XTA import geometry, projection_coverage_cpu as candidate
     from XTA.interpolation import CTILE_INDEX_DTYPE
     from tools.benchmark_native_pull_projection import heatsoak
-    spec = importlib.util.spec_from_file_location('XTA._azimuthal_rows_frozen', args.reference_source)
-    original = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = original
-    spec.loader.exec_module(original)
+    from tools.historical_benchmark_source import load_historical_module
+    from tools.native_cpu_provenance import native_cpu_provenance
+    package = (args.reference_package or args.reference_source.parent).resolve()
+    if not (package / '__init__.py').is_file():
+        parser.error('Supply --reference-package with the matching historical XTA directory')
+    original = load_historical_module(
+        args.reference_source, package, 'projection_coverage_cpu', evidence_dir=output,
+    )
+    native_cpu = native_cpu_provenance('_pull_azimuthal', '_pull_azimuthal_encoded')
     cpu_file = ROOT/'XTA/projection_coverage_cpu.py'
     candidate_hash = hashlib.sha256(cpu_file.read_bytes()).hexdigest()
     work, target = (2911, 3064, 3022), (1931, 3064, 3022)
     bbox = np.array((0, 0, 0, *target), np.int64)
     count, first = target[1]*target[2], (target[0]//2)*target[1]*target[2]
     rng = np.random.default_rng(160381)
-    report = dict(reference_sha256=args.reference_sha256, candidate_sha256=candidate_hash,
+    report = dict(reference_sha256=args.reference_sha256, reference_package=str(package),
+        candidate_sha256=candidate_hash, native_cpu=native_cpu,
         python=sys.version, numpy=np.__version__, repetitions=args.repetitions,
         limitations='Synthetic independent-frame CPU slabs; no full-volume/model/GPU or cluster throughput claim',
         measurements=[])
@@ -98,7 +105,7 @@ def main():
                     return backend._pull_azimuthal(source, destination, first, plan.integers,
                         plan.coefficients, bbox, mode == 'max', keys, True,
                         plan.invalid_key, plan.row_lookup)
-                # Exclude JIT specialization and per-layout cold execution.
+                # Exclude historical setup and each layout's initial execution.
                 before_stats, after_stats = run(original, a), run(candidate, b)
                 np.testing.assert_array_equal(a, b)
                 assert before_stats == after_stats
@@ -107,7 +114,7 @@ def main():
                     report['heatsoak'] = heatsoak(args.heatsoak_seconds, min(8, os.cpu_count() or 1))
                     soaked = True
                 if not soaked:
-                    # First three signatures are warm before the measured pass.
+                    # Check the first three layouts before the measured pass.
                     continue
                 times = dict(original=[], candidate=[])
                 for repetition in range(args.repetitions):

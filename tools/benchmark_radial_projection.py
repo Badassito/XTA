@@ -101,7 +101,7 @@ def main():
         )
         t0 = time.perf_counter()
         cp._project_radial_block(*arguments, 0, 0, bounds, False)
-        report['jit_warmup_seconds'] = time.perf_counter() - t0
+        report['native_first_call_seconds'] = time.perf_counter() - t0
 
         def reference(z):
             plane = np.empty(output_shape[1:], np.uint8)

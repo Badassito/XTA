@@ -16,6 +16,8 @@ python -m XTA --mode lta --help
 
 The versioned launcher and the installed `xta` command use the same dispatcher.
 Runtime dependencies and optional backends are declared in [pyproject.toml](pyproject.toml).
+Platform wheels include native CPU kernels. To run numerical work from a source
+checkout, build them once with `python -B tools/build_native_cpu.py`.
 
 ## Paired-volume registration
 
@@ -95,6 +97,7 @@ any forced label resizing.
 
 ## Guides
 
+- [Native CPU kernels](docs/native_cpu.md)
 - [Native TTA scheduler](docs/native_scheduler.md)
 - [Topology options, 2D hole filling and centerline views](docs/topology_and_cpr.md)
 - [SAM interpolation and extrapolation](docs/sam_interpolation.md)

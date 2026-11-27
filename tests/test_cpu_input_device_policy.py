@@ -8,6 +8,8 @@ import pytest
 
 from XTA.yolo_cpu_input import CpuInputPrefetch, cpu_input_eligible, cpu_input_family_eligible
 from tests import test_yolo_cpu_input as helpers
+from tests.native_detector_test_support import DetectorRun
+from tests.native_scheduler_cases import finish_actor
 
 
 @pytest.fixture(autouse=True)
@@ -54,13 +56,44 @@ def test_default_prefetch_creates_no_tilted_packets_builders_or_ram_credit():
 
 
 @pytest.mark.parametrize('opt_in', [False, True])
-def test_scheduler_priority_uses_the_same_cpu_preparation_device_policy(monkeypatch, opt_in):
+def test_scheduler_priority_uses_the_same_cpu_preparation_device_policy(
+        tmp_path, monkeypatch, opt_in):
     if opt_in:
         monkeypatch.setenv('YOLO_TTA_CPU_INPUT_TILTED', '1')
-    scheduler = helpers.YoloCpuInputTests()._selection()
-    for identity in (1, 3):
-        descriptor = scheduler.state.gpu_worker_tasks_by_id[identity]
-        descriptor['view'] = replace(descriptor['view'], family='tilted', tilt_base_view='transverse')
-    selected, _workers = scheduler.pop_gpu_worker_pending_task_id()
-    chosen = scheduler.state.gpu_worker_tasks_by_id[selected]
-    assert chosen['view'].family == ('orthogonal' if opt_in else 'tilted')
+    cartesian = helpers.task(task_id=1)
+    tilted = helpers.task(task_id=2, tilted=True)
+    executor = helpers.ManualExecutor()
+    owner = CpuInputPrefetch(
+        [cartesian, tilted], np.zeros((5, 9, 10), np.uint8), executor,
+        max_bytes=100_000, headroom=lambda: 1_000_000,
+        allocate=lambda shape, *_, **__: np.empty(shape, np.uint8),
+        backing=lambda _array: Path('prefetched-input'),
+    )
+    executor.owner = owner
+    try:
+        with owner.condition:
+            assert owner.condition.wait_for(
+                lambda: not owner.pump_requested and not owner.pump_scheduled, timeout=5)
+        assert len(executor.jobs) == (2 if opt_in else 1)
+        for index in range(len(executor.jobs)):
+            executor.run(index)
+        with DetectorRun(tmp_path) as run:
+            run.scheduler.cpu_input_prefetch = owner
+            actor = run.worker(0)
+            run.start_transport()
+            run.declare(cartesian, tilted)
+            expected = (cartesian, tilted) if opt_in else (tilted, cartesian)
+            for count, descriptor in enumerate(expected, start=1):
+                run.drain_until(lambda: run.native.snapshot()['dispatched'] >= count)
+                chosen = run.take(0)
+                assert chosen['task_id'] == descriptor['task_id']
+                if opt_in or descriptor is cartesian:
+                    assert chosen['cpu_input_path'] == 'prefetched-input'
+                    assert chosen['cpu_input_offset'] == 0
+                else:
+                    assert 'cpu_input_path' not in chosen
+                finish_actor(actor, chosen)
+            run.drain_until(lambda: len(run.results) == 2 and
+                            not run.scheduler.publication_outstanding())
+    finally:
+        owner.shutdown()

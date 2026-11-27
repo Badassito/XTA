@@ -11,7 +11,6 @@ import argparse
 from contextlib import ExitStack
 from dataclasses import replace
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -21,7 +20,7 @@ import time
 import tracemalloc
 from unittest import mock
 
-for _variable in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+for _variable in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
     os.environ[_variable] = '2'
 os.environ['YOLO_TTA_GPU_SPHERICAL_BACKPROJECT'] = '0'
 sys.dont_write_bytecode = True
@@ -36,22 +35,14 @@ from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter, RawBBoxMaskStor
 from XTA.qsc import QSC_FACE_BASES
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 from XTA.spherical_projection_bounds import spherical_output_bounds
-from XTA.spherical_projection_cpu import prepare_spherical_chunk_numba
+from XTA.spherical_projection_cpu import prepare_spherical_chunk_native
+from tools.historical_benchmark_source import load_historical_module
+from tools.native_cpu_provenance import native_cpu_provenance
 
 
 OUTPUT_SHAPE = (1931, 3064, 3022)
 WORKING_SHAPE = (2911, 3064, 3022)
 PATCH_SIZE = 3072
-
-
-def load_baseline(root, stem):
-    path = root / 'XTA' / f'{stem}.py'
-    name = f'XTA._publication_benchmark_baseline_{stem}'
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def build_cases(samples, small=False):
@@ -251,26 +242,34 @@ def main():
         parser.error('Generated evidence belongs outside the repository, in task Scratch')
     if not 1 <= args.repeats <= 10 or not 2 <= args.samples <= 32:
         parser.error('repeats must be 1..10 and samples 2..32')
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     cv2.setNumThreads(1)
-    baseline = load_baseline(args.baseline_root.resolve(), 'spherical_projection')
-    baseline_cpu = load_baseline(args.baseline_root.resolve(), 'spherical_projection_cpu')
+    baseline_package = args.baseline_root.resolve() / 'XTA'
+    baseline = load_historical_module(
+        baseline_package / 'spherical_projection.py', baseline_package, 'spherical_projection',
+        evidence_dir=args.output.parent,
+    )
+    baseline_cpu = load_historical_module(
+        baseline_package / 'spherical_projection_cpu.py', baseline_package, 'spherical_projection_cpu',
+        evidence_dir=args.output.parent,
+    )
     encoded = getattr(candidate, '_project_spherical_encoded_block', None)
     if not callable(encoded):
         parser.error('candidate compact producer is unavailable')
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     artifact_dir = args.output.parent / (args.output.stem + '-stores')
     if artifact_dir.exists():
         parser.error(f'benchmark artifact directory already exists: {artifact_dir}')
     artifact_dir.mkdir()
     rows = []
-    compile_started = time.perf_counter()
+    setup_started = time.perf_counter()
+    native_cpu = native_cpu_provenance("spherical_pull")
     first = next(build_cases(args.samples, args.small))
     _, view, source, boxes, _, _, shape, _ = first
     radii = np.asarray(view.spherical_radii, np.float64)
     rotation = np.asarray(view.spherical_rotation_xyz, np.float64).reshape(3, 3)
     baseline_pull = baseline_cpu.prepare_spherical_chunk_numba(source, view, radii, rotation, shape, boxes)
-    compact_pull = prepare_spherical_chunk_numba(source, view, radii, rotation, shape, boxes)
-    compile_seconds = time.perf_counter() - compile_started
+    compact_pull = prepare_spherical_chunk_native(source, view, radii, rotation, shape, boxes)
+    setup_seconds = time.perf_counter() - setup_started
     for case in build_cases(args.samples, args.small):
         name, view, source, boxes, bounds, zs, shape, working = case
         for format_name in args.formats:
@@ -305,7 +304,7 @@ def main():
     report = {
         'baseline_root': str(args.baseline_root.resolve()), 'thread_limit': 2, 'opencv_threads': 1,
         'compiled_pull_parallel': False, 'repeats': args.repeats, 'small': args.small,
-        'compile_or_cache_load_seconds': compile_seconds, 'cases': rows,
+        'baseline_and_candidate_setup_seconds': setup_seconds, 'native_cpu': native_cpu, 'cases': rows,
         'baseline_projection_sha256': hashlib.sha256(Path(baseline.__file__).read_bytes()).hexdigest(),
         'candidate_projection_sha256': hashlib.sha256(Path(candidate.__file__).read_bytes()).hexdigest(),
         'candidate_cpu_sha256': hashlib.sha256(

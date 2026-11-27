@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import io
+import inspect
 import threading
 from pathlib import Path
 from unittest import mock
@@ -20,6 +21,7 @@ import pytest
 from XTA import nrrd_compression as nc
 from XTA import nrrd_sparse_kernels as nk
 from XTA import outputs
+from XTA.native_cpu import load_native_cpu
 from XTA.interpolation import (
     CVOL_FORMAT,
     INTERNAL_PACKED_CVOL_FORMAT,
@@ -75,12 +77,6 @@ def _codec():
 
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
-
-
-@pytest.fixture(scope='module', autouse=True)
-def _warm():
-    info = nk.warm_nrrd_producer_kernels()
-    assert info['crop_row_signatures'] == 1 and info['tee_signatures'] == 1
 
 
 # ----------------------------------------------------------------------------- crop rows
@@ -500,9 +496,23 @@ def test_concurrent_shards_resize_in_parallel(monkeypatch):
     np.testing.assert_array_equal(job_list[0]['volume'], ref_jobs[0]['volume'])
 
 
-def test_warm_compiles_every_kernel_signature():
-    info = nk.warm_nrrd_producer_kernels()
-    assert info['seconds'] < 5.0
-    for key in ('crop_row_signatures', 'native_signatures', 'restored_signatures',
-                'tee_signatures', 'tee_or_signatures'):
-        assert info[key] == 1
+def test_sparse_nrrd_operators_are_compiled():
+    native = load_native_cpu()
+    for name in ('area_crop_resize', 'fill_crop_row_batch', 'fill_native_member_group',
+                 'fill_restored_member_group', 'resize_records_for_tee', 'or_tee_records'):
+        assert inspect.isbuiltin(getattr(native, f'nrrd_{name}'))
+
+
+def test_native_tee_rejects_invalid_target_before_committing():
+    regions = np.array([[0, 0, 1, 2, 0], [1, 1, 2, 2, 2]], dtype=np.int64)
+    results = np.array([1, 1, 1], dtype=np.uint8)
+    records = np.zeros((2, 6), dtype=np.int64)
+    records[1, 5] = 1
+    target_ptr = np.array([0, 1, 2], dtype=np.int64)
+    target_index = np.array([0, 2], dtype=np.int64)
+    volume = np.zeros((2, 2, 2), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match='target is outside the volume'):
+        nk.or_tee_records(regions, results, records, target_ptr, target_index, volume)
+
+    assert not volume.any()

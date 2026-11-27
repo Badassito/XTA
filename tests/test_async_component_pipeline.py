@@ -76,7 +76,7 @@ def run_worker(result_path: Path) -> None:
                         prepared = assembly.prepare_view_volume_after_fullframe(
                             model_name='model', view=view, union_mm=shadow, confmap_mm=None,
                             union_path=shadow_path, confmap_path=None, temp_dir=root,
-                            dense_tiling_active=False, min_conf=0, min_radius=0,
+                            tiling_active=False, min_conf=0, min_radius=0,
                             interpolate=6, interpolation_walk_back=1, interpolation_candidates=1,
                             interpolate_passes=1, interpolate_min_radius=0, interpolation_search_angle=15,
                             slice_workers=1, interpolation_task_workers=1,

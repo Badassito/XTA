@@ -45,19 +45,29 @@ def test_full_twenty_one_lanes_leave_age_and_size_leaders_unchanged(tmp_path, ch
 
 
 def test_real_dense_rejection_still_backfills_after_a_lane_opens(tmp_path):
-    stage, _writer, _prepare, leases = mixed_queue(tmp_path, workers=21, cap=100)
+    stage, _writer, prepare, leases = mixed_queue(tmp_path, workers=21, cap=100)
     try:
         caller = fill_lanes(stage, tmp_path)
         large, _ = parent(stage, tmp_path, 'too-large-for-free-dense', 'radial', 90)
         small, _ = parent(stage, tmp_path, 'fits-dense', 'radial', 10)
-        completed = next(iter(caller)); completed.set_result(None)
-        leases.complete(caller[completed], retain_for_dense_retirement=False)
+        completed = next(iter(caller))
+        execute, (_task, key, lease), options = prepare.entries.pop(completed)
+        # Run the queued staging wrapper so native receives Ready before the lease retires.
+        assert completed.set_running_or_notify_cancel()
+        completed.set_result(execute(lambda: None, key, lease, **options))
+        assert leases.complete(key, retain_for_dense_retirement=False)
         assert stage.pump(budget=OneProbe(), resumed_futures=caller) == ({}, False)
         assert stage._expensive_admissions == 21
-        assert stage._prepare_arrivals[large]['denials']['dense_limit'] == 1
+        assert stage._prepare_arrivals[large]['denials']['native_dense'] == 1
+        native = stage._dense_owner.run.native
+        ledger = native.snapshot()
+        assert (ledger['byte_capacity'], ledger['bytes_used'], ledger['blocked_parents']) == (100, 20, 1)
+        assert stage._native_restore_grants[large].state == 'Pending'
         resumed, _ = stage.pump(budget=OneProbe(), resumed_futures=caller)
         assert list(resumed.values()) == [small] and stage._expensive_admissions == 22
         assert stage.snapshot()['active_prepares'] == 21 and large not in leases.leases
+        ledger = native.snapshot()
+        assert (ledger['bytes_used'], ledger['blocked_parents']) == (30, 1)
     finally:
         cleanup(stage, leases)
 
@@ -99,13 +109,14 @@ def test_all_denial_fields_survive_actual_bounded_scalar_trace_serializer(tmp_pa
     stage, _writer, _prepare, leases = mixed_queue(tmp_path, workers=21)
     key, _ = parent(stage, tmp_path, 'parent', 'radial', 10)
     stage._remember_prepare(key, 10)
-    reasons = ('worker_limit', 'cheap_lane', 'parent_condition', 'dense_limit', 'startup_headroom')
+    reasons = ('worker_limit', 'cheap_lane', 'parent_condition', 'dense_limit',
+               'startup_headroom', 'native_dense')
     try:
         for index, reason in enumerate(reasons, 1):
             stage._prepare_arrivals[key]['denials'][reason] = index
             stage._prepare_denials[reason] = index*10
         record = stage._prepare_admission_record(key, cpu_prepare=False, active_count=20)
-        assert len(record) == 24
+        assert len(record) == 26
         sink.trace_event('sam_parent_prepare_admitted', **record)
         written = sink._trace_events[-1]
         for index, reason in enumerate(reasons, 1):

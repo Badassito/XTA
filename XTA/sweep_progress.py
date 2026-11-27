@@ -114,6 +114,17 @@ class FanoutProgress:
                                   "nominal_output_voxels", "kernel_calls", "dense_d2h_bytes"):
                         if field in result:
                             totals[field] = totals.get(field, 0) + int(result[field])
+                    device_lanes = result.get("lane_diagnostics", ())
+                    device_timing = device_lanes[0].get("radial_device_timing") if device_lanes else None
+                    for name, timing in (("radial_device_timing", device_timing),
+                                         ("radial_host_timing", result.get("radial_host_timing"))):
+                        if timing is None:
+                            continue
+                        summary = totals.setdefault(name, {"passes": 0})
+                        summary["passes"] += 1
+                        for field, value in timing.items():
+                            prior = summary.get(field, 0)
+                            summary[field] = max(prior, value) if field.startswith("max_") else prior + value
                     reason = result.get("cuda_reason")
                     if (reason and not backend.startswith("cuda")
                             and reason != "empty_output_certificate"):

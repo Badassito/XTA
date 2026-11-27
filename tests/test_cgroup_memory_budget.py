@@ -26,6 +26,7 @@ def proc_files(monkeypatch, *, v2=True, membership='/job/step', mount=None):
         return value
 
     monkeypatch.setattr(Path, 'read_text', read)
+    monkeypatch.setattr(workspace, '_memory_sample', workspace._portable_memory_sample)
     return files, base
 
 
@@ -184,8 +185,7 @@ def test_smallest_slurm_cap_requires_independent_enforcement(monkeypatch):
 def test_available_anon_api_still_applies_kernel_headroom(monkeypatch):
     files, base = proc_files(monkeypatch)
     finite(files, base, '/job', 600, 100)
-    monkeypatch.setattr(workspace, '_read_meminfo_bytes', lambda: {
-        'MemAvailable': 900, 'SwapFree': 1000})
+    files['/proc/meminfo'] = 'MemAvailable: 1 kB\nSwapFree: 1 kB\n'
     assert workspace.available_anon_work_bytes() == 500
 
 
@@ -194,39 +194,30 @@ def test_publication_shares_one_meminfo_but_refreshes_all_cgroup_limits(monkeypa
     from XTA import publication_memory
 
     files, base = proc_files(monkeypatch, v2=v2)
-    finite(files, base, '/job/step', 400, 50, v2=v2)
-    finite(files, base, '/job', 600, 500, v2=v2)
-    snapshots = []
-    mem_available = 900
-
-    def read_meminfo():
-        snapshot = {'MemAvailable': mem_available, 'SwapFree': 10000}
-        snapshots.append(snapshot)
-        return snapshot
-
-    monkeypatch.setattr(workspace, '_read_meminfo_bytes', read_meminfo)
-    monkeypatch.setattr(publication_memory, '_read_meminfo_bytes', read_meminfo)
-    assert publication_memory.publication_ram_headroom() == 100
-    finite(files, base, '/job', 1000, 500, v2=v2)
-    assert publication_memory.publication_ram_headroom() == 350
-    finite(files, base, '/job/step', 100, 75, v2=v2)
-    assert publication_memory.publication_ram_headroom() == 25
-    mem_available = 10
-    assert publication_memory.publication_ram_headroom() == 10
-    assert len(snapshots) == 4  # One fresh physical snapshot for every call.
-    assert len({id(snapshot) for snapshot in snapshots}) == 4
+    kib = 1024
+    files['/proc/meminfo'] = 'MemAvailable: 900 kB\nSwapFree: 10000 kB\n'
+    finite(files, base, '/job/step', 400 * kib, 50 * kib, v2=v2)
+    finite(files, base, '/job', 600 * kib, 500 * kib, v2=v2)
+    reads = counted_reads(monkeypatch)
+    assert publication_memory.publication_ram_headroom() == 100 * kib
+    finite(files, base, '/job', 1000 * kib, 500 * kib, v2=v2)
+    assert publication_memory.publication_ram_headroom() == 350 * kib
+    finite(files, base, '/job/step', 100 * kib, 75 * kib, v2=v2)
+    assert publication_memory.publication_ram_headroom() == 25 * kib
+    files['/proc/meminfo'] = 'MemAvailable: 10 kB\nSwapFree: 10000 kB\n'
+    assert publication_memory.publication_ram_headroom() == 10 * kib
+    assert reads.count('/proc/meminfo') == 4  # One fresh physical snapshot per call.
 
 
 def test_shared_meminfo_keeps_swap_for_anon_but_not_physical_publication(monkeypatch):
     from XTA import publication_memory
 
-    proc_files(monkeypatch)
-    snapshot = {'MemAvailable': 20, 'SwapFree': 1000}
-    monkeypatch.setattr(workspace, '_read_meminfo_bytes', lambda: snapshot)
-    monkeypatch.setattr(publication_memory, '_read_meminfo_bytes', lambda: snapshot)
-    assert workspace.available_anon_work_bytes() == 1020
-    assert workspace.available_anon_work_bytes(meminfo=snapshot) == 1020
-    assert publication_memory.publication_ram_headroom() == 20
+    files, _base = proc_files(monkeypatch)
+    files['/proc/meminfo'] = 'MemAvailable: 20 kB\nSwapFree: 1000 kB\n'
+    snapshot = workspace._read_meminfo_bytes()
+    assert workspace.available_anon_work_bytes() == 1020 * 1024
+    assert workspace.available_anon_work_bytes(meminfo=snapshot) == 1020 * 1024
+    assert publication_memory.publication_ram_headroom() == 20 * 1024
 
 
 def test_shared_meminfo_does_not_hide_unreadable_finite_cgroup_usage(monkeypatch):
@@ -234,8 +225,7 @@ def test_shared_meminfo_does_not_hide_unreadable_finite_cgroup_usage(monkeypatch
 
     files, base = proc_files(monkeypatch)
     finite(files, base, '/job', 600, PermissionError())
-    snapshot = {'MemAvailable': 900, 'SwapFree': 1000}
-    monkeypatch.setattr(publication_memory, '_read_meminfo_bytes', lambda: snapshot)
+    files['/proc/meminfo'] = 'MemAvailable: 900 kB\nSwapFree: 1000 kB\n'
     assert publication_memory.publication_ram_headroom() == 0
 
 

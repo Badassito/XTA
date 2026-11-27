@@ -85,6 +85,7 @@ extern "C" __global__ void native_pull(
               if (frame<-.5 || frame>=(double)sf-.5 || nv<-.5 || nv>=(double)nh-.5 || nu<-.5 || nu>=(double)nw-.5) continue;
               double row=c[6]*nu+c[7]*nv+c[8], column=c[3]*nu+c[4]*nv+c[5];
               long long f=(long long)floor(frame+.5), r=(long long)floor(row+.5), col=(long long)floor(column+.5);
+              f=f<0 ? 0 : (f>=sf ? sf-1 : f);
               r=r<0 ? 0 : (r>=sh ? sh-1 : r); col=col<0 ? 0 : (col>=sw ? sw-1 : col);
               int pixel=source_pixel(source,records,f,r,col,sh,sw,packed,&input_reads);
               ++addresses;

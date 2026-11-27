@@ -105,6 +105,14 @@ def test_encoded_cpu_matches_explicit_gpu_decoded_output(tmp_path, monkeypatch, 
     calls = require_gpu_stage(monkeypatch, view)
     writer = IncrementalRawBBoxMaskStoreWriter(shape=shape, store_dir=tmp_path/'gpu.cvol',
         format_name=INTERNAL_PACKED_CVOL_FORMAT, desc='SAM encoded CPU versus explicit GPU')
+    certified_empty_ranges = []
+    consume_empty_range = writer.consume_empty_range
+
+    def record_empty_range(first, count):
+        consume_empty_range(first, count)
+        certified_empty_ranges.append((int(first), int(count)))
+
+    monkeypatch.setattr(writer, 'consume_empty_range', record_empty_range)
     project = (cylindrical_projection.backproject_radial_volume_to_volume if view.family == 'radial'
                else spherical_projection.backproject_spherical_volume_to_volume)
     started = time.perf_counter()
@@ -117,13 +125,20 @@ def test_encoded_cpu_matches_explicit_gpu_decoded_output(tmp_path, monkeypatch, 
         writer.discard()
         raise
     gpu_seconds = time.perf_counter()-started
-    assert calls and sum(row['count'] for row in calls) == shape[0]
+    assert calls
+    gpu_ranges = [(call['first'], call['count']) for call in calls]
+    next_z = 0
+    for first, count in sorted(gpu_ranges + certified_empty_ranges):
+        assert first == next_z and count > 0
+        next_z += count
+    assert next_z == shape[0]
     actual, expected = dense_store(tmp_path/'cpu.cvol'), dense_store(tmp_path/'gpu.cvol')
     np.testing.assert_array_equal(actual, expected)
     assert hashlib.sha256(data.tobytes()).hexdigest() == before
     row = dict(view=view.name, family=view.family, output_shape=shape,
         exact=True, changed_voxels=0, foreground=int(np.count_nonzero(actual)),
         decoded_sha256=hashlib.sha256(actual.tobytes()).hexdigest(), gpu_encoded_calls=calls,
+        certified_empty_ranges=certified_empty_ranges,
         cpu_backend=cpu['backend'], cpu_native_decode_bytes=cpu['native_decode_bytes'],
         cpu_seconds=cpu_seconds, gpu_seconds=gpu_seconds,
         timing_limit='Small local sanity case; initialization/JIT may be included, not cluster throughput.')

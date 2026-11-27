@@ -162,9 +162,9 @@ class AzimuthalChannelSeamTests(unittest.TestCase):
             return np.ascontiguousarray(plane[:, ::-1] if mirror_u else plane)
 
         with mock.patch.object(
-            geometry, "render_dense_tile_frame_for_job", side_effect=fake_tile,
+            geometry, "render_tile_frame_for_job", side_effect=fake_tile,
         ):
-            renderer = geometry.make_dense_tile_channel_renderer(
+            renderer = geometry.make_tile_channel_renderer(
                 np.zeros((1, 1, 1), dtype=np.uint8),
                 view,
                 mock.sentinel.tile_job,

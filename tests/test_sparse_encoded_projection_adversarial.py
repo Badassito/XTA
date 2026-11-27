@@ -159,7 +159,7 @@ def test_encoded_unadmitted_worker_uses_exact_numpy_fallback(tmp_path):
         result = sparse_projection.project_azimuthal_sparse_store(
             path, view, tmp_path / 'projected.cvol', out_shape_tyx=_TARGET, workers=8)
     np.testing.assert_array_equal(_decode(result['path']), _oracle(data, view))
-    assert result['backend'] == 'cpu_numba'
+    assert result['backend'] == 'cpu_native'
     assert result['projection_workers'] == 1
     assert 'one admitted output worker' in result['compiled_fallback_reason']
 

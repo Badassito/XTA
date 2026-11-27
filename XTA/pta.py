@@ -113,7 +113,7 @@ from .pta_planning import (
     rotated_bbox_size,
     center_scale_matrix,
     build_affine,
-    dense_tile_positions,
+    tile_positions,
     build_render_plan,
     render_plan_frame_indices,
     iter_render_source_frame_jobs_round_robin,
@@ -1264,7 +1264,7 @@ def write_overlay_for_plan(*, volume: np.ndarray, mask: np.ndarray, plan: Render
                             tile=tile,
                             idx=frame_idx,
                         )
-                        tile_mask_out = shared_geometry.render_categorical_dense_tile_for_job(
+                        tile_mask_out = shared_geometry.render_categorical_tile_for_job(
                             mask,
                             plan.view.shared_view,
                             tile.shared_job,
@@ -3388,7 +3388,7 @@ def classify_original_foregrounds_for_volume(
         if plan.tile_layout:
             for tile in plan.tile_layout:
                 if tile.shared_job is not None and plan.view.shared_view is not None:
-                    tile_mask_out = shared_geometry.render_categorical_dense_tile_for_job(
+                    tile_mask_out = shared_geometry.render_categorical_tile_for_job(
                         prep.mask_for_render,
                         plan.view.shared_view,
                         tile.shared_job,
@@ -3403,7 +3403,7 @@ def classify_original_foregrounds_for_volume(
                     tile_mask_out = resize_centered(tile_mask, tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT)
                 if prep.semantic_foreground and prep.semantic_coverage_for_render is not None:
                     if tile.shared_job is not None and plan.view.shared_view is not None:
-                        tile_coverage = shared_geometry.render_categorical_dense_tile_for_job(
+                        tile_coverage = shared_geometry.render_categorical_tile_for_job(
                             prep.semantic_coverage_for_render, plan.view.shared_view,
                             tile.shared_job, int(idx),
                         )

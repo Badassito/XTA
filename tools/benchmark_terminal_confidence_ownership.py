@@ -419,7 +419,7 @@ def main():
         return
     os.environ.update(CUDA_VISIBLE_DEVICES='-1', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1',
         OPENBLAS_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1', PYTHONDONTWRITEBYTECODE='1',
-        NUMBA_CACHE_DIR=str(args.output_dir/'numba-cache'), YOLO_TTA_TELEMETRY_DIR=str(args.output_dir/'telemetry'))
+        YOLO_TTA_TELEMETRY_DIR=str(args.output_dir/'telemetry'))
     sys.dont_write_bytecode=True
     if args.native_zlib_library:
         os.environ.update(XTA_QUALIFY_NATIVE_ZLIB='1',XTA_TEST_NATIVE_ZLIB_LIBRARY=str(args.native_zlib_library.resolve()))

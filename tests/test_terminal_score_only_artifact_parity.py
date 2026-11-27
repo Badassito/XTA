@@ -11,17 +11,18 @@ from contextlib import nullcontext
 import hashlib
 import json
 import os
+from unittest.mock import patch
 import weakref
 
 import numpy as np
 import pytest
 
-from XTA import confidence_capture_cpu as cpu
 from XTA import confidence_evidence as evidence
 from XTA import confidence_native_codec as native
 from XTA import confidence_storage as storage
 from XTA import geometry
 from XTA.confidence_capture import confidence_capture_resources, plan_confidence_capture
+from XTA.native_cpu import load_native_cpu
 
 
 _ARTIFACTS = ('index.bin', 'scores.u8.zlib', 'metadata.json')
@@ -39,7 +40,6 @@ def codec_backend(request, monkeypatch):
     if path:
         if path not in _QUALIFIED_CODECS:
             codec = native.NativeConfidenceCodec(ctypes.CDLL(path), source='explicit_qualification')
-            codec.warm()
             _QUALIFIED_CODECS[path] = codec
         codec = _QUALIFIED_CODECS[path]
         receipt = dict(backend='native_compress2', codec_version=codec.version,
@@ -96,7 +96,6 @@ def _capture(root, mask, scores, active, boxes, *, metadata=True,
         metrics.append(dict(kwargs.get('metrics') or {}))
         return result
 
-    from unittest.mock import patch
     try:
         with confidence_capture_resources(plan), patch.object(storage, 'write_blocks', measured):
             kwargs = (dict(known_slice_any=active, known_slice_bboxes=boxes) if metadata else {})
@@ -148,8 +147,11 @@ def test_score_only_publishes_identical_complete_artifacts(tmp_path, codec_backe
     expected = np.where(mask != 0, scores, np.uint8(0))
     baseline = _capture(tmp_path / 'baseline', mask.copy(), scores.copy(), active, boxes,
                         metadata=metadata)
-    actual = _capture(tmp_path / 'score-only', mask, scores, active, boxes,
-                      metadata=metadata, score_only=True)
+    kernels = load_native_cpu()
+    with (patch.object(kernels, 'masked_cell_bounds', wraps=kernels.masked_cell_bounds) as scan,
+          patch.object(kernels, 'copy_masked_cells_batch', wraps=kernels.copy_masked_cells_batch) as copy):
+        actual = _capture(tmp_path / 'score-only', mask, scores, active, boxes,
+                          metadata=metadata, score_only=True)
     _assert_artifacts(tmp_path, baseline, actual, route='score-only', backend=backend)
     np.testing.assert_array_equal(actual[1], expected)
     np.testing.assert_array_equal(actual[2], expected != 0)
@@ -171,15 +173,13 @@ def test_score_only_publishes_identical_complete_artifacts(tmp_path, codec_backe
     if case not in ('empty', 'all_zero_scores'):
         assert mask[1, 17, 19] != 0 and scores[1, 17, 19] == 0
     if metadata and np.any(expected):
-        assert cpu.masked_cell_bounds.nopython_signatures
+        scan.assert_called()
         assert actual[3]['capture_backend'] == 'compiled_masked_cells_ordered_frames'
         if backend == 'native':
-            assert codec._kernel.nopython_signatures
-            assert codec._kernel.targetoptions['nogil']
             assert actual[3]['codec_backend'] == 'native_compress2'
             assert actual[3]['native_compression_batches'] > 0
         else:
-            assert cpu.copy_masked_cells_batch.nopython_signatures
+            copy.assert_called()
             assert actual[3]['codec_backend'] == 'python_zlib'
 
 
@@ -269,7 +269,6 @@ def test_actual_terminal_view_metadata_and_manifest_parity(tmp_path, codec_backe
     np.testing.assert_array_equal(mask, before)
     assert mask[1, 1, 1] == 255 and actual[1][1, 1, 1] == 0
     if backend == 'native':
-        assert codec._kernel.nopython_signatures
         assert actual[3]['native_compression_batches'] > 0
 
 

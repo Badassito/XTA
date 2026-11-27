@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import unittest
 
 import numpy as np
@@ -57,26 +56,22 @@ class PackedMetadataTests(unittest.TestCase):
                     cases += 1
         self.assertEqual(cases, 330)
 
-    def test_intrinsics_define_zero_and_word_edge_results(self):
-        population = packed._packed_popcount32
-        trailing = packed._packed_trailing_zeros32
-        leading = packed._packed_leading_zeros32
-
-        @packed._numba.njit
-        def evaluate(value):
-            return population(value), trailing(value), leading(value)
-
-        for value, expected in ((0, (0, 32, 32)), (1, (1, 0, 31)),
-                                (0x80000000, (1, 31, 0)), (0xffffffff, (32, 0, 0))):
+    def test_zero_and_edge_words_preserve_counts_and_bounds(self):
+        for value, expected in ((0, (0, 0, 0)), (1, (1, 0, 1)),
+                                (0x80000000, (1, 31, 32)), (0xffffffff, (32, 0, 32))):
             with self.subTest(value=value):
-                self.assertEqual(evaluate(np.uint32(value)), expected)
+                row = packed._packed_owner_metadata(np.array([value], np.uint32), 1, 32, 0, 1)[0]
+                self.assertEqual((row[4], row[2], row[3]), expected)
 
-    def test_generic_cpu_target_compiles_and_preserves_metadata(self):
+    def test_fresh_cpu_process_loads_native_binary_and_preserves_metadata(self):
         script = '''
 import numpy as np
 from XTA import packed_publication as p
-from numba import config
-assert config.CPU_NAME == 'generic'
+import sys
+from XTA.native_cpu import load_native_cpu
+from importlib.machinery import ExtensionFileLoader
+assert isinstance(load_native_cpu().__loader__, ExtensionFileLoader)
+assert not any(name.partition('.')[0] in ('numba', 'llvmlite') for name in sys.modules)
 rng = np.random.default_rng(22410)
 for width in (1,7,8,9,31,32,33,63,64,65,97,128,129,3022):
     volume=(rng.random((7,5,width))<.08).astype(np.uint8)
@@ -92,18 +87,13 @@ for width in (1,7,8,9,31,32,33,63,64,65,97,128,129,3022):
             yy,xx=np.nonzero(volume[first+zi])
             if len(yy): expected[zi]=yy.min(),yy.max()+1,xx.min(),xx.max()+1,len(yy)
         np.testing.assert_array_equal(p._packed_owner_metadata(words,5,width,first,count),expected)
-print('generic target: 56 exact metadata cases')
+print('native extension: 56 exact metadata cases')
 '''
-        with tempfile.TemporaryDirectory() as directory:
-            environment = dict(os.environ, NUMBA_CPU_NAME='generic', NUMBA_CACHE_DIR=directory,
-                               CUDA_VISIBLE_DEVICES='')
-            environment.pop('NUMBA_CPU_FEATURES', None)
-            result = subprocess.run([sys.executable, '-X', 'utf8', '-B', '-c', script],
-                                    cwd=Path(__file__).resolve().parents[1], env=environment,
-                                    capture_output=True, text=True, encoding='utf-8',
-                                    errors='replace', timeout=90)
+        result = subprocess.run([sys.executable, '-X', 'utf8', '-B', '-c', script],
+                                cwd=Path(__file__).resolve().parents[1], env=dict(os.environ, CUDA_VISIBLE_DEVICES=''),
+                                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=90)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('generic target: 56 exact metadata cases', result.stdout)
+        self.assertIn('native extension: 56 exact metadata cases', result.stdout)
 
 
 if __name__ == '__main__':

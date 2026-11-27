@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import OrderedDict, deque
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import math
@@ -854,9 +855,16 @@ class _MaskFrameCrops:
         otherwise nothing is touched and the caller merges level by level.
         Returns (populated by level, gap by level, box over populated strips).
         """
+        if len(frames) != len(checks):
+            raise ValueError('One gap check is required for each cutoff level')
+        if not frames or frames[0] is not self or any(type(f) is not _MaskFrameCrops for f in frames):
+            return None
+        cutoffs = [frame._reader.cutoff for frame in frames]
+        if cutoffs != sorted(set(cutoffs)) or any(frame._z != self._z for frame in frames):
+            return None
         entries, owners, path = [], [], None
         for level, (frame, check) in enumerate(zip(frames, checks), 1):
-            if type(frame) is not _MaskFrameCrops or frame._iterator is not None:
+            if frame._iterator is not None:
                 return None
             reader = frame._reader
             if reader._decoder is None:
@@ -901,8 +909,23 @@ class _MaskFrameCrops:
             self._iterator.close()
 
 
+def _verified_view_ranges(root, meta):
+    for receipt in meta['ranges']:
+        range_meta, index, _ = _range(root, receipt, meta['product'], tuple(meta['cutoffs']))
+        yield range_meta, index, Path(receipt['path']) / 'payload.bin'
+
+
 class NativeViewReader:
     def __init__(self, root, meta, cutoff):
+        self._bind_ranges(root, meta, cutoff, _verified_view_ranges(root, meta))
+
+    @classmethod
+    def _from_family(cls, family, cutoff):
+        reader = cls.__new__(cls)
+        reader._bind_ranges(family.root, family.metadata, cutoff, family._ranges)
+        return reader
+
+    def _bind_ranges(self, root, meta, cutoff, ranges):
         self.root, self.metadata, self.cutoff = root, meta, cutoff
         self.shape = tuple(meta['product']['native_shape'])
         self.prediction_count = int(meta['prediction_counts'][str(cutoff)])
@@ -915,11 +938,9 @@ class NativeViewReader:
         self._padding={}
         self._verification={}
         self.io_metrics=dict(payload_open_calls=0,payload_read_bytes=0)
-        for receipt in meta['ranges']:
-            m, index, _ = _range(root, receipt, meta['product'], tuple(meta['cutoffs']))
+        for m, index, path in ranges:
             pos = m['cutoffs'].index(cutoff)
             rows = index[pos]
-            path=Path(receipt['path'])/'payload.bin'
             self._verification[path]=bool(m.get('verify_integrity',False))
             self._ranges.append((m, rows, path))
             for row in rows[m['frame_count']:]:
@@ -1152,15 +1173,123 @@ class NativeViewReader:
         self.close()
 
 
-def open_view(model_name, view_name, cutoff, *, native_shape=None, identity=None, root=None):
-    root, meta = _decision(model_name,view_name,cutoff,native_shape,identity,root)
+def _require_ready_view(meta):
     if meta is None or meta['status']=='fallback':
         raise ValueError('Native view is explicitly unavailable for this route')
     if meta['status'] in ('projected','consumed'):
         raise SweepViewRetiredError('Native view payloads were durably projected and retired')
+
+
+def open_view(model_name, view_name, cutoff, *, native_shape=None, identity=None, root=None):
+    root, meta = _decision(model_name,view_name,cutoff,native_shape,identity,root)
+    _require_ready_view(meta)
     if meta.get('scalar_owned_cutoff')==cutoff:
         raise SweepViewScalarOwnedError('Scalar pipeline owns this cutoff; no staged pixel lane exists')
     return NativeViewReader(root,meta,cutoff)
+
+
+class _SiblingMaskCrops:
+    """Readers for one producer publication; callable as the ordinary per-cutoff crop API."""
+
+    def __init__(self, root, meta, cutoffs):
+        self.root, self.metadata = root, meta
+        self.shape = tuple(meta['product']['native_shape'])
+        self._closed = False
+        self._ranges = tuple(_verified_view_ranges(root, meta))
+        self._starts = tuple(m['frame_start'] for m, _, _ in self._ranges)
+        self.readers = {}
+        self._reader_stack = ExitStack()
+        try:
+            for cutoff in cutoffs:
+                self.readers[cutoff] = self._reader_stack.enter_context(NativeViewReader._from_family(self, cutoff))
+        except BaseException:
+            self.close()
+            raise
+
+    def __call__(self, cutoff, z):
+        return self.readers[cutoff].iter_mask_crops(z)
+
+    def native_crops(self, cutoff, z):
+        return self.readers[cutoff].iter_crops(z)
+
+    def rank_merger(self, cutoffs, shape):
+        """Bind an ordered subset once. A declined frame remains entirely unread scientifically."""
+        selected = _cents(cutoffs)
+        if (selected != tuple(sorted(selected)) or tuple(shape) != self.shape
+                or any(c not in self.readers for c in selected)):
+            raise ValueError('Rank input differs from the bound journal cutoff family or grid')
+        lanes = tuple(self.readers[c] for c in selected)
+        positions = np.array([self.metadata['cutoffs'].index(c) for c in selected], dtype=np.int64)
+        positions.flags.writeable = False
+        native = all(lane._decoder is not None for lane in lanes)
+        # A padded frame can have rows from different payloads. Its existing
+        # level reader owns ordering, exact exceptions and partial yields.
+        padded = set().union(*(lane._padding for lane in lanes))
+
+        def merge(z, plane, checks):
+            if self._closed or any(lane._closed for lane in lanes):
+                raise RuntimeError('Native view reader is closed')
+            if not 0 <= z < self.shape[0]:
+                raise IndexError('Native view frame is out of range')
+            if not isinstance(checks, np.ndarray) or checks.dtype != np.bool_ or checks.shape != positions.shape:
+                raise ValueError('One boolean gap check is required for each cutoff level')
+            if z in padded:
+                return None
+            position = bisect_right(self._starts, z) - 1
+            if position < 0:
+                return None
+            meta, index, path = self._ranges[position]
+            local = z - self._starts[position]
+            if local >= meta['frame_count'] or meta.get('verify_integrity', False):
+                return None
+            rows = index[:, local:local+1]
+            active = np.flatnonzero(rows['state'][:, 0][positions] != 1)
+            if not active.size:
+                return plane, (), (), (self.shape[1], 0, self.shape[2], 0)
+            if not native:
+                return None
+            owner = lanes[active[0]]
+            payload = owner._native_payload(path)
+            if payload is None:
+                return None
+            if plane is None:
+                plane = np.zeros(self.shape[1:], np.uint8)
+            elif (type(plane) is not np.ndarray or plane.shape != self.shape[1:] or plane.dtype != np.uint8
+                  or not plane.flags.c_contiguous or not plane.flags.writeable):
+                return None
+            status, counts, top, bottom, left, right = owner._decoder.merge_family_rank_rows(
+                payload, rows.view(np.uint8), positions, checks, plane, _CHUNK_BYTES)
+            if status:
+                return None
+            for i in active:
+                lanes[i]._count_read(int(counts[i, 2]))
+            return plane, np.flatnonzero(counts[:, 0]), np.flatnonzero(counts[:, 1]), (top, bottom, left, right)
+
+        return merge
+
+    def close(self):
+        self._closed = True
+        try:
+            self._reader_stack.close()
+        finally:
+            self._ranges = self._starts = ()
+
+
+@contextmanager
+def open_sibling_views(model_name, view_name, family_cutoffs, *, native_shape, identity=None, root=None):
+    """Acquire a fresh sealed producer decision and verify its ranges once for all sibling lanes."""
+    cuts = _cents(family_cutoffs)
+    root, meta = _decision(model_name, view_name, cuts[0], native_shape, identity, root)
+    _require_ready_view(meta)
+    if tuple(meta['cutoffs']) != cuts or cuts != tuple(sorted(cuts)):
+        raise SweepViewIntegrityError('Native view cutoff family differs from the producer')
+    if meta.get('scalar_owned_cutoff') in cuts[1:]:
+        raise SweepViewScalarOwnedError('Scalar pipeline owns requested sibling pixels')
+    family = _SiblingMaskCrops(root, meta, cuts[1:])
+    try:
+        yield family
+    finally:
+        family.close()
 
 
 def hydrate(model_name, view_name, cutoff, union, scores=None, *, targets_zeroed=True,

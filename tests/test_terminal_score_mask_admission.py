@@ -50,7 +50,7 @@ def _owned_prepare(root, mask_callback, confidence_callback, *, with_metadata):
         admission=SimpleNamespace(reserve=lambda *_args: nullcontext()), transient_bytes=1,
         model_name='model', view=view, union_mm=mask, confmap_mm=scores,
         d1_shadow_path=None, union_path=root/'owned-mask.u8.dat',
-        confmap_path=None, temp_dir=root, dense_tiling_active=False,
+        confmap_path=None, temp_dir=root, tiling_active=False,
         min_conf=0., min_radius=0., interpolation_distance=0, interpolation_walk_back=1,
         interpolation_candidates=1, interpolation_passes=1, interpolation_min_radius=0.,
         interpolation_search_angle=0., slice_workers=2,

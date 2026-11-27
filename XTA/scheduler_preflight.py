@@ -13,7 +13,7 @@ def preflight_tta_scheduler(*, gpu_device_count, cpu_enabled, tile_configs, view
     from .native_scheduler import require_native_scheduler
 
     if tile_configs:
-        raise ValueError('Native detector scheduler does not yet support dense tile ownership')
+        raise ValueError('Native detector scheduler does not yet support tile ownership')
     if gpu_device_count and cpu_enabled:
         raise ValueError('Native detector scheduler does not yet support hybrid OpenVINO/CUDA dispatch')
     if d1_owner_groups is None:
@@ -25,6 +25,9 @@ def preflight_tta_scheduler(*, gpu_device_count, cpu_enabled, tile_configs, view
         unsupported = [v.name for v in views if not cpu_inference_supports_view(v)]
         if unsupported:
             raise ValueError(f'OpenVINO cannot execute requested detector views {unsupported}')
+    from .native_cpu import load_native_cpu
+
+    load_native_cpu()
     global _native_preflight_reported
     if _native_preflight_reported:
         require_native_scheduler()

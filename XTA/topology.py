@@ -22,7 +22,8 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import _numba, cv2, tqdm
+from ._deps import cv2, tqdm
+from .native_cpu import kernels
 from .topology_runs import run_adjacent_pair_codes
 
 from .config import (
@@ -69,33 +70,9 @@ if TYPE_CHECKING:
         _try_acquire_specific_main_process_gpu_stage,
     )
 
-@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-def _numba_union_find_batch_kernel(
-    parent: np.ndarray,   # int64, mutated in place
-    rank: np.ndarray,     # int32, mutated in place
-    touches: np.ndarray,  # bool, mutated in place
-    a_ids: np.ndarray,    # int64
-    b_ids: np.ndarray,    # int64
-) -> None:
-    # Path halving and union by rank, applied to a whole batch in one nogil call.
-    for i in range(a_ids.shape[0]):
-        ra = a_ids[i]
-        while parent[ra] != ra:
-            parent[ra] = parent[parent[ra]]
-            ra = parent[ra]
-        rb = b_ids[i]
-        while parent[rb] != rb:
-            parent[rb] = parent[parent[rb]]
-            rb = parent[rb]
-        if ra == rb:
-            continue
-        if rank[ra] < rank[rb]:
-            ra, rb = rb, ra
-        parent[rb] = ra
-        if touches[rb]:
-            touches[ra] = True
-        if rank[ra] == rank[rb]:
-            rank[ra] += 1
+def _union_find_batch_kernel(parent, rank, touches, codes, gid_base, member_counts):
+    return kernels.topology_union_find_batch(parent, rank, touches, codes, gid_base, member_counts)
+
 
 class _UnionFind:
     """Array-backed disjoint-set structure with batched pair merges and path compression."""
@@ -134,36 +111,30 @@ class _UnionFind:
         self._size = stop
         return np.arange(start, stop, dtype=np.uint32)
 
-    def find(self, x: int) -> int:
-        parent = self.parent
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return int(x)
+    def union_pair_codes(
+        self, codes: np.ndarray, *, gid_base: int | Tuple[int, int] = 0,
+        member_counts: Optional[Tuple[int, int]] = None, context: str = 'component pair',
+    ) -> None:
+        """Merge borrowed packed pairs in order, subtracting each endpoint's base.
 
-    def union_pair_codes(self, codes: np.ndarray) -> None:
-        """Merge encoded pairs with the required compiled kernel.
-
-        A kernel may have changed parent links before raising. Do not replay a
-        partially applied batch through a second implementation.
+        Callers keep the codes unchanged until return. The native merger owns a
+        snapshot if a code can alias the forest it mutates. Optional shard counts
+        validate the whole batch before mutation. A kernel error is never replayed.
         """
         codes_arr = np.asarray(codes, dtype=np.uint64)
-        if codes_arr.size <= 0:
+        if not codes_arr.size:
             return
-        a_ids = (codes_arr >> np.uint64(32)).astype(np.int64, copy=False)
-        b_ids = (codes_arr & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
-        if _numba_union_find_batch_kernel is None:  # pragma: no cover - mandatory Numba import
-            raise RuntimeError('Compiled topology union-find kernel is unavailable')
         try:
-            _numba_union_find_batch_kernel(
-                self.parent, self.rank, self.touches_boundary,
-                np.ascontiguousarray(a_ids), np.ascontiguousarray(b_ids),
+            invalid_member = _union_find_batch_kernel(
+                self.parent, self.rank, self.touches_boundary, codes_arr, gid_base, member_counts,
             )
         except Exception as exc:
             raise RuntimeError('Compiled topology union-find failed; batch state is partial') from exc
-
-    def mark_boundary(self, x: int) -> None:
-        self.touches_boundary[self.find(int(x))] = True
+        if invalid_member is not None:
+            assert member_counts is not None
+            side = 'high' if invalid_member == 1 else 'low'
+            limit = member_counts[invalid_member - 1]
+            raise ValueError(f'{context} {side} ids must be in 1..{int(limit)}')
 
     def root_map(self) -> np.ndarray:
         # vectorized pointer jumping — every id follows its parent chain in
@@ -293,119 +264,25 @@ def _adjacent_gid_pair_codes_numpy(
 _ADJACENCY_INITIAL_CAPACITY = 1024
 _ADJACENCY_MAX_CAPACITY = 262144
 
-@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
-def _numba_adjacency_hash_slot(code, mask):
-    value = code
-    value = (value ^ (value >> np.uint64(30))) * np.uint64(0xbf58476d1ce4e5b9)
-    value = (value ^ (value >> np.uint64(27))) * np.uint64(0x94d049bb133111eb)
-    value = value ^ (value >> np.uint64(31))
-    return np.int64(value & np.uint64(mask))
 
-@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
 def _numba_adjacency_scan_kernel(
-    prev, curr, offsets, prev_offset, curr_offset,
-    table, used, position, neighbor, last_code,
+    prev, curr, offsets, prev_offset, curr_offset, table, used, position, neighbor, last_code,
 ):
-    height, width = prev.shape
-    total = height * width
-    capacity_mask = len(table) - 1
-    threshold = len(table) // 2
-    y, x = position // width, position % width
-    while y < height:
-        while x < width:
-            value = prev[y, x]
-            if value > 0:
-                left = np.uint64(value) + prev_offset
-                while neighbor < len(offsets):
-                    dy, dx = offsets[neighbor, 0], offsets[neighbor, 1]
-                    cy, cx = y + dy, x + dx
-                    neighbor += 1
-                    if cy < 0 or cy >= height or cx < 0 or cx >= width:
-                        continue
-                    other = curr[cy, cx]
-                    if other <= 0:
-                        continue
-                    code = (left << np.uint64(32)) | (np.uint64(other) + curr_offset)
-                    if code == last_code:
-                        continue
-                    last_code = code
-                    slot = _numba_adjacency_hash_slot(code, capacity_mask)
-                    while table[slot] != 0 and table[slot] != code:
-                        slot = (slot + 1) & capacity_mask
-                    if table[slot] == code:
-                        continue
-                    table[slot] = code
-                    used += 1
-                    if used >= threshold:
-                        return used, y * width + x, neighbor, last_code
-            x += 1
-            neighbor = 0
-        y += 1
-        x = 0
-    return used, total, 0, last_code
+    return kernels.topology_adjacency_scan(
+        prev, curr, offsets, prev_offset, curr_offset, table, used, position, neighbor, last_code,
+    )
 
-@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+
 def _numba_adjacency_rehash_kernel(source, destination):
-    mask = len(destination) - 1
-    for code in source:
-        if code == 0:
-            continue
-        slot = _numba_adjacency_hash_slot(code, mask)
-        while destination[slot] != 0:
-            slot = (slot + 1) & mask
-        destination[slot] = code
+    return kernels.topology_adjacency_rehash(source, destination)
 
-@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+
 def _numba_adjacency_extract_kernel(table, count):
-    result = np.empty(count, dtype=np.uint64)
-    index = 0
-    for code in table:
-        if code != 0:
-            result[index] = code
-            index += 1
-    return result
+    return kernels.topology_adjacency_extract(table, count)
 
-@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
+
 def _numba_merge_sorted_pair_codes_kernel(a, b):
-    """Merge sorted unique batches, allocating exactly their union cardinality."""
-    if len(a) == 0:
-        return b
-    if len(b) == 0:
-        return a
-    i, j, count = 0, 0, 0
-    while i < len(a) and j < len(b):
-        if a[i] < b[j]:
-            i += 1
-        elif a[i] > b[j]:
-            j += 1
-        else:
-            i += 1
-            j += 1
-        count += 1
-    count += len(a) - i + len(b) - j
-    result = np.empty(count, dtype=np.uint64)
-    i, j, at = 0, 0, 0
-    while i < len(a) and j < len(b):
-        if a[i] < b[j]:
-            result[at] = a[i]
-            i += 1
-        elif a[i] > b[j]:
-            result[at] = b[j]
-            j += 1
-        else:
-            result[at] = a[i]
-            i += 1
-            j += 1
-        at += 1
-    while i < len(a):
-        result[at] = a[i]
-        i += 1
-        at += 1
-    while j < len(b):
-        result[at] = b[j]
-        j += 1
-        at += 1
-    return result
+    return kernels.topology_adjacency_merge(a, b)
 
 
 def _normalized_adjacency_offsets(
@@ -475,18 +352,15 @@ def _compiled_adjacent_gid_pair_codes(
             return run_codes
     table = np.zeros(initial, dtype=np.uint64)
     used, position, neighbor = 0, 0, 0
-    last_code = np.uint64(0)
+    last_code = 0
     merged = np.empty(0, dtype=np.uint64)
     total = int(prev_gid.size)
     while position < total:
         used, position, neighbor, last_code = _numba_adjacency_scan_kernel(
             prev_gid, curr_gid, offsets,
-            np.uint64(int(prev_offset)), np.uint64(int(curr_offset)),
+            int(prev_offset), int(curr_offset),
             table, used, position, neighbor, last_code,
         )
-        # Numba boxes uint64 returns as Python ints. Preserve the unsigned type
-        # when resuming a scan whose last pair has its high bit set.
-        last_code = np.uint64(last_code)
         if position < total and len(table) < maximum:
             enlarged = np.zeros(min(maximum, len(table) * 2), dtype=np.uint64)
             _numba_adjacency_rehash_kernel(table, enlarged)
@@ -523,8 +397,6 @@ def _adjacent_gid_pair_codes(
         return _adjacent_gid_pair_codes_numpy(
             prev_gid, curr_gid, xy_offsets, prev_offset, curr_offset,
         )
-    if _numba_adjacency_scan_kernel is None:  # pragma: no cover - mandatory Numba import
-        raise RuntimeError('Compiled topology adjacency kernel is unavailable')
     try:
         return _compiled_adjacent_gid_pair_codes(
             prev_gid, curr_gid, xy_offsets, prev_offset, curr_offset,
@@ -533,7 +405,8 @@ def _adjacent_gid_pair_codes(
         runtime_telemetry().fallback('topology.adjacency.compiled', exc)
         raise RuntimeError('Compiled topology adjacency failed') from exc
 
-def _mark_boundary_components_from_local_labels(
+
+def _mark_fresh_boundary_components(
     uf: _UnionFind,
     local_to_gid: np.ndarray,
     labels2d: np.ndarray,
@@ -543,27 +416,18 @@ def _mark_boundary_components_from_local_labels(
     if labels2d.size == 0 or local_to_gid.size <= 1:
         return
 
+    # These IDs were allocated for the current slice and have not been linked.
     if z == 0 or z == z_max:
-        for gid in local_to_gid[1:]:
-            uf.mark_boundary(int(gid))
+        uf.touches_boundary[local_to_gid[1:]] = True
+        return
 
-    border_vals = np.unique(np.concatenate([
-        labels2d[0, :],
-        labels2d[-1, :],
-        labels2d[:, 0],
-        labels2d[:, -1],
-    ]))
-    border_vals = border_vals[border_vals > 0]
-    for local_lbl in border_vals.tolist():
-        uf.mark_boundary(int(local_to_gid[int(local_lbl)]))
+    border_vals = np.concatenate((
+        labels2d[0, :], labels2d[-1, :], labels2d[:, 0], labels2d[:, -1],
+    ))
+    uf.touches_boundary[local_to_gid[border_vals[border_vals > 0]]] = True
 
-@_numba.njit(cache=True, nogil=True)  # type: ignore[misc]
 def _apply_void_fill_slab(mask, labels, lookup):
-    for z in range(mask.shape[0]):
-        for y in range(mask.shape[1]):
-            for x in range(mask.shape[2]):
-                if lookup[labels[z, y, x]]:
-                    mask[z, y, x] = np.uint8(1)
+    return kernels.topology_void_fill_slab(mask, labels, lookup)
 
 
 @runtime_telemetry_phase('topology.void_fill')
@@ -621,8 +485,6 @@ def fill_3d_voids_inplace_streaming(
             else:
                 # GPU preparation never edits mask; apply starts only after the complete join.
                 with runtime_telemetry().span('topology.void_fill.apply'):
-                    _apply_void_fill_slab(mask_mm[:0], bg_gid_store[:0], lookups[0])
-
                     def apply_slab(index: int) -> None:
                         z0, z1 = slabs[index]
                         _apply_void_fill_slab(mask_mm[z0:z1], bg_gid_store[z0:z1], lookups[index])
@@ -648,7 +510,7 @@ def fill_3d_voids_inplace_streaming(
             gid_slice = local_to_gid[labels2d]
             bg_gid_store[z, :, :] = gid_slice
 
-            _mark_boundary_components_from_local_labels(uf, local_to_gid, labels2d, z=z, z_max=z_dim - 1)
+            _mark_fresh_boundary_components(uf, local_to_gid, labels2d, z=z, z_max=z_dim - 1)
 
             if prev_gid_slice is not None and np.any(prev_gid_slice) and np.any(gid_slice):
                 uf.union_pair_codes(_adjacent_gid_pair_codes(prev_gid_slice, gid_slice, adjacent_offsets))
@@ -656,9 +518,8 @@ def fill_3d_voids_inplace_streaming(
             prev_gid_slice = np.asarray(gid_slice)
 
         root_map = uf.root_map()
-        touches_by_gid = np.zeros(root_map.shape, dtype=bool)
-        for gid in range(1, root_map.shape[0]):
-            touches_by_gid[gid] = bool(uf.touches_boundary[int(root_map[gid])])
+        touches_by_gid = uf.touches_boundary[root_map]
+        touches_by_gid[0] = False
 
         for z in tqdm(range(z_dim), desc='3D void fill: apply enclosed components'):
             gid_slice = np.asarray(bg_gid_store[z])
@@ -674,62 +535,28 @@ def fill_3d_voids_inplace_streaming(
         gid_slice = None
         del bg_gid_store
 
-@_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
-def _numba_compact_relabel_kernel(labels, lut_flat, lut_offsets, bboxes, counts):  # pragma: no cover - jit
-    z_dim = labels.shape[0]
-    for z in _numba.prange(z_dim):
-        if counts[z] == 0:
-            continue
-        off = lut_offsets[z]
-        y0 = bboxes[z, 0]
-        y1 = bboxes[z, 1]
-        x0 = bboxes[z, 2]
-        x1 = bboxes[z, 3]
-        for y in range(y0, y1):
-            row = labels[z, y]
-            for x in range(x0, x1):
-                v = row[x]
-                if v != 0:
-                    row[x] = lut_flat[off + v]
 
-@_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
-def _numba_keep_lut_apply_kernel(labels, keep_flat, lut_offsets, bboxes, apply_slice, mask_out):  # pragma: no cover - jit
-    z_dim = labels.shape[0]
-    for z in _numba.prange(z_dim):
-        if apply_slice[z] == 0:
-            continue
-        off = lut_offsets[z]
-        y0 = bboxes[z, 0]
-        y1 = bboxes[z, 1]
-        x0 = bboxes[z, 2]
-        x1 = bboxes[z, 3]
-        for y in range(y0, y1):
-            lrow = labels[z, y]
-            mrow = mask_out[z, y]
-            for x in range(x0, x1):
-                mrow[x] = keep_flat[off + lrow[x]]
+def _numba_compact_relabel_kernel(labels, lut_flat, lut_offsets, bboxes, counts):
+    workers = min(max(1, labels.shape[0]), _cpu_count())
+    return kernels.topology_compact_relabel(labels, lut_flat, lut_offsets, bboxes, counts, workers)
 
-@_numba.njit(cache=True, nogil=True, parallel=True)  # type: ignore[misc]
-def _numba_sparse_keep_lut_apply_kernel(  # pragma: no cover - jit
+
+def _numba_keep_lut_apply_kernel(labels, keep_flat, lut_offsets, bboxes, apply_slice, mask_out):
+    workers = min(max(1, mask_out.shape[0]), _cpu_count())
+    return kernels.topology_keep_lut_apply(
+        labels, keep_flat, lut_offsets, bboxes, apply_slice, mask_out, workers,
+    )
+
+
+def _numba_sparse_keep_lut_apply_kernel(
     labels_flat, label_offsets, keep_flat, lut_offsets, bboxes, apply_slice, mask_out,
 ):
     """Keep-largest apply directly from the packed per-slice label arena."""
-    z_dim = apply_slice.shape[0]
-    for z in _numba.prange(z_dim):
-        if apply_slice[z] == 0:
-            continue
-        keep_off = lut_offsets[z]
-        label_off = label_offsets[z]
-        y0 = bboxes[z, 0]
-        y1 = bboxes[z, 1]
-        x0 = bboxes[z, 2]
-        x1 = bboxes[z, 3]
-        crop_w = x1 - x0
-        for y in range(y0, y1):
-            row_off = label_off + (y - y0) * crop_w
-            mrow = mask_out[z, y]
-            for x in range(x0, x1):
-                mrow[x] = keep_flat[keep_off + labels_flat[row_off + x - x0]]
+    workers = min(max(1, mask_out.shape[0]), _cpu_count())
+    return kernels.topology_sparse_keep_lut_apply(
+        labels_flat, label_offsets, keep_flat, lut_offsets, bboxes, apply_slice, mask_out, workers,
+    )
+
 
 @dataclass(frozen=True)
 class SliceLocalLabelLUTs:
@@ -1180,7 +1007,7 @@ def topology_slab_ranges(z_dim: int) -> List[Tuple[int, int]]:
     ]
 
 def topology_slab_workers(requested_workers: int, slab_count: int) -> int:
-    """Bound concurrent local union-find slabs; Numba releases the GIL for pair batches."""
+    """Bound concurrent local union-find slabs; Pair batches release the GIL."""
     # The former fixed cap of eight consumed only ~5% of a 160-vCPU allocation during the
     # post-inference keep_objects tail. Use up to half the visible logical CPUs (64 max) while
     # retaining an explicit environment override and one worker per available slab.
@@ -2297,7 +2124,7 @@ def _label_foreground_volume_streaming_impl(
                 return
             joined = pending[0] if len(pending) == 1 else np.concatenate(pending)
             t_union = time.perf_counter()
-            local_uf.union_pair_codes(np.ascontiguousarray(joined, dtype=np.uint64))
+            local_uf.union_pair_codes(joined, gid_base=gid_base)
             union_seconds += time.perf_counter() - t_union
             pending.clear()
             pending_count = 0
@@ -2308,24 +2135,18 @@ def _label_foreground_volume_streaming_impl(
             pair_seconds += time.perf_counter() - t_pair
             if global_codes.size <= 0:
                 continue
-            a_local = (global_codes >> np.uint64(32)) - np.uint64(int(gid_base))
-            b_local = (global_codes & np.uint64(0xFFFFFFFF)) - np.uint64(int(gid_base))
-            local_codes = np.ascontiguousarray(
-                (a_local << np.uint64(32)) | b_local, dtype=np.uint64,
-            )
-            if pending_count > 0 and pending_count + int(local_codes.size) > int(union_code_cap):
+            if pending_count > 0 and pending_count + int(global_codes.size) > int(union_code_cap):
                 _flush_local()
-            if int(local_codes.size) >= int(union_code_cap):
-                for code0 in range(0, int(local_codes.size), int(union_code_cap)):
+            if int(global_codes.size) >= int(union_code_cap):
+                for code0 in range(0, int(global_codes.size), int(union_code_cap)):
                     t_union = time.perf_counter()
-                    local_uf.union_pair_codes(np.ascontiguousarray(
-                        local_codes[int(code0):int(code0) + int(union_code_cap)],
-                        dtype=np.uint64,
-                    ))
+                    local_uf.union_pair_codes(
+                        global_codes[code0:code0 + union_code_cap], gid_base=gid_base,
+                    )
                     union_seconds += time.perf_counter() - t_union
             else:
-                pending.append(local_codes)
-                pending_count += int(local_codes.size)
+                pending.append(global_codes)
+                pending_count += int(global_codes.size)
         _flush_local()
 
         local_root_map = local_uf.root_map()
@@ -2408,7 +2229,7 @@ def _label_foreground_volume_streaming_impl(
                 return
             joined = boundary_pending[0] if len(boundary_pending) == 1 else np.concatenate(boundary_pending)
             t_union = time.perf_counter()
-            global_uf.union_pair_codes(np.ascontiguousarray(joined, dtype=np.uint64))
+            global_uf.union_pair_codes(joined)
             topology_boundary_union_seconds += time.perf_counter() - t_union
             boundary_pending.clear()
             boundary_pending_count = 0
@@ -2418,8 +2239,8 @@ def _label_foreground_volume_streaming_impl(
             codes = np.asarray(original_codes, dtype=np.uint64)
             if codes.size <= 0:
                 return
-            a_gid = (codes >> np.uint64(32)).astype(np.int64, copy=False)
-            b_gid = (codes & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
+            a_gid = codes >> np.uint64(32)
+            b_gid = codes & np.uint64(0xFFFFFFFF)
             a_nodes = gid_to_slab_component[a_gid].astype(np.uint64, copy=False)
             b_nodes = gid_to_slab_component[b_gid].astype(np.uint64, copy=False)
             valid = (a_nodes > 0) & (b_nodes > 0) & (a_nodes != b_nodes)
@@ -2433,13 +2254,10 @@ def _label_foreground_volume_streaming_impl(
             if int(mapped_codes.size) >= int(union_code_cap):
                 for code0 in range(0, int(mapped_codes.size), int(union_code_cap)):
                     t_union = time.perf_counter()
-                    global_uf.union_pair_codes(np.ascontiguousarray(
-                        mapped_codes[int(code0):int(code0) + int(union_code_cap)],
-                        dtype=np.uint64,
-                    ))
+                    global_uf.union_pair_codes(mapped_codes[code0:code0 + union_code_cap])
                     topology_boundary_union_seconds += time.perf_counter() - t_union
             else:
-                boundary_pending.append(np.ascontiguousarray(mapped_codes, dtype=np.uint64))
+                boundary_pending.append(mapped_codes)
                 boundary_pending_count += int(mapped_codes.size)
 
         for slab_idx in range(1, len(slab_ranges)):
@@ -2584,9 +2402,7 @@ def _label_foreground_volume_streaming_impl(
         # full-volume relabel write pass entirely.
         return labels_store, int(unique_roots.size), label_paths
 
-    if _numba_compact_relabel_kernel is None:  # pragma: no cover - mandatory Numba import
-        raise RuntimeError('Compiled topology compact relabel kernel is unavailable')
-    print('3D topology: compact relabel via numba nogil kernel')
+    print('3D topology: compact relabel via native CPU kernel')
     try:
         _numba_compact_relabel_kernel(
             np.asarray(labels_store),

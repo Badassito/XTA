@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from ._deps import _numba
+from .native_cpu import kernels
 from .env_flags import env_flag
 from .workspace import yolo_hole_fill_enabled
 from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure, _CROP_METADATA_DTYPE
@@ -115,23 +115,10 @@ def is_radial_owner_task(task):
 
 
 def _bucket_shell_pixels(shells, count):
-    offsets = np.zeros(count + 1, np.int64)
-    for shell in shells:
-        if shell >= 0:
-            offsets[shell + 1] += 1
-    for i in range(count):
-        offsets[i + 1] += offsets[i]
-    pixels = np.empty(offsets[-1], np.int32)
-    cursor = offsets[:-1].copy()
-    for pixel in range(len(shells)):
-        shell = shells[pixel]
-        if shell >= 0:
-            pixels[cursor[shell]] = pixel
-            cursor[shell] += 1
-    return offsets, pixels
+    return kernels.bucket_shell_pixels(shells, count)
 
 
-_bucket_shell_pixels_compiled = _numba.njit(cache=True, nogil=True)(_bucket_shell_pixels)
+_bucket_shell_pixels_compiled = _bucket_shell_pixels
 
 
 _OWNER_KERNEL_SOURCE = r'''

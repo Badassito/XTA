@@ -67,16 +67,17 @@ from .runtime import (
     flush_runtime_task_trace,
     runtime_telemetry,
 )
+from .spherical_host_cache import close_spherical_host_cache, install_spherical_host_cache
 from .workspace import configure_pipeline_modes, yolo_hole_fill_enabled
 from .tta_worker_bootstrap import loaded_runtime_versions
 from .geometry import (
     AugJob,
     BatchResultFrameSpec,
-    DenseTileJob,
+    TileJob,
     InMemoryYoloVolumeSource,
     StreamingYoloVolumeSource,
     ViewInfo,
-    build_dense_tile_raster_plan,
+    build_tile_raster_plan,
     build_fullframe_raster_plan,
     is_azimuthal_view,
     is_radial_view,
@@ -164,6 +165,28 @@ def _announce_worker_render_path(view: ViewInfo, kind: str, render_path: str, re
         flush=True,
     )
 
+
+def _publish_detector_result(result_queue, receipt, *, device, task=None, **trace_context):
+    """Publish one completed task and account for its final input route."""
+    stats = receipt['stats']
+    render = {
+        name: stats[name]
+        for name in ('render_path', 'render_frames', 'render_recovered_on_cpu')
+        if name in stats
+    }
+    runtime_trace_event('worker_publication_done', task=task, device=device, **trace_context, **render)
+    result_queue.put(receipt)
+    if 'render_path' in render and 'render_frames' in render:
+        try:
+            family = getattr(task.get('view'), 'family', '') if task is not None else trace_context.get('family')
+            prefix = f"worker.render.{family or 'unknown'}.{render['render_path']}"
+            telemetry = runtime_telemetry()
+            telemetry.add(f'{prefix}.completed_tasks', 1)
+            telemetry.add(f'{prefix}.completed_frames', render['render_frames'])
+        except Exception:
+            # Counters must not invalidate a result already sent to the parent.
+            pass
+
 def _canonical_image_sink_for_task(
     task: Dict[str, object], *, backend: str,
 ) -> Optional[object]:
@@ -207,8 +230,8 @@ def _canonical_raster_plan_for_task(
     )
     if kind == 'fullframe' and isinstance(job, AugJob):
         expected = build_fullframe_raster_plan(view, job, channel_format)
-    elif kind == 'tile' and isinstance(job, DenseTileJob):
-        expected = build_dense_tile_raster_plan(view, job, channel_format)
+    elif kind == 'tile' and isinstance(job, TileJob):
+        expected = build_tile_raster_plan(view, job, channel_format)
     else:
         raise TypeError(
             f'worker raster-plan task kind/job mismatch: kind={kind!r}, job={type(job)!r}'
@@ -1480,6 +1503,7 @@ def run_prediction_volume_in_openvino_worker(
                 stats['sweep_native_fanout'] = {
                     'status': 'unsupported', 'reason': f'{type(exc).__name__}: {exc}',
                 }
+        stats.update(render_path='cpu', render_frames=int(slice_count), render_recovered_on_cpu=False)
         return stats
     except BaseException as exc:
         if native_fanout is not None:
@@ -1629,12 +1653,11 @@ def _cpu_inference_worker_main(
                 stats['worker_compute_seconds'] = max(0.0, time.perf_counter() - started)
                 stats['backend'] = 'cpu'
                 stats['cpu_instance'] = int(instance_id)
-                runtime_trace_event('worker_publication_done', task=task_local, device=f'cpu:{instance_id}')
-                result_queue.put({
+                _publish_detector_result(result_queue, {
                     'type': 'result', 'worker_kind': 'cpu',
                     'cpu_index': int(instance_id), 'task_id': int(task_id),
                     'ok': True, 'stats': stats,
-                })
+                }, task=task_local, device=f'cpu:{instance_id}')
             except Exception as exc:
                 import traceback
                 runtime_trace_event('worker_error', task=task, device=f'cpu:{instance_id}', error=repr(exc))
@@ -1716,8 +1739,8 @@ def run_prediction_volume_in_worker(
         raise ValueError(f'Unsupported worker task kind: {kind!r}')
     if kind == 'fullframe' and not isinstance(job, AugJob):
         raise TypeError(f'Full-frame worker task requires AugJob, got {type(job)!r}')
-    if kind == 'tile' and not isinstance(job, DenseTileJob):
-        raise TypeError(f'Tile worker task requires DenseTileJob, got {type(job)!r}')
+    if kind == 'tile' and not isinstance(job, TileJob):
+        raise TypeError(f'Tile worker task requires TileJob, got {type(job)!r}')
 
     slice_offset = int(task.get('slice_start', 0))
     slice_count = int(task.get('slice_count', int(view.num_slices)))
@@ -1905,6 +1928,7 @@ def run_prediction_volume_in_worker(
         # Full-frame and tile tasks use separate source classes but the same cached native
         # planes; a tile is cropped/warped/resized directly on device before inference.
         render_path = 'cpu'
+        render_recovered_on_cpu = False
         if bool(task.get('_startup_first_task', False)):
             startup_source_started = time.perf_counter()
             runtime_trace_event('worker_source_prepare_start', task=task, device=startup_device)
@@ -2044,6 +2068,7 @@ def run_prediction_volume_in_worker(
                     'using the CPU render path for this independent task.'
                 )
                 source = None
+                render_recovered_on_cpu = True
 
         if source is None:
             render_path = 'cpu'
@@ -2215,6 +2240,11 @@ def run_prediction_volume_in_worker(
             gray_capture.wait_device_copies()
 
         public_stats: Dict[str, object] = {
+            # Count the task's final input frames. Retries and contextual
+            # samples do not add extra frames to the completed route.
+            'render_path': 'cpu' if retry_with_cpu_render else render_path,
+            'render_frames': int(num_frames),
+            'render_recovered_on_cpu': render_recovered_on_cpu or retry_with_cpu_render,
             'prediction_count': int(stats.get('prediction_count', 0)),
             'frames_with_predictions': int(stats.get('frames_with_predictions', 0)),
             'device_hole_filled_frames': int(stats.get('device_hole_filled_frames', 0)),
@@ -2496,6 +2526,7 @@ def _release_gpu_worker_inference_assets(
     stats['phase'] = 'release_renderer'
     if engine is not None:
         stats['renderer'] = engine.release_inference_assets()
+        close_spherical_host_cache(engine)
     else:
         stats['renderer'] = {'already_released': False, 'source_bytes': 0, 'texture_bytes': 0}
     with inference_module._AFFINE_GRID_CACHE_LOCK:
@@ -2548,6 +2579,7 @@ def _gpu_inference_worker_main(
     from .tta_worker_transport import DetectorActorPort
     task_queue = result_queue = DetectorActorPort(task_queue, result_queue)
     from .semantic_trt import SemanticTrtRingConsumedError, release_semantic_trt_cache
+    render_engine = None
     try:
         # Pin the process to its physical GPU before any CUDA context is created, so the model and
         # all tensors live on that device and never contend with the other workers' GPUs. The
@@ -2657,9 +2689,17 @@ def _gpu_inference_worker_main(
         # the first task, once the shared source volume exists and VRAM headroom is known).
         try:
             with runtime_telemetry().span('startup.worker.render_engine'):
-                _init_worker_gpu_render_engine('cuda:0')
+                render_engine = _init_worker_gpu_render_engine('cuda:0')
         except Exception as _render_engine_exc:
             print(f'Warning: GPU render engine init failed ({_render_engine_exc}); worker uses CPU rendering.')
+        direction_budget = int(init_dict.get('spherical_host_cache_budget_bytes', 0))
+        if direction_budget > 0:
+            host_cache = install_spherical_host_cache(
+                render_engine, owner_count=int(init_dict['spherical_host_cache_owner_count']),
+                budget_bytes=direction_budget,
+            )
+            if host_cache is not None:
+                runtime_telemetry().register_sample_provider('tta.cuda.spherical_host_cache', host_cache.snapshot)
         # D1 consumes device unions directly and never needs ordinary D2H lanes.
         # Retain their configured capacity, but allocate only if an ordinary flush occurs.
         _arm_worker_gpu_union_retirement_manager('cuda:0', int(cfg.imgsz))
@@ -2676,6 +2716,7 @@ def _gpu_inference_worker_main(
         result_queue.put({'type': 'ready', 'gpu_index': int(gpu_index), 'pid': int(os.getpid()),
                           'device': f'cuda:{gpu_index}', 'cuda_device_uuid': cuda_device_uuid})
     except Exception as exc:  # pragma: no cover - worker init failure surfaced to main
+        close_spherical_host_cache(render_engine)
         _seal_worker_gpu_union_retirement_manager()
         import traceback
         runtime_trace_event('worker_startup_failed', device=f'cuda:{gpu_index}', failed=True,
@@ -2700,12 +2741,10 @@ def _gpu_inference_worker_main(
                           trace_context: Dict[str, object]) -> None:
         try:
             finished_stats = deferred.finish()
-            runtime_trace_event('worker_publication_done', task_id=finished_task_id,
-                                device=f'cuda:{gpu_index}', **trace_context)
-            result_queue.put({
+            _publish_detector_result(result_queue, {
                 'type': 'result', 'task_id': int(finished_task_id),
                 'gpu_index': int(gpu_index), 'ok': True, 'stats': finished_stats,
-            })
+            }, device=f'cuda:{gpu_index}', task_id=finished_task_id, **trace_context)
         except Exception as exc:  # pragma: no cover - surfaced to scheduler
             import traceback
             runtime_trace_event('worker_error', task_id=finished_task_id,
@@ -2987,11 +3026,10 @@ def _gpu_inference_worker_main(
                 completed = dict(completed)
                 task_queue.compute_done(task_id)
                 completed['worker_compute_seconds'] = float(compute_seconds)
-                runtime_trace_event('worker_publication_done', task=task_local, device=f'cuda:{gpu_index}')
-                result_queue.put({
+                _publish_detector_result(result_queue, {
                     'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index),
                     'ok': True, 'stats': completed,
-                })
+                }, task=task_local, device=f'cuda:{gpu_index}')
         except (_ResidentTensorRTRingFatalError, RadialCudaProjectionUnsafeFailure,
                 SemanticTrtRingConsumedError) as exc:  # unsafe device state or consumed semantic task
             # A failed post/infer-stream drain or binding-address restore means this process's
@@ -3027,4 +3065,7 @@ def _gpu_inference_worker_main(
             _close_fd_list(persistent_source_memfds.values())
             persistent_source_memfds.clear()
         finally:
-            flush_runtime_task_trace()
+            try:
+                close_spherical_host_cache(render_engine)
+            finally:
+                flush_runtime_task_trace()

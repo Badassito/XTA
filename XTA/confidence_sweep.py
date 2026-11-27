@@ -48,7 +48,7 @@ from .unification.tta_manifest import (
 
 
 SCHEMA = 'xta.confidence_sweep/1'
-_REPLACED_OPTIONS = {'--conf', '--output', '--temp', '--min_conf', '--capture_component_replay'}
+_REPLACED_OPTIONS = {'--output', '--temp', '--min_conf', '--capture_component_replay'}
 _IDENTITY_FIELDS = ('path', 'size_bytes', 'modified_time_ns',
                     'change_or_creation_time_ns', 'device', 'file_id')
 _OPTIONAL_IDENTITIES = ('sam_checkpoint_identity_sha256', 'augmentation_policy_sha256',
@@ -1181,6 +1181,7 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
     cents = _cutoffs(cutoffs_hundredths)
     parser = ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
     parser.add_argument('--save', nargs='+')
+    parser.add_argument('--conf', nargs='+')
     parsed, scalar_arguments = parser.parse_known_args(mode_arguments)
     if save_request is None:
         from .config import resolve_save_request
@@ -1215,6 +1216,9 @@ def run_confidence_sweep(mode_arguments, *, cutoffs_hundredths, output_root,
     cache_gib = os.environ.get('XTA_YOLO_SWEEP_CACHE_GIB', '64')
     if not math.isfinite(float(cache_gib)) or float(cache_gib) < 0:
         raise ValueError('XTA_YOLO_SWEEP_CACHE_GIB must be finite and nonnegative')
+    from .native_cpu import load_native_cpu
+
+    load_native_cpu()
     root = Path(output_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     sweep_id = uuid4().hex

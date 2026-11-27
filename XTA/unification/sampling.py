@@ -57,7 +57,7 @@ def _forward_sampling_policy(spherical_fp32: bool) -> ForwardSamplingPolicy:
             "spherical_qsc_face_patch_extraction",
             "in_plane_affine_and_output_resize",
             "channel_addressing",
-            "dense_tile_transform",
+            "dense_tile_transform",  # Serialized spelling preserves existing raster digests.
         ),
         role_kernels=(
             (

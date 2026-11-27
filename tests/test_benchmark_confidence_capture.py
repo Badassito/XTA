@@ -115,11 +115,15 @@ def test_cpu_environment_drops_test_and_telemetry_leaks(scratch,monkeypatch):
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES','0')
     monkeypatch.setenv('YOLO_TTA_TELEMETRY_PATH','outside.json')
     monkeypatch.setenv('XTA_TEST_SPHERICAL_CUDA','1')
+    artifacts = scratch/'prepared-cpu-artifacts'
+    monkeypatch.setenv('XTA_NATIVE_CPU_ARTIFACTS', str(artifacts))
     env=probe.cpu_environment(scratch/'environment')
     assert env['CUDA_VISIBLE_DEVICES']=='-1'
     assert 'YOLO_TTA_TELEMETRY_PATH' not in env and 'XTA_TEST_SPHERICAL_CUDA' not in env
-    for key in ('TEMP','TMP','TMPDIR','NUMBA_CACHE_DIR','CUPY_CACHE_DIR','CUDA_CACHE_PATH'):
+    for key in ('TEMP', 'TMP', 'TMPDIR', 'CUPY_CACHE_DIR', 'CUDA_CACHE_PATH',
+                'XTA_NATIVE_SCHEDULER_CACHE'):
         assert Path(env[key]).is_relative_to(scratch/'environment')
+    assert Path(env['XTA_NATIVE_CPU_ARTIFACTS']) == artifacts
     assert os.environ['CUDA_VISIBLE_DEVICES']=='0'  # Parent state is not mutated.
 
 

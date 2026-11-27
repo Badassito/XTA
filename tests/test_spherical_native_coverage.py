@@ -14,7 +14,7 @@ import pytest
 
 from XTA.spherical_geometry import build_spherical_view_infos,cube_rotation
 from XTA.spherical_projection import backproject_spherical_volume_to_volume
-from XTA.spherical_projection_cpu import pull_spherical_chunk_numba
+from XTA.spherical_projection_cpu import pull_spherical_chunk_native
 from XTA import geometry
 from XTA.config import TiltedViewGroup
 
@@ -209,7 +209,7 @@ def test_positive_scores_share_exact_rational_native_binary_support():
         radii=np.asarray(view.spherical_radii)
         rotation=np.asarray(view.spherical_rotation_xyz).reshape(3,3)
         for z in range(output[0]):
-            plane=pull_spherical_chunk_numba(source,view,radii,rotation,output,z,0,output[1]*output[2],scalar_max=True).reshape(output[1:])
+            plane=pull_spherical_chunk_native(source,view,radii,rotation,output,z,0,output[1]*output[2],scalar_max=True).reshape(output[1:])
             score[z]=np.maximum(score[z],plane)
     expected,_,_=annulus(work,output,.5,3.)
     np.testing.assert_array_equal(score,np.where(expected,217,0).astype(np.uint8))
@@ -222,7 +222,7 @@ def test_compiled_pull_chunk_splits_keep_localized_native_support():
     rotation=np.asarray(view.spherical_rotation_xyz).reshape(3,3)
     radii=np.asarray(view.spherical_radii)
     splits=(0,17,127001,128001,output[1]*output[2])
-    actual=np.concatenate([pull_spherical_chunk_numba(data,view,radii,rotation,output,1,a,b)
+    actual=np.concatenate([pull_spherical_chunk_native(data,view,radii,rotation,output,1,a,b)
         for a,b in zip(splits,splits[1:])]).reshape(output[1:])
     valid,points,_=annulus(work,output,.5,3.)
     expected=valid&closed_face(points,cube_rotation(),0)

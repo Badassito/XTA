@@ -22,7 +22,7 @@ def test_benchmark_cases_use_equal_nonempty_compiled_and_python_candidates() -> 
         assert reference.shape[1] == compiled.shape[1] == 9
         assert reference.shape[0] > 0
         np.testing.assert_array_equal(compiled, reference)
-    with mock.patch.object(interpolation, '_find_slice_projection_candidates_numba', return_value=None):
+    with mock.patch.object(interpolation, '_find_slice_projection_candidates_native', return_value=None):
         with pytest.raises(RuntimeError, match='refusing to time the Python fallback'):
             cases[0].compiled()
 
@@ -44,11 +44,11 @@ def test_compiled_workspace_growth_preserves_all_fragmented_candidates() -> None
             mock.patch.dict(os.environ, {
                 'YOLO_TTA_INTERPOLATION_NUMBA_MAX_TRACKED_CANDIDATES': '8',
             }),
-            mock.patch.object(interpolation, '_numba_find_projection_candidates_kernel',
-                              wraps=interpolation._numba_find_projection_candidates_kernel) as kernel,
+            mock.patch.object(interpolation.kernels, 'interpolation_find_projection_candidates',
+                              wraps=interpolation.kernels.interpolation_find_projection_candidates) as kernel,
         ):
-            assert interpolation.interpolation_projection_numba_max_tracked() == 8
-            compiled = interpolation._find_slice_projection_candidates_numba(**kwargs)
+            assert interpolation.interpolation_projection_max_tracked() == 8
+            compiled = interpolation._find_slice_projection_candidates_native(**kwargs)
             assert [int(call.args[-1]) for call in kernel.call_args_list] == [8, 16]
             python_candidates = _find_slice_projection_candidates_python(**kwargs)
             assert len(python_candidates) == 16
@@ -65,7 +65,7 @@ def test_compiled_candidate_kernel_error_propagates() -> None:
     labels[1, 14, 14] = 2
     seed = interpolation.SliceEndpointSeed(1, (0, 15, 15), 1)
     with mock.patch.object(
-        interpolation, '_numba_find_projection_candidates_kernel',
+        interpolation.kernels, 'interpolation_find_projection_candidates',
         side_effect=RuntimeError('injected compiled failure'),
     ):
         with pytest.raises(RuntimeError, match='injected compiled failure'):

@@ -148,7 +148,7 @@ def main() -> int:
     env = dict(os.environ)
     env.update(PYTHONPATH=os.pathsep.join([str(ROOT), env.get('PYTHONPATH', '')]),
                PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1',
-               CUPY_CACHE_DIR=str(case / 'cupy-cache'), NUMBA_CACHE_DIR=str(case / 'numba-cache'),
+               CUPY_CACHE_DIR=str(case / 'cupy-cache'),
                YOLO_CONFIG_DIR=str(case / 'ultralytics-config'), YOLO_AUTOINSTALL='false',
                OMP_NUM_THREADS='2', MKL_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2',
                SLURM_CPUS_PER_TASK='4', YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND='0',

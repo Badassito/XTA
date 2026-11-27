@@ -34,7 +34,7 @@ def main():
     parser.add_argument('--heat-seconds', type=float, default=60)
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--cache-dir', type=Path,
-                        help='Reuse a warmed compilation cache beneath Scratch')
+                        help='Reuse a CuPy kernel cache beneath Scratch')
     parser.add_argument('--source-root', type=Path, default=ROOT,
                         help='Source checkout/snapshot containing XTA for this arm')
     parser.add_argument('--cprofile', action='store_true',
@@ -67,7 +67,6 @@ def main():
         [str(source_root), str(ROOT), *environment.get('PYTHONPATH', '').split(os.pathsep)])
     environment.pop('YOLO_TTA_TELEMETRY_PATH', None)
     environment['CUPY_CACHE_DIR'] = str(cache / 'cupy-cache')
-    environment['NUMBA_CACHE_DIR'] = str(cache / 'numba-cache')
     lock = SCRATCH / 'Temp/GPU_LOCK'
     with gpu_reservation(lock, task_name='148334 local feed profile', poll_interval=15.) as claim:
         report = dict(scope=__doc__, claim=claim, source=str(source_root), runs=[], status='running')
@@ -104,7 +103,7 @@ def main():
                                  YOLO_TTA_TRACE_RUN_ID=f'local-feed-{number:02d}')
                 (case / 'invocation.json').write_text(json.dumps(dict(argv=command,
                     environment={key: value for key, value in child_env.items()
-                                 if key.startswith(('YOLO_', 'NUMBA_', 'CUPY_', 'SLURM_'))
+                                 if key.startswith(('YOLO_', 'XTA_NATIVE_CPU_', 'CUPY_', 'SLURM_'))
                                  or key in ('PYTHONPATH', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS')}),
                     indent=2) + '\n', encoding='utf-8')
                 started = time.perf_counter()

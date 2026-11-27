@@ -166,6 +166,79 @@ def test_queued_builder_is_cancelled_on_controller_without_allocation():
         allocate.assert_not_called()
 
 
+def test_submitted_partial_fallback_preserves_later_split_ready_hit():
+    descriptor = task(count=3)
+    with prefetch([descriptor]) as (owner, executor, closed):
+        first = dict(descriptor, slice_count=1)
+        miss = owner.attach_ready(first)
+        owner.release_submitted_fallbacks([miss, miss])
+        with owner.condition:
+            assert owner.condition.wait_for(lambda: first['task_id'] in owner.completed_task_ids, 3)
+        assert owner.packets[0].remaining == {1, 2}
+        assert not executor.jobs[0][0].cancelled()
+        executor.run()
+        sibling = dict(descriptor, task_id=99, slice_start=1, slice_count=2)
+        assert owner.attach_ready(sibling) is None and sibling['cpu_input_offset'] == 1
+        owner.retire(first)
+        assert owner.bytes and not closed
+        owner.retire(sibling)
+        idle(owner)
+        assert owner.bytes == 0 and len(closed) == 1
+
+
+def test_committed_miss_notification_never_waits_on_optional_owner_or_releases_borrowed_alias():
+    descriptor = task()
+    with prefetch([descriptor]) as (owner, executor, closed):
+        executor.run()
+        attached = dict(descriptor)
+        owner.attach_ready(attached)
+        assert 'cpu_input_path' in attached
+        fallback = dict(descriptor, task_id=7)
+        def submit():
+            miss = owner.attach_ready(fallback)
+            assert 'cpu_input_path' not in fallback and miss is not None
+            same_id = owner.attach_ready(dict(descriptor))
+            owner.release_submitted_fallbacks([miss, same_id])
+            return miss
+        with ThreadPoolExecutor(max_workers=1) as sender:
+            with owner.lock:
+                miss = sender.submit(submit).result(timeout=2)
+        with owner.condition:
+            assert owner.condition.wait_for(lambda: 7 in owner.completed_task_ids, 3)
+        owner.release_submitted_fallbacks([miss])
+        owner.retire(fallback)
+        assert owner.packets[0].borrowers == {attached['task_id']}
+        assert owner.bytes > 0 and not closed
+        owner.retire(attached)
+        idle(owner)
+        assert owner.bytes == 0 and len(closed) == 1
+
+
+def test_running_submitted_fallback_keeps_charged_allocation_until_builder_settles():
+    allocating, release = threading.Event(), threading.Event()
+    def allocate(shape, *args, **kwargs):
+        allocating.set()
+        assert release.wait(5)
+        return np.empty(shape, np.uint8)
+    descriptor = task()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with prefetch([descriptor], executor=executor, allocate=allocate) as (owner, _, closed):
+            try:
+                assert allocating.wait(3)
+                before = owner.bytes
+                miss = owner.attach_ready(descriptor)
+                owner.release_submitted_fallbacks([miss])
+                with owner.condition:
+                    assert owner.condition.wait_for(lambda: descriptor['task_id'] in owner.completed_task_ids, 3)
+                assert owner.bytes == before > 0 and not closed
+                release.set()
+                with owner.condition:
+                    assert owner.condition.wait_for(lambda: owner.bytes == 0, 3)
+                assert len(closed) == 1
+            finally:
+                release.set()
+
+
 def test_running_builder_retires_only_after_render_returns():
     entered, release = threading.Event(), threading.Event()
     def allocate(shape, *a, **kw):

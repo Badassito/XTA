@@ -39,7 +39,8 @@ ARTIFACTS = ('scores.u8.zlib', 'index.bin', 'metadata.json')
 BACKENDS = ('archived_serial', 'new_serial', 'new_parallel')
 MIB = 1024**2
 MAX_RETAINED_PAYLOAD_BYTES = 512*MIB
-GUARD_FILES = ('tools/benchmark_confidence_capture.py', 'tools/qualify_release.py',
+GUARD_FILES = ('tools/benchmark_confidence_capture.py', 'tools/native_cpu_provenance.py',
+    'tools/qualify_release.py',
     'XTA/__init__.py', 'XTA/_deps.py', 'XTA/confidence_capture.py',
     'XTA/confidence_capture_cpu.py', 'XTA/confidence_evidence.py',
     'XTA/confidence_storage.py', 'XTA/json_publication.py')
@@ -331,7 +332,7 @@ def rss_measurement():
         result['peak_sampled_rss_bytes'] = max(result['peak_sampled_rss_bytes'],final.rss)
         result['peak_sampled_increment_bytes'] = max(0,result['peak_sampled_rss_bytes']-initial.rss)
         result['process_lifetime_peak_rss_bytes'] = getattr(final,'peak_wset',None)
-        result['note'] = 'RSS includes imports/JIT, inputs, metadata and capture; sampled increment is observational, not an admission guarantee.'
+        result['note'] = 'RSS includes imports, inputs, metadata and capture; sampled increment is observational, not an admission guarantee.'
 
 
 def expected_decoded_exact(directory, mask, scores):
@@ -370,8 +371,21 @@ def byte_equal(first, second):
                 return True
 
 
+def matches_legacy_score_semantics(baseline, candidate):
+    """Accept the single historical label already supported by the evidence reader."""
+    from XTA.confidence_evidence import SCORE_SEMANTICS, _LEGACY_SCORE_SEMANTICS
+
+    def field(value):
+        return f'"score_semantics": "{value}"'.encode()
+
+    archived = baseline.read_bytes()
+    current = candidate.read_bytes()
+    legacy = field(_LEGACY_SCORE_SEMANTICS)
+    return archived.count(legacy) == 1 and archived.replace(legacy, field(SCORE_SEMANTICS)) == current
+
+
 def benchmark_child(spec):
-    """Child owns one case/backend; input creation/JIT/oracles are not timed."""
+    """Child owns one case/backend; input creation, native setup and oracles are not timed."""
     if os.environ.get('CUDA_VISIBLE_DEVICES') != '-1':
         raise RuntimeError('CPU-only child must hide CUDA before numerical imports')
     import numpy as np
@@ -401,7 +415,7 @@ def benchmark_child(spec):
             source_control_bytes=int(active.nbytes+boxes.nbytes),
             archived_max_masked_hull_result_bytes=area_max,
             archived_max_mask_predicate_bytes=area_max,
-            note='Archived serial path has no explicit capture admission plan; its NumPy condition/result can span one support hull. New admission charges the complete bounded compressed frame window. RSS is observed separately and includes scientific input buffers plus runtime/JIT.')
+            note='Archived serial path has no explicit capture admission plan; its NumPy condition/result can span one support hull. New admission charges the complete bounded compressed frame window. RSS is observed separately and includes scientific input buffers plus runtime setup.')
         source_provenance = dict(benchmark='bounded_capture_only',case=case['name'],seed=spec['seed'])
         if case['kind']=='retained':
             source_provenance.update(original_frame_ids=case['original_frame_ids'],
@@ -414,21 +428,19 @@ def benchmark_child(spec):
             writer,reader_class,receipt['archived_source'] = archived_capture(spec['archive'],spec['archive_sha256'])
         else:
             from XTA.confidence_capture import plan_confidence_capture,confidence_capture_resources
-            from XTA.confidence_capture_cpu import warm_confidence_capture_kernels
+            from tools.native_cpu_provenance import native_cpu_provenance
             from XTA.confidence_evidence import _MaskedNativeScoreReader
             from XTA.confidence_storage import write_blocks
             requested = 1 if spec['backend']=='new_serial' else spec['workers']
             plan = plan_confidence_capture(scores.shape,requested,workspace_bytes=spec['workspace_bytes'],
                                             block_size=spec['block_size'])
             started = time.perf_counter()
-            receipt['compiler_warmup'] = warm_confidence_capture_kernels()
-            receipt['compiler_warmup']['elapsed_seconds'] = time.perf_counter()-started
-            receipt['compiler_warmup']['excluded_from_capture_timing'] = True
+            receipt['native_cpu'] = native_cpu_provenance(
+                'masked_cell_bounds', 'copy_masked_cells_batch')
+            receipt['native_setup_seconds_excluded'] = time.perf_counter()-started
             receipt['admitted_plan'] = asdict(plan)
             writer,reader_class = write_blocks,_MaskedNativeScoreReader
         receipt['executed_modules_before_capture']=executed_repository_modules()
-        # The actual Numba signatures use readonly source views; warm helper
-        # prepares both readonly/writeable tiny variants, without a disk cache.
         for sample in range(-spec['warmups'],spec['repetitions']):
             destination = output/('warmup_'+str(-sample) if sample<0 else 'sample_'+str(sample))
             metrics = {}
@@ -494,7 +506,7 @@ def cpu_environment(output):
         if name.startswith(('YOLO_TTA_', 'XTA_TEST_')):
             environment.pop(name,None)
     environment.update(CUDA_VISIBLE_DEVICES='-1',OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',
-        MKL_NUM_THREADS='1',NUMEXPR_NUM_THREADS='1',NUMBA_NUM_THREADS='1',PYTHONDONTWRITEBYTECODE='1')
+        MKL_NUM_THREADS='1',NUMEXPR_NUM_THREADS='1',PYTHONDONTWRITEBYTECODE='1')
     return environment
 
 
@@ -629,7 +641,7 @@ def main(argv=None):
             parallel=asdict(plan_confidence_capture(case['shape'],args.workers,
             workspace_bytes=args.workspace_mib*MIB,block_size=args.block_size))) for case in cases]
         receipt['input_hard_cap_bytes']=args.max_input_mib*MIB
-        receipt['measurement_note']='Fresh process per backend/case. Backend order rotates by case; repetitions within a child are consecutive. Setup, JIT warmup, decoding, input hashing and parity checks are outside capture timing. Parallel phase metrics sum worker durations; use measured wall time for elapsed throughput. OS file cache and local machine differ from cluster.'
+        receipt['measurement_note']='Fresh process per backend/case. Backend order rotates by case; repetitions within a child are consecutive. Setup, decoding, input hashing and parity checks are outside capture timing. Parallel phase metrics sum worker durations; use measured wall time for elapsed throughput. OS file cache and local machine differ from cluster.'
         if not (args.execute or args.check_only):
             receipt['status']='planned'
             return 0
@@ -660,14 +672,22 @@ def main(argv=None):
                 write_json(path,receipt)
             baseline=Path(receipts['archived_serial']['retained_output'])
             comparisons=[]
+            receipt['comparisons'].append(dict(case=case['name'],comparisons=comparisons))
             for backend in BACKENDS[1:]:
                 actual=Path(receipts[backend]['retained_output'])
                 equality={name:byte_equal(baseline/name,actual/name) for name in ARTIFACTS}
                 same_inputs=receipts[backend]['input_before']==receipts['archived_serial']['input_before']
-                comparisons.append(dict(backend=backend,exact_files=equality,same_input_bytes=same_inputs))
-                if not all(equality.values()) or not same_inputs:
+                metadata_alias = not equality['metadata.json'] and matches_legacy_score_semantics(
+                    baseline/'metadata.json', actual/'metadata.json')
+                comparisons.append(dict(backend=backend,exact_files=equality,
+                    historical_score_semantics_alias=metadata_alias,same_input_bytes=same_inputs))
+                if not (same_inputs and equality['scores.u8.zlib'] and equality['index.bin']
+                        and (equality['metadata.json'] or metadata_alias)):
                     raise AssertionError(f'Archived/current capture differs: {case["name"]}/{backend}')
-            receipt['comparisons'].append(dict(case=case['name'],comparisons=comparisons))
+            serial = Path(receipts['new_serial']['retained_output'])
+            parallel = Path(receipts['new_parallel']['retained_output'])
+            if not all(byte_equal(serial/name, parallel/name) for name in ARTIFACTS):
+                raise AssertionError(f'Current serial/parallel capture differs: {case["name"]}')
             if args.execute:
                 receipt.setdefault('summary',{})[case['name']]={backend:dict(
                     median_wall_seconds=statistics.median(row['wall_seconds'] for row in item['records']),

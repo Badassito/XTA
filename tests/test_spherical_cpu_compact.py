@@ -88,8 +88,8 @@ class SphericalCpuCompactTests(unittest.TestCase):
         self._check_geometry(None)
 
     def test_rectangular_compiled_raw_and_packbits_match_unbounded_oracle(self):
-        compiled.prepare_spherical_chunk_numba(self.source, self.view, self.radii, self.rotation, self.shape)
-        self._check_geometry(compiled.pull_spherical_chunk_numba)
+        compiled.prepare_spherical_chunk_native(self.source, self.view, self.radii, self.rotation, self.shape)
+        self._check_geometry(compiled.pull_spherical_chunk_native)
 
     def _check_geometry(self, pull):
         rng = np.random.default_rng(7701)
@@ -119,7 +119,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
 
     def test_empty_bounds_never_allocate_dense_or_read_and_preserve_all_z_records(self):
         boxes = np.zeros((self.view.num_slices, 4), np.int64)
-        compiled.prepare_spherical_chunk_numba(self.source, self.view, self.radii, self.rotation, self.shape, boxes)
+        compiled.prepare_spherical_chunk_native(self.source, self.view, self.radii, self.rotation, self.shape, boxes)
         original_empty = np.empty
         def bounded_empty(shape, *args, **kwargs):
             self.assertEqual(shape, 0)
@@ -259,13 +259,13 @@ class SphericalCpuCompactTests(unittest.TestCase):
     def test_four_and_nine_compiled_readers_publish_identical_ordered_blocks(self):
         source = self.source.copy()
         source.flags.writeable = False
-        compiled.prepare_spherical_chunk_numba(
+        compiled.prepare_spherical_chunk_native(
             source, self.view, self.radii, self.rotation, self.shape)
 
         def project(first, count):
             return sp._project_spherical_encoded_block(
                 source, self.view, self.radii, self.rotation, self.shape,
-                first, count, cpu_pull=compiled.pull_spherical_chunk_numba, packed=True)
+                first, count, cpu_pull=compiled.pull_spherical_chunk_native, packed=True)
 
         results = []
         for workers in (4, 9):
@@ -298,7 +298,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
             block = sp.SphericalCpuEncodedBlock(0, tuple(records), np.empty(0, np.uint8))
             with (self.subTest(field=field),
                   mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
-                  mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=compiled.pull_spherical_chunk_numba),
+                  mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=compiled.pull_spherical_chunk_native),
                   mock.patch.object(sp, 'spherical_output_bounds', return_value=SphericalOutputBounds(
                       0, self.shape[0], 0, self.shape[1], 0, self.shape[2])),
                   mock.patch.object(sp, '_project_spherical_encoded_block', return_value=block),
@@ -319,7 +319,7 @@ class SphericalCpuCompactTests(unittest.TestCase):
         sink = EncodedSink(self.shape)
         with (mock.patch.object(sp, '_try_spherical_cuda_stage', return_value=None),
               mock.patch.object(sp, 'spherical_cuda_backproject_enabled', return_value=False),
-              mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=compiled.pull_spherical_chunk_numba),
+              mock.patch.object(sp, '_select_spherical_cpu_pull', return_value=compiled.pull_spherical_chunk_native),
               mock.patch.object(sp, '_spherical_block_schedule', return_value=(1, 1)),
               mock.patch.object(sp, '_project_spherical_encoded_block', side_effect=project),
               redirect_stdout(io.StringIO()), self.assertRaises(ValueError) as caught):
@@ -339,14 +339,14 @@ class SphericalCpuCompactTests(unittest.TestCase):
         shape, z, bounds = (19, 23, 29), 5, (2, 18, 4, 25)
         expected = oracle.project_spherical_block(source, view, radii, rotation, shape, z, 1)[0, 2:18, 4:25].ravel()
         args = (source, view, radii, rotation, shape, z)
-        pieces = [compiled.pull_spherical_rectangle_numba(*args, first, min(first + 37, len(expected)),
+        pieces = [compiled.pull_spherical_rectangle_native(*args, first, min(first + 37, len(expected)),
                   bounds_yx=bounds) for first in range(0, len(expected), 37)]
         np.testing.assert_array_equal(np.concatenate(pieces), expected)
         for bad in ((-1, 18, 4, 25), (2, 24, 4, 25), (2, 18, 25, 25), (2, 18, 4, 30)):
             with self.subTest(bounds=bad), self.assertRaisesRegex(ValueError, 'rectangle'):
-                compiled.pull_spherical_rectangle_numba(*args, 0, 1, bounds_yx=bad)
+                compiled.pull_spherical_rectangle_native(*args, 0, 1, bounds_yx=bad)
         with self.assertRaisesRegex(ValueError, 'rectangle'):
-            compiled.pull_spherical_rectangle_numba(*args, 0, len(expected) + 1, bounds_yx=bounds)
+            compiled.pull_spherical_rectangle_native(*args, 0, len(expected) + 1, bounds_yx=bounds)
 
     def test_rectangular_chunks_cancel_before_more_than_one_chunk_and_skip_x(self):
         cancel = threading.Event()

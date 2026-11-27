@@ -15,7 +15,7 @@ import statistics
 import sys
 import time
 
-for variable in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+for variable in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
     os.environ.setdefault(variable, '2')
 os.environ['YOLO_TTA_GPU_SPHERICAL_BACKPROJECT'] = '0'
 

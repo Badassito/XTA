@@ -45,42 +45,52 @@ def qualification_workspace(tmp_path, monkeypatch):
     return tmp_path / 'evidence', identity
 
 
-def test_failed_full_suite_prevents_inventory_and_bundle(qualification_workspace, monkeypatch):
+@pytest.mark.parametrize('failure', ('native-cpu-build', 'full-tests'))
+def test_failed_required_step_prevents_inventory_and_bundle(qualification_workspace, monkeypatch, failure):
     output, _ = qualification_workspace
     commands = []
 
     def fail(command, **kwargs):
         commands.append(command)
-        return SimpleNamespace(returncode=1)
+        phase = 'full-tests' if command[-1] == 'tests' else 'native-cpu-build'
+        return SimpleNamespace(returncode=int(phase == failure))
 
     monkeypatch.setattr(gate.subprocess, 'run', fail)
-    with pytest.raises(RuntimeError, match='full-tests failed'):
+    with pytest.raises(RuntimeError, match=f'{failure} failed'):
         gate.qualify(output, snapshot=True, gpu_lock_timeout=0)
-    assert len(commands) == 1
-    assert commands[0][-1] == 'tests'
+    expected = ['native-cpu-build', 'full-tests'] if failure == 'full-tests' else ['native-cpu-build']
+    assert len(commands) == len(expected)
+    assert commands[0][2:] == ['tools/build_native_cpu.py', '--artifacts-dir', str(output / 'native-cpu')]
+    if failure == 'full-tests':
+        assert commands[1][-1] == 'tests'
     receipt = json.loads((output / 'qualification.json').read_text())
+    assert [step['name'] for step in receipt['steps']] == expected
+    assert receipt['steps'][-1]['returncode'] == 1
     assert receipt['success'] is False
     assert not (gate.ROOT.parent / 'Scratch/Temp/GPU_LOCK').exists()
     assert not (output / 'source').exists()
 
 
-def test_test_source_mutation_prevents_build(qualification_workspace, monkeypatch):
+@pytest.mark.parametrize('mutation_step', ('native-cpu-build', 'full-tests'))
+def test_source_mutation_prevents_qualification(qualification_workspace, monkeypatch, mutation_step):
     output, identity = qualification_workspace
     commands = []
 
     def mutate(command, **kwargs):
         commands.append(command)
-        identity['files'] = {'source.py': 'after'}
+        phase = 'full-tests' if command[-1] == 'tests' else 'native-cpu-build'
+        if phase == mutation_step:
+            identity['files'] = {'source.py': 'after'}
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(gate.subprocess, 'run', mutate)
-    with pytest.raises(RuntimeError, match='changed the source tree'):
+    with pytest.raises(RuntimeError, match=f'{mutation_step} changed the source tree'):
         gate.qualify(output, snapshot=True, gpu_lock_timeout=0)
-    assert len(commands) == 1
+    assert len(commands) == (1 if mutation_step == 'native-cpu-build' else 2)
     assert json.loads((output / 'qualification.json').read_text())['success'] is False
 
 
-def test_success_runs_whole_suite_then_inventory_then_snapshot(qualification_workspace, monkeypatch):
+def test_success_builds_cpu_artifact_then_tests_inventory_and_snapshot(qualification_workspace, monkeypatch):
     output, _ = qualification_workspace
     commands = []
 
@@ -92,21 +102,28 @@ def test_success_runs_whole_suite_then_inventory_then_snapshot(qualification_wor
         assert all(env[name] == '0' for name in gate.CUDA_COVERAGE_ENVIRONMENT)
         assert env['PYTHONIOENCODING'] == 'utf-8'
         assert 'PYTHONOPTIMIZE' not in env
+        assert 'XTA_NATIVE_CPU_BINARY' not in env
         for name, dirname in (
                 ('TEMP', 'runtime-temp'), ('TMP', 'runtime-temp'),
                 ('TMPDIR', 'runtime-temp'), ('CUPY_CACHE_DIR', 'cupy-cache'),
-                ('NUMBA_CACHE_DIR', 'numba-cache'), ('CUDA_CACHE_PATH', 'cuda-cache')):
+                ('XTA_NATIVE_CPU_ARTIFACTS', 'native-cpu'),
+                ('XTA_NATIVE_SCHEDULER_CACHE', 'native-cache'), ('CUDA_CACHE_PATH', 'cuda-cache')):
             assert Path(env[name]) == output / dirname
             assert Path(env[name]).is_dir()
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(gate.subprocess, 'run', succeed)
     monkeypatch.setenv('PYTHONOPTIMIZE', '1')
+    monkeypatch.setenv('XTA_NATIVE_CPU_BINARY', str(output / 'inherited-artifact'))
+    monkeypatch.setenv('XTA_NATIVE_CPU_ARTIFACTS', str(output / 'inherited-artifact-root'))
     receipt = gate.qualify(output, snapshot=True, gpu_lock_timeout=0, cpu_only=True)
     assert receipt['success'] is True
-    assert [step['name'] for step in receipt['steps']] == ['full-tests', 'package-inventory', 'source-bundle']
-    assert 'tests' == commands[0][-1]
-    assert '--continue-on-collection-errors' not in commands[0]
+    assert [step['name'] for step in receipt['steps']] == [
+        'native-cpu-build', 'full-tests', 'package-inventory', 'source-bundle'
+    ]
+    assert commands[0][2:] == ['tools/build_native_cpu.py', '--artifacts-dir', str(output / 'native-cpu')]
+    assert commands[1][-1] == 'tests'
+    assert '--continue-on-collection-errors' not in commands[1]
     assert '--snapshot' in commands[-1]
     assert receipt['coverage'] == 'cpu-only'
     assert receipt['required_cuda_tests'] == []
@@ -125,6 +142,17 @@ def test_cpu_environment_hides_cuda_without_mutating_the_parent(tmp_path, monkey
     assert 'PYTHONOPTIMIZE' not in env and os.environ['PYTHONOPTIMIZE'] == '1'
     assert all(env[name] == '0' and os.environ[name] == '1'
                for name in gate.CUDA_COVERAGE_ENVIRONMENT)
+
+
+def test_shared_probe_environment_preserves_the_selected_cpu_artifact(tmp_path, monkeypatch):
+    selected = {
+        'XTA_NATIVE_CPU_BINARY': str(tmp_path / 'extension'),
+        'XTA_NATIVE_CPU_ARTIFACTS': str(tmp_path / 'artifacts'),
+    }
+    for name, value in selected.items():
+        monkeypatch.setenv(name, value)
+    env = gate._qualification_environment(tmp_path / 'evidence', cpu_only=True)
+    assert {name: env[name] for name in selected} == selected
 
 
 def test_cuda_qualification_preserves_the_selected_device_pool(tmp_path, monkeypatch):
@@ -297,7 +325,7 @@ def test_full_gate_activates_projection_oracles_under_gpu_lock_and_records_execu
     for name in gate.CUDA_COVERAGE_ENVIRONMENT:
         monkeypatch.setenv(name, '0')
     receipt = gate.qualify(output, snapshot=True, gpu_lock_timeout=0)
-    assert receipt['success'] is True and len(commands) == 3
+    assert receipt['success'] is True and len(commands) == 4
     assert receipt['coverage'] == 'cpu-and-cuda'
     assert receipt['required_cuda_tests']
     assert len(receipt['cuda_numerical_tests']) == len(gate.REQUIRED_CUDA_TESTS)
@@ -313,16 +341,17 @@ def test_full_gate_missing_projection_oracle_prevents_inventory_and_bundle(
 
     def succeed_with_missing_projection(command, **kwargs):
         commands.append(command)
-        suite = _required_cuda_junit(output / 'junit.xml')
-        for case in list(suite):
-            if case.get('classname') == classname:
-                suite.remove(case)
-        ET.ElementTree(suite).write(output / 'junit.xml')
+        if command[-1] == 'tests':
+            suite = _required_cuda_junit(output / 'junit.xml')
+            for case in list(suite):
+                if case.get('classname') == classname:
+                    suite.remove(case)
+            ET.ElementTree(suite).write(output / 'junit.xml')
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(gate.subprocess, 'run', succeed_with_missing_projection)
     with pytest.raises(RuntimeError, match=classname):
         gate.qualify(output, snapshot=True, gpu_lock_timeout=0)
-    assert len(commands) == 1
+    assert len(commands) == 2 and commands[-1][-1] == 'tests'
     assert not (output / 'source').exists()
     assert json.loads((output / 'qualification.json').read_text())['success'] is False

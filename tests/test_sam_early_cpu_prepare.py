@@ -58,9 +58,9 @@ def test_runtime_warmup_gates_parent_resume_and_preserves_startup_error(failure)
 
 @pytest.mark.parametrize('metadata', [None, [False, False, False], [False, True, False]])
 def test_completed_parent_foreground_gates_runtime_without_scanning_pixels(tmp_path, metadata):
-    submit, ns, view, key, _leases, captured, executor, _future, _dispatch = submission(
+    submit, ns, view, key, _leases, captured, executor, _future = submission(
         tmp_path, ready=True)
-    ns['dense_tiling_active'] = False
+    ns['tiling_active'] = False
     if metadata is not None:
         ns['view_slice_meta'][key] = dict(valid=True, slice_any=np.array(metadata))
     _function(Path(pipeline.__file__).read_text(), '_sam_parents_ready', ns)
@@ -75,18 +75,23 @@ def test_completed_parent_foreground_gates_runtime_without_scanning_pixels(tmp_p
 
 @pytest.mark.parametrize('failed', [False, True])
 def test_parent_checkpoint_drains_before_optional_mutating_cpu_prepare(tmp_path, failed):
-    fn, ns, view, key, leases, captured, _exec, _fut, _dispatch = submission(tmp_path)
-    ns['dense_tiling_active'] = False
+    fn, ns, view, key, leases, captured, executor, _future = submission(tmp_path)
+    ns['tiling_active'] = False
     ns['sam_parent_staging'].owns_ram_first_parent.return_value = True
     ns['sam_cpu_prepare_executor'] = mock.Mock()
     original = ns['baseline_union_by_model_view'][key]
+    original_scores = ns['baseline_confmap_by_model_view'][key]
     if failed:
         ns['sam_parent_staging'].defer.side_effect = RuntimeError('controlled defer rejection')
         with pytest.raises(RuntimeError, match='controlled defer rejection'):
             fn('model', view)
         assert leases.leases[key].phase == 'inference'
         assert ns['baseline_union_by_model_view'][key] is original
-        ns['_dispatch_inference_windows'].assert_not_called()
+        assert ns['baseline_confmap_by_model_view'][key] is original_scores
+        assert key not in ns['view_processing_submitted']
+        assert not ns['view_processing_futures']
+        executor.submit.assert_not_called()
+        ns['sam_parent_staging'].enqueue_ready.assert_not_called()
     else:
         fn('model', view)
         assert captured and captured[0][0].union_mm is original

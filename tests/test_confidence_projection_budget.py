@@ -14,30 +14,6 @@ from XTA.confidence_evidence import write_block_confidence_evidence
 from XTA.confidence_projection import score_projection_reader, score_projection_workspace
 
 
-def _warm_native_pull_kernels():
-    """Compile the fixed native-pull kernel signatures on tiny synthetic arrays only."""
-    from XTA import projection_coverage_cpu as fast
-    integer = fast._readonly(np.asarray((0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 1), np.int64))
-    coefficient = fast._readonly(np.asarray((0., 0., .5, 1., 0., 0., 0., 1., 0.,
-                                             1., 1., 1., .5, .5, .5), np.float64))
-    bbox = np.asarray((0, 0, 0, 2, 2, 2), np.int64)
-    row_lookup = fast._readonly(np.arange(2, dtype=np.int32))
-    key_mutable = np.zeros(4, np.uint32)
-    key_readonly = fast._readonly(key_mutable.copy())
-    output = np.empty(4, np.uint8)
-    invalid_key = np.uint64(np.iinfo(np.uint32).max)
-    for readonly in (False, True):
-        source = np.zeros((2, 2, 2), np.uint8)
-        source[0, 0, 0] = 17
-        if readonly:
-            source.setflags(write=False)
-        fast._pull_tilted(source, output, 0, integer, coefficient, bbox, False)
-        fast._pull_azimuthal(source, output, 0, integer, coefficient, bbox, False,
-                             key_readonly, True, invalid_key, row_lookup)
-        fast._pull_azimuthal(source, output, 0, integer, coefficient, bbox, True,
-                             key_mutable, False, invalid_key, row_lookup)
-
-
 @pytest.fixture
 def gc_disabled():
     was_enabled = gc.isenabled()
@@ -59,12 +35,6 @@ def _evidence(root, view, source_shape, values):
 
 
 def test_real_conversion_cold_warm_and_distinct_geometries_fit_three_mib(tmp_path):
-    # JIT compiler/code-cache initialization is process-wide control memory,
-    # as for the existing Radial/Spherical Numba backends. Warm only tiny
-    # uint8 kernel signatures; every measured large geometry below stays cold.
-    import os
-    if os.environ.get('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled') == 'compiled':
-        _warm_native_pull_kernels()
     cache = backprojection._DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE
     original = cache.copy()
     cache.clear()

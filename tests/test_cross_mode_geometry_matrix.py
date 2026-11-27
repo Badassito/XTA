@@ -383,9 +383,9 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
         assert plan.view.shared_view is not None
         assert tile.shared_job is not None
         renderer = (
-            geometry.render_categorical_dense_tile_for_job
+            geometry.render_categorical_tile_for_job
             if categorical
-            else geometry.render_dense_tile_frame_for_job
+            else geometry.render_tile_frame_for_job
         )
         return renderer(
             volume,

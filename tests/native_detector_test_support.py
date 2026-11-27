@@ -35,10 +35,10 @@ def detector_state():
 def detector_inputs(root, **overrides):
     fields = dict(
         batch=1, conf=0.25, cpu_batch=1, cpu_precision='fp32', gpu_batch=1, gpu_quantize=None,
-        imgsz=8, interpolation_distance=0, min_conf=0.0, min_radius=0.0, dense_tiling_active=False,
+        imgsz=8, interpolation_distance=0, min_conf=0.0, min_radius=0.0, tiling_active=False,
         nrrd_layers_needed=False, direct_union_inference_view_limit=2,
         direct_union_inference_byte_limit=1 << 30, direct_union_total_dense_byte_limit=1 << 31,
-        gpu_worker_tile_dense_result_limit=1 << 30, gpu_worker_tile_dense_result_task_limit=4,
+        gpu_worker_tile_result_limit=1 << 30, gpu_worker_tile_result_task_limit=4,
         gpu_worker_process_active=True, inference_worker_process_active=True, gpu_device_count=1,
         v1613_d1_owner_active=False, gpu_worker_result_dir=Path(root) / 'gpu_worker_results',
         ensure_baseline_workspaces=lambda _model, _view: None, gib=1 << 30,

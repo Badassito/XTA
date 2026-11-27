@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -79,6 +80,8 @@ def test_sdist_contains_maintained_test_helpers_fixtures_and_root_rules(distribu
         '.gitattributes', '.gitignore', 'AGENTS.md', 'README.md',
         'native/prepared_scheduler.cpp', 'native/prepared_scheduler.hpp', 'native/device_stage.hpp',
         'tools/build_native_scheduler.py',
+        'native/cpu_kernels.cpp', 'native/cpu_kernels.hpp', 'native/cpu_domains.inc',
+        'XTA/native_cpu.py', 'XTA/native_cpu_build.py', 'tools/build_native_cpu.py',
     ))
     assert expected <= members.keys(), sorted(expected - members.keys())
     for name in expected:
@@ -137,3 +140,87 @@ def test_installed_wheel_imports_required_native_scheduler(distributions):
          f'assert Path(native.__file__).resolve() == root / "XTA" / {extension!r}; '
          'assert "torch" not in sys.modules and "cupy" not in sys.modules'],
         cwd=workspace, log='installed-native-scheduler.log')
+
+
+def test_installed_wheel_loads_cpu_kernels_without_scheduler(distributions):
+    *_, wheel, installed, workspace, run = distributions
+    filename = '_xta_cpu_kernels' + sysconfig.get_config_var('EXT_SUFFIX')
+    with zipfile.ZipFile(wheel) as archive:
+        assert filename in archive.namelist()
+    # A previous wheel can leave a same-ABI module visible elsewhere on sys.path.
+    decoy = workspace / 'other-cpu-installation'
+    decoy.mkdir()
+    shutil.copyfile(installed / filename, decoy / filename)
+    run([sys.executable, '-B', '-I', '-c',
+         'from pathlib import Path; import sys; '
+         f'root = Path({str(installed)!r}); sys.path.insert(0, str(root)); '
+         f'sys.path.insert(0, {str(decoy)!r}); '
+         'from XTA.native_cpu import kernels, load_native_cpu; '
+         'assert "_xta_cpu_kernels" not in sys.modules; '
+         'native = load_native_cpu(); '
+         f'assert Path(native.__file__).resolve() == root / {filename!r}; '
+         'assert kernels.ABI_VERSION == 1 and len(native.SOURCE_SHA256) == 64; '
+         'assert not {"torch", "cupy", "numba", "XTA._prepared_scheduler"}.intersection(sys.modules)'],
+        cwd=workspace, log='installed-native-cpu.log')
+
+
+def test_source_loads_prebuilt_cpu_kernels_from_foreign_workdir(distributions):
+    *_, workspace, run = distributions
+    source, artifacts = workspace / 'sdist-source', workspace / 'cpu-artifacts'
+    build = run([sys.executable, '-B', str(source / 'tools' / 'build_native_cpu.py'),
+                 '--artifacts-dir', str(artifacts)],
+                cwd=workspace, log='source-native-cpu-build.log')
+    binary = Path(build.stdout.strip().splitlines()[-1])
+    assert binary.is_file() and binary.is_relative_to(artifacts)
+    run([sys.executable, '-B', '-I', '-c',
+         'import os, subprocess, sys; from pathlib import Path; '
+         f'sys.path.insert(0, {str(source)!r}); '
+         f'os.environ["XTA_NATIVE_CPU_ARTIFACTS"] = {str(artifacts)!r}; '
+         'os.environ.pop("XTA_NATIVE_CPU_BINARY", None)\n'
+         'def refuse_build(*args, **kwargs): raise AssertionError("unexpected compiler process")\n'
+         'subprocess.Popen = refuse_build\n'
+         'from XTA.native_cpu import load_native_cpu\n'
+         f'assert Path(load_native_cpu().__file__).resolve() == Path({str(binary)!r})\n'
+         'assert not {"torch", "cupy", "numba", "XTA._prepared_scheduler"}.intersection(sys.modules)'],
+        cwd=workspace, log='source-native-cpu-no-build.log')
+
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX render workers use fork")
+def test_forked_native_cpu_loader_recovers_inherited_lock(distributions):
+    *_, installed, workspace, run = distributions
+    code = f"""
+import os
+import signal
+import sys
+import threading
+import warnings
+sys.path.insert(0, {str(installed)!r})
+from XTA import native_cpu
+
+acquired = threading.Event()
+release = threading.Event()
+
+def hold_load_lock():
+    with native_cpu._native_cpu_load_lock:
+        acquired.set()
+        release.wait()
+
+worker = threading.Thread(target=hold_load_lock, daemon=True)
+worker.start()
+assert acquired.wait(5)
+with warnings.catch_warnings():
+    warnings.simplefilter('ignore', DeprecationWarning)
+    pid = os.fork()
+if pid == 0:
+    signal.alarm(5)
+    try:
+        assert native_cpu.load_native_cpu().ABI_VERSION == 1
+    except BaseException:
+        os._exit(1)
+    os._exit(0)
+release.set()
+worker.join(timeout=5)
+assert os.waitpid(pid, 0) == (pid, 0)
+"""
+    run([sys.executable, '-B', '-I', '-c', code], cwd=workspace, log='fork-native-cpu.log')

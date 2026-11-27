@@ -231,7 +231,7 @@ def test_fullframe_extrapolation_uses_completed_local_baseline_and_excludes_tail
          mock.patch.object(assembly, 'interpolate_view_volume_pass_maybe_process', side_effect=sdf):
         result = assembly.prepare_view_volume_after_fullframe(model_name='detector', view=view,
             union_mm=observed, confmap_mm=None, union_path=tmp_path/'original.dat', confmap_path=None,
-            temp_dir=tmp_path, dense_tiling_active=True, min_conf=0., min_radius=0.,
+            temp_dir=tmp_path, tiling_active=True, min_conf=0., min_radius=0.,
             interpolate=distance, interpolation_walk_back=0, interpolation_candidates=1,
             interpolate_passes=1, interpolate_min_radius=0., interpolation_search_angle=0.,
             slice_workers=1, interpolation_task_workers=1,
@@ -303,7 +303,7 @@ def test_extrapolation_only_parent_memory_preflight_matches_actual_reservation()
 
 def test_extrapolation_only_parent_uses_shared_admitted_sam_lease(tmp_path):
     from tests.test_sam_parent_staging_pipeline import submission
-    function, _, view, _, _, captured, _, _, _ = submission(tmp_path)
+    function, _, view, _, _, captured, _, _ = submission(tmp_path)
     function('model', view)
     task = captured[0][0]
     task.interpolation_backend = 'sdf'

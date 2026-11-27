@@ -70,35 +70,8 @@ def diagnostics(monkeypatch):
     return telemetry, events
 
 
-@pytest.mark.parametrize('failed', [False, True])
-def test_parent_kernel_reports_work_and_flush_visible_progress(diagnostics, monkeypatch, capsys, failed):
-    from XTA import pipeline
-
-    telemetry, events = diagnostics
-    monkeypatch.setattr(pipeline, 'runtime_telemetry', lambda: telemetry)
-    monkeypatch.setattr(pipeline, 'runtime_trace_event',
-                        lambda name, **fields: events.append((name, fields)))
-
-    def warm():
-        assert 'Warming parent kernel sample.' in capsys.readouterr().out
-        assert events == [('startup_parent_warmup_start', {'kernel': 'sample'})]
-        if failed:
-            raise OSError('compiler failed')
-        return {'signatures': 1}
-
-    if failed:
-        with pytest.raises(OSError, match='compiler failed'):
-            pipeline._warm_parent_kernel('sample', warm)
-    else:
-        assert pipeline._warm_parent_kernel('sample', warm)['signatures'] == 1
-    assert events[-1][0] == 'startup_parent_warmup_done'
-    assert events[-1][1]['failed'] is failed
-    outcome = 'failed' if failed else 'finished'
-    assert f'Parent kernel sample {outcome} in' in capsys.readouterr().out
-
-
 @pytest.mark.skipif(not (shutil.which('ffmpeg') and shutil.which('ffprobe')), reason='Requires FFmpeg')
-def test_cpu_cli_warms_after_worker_registration_and_before_admission(tmp_path):
+def test_cpu_cli_registers_workers_before_admission_without_parent_warmup(tmp_path):
     pytest.importorskip('openvino')
     from tools.qualify_tta_reconciliation import create_cpu_fixtures, runtime_environment
 
@@ -106,7 +79,7 @@ def test_cpu_cli_warms_after_worker_registration_and_before_admission(tmp_path):
     create_cpu_fixtures(fixture, size=64, frames=6)
     telemetry = tmp_path / 'telemetry'
     env = runtime_environment(tmp_path)
-    env.update(CUDA_VISIBLE_DEVICES='', YOLO_TTA_TASK_TRACE='1', YOLO_TTA_TELEMETRY='1',
+    env.update(CUDA_VISIBLE_DEVICES='-1', YOLO_TTA_TASK_TRACE='1', YOLO_TTA_TELEMETRY='1',
                YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER='0', YOLO_TTA_TELEMETRY_DIR=str(telemetry))
     env.setdefault('XTA_NATIVE_SCHEDULER_CACHE', str(tmp_path / 'native-cache'))
     output = tmp_path / 'output'
@@ -130,9 +103,9 @@ def test_cpu_cli_warms_after_worker_registration_and_before_admission(tmp_path):
                            key=lambda event: event['sequence'])
     names = [event['event'] for event in parent_events]
     assert names.index('startup_worker_spawn_done') < names.index('startup_detector_workers_registered')
-    assert names.index('startup_detector_workers_registered') < names.index('startup_parent_warmup_start')
-    assert max(i for i, name in enumerate(names) if name == 'startup_parent_warmup_done') < (
-        names.index('startup_detector_inventory_start'))
+    assert names.index('startup_detector_workers_registered') < names.index('startup_detector_inventory_start')
+    assert not any(name.startswith('startup_parent_warmup_') for name in names)
+    assert 'Warming parent kernel' not in log.read_text(encoding='utf-8')
     admission = parent_events[names.index('startup_detector_inventory_start')]['monotonic_ns']
     dequeued = min(event['monotonic_ns'] for event in events if event['event'] == 'worker_dequeue')
     assert admission <= dequeued

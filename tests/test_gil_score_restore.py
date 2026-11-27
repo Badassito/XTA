@@ -154,6 +154,73 @@ def test_iter_and_scatter_identical(native, tmp_path, monkeypatch, seed, shape, 
         reader.close()
 
 
+@pytest.mark.parametrize('failure', [None, 'corrupt', 'short_read'])
+def test_crop_planner_bounds_index_work_and_preserves_stream(tmp_path, monkeypatch, failure):
+    record_limit, byte_limit = 4, 6
+    monkeypatch.setattr(storage, '_INFLATE_DECODED_BATCH_RECORDS', record_limit)
+    monkeypatch.setattr(storage, '_INFLATE_DECODED_BATCH_BYTES', byte_limit)
+    widths = [9] + [1]*8 + [2, 3, 2, 2] + [3, 1]*9
+    blocks = []
+    for y, width in enumerate(widths):
+        raw = np.full((1, width), y+1, np.uint8)
+        encoded = b'bad zlib block' if failure == 'corrupt' and y == 10 else zlib.compress(raw.tobytes())
+        blocks.append((0, y, 0, raw, encoded))
+    reference = _write_fixture(tmp_path / 'e', (1, len(widths), max(widths)), blocks)
+    reader = BlockScoreReader(reference)
+    batches, slice_lengths = [], []
+    original_index = reader.index
+
+    class GuardedIndex:
+        _mmap = original_index._mmap
+
+        def __getitem__(self, key):
+            result = original_index[key]
+            if isinstance(key, slice):
+                slice_lengths.append(len(result))
+                assert len(result) <= record_limit
+            return result
+
+    class TestInflater:
+        def inflate_blocks(self, payload, records, base, starts, total):
+            assert reader._index_pins == 1
+            batches.append(records['w'].tolist())
+            decoded = np.empty(total, np.uint8)
+            for index, (record, start) in enumerate(zip(records, starts)):
+                offset = int(record['offset'])-base
+                length = int(record['length'])
+                try:
+                    raw = zlib.decompress(payload[offset:offset+length])
+                except zlib.error:
+                    return decoded, index, -1
+                decoded[start:start+len(raw)] = np.frombuffer(raw, np.uint8)
+            return decoded, len(records), 0
+
+    def drain(crops):
+        result = []
+        try:
+            for *bounds, crop in crops:
+                assert reader._index_pins == 0
+                assert not crop.flags.writeable
+                result.append((bounds, crop.shape, crop.tobytes()))
+        except (ValueError, zlib.error) as exc:
+            return result, (type(exc), str(exc))
+        return result, None
+
+    try:
+        if failure == 'short_read':
+            with (reference.path / 'scores.u8.zlib').open('r+b') as stream:
+                stream.truncate(reference.metadata['payload_bytes']-2)
+        expected = drain(reader.iter_python_crops(0))
+        reader.index = GuardedIndex()
+        reader._inflater = TestInflater()
+        assert drain(reader.iter_crops(0)) == expected
+        assert batches[:4] == [[9], [1, 1, 1], [1, 1, 1, 1], [1, 2, 3]]
+        assert sum(slice_lengths) <= 2*len(widths)
+        assert (expected[1] is not None) == (failure is not None)
+    finally:
+        reader.close()
+
+
 def test_memmap_destination_and_python_fallback(native, tmp_path, monkeypatch):
     shape = (5, 260, 300)
     reference = _write_fixture(tmp_path / 'e', shape, _random_blocks(9, shape, overlap=True))
@@ -335,16 +402,48 @@ def test_write_blocks_round_trip_and_staging_restore(native, tmp_path):
         reader.close()
 
 
-def test_warm_function_compiles_production_signatures(native):
-    receipt = inflate.warm_confidence_inflate_kernels()
-    assert receipt['backend'] == 'native_uncompress2'
-    assert receipt['blocks_signatures'] == 1 and receipt['scatter_signatures'] == 1
-    # Production argument types: fresh payload/rows/decode arrays and a C uint8 3-D destination.
-    signatures = native._inflate_scatter.nopython_signatures
-    output_type = signatures[0].args[3]
-    assert signatures[0].args[1].layout == 'C' and not signatures[0].args[1].mutable
-    assert output_type.dtype.name == 'uint8' and output_type.ndim == 3 and output_type.layout == 'C'
-    assert output_type.mutable
+def test_native_batches_accept_unaligned_readonly_index_and_strided_output(native):
+    encoded = zlib.compress(b'ABCDEF')
+    payload = np.frombuffer(encoded, dtype=np.uint8)
+    index_bytes = bytearray(1 + 2 * BLOCK_DTYPE.itemsize + 13)
+    # Misaligned first record and a record stride larger than its packed width.
+    records = np.ndarray((2,), BLOCK_DTYPE, buffer=index_bytes, offset=1,
+                         strides=(BLOCK_DTYPE.itemsize + 13,))
+    records[0] = (0, 0, 0, 2, 3, 11, len(encoded))
+    records[1] = (0, 0, 0, 2, 3, 11, len(encoded))
+    records.setflags(write=False)
+    decoded, done, status = native.inflate_blocks(
+        payload, records[::-1], 11, np.array([0, 6], np.int64), 12)
+    assert (done, status) == (2, 0)
+    assert decoded[:12].tobytes() == b'ABCDEFABCDEF'
+    prefixed = np.frombuffer(b'!' + encoded, dtype=np.uint8)
+    leading = records[:1].copy()
+    leading['offset'] = 0
+    decoded, done, status = native.inflate_blocks(prefixed, leading, -1, np.zeros(1, np.int64), 6)
+    assert (done, status, decoded[:6].tobytes()) == (1, 0, b'ABCDEF')
+
+    backing = np.zeros((1, 2, 6), np.uint8)
+    destination = backing[:, :, ::-2]
+    assert native.inflate_scatter(payload, records, 11, destination) == (2, 0, 12)
+    assert destination.tobytes() == b'ABCDEF'
+    assert not backing[:, :, ::2].any()
+    destination.setflags(write=False)
+    with pytest.raises((BufferError, TypeError, ValueError)):
+        native.inflate_scatter(payload, records, 11, destination)
+
+
+def test_scatter_mixed_cell_sizes_preserves_completed_prefix(native):
+    stream_a, stream_b = zlib.compress(b'A'), zlib.compress(b'BCDEFG')
+    payload = np.frombuffer(stream_a + stream_b, dtype=np.uint8)
+    records = np.array([
+        (0, 0, 0, 1, 1, 0, len(stream_a)),
+        (1, 0, 0, 2, 3, len(stream_a), len(stream_b)),
+        (0, 0, 0, 1, 1, len(payload), 1),
+    ], dtype=BLOCK_DTYPE)
+    output = np.zeros((2, 2, 3), np.uint8)
+    done, status, assigned = native.inflate_scatter(payload, records, 0, output)
+    assert (done, status, assigned) == (2, -100, 7)
+    assert output.tobytes() == b'A' + bytes(5) + b'BCDEFG'
 
 
 def test_positioned_read_path_with_partial_reads(native, tmp_path, monkeypatch):

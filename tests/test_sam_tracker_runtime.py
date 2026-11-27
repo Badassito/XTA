@@ -151,7 +151,7 @@ class SamRawObservationTests(unittest.TestCase):
 
 
 class SamTrackerArtifactTests(unittest.TestCase):
-    def _execute(self, directory, *, removed=False, output_name="result"):
+    def _execute(self, directory, *, removed=False, output_name="result", read_artifact=True):
         import XTA.sam_tracker_runtime as runtime
 
         root = Path(directory)
@@ -172,7 +172,7 @@ class SamTrackerArtifactTests(unittest.TestCase):
             "crop_xyxy": [4, 2, 17, 11], "frame_start": 0, "frame_stop": 3,
             "seed_frame": 0, "direction": "forward", "output_dir": str(root / output_name),
         })
-        return load_tracker_run_result(Path(output["artifact_path"]))
+        return load_tracker_run_result(Path(output["artifact_path"])) if read_artifact else output
 
     def test_rectangular_raw_packet_roundtrip_independent_of_score(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -185,6 +185,30 @@ class SamTrackerArtifactTests(unittest.TestCase):
             self.assertTrue(result.receipt["prediction_valid"])
             self.assertTrue(all(value < 0.1 for value in result.tracker_scores.values()))
             self.assertTrue(all(value == "observed" for value in result.observation_status.values()))
+
+    def test_worker_foreground_metric_uses_builtin_integer_with_numpy_scalar_counts(self):
+        from XTA.lta_workers import _normalize_adapter_output
+
+        count_nonzero = np.count_nonzero
+        calls = 0
+
+        def count_as_numpy_int(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return np.int64(count_nonzero(*args, **kwargs))
+
+        with tempfile.TemporaryDirectory() as directory:
+            # Use a plain callable so the fixture does not retain the mask arguments.
+            with patch.object(np, "count_nonzero", new=count_as_numpy_int):
+                output = self._execute(directory, read_artifact=False)
+            self.assertGreater(calls, 0)
+            artifact_path, metrics, _ = _normalize_adapter_output(output)
+            self.assertIs(type(output["metrics"]["foreground_pixels"]), int)
+            self.assertIs(type(metrics["foreground_pixels"]), int)
+            packet = load_tracker_run_result(Path(artifact_path))
+            expected = sum(int(count_nonzero(mask)) for mask in packet.frames.values())
+            self.assertGreater(expected, 0)
+            self.assertEqual(metrics["foreground_pixels"], expected)
 
     def test_worker_releases_each_observed_mask_after_packing(self):
         observed = []

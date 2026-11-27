@@ -21,7 +21,7 @@ def reference_select(self,
             continue
         if not self.direct_union_task_admissible(task):
             continue
-        if not self.tile_dense_result_task_admissible(task):
+        if not self.tile_result_task_admissible(task):
             continue
         feasible = self.d1_feasible_workers(task, candidates)
         if not feasible:

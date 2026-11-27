@@ -95,7 +95,7 @@ def _compile_extension(directory: Path, identity: dict) -> Path:
     temporary.mkdir()
     environment = {
         **os.environ,
-        "XTA_BUILD_INTEL": "none",
+        "XTA_BUILD_EXTENSION": "scheduler",
         "TMPDIR": str(temporary),
         "TMP": str(temporary),
         "TEMP": str(temporary),

@@ -37,13 +37,13 @@ class TtaSchedulerInputs:
     interpolation_distance: int
     min_conf: float
     min_radius: float
-    dense_tiling_active: bool
+    tiling_active: bool
     nrrd_layers_needed: bool
     direct_union_inference_view_limit: int
     direct_union_inference_byte_limit: int
     direct_union_total_dense_byte_limit: int
-    gpu_worker_tile_dense_result_limit: int
-    gpu_worker_tile_dense_result_task_limit: int
+    gpu_worker_tile_result_limit: int
+    gpu_worker_tile_result_task_limit: int
     gpu_worker_process_active: bool
     inference_worker_process_active: bool
     gpu_device_count: int
@@ -100,19 +100,19 @@ class TtaSchedulerState:
     gpu_worker_dispatched_by_id: Dict[int, int] = field(default_factory=dict)
     gpu_worker_results_by_id: Dict[int, int] = field(default_factory=dict)
     gpu_worker_next_dynamic_task_id: int = 0
-    gpu_worker_tile_dense_result_bytes_reserved: int = 0
-    gpu_worker_tile_dense_result_memfd_bytes_reserved: int = 0
-    gpu_worker_tile_dense_result_max_retention_seconds: float = 0.0
-    gpu_worker_tile_dense_result_reservations: Dict[int, int] = field(
+    gpu_worker_tile_result_bytes_reserved: int = 0
+    gpu_worker_tile_result_memfd_bytes_reserved: int = 0
+    gpu_worker_tile_result_max_retention_seconds: float = 0.0
+    gpu_worker_tile_result_reservations: Dict[int, int] = field(
         default_factory=dict
     )
-    gpu_worker_tile_dense_result_memfd_reservations: Dict[int, int] = field(
+    gpu_worker_tile_result_memfd_reservations: Dict[int, int] = field(
         default_factory=dict
     )
-    gpu_worker_tile_dense_result_reserved_at: Dict[int, float] = field(
+    gpu_worker_tile_result_reserved_at: Dict[int, float] = field(
         default_factory=dict
     )
-    gpu_worker_tile_dense_result_workspaces: Dict[
+    gpu_worker_tile_result_workspaces: Dict[
         int, Tuple[Optional[np.ndarray], Optional[np.ndarray]]
     ] = field(default_factory=dict)
     gpu_worker_tile_task_id_by_key: Dict[Tuple[str, str, str], int] = field(
@@ -411,7 +411,7 @@ class TtaScheduler:
         from .scheduler_preflight import preflight_tta_scheduler
         preflight_tta_scheduler(gpu_device_count=len(self.state.gpu_task_queues),
                                 cpu_enabled=bool(self.state.cpu_task_queues),
-                                tile_configs=self.inputs.dense_tiling_active,
+                                tile_configs=self.inputs.tiling_active,
                                 d1_owner_groups=self.inputs.d1_owner_groups_requested)
         cpu_reserve = self.cpu_input_prefetch.max_bytes if self.cpu_input_prefetch is not None else 0
         if self.cpu_input_prefetch is not None:
@@ -549,6 +549,7 @@ class TtaScheduler:
                 parent.owners = [(key, self.state.direct_union_backing_leases[key]) for key in parent.members]
                 if sum(owner.nbytes for _, owner in parent.owners) != parent.dense_bytes:
                     raise RuntimeError(f'Detector parent {parent.key} allocated outside its native byte grant')
+            missed_inputs = []
             for task_id in parent.task_ids:
                 task = self.state.gpu_worker_tasks_by_id[task_id]
                 for member in self._direct_union_admission_tasks(task):
@@ -558,12 +559,19 @@ class TtaScheduler:
                         conf = self.state.baseline_confmap_paths.get(key)
                         member['result_conf_path'] = str(conf) if conf is not None else None
                 descriptor = dict(task)
+                missed = None
                 if self.cpu_input_prefetch is not None:
-                    self.cpu_input_prefetch.attach_ready(descriptor)
+                    missed = self.cpu_input_prefetch.attach_ready(descriptor)
                 with detector_handle_submission(descriptor) as (packet, handles):
                     payload = bytes(ForkingPickler.dumps(packet))
                     kinds = int(bool(task.get('cpu_eligible'))) | (2 * int(bool(task.get('gpu_eligible'))))
                     self.native.submit_prepared(task_id, parent_id, payload, kinds, handles=handles)
+                if missed is not None:
+                    missed_inputs.append(missed)
+            # Every range in this parent now has its final immutable input choice.
+            # An unfinished or failed submission keeps the old teardown ownership.
+            if missed_inputs:
+                self.cpu_input_prefetch.release_submitted_fallbacks(missed_inputs)
             self._preparing.remove(parent_id)
         self._retire_consumed()
 
@@ -806,10 +814,10 @@ class TtaScheduler:
             issues['outstanding_parent_tickets'] = sorted(self._parents)
         return issues
 
-    def release_tile_dense_result_task_id(self, *_args, **_kwargs):
-        raise RuntimeError('Dense tile ownership is unavailable with this native scheduler')
+    def release_tile_result_task_id(self, *_args, **_kwargs):
+        raise RuntimeError('Tile ownership is unavailable with this native scheduler')
 
-    release_tile_dense_result_for_key = release_tile_dense_result_task_id
+    release_tile_result_for_key = release_tile_result_task_id
 
     def describe_hybrid_cpu_idle_reason(self):
         return self.state.hybrid_cpu_idle_reason_last
@@ -864,7 +872,7 @@ class TtaScheduler:
             slice_offset=int(task.get('slice_start', 0)),
         )
 
-    def tile_dense_result_task_bytes(self, task: Dict[str, object]) -> int:
+    def tile_result_task_bytes(self, task: Dict[str, object]) -> int:
         if str(task.get('kind', '')) != 'tile':
             return 0
         shape = tuple(int(v) for v in task.get('processing_shape', ()))

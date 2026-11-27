@@ -91,7 +91,7 @@ def run_case(case: Path, hybrid: bool):
         OMP_NUM_THREADS='2', MKL_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2', SLURM_CPUS_PER_TASK='8',
         YOLO_TTA_CPU_SOCKET_RESERVE_CORES='0', YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND='0',
         YOLO_TTA_TELEMETRY='0', YOLO_CONFIG_DIR=str(case / 'ultralytics-config'),
-        NUMBA_CACHE_DIR=str(case / 'numba-cache'), CUPY_CACHE_DIR=str(case / 'cupy-cache'),
+        CUPY_CACHE_DIR=str(case / 'cupy-cache'),
         TORCHINDUCTOR_CACHE_DIR=str(case / 'torchinductor-cache'), TRITON_CACHE_DIR=str(case / 'triton-cache'),
         NO_ALBUMENTATIONS_UPDATE='1', PTA_GPU_TORCH_COMPILE='0', YOLO_AUTOINSTALL='false')
     (case / f'{mode}_invocation.json').write_text(json.dumps(argv, indent=2))

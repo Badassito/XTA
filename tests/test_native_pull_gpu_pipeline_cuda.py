@@ -64,7 +64,6 @@ def test_actual_gpu_producer_joins_before_source_and_device_retirement(
             out_shape_tyx=target, workers=3)
         np.testing.assert_array_equal(_decode(output_path), expected)
         assert result['gpu_planes'] == target[0]
-        assert result['timings_seconds']['cpu_warmup_calls'] == 0
     assert producer_threads and writer_threads
     assert all(thread != caller for thread in producer_threads)
     assert set(writer_threads) == {caller}

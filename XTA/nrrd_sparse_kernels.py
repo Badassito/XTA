@@ -1,4 +1,4 @@
-"""Fused nogil kernels for the sparse NRRD layer producer; no JIT disk cache or GPU.
+"""Fused native CPU kernels for the sparse NRRD layer producer.
 
 The NRRD sink and z-shard band threads run in the busy main process. Their former
 per-slice/per-band loops made many short GIL-releasing NumPy, OpenCV and executor
@@ -13,16 +13,14 @@ validated fast-path contract, so failures keep their original type and message.
 from __future__ import annotations
 
 import threading
-import time
 from functools import lru_cache
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ._deps import _numba
+from .native_cpu import kernels as _native_cpu
 from .outputs import (
     _nrrd_sparse_resize_axis_map,
-    _numba_nrrd_area_crop_resize_kernel,
     _restore_source_indices_for_output_z,
 )
 from .workspace import _env_int
@@ -30,12 +28,6 @@ from .workspace import _env_int
 RESIZE_IDENTITY = 0
 RESIZE_NEAREST = 1
 RESIZE_AREA = 2
-
-_BIT_LUT = np.array(
-    [[(value >> bit) & 1 for bit in range(8)] for value in range(256)], dtype=np.uint8,
-)
-_BIT_LUT.setflags(write=False)
-
 
 def nrrd_producer_batch_bytes() -> int:
     """Codec-input bytes per fused producer batch (one compression job / member group)."""
@@ -47,286 +39,45 @@ def nrrd_producer_batch_bytes() -> int:
 # Compiled kernels
 # --------------------------------------------------------------------------------------
 
-@_numba.njit(nogil=True, cache=False)
-def _decode_crop_rows_into(chunks, offset, packed, crop_h, crop_w, out2d, row0, col0):
-    """Decode one bbox payload into ``out2d[row0:row0+h, col0:col0+w]`` (assignment)."""
-    lut = _BIT_LUT
-    if packed:
-        packed_w = (crop_w + 7) >> 3
-        full = crop_w >> 3
-        for r in range(crop_h):
-            src = offset + r * packed_w
-            line = out2d[row0 + r]
-            for j in range(full):
-                value = chunks[src + j]
-                base = col0 + (j << 3)
-                for bit in range(8):
-                    line[base + bit] = lut[value, bit]
-            for c in range(full << 3, crop_w):
-                line[col0 + c] = (chunks[src + (c >> 3)] >> (c & 7)) & 1
-    else:
-        for r in range(crop_h):
-            src = offset + r * crop_w
-            line = out2d[row0 + r]
-            for c in range(crop_w):
-                line[col0 + c] = chunks[src + c]
-
-
-@_numba.njit(nogil=True, cache=False)
-def _sparse_resize_region(y0, x0, y1, x1, in_h, in_w, out_h, out_w,
-                          y_starts, y_stops, x_starts, x_stops, mode):
-    """Affected output bbox, as ``_resize_sparse_binary_crop_to_output_region``."""
-    if mode == RESIZE_IDENTITY:
-        return y0, x0, y1, x1
-    oy0 = np.searchsorted(y_stops, y0, side='right')
-    oy1 = np.searchsorted(y_starts, y1, side='left')
-    ox0 = np.searchsorted(x_stops, x0, side='right')
-    ox1 = np.searchsorted(x_starts, x1, side='left')
-    oy0 = max(0, min(oy0, out_h))
-    oy1 = max(oy0, min(oy1, out_h))
-    ox0 = max(0, min(ox0, out_w))
-    ox1 = max(ox0, min(ox1, out_w))
-    return oy0, ox0, oy1, ox1
-
-
-@_numba.njit(nogil=True, cache=False)
-def _sparse_resize_into(crop, y0, x0, y1, x1, in_h, in_w, out_h, out_w,
-                        y_starts, x_starts, mode, oy0, ox0, restored):
-    """Fill ``restored`` (the region's shape) exactly as the reference resize; return any()."""
-    rh = restored.shape[0]
-    rw = restored.shape[1]
-    if mode == RESIZE_IDENTITY:
-        for r in range(rh):
-            for c in range(rw):
-                restored[r, c] = crop[r, c]
-        return True
-    if mode == RESIZE_NEAREST:
-        for r in range(rh):
-            sy = y_starts[oy0 + r] - y0
-            for c in range(rw):
-                restored[r, c] = crop[sy, x_starts[ox0 + c] - x0]
-    else:
-        crop_h = crop.shape[0]
-        crop_w = crop.shape[1]
-        # cv2.integral(sdepth=CV_32S): exact int32 prefix sums with a zero first row/column.
-        integral = np.zeros((crop_h + 1, crop_w + 1), np.int32)
-        for r in range(crop_h):
-            acc = 0
-            for c in range(crop_w):
-                acc += crop[r, c]
-                integral[r + 1, c + 1] = integral[r, c + 1] + acc
-        _numba_nrrd_area_crop_resize_kernel(
-            integral, crop, in_h, in_w, out_h, out_w,
-            y0, x0, y1, x1, oy0, ox0, restored,
-        )
-    for r in range(rh):
-        for c in range(rw):
-            if restored[r, c] != 0:
-                return True
-    return False
-
-
-@_numba.njit(nogil=True, cache=False)
 def fill_crop_row_batch(chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
                         z_first, z_stop, width, total_rows):
-    """Crop-row bands for ``[z_first, z_stop)``: each nonempty slice's bbox rows, full width."""
-    buf = np.empty((total_rows, width), np.uint8)
-    row = 0
-    for z in range(z_first, z_stop):
-        if kinds[z] != 1:
-            continue
-        y0 = y0s[z]
-        x0 = x0s[z]
-        x1 = x1s[z]
-        crop_h = y1s[z] - y0
-        for r in range(crop_h):
-            line = buf[row + r]
-            for c in range(x0):
-                line[c] = 0
-            for c in range(x1, width):
-                line[c] = 0
-        _decode_crop_rows_into(chunks, offsets[z], packed, crop_h, x1 - x0, buf, row, x0)
-        row += crop_h
-    return buf
+    """Decode the nonempty slices of a crop-row band at full width."""
+    return _native_cpu.nrrd_fill_crop_row_batch(
+        chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds, z_first, z_stop, width, total_rows,
+    )
 
 
-@_numba.njit(nogil=True, cache=False)
 def fill_native_member_group(chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
                              member_first, member_count, total_slices, height, width):
-    """Whole-slice members (rows of ``height``) with every bbox crop placed in its slice.
-
-    Returns the ``(slices*height, width)`` buffer and one record per crop:
-    ``row0, y0, x0, y1, x1, z``.
-    """
-    buf = np.zeros((total_slices * height, width), np.uint8)
-    records = np.empty((total_slices, 6), np.int64)
-    count = 0
-    slot = 0
-    for m in range(member_first.shape[0]):
-        for k in range(member_count[m]):
-            z = member_first[m] + k
-            if kinds[z] == 1:
-                y0 = y0s[z]
-                x0 = x0s[z]
-                y1 = y1s[z]
-                x1 = x1s[z]
-                row0 = slot * height + y0
-                _decode_crop_rows_into(chunks, offsets[z], packed, y1 - y0, x1 - x0, buf, row0, x0)
-                records[count, 0] = row0
-                records[count, 1] = y0
-                records[count, 2] = x0
-                records[count, 3] = y1
-                records[count, 4] = x1
-                records[count, 5] = z
-                count += 1
-            slot += 1
-    return buf, records[:count].copy()
+    """Decode whole source slices and return their placed crop records."""
+    return _native_cpu.nrrd_fill_native_member_group(
+        chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
+        member_first, member_count, total_slices, height, width,
+    )
 
 
-@_numba.njit(nogil=True, cache=False)
 def fill_restored_member_group(chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
-                               member_first, member_count, total_slices,
-                               source_ptr, source_index,
-                               in_h, in_w, out_h, out_w,
-                               y_starts, y_stops, x_starts, x_stops, mode):
-    """Restored whole-slice members: OR every resized active source into its output plane.
-
-    One record per output slice with a nonempty temporal union bbox:
-    ``row0, y0, x0, y1, x1, out_z``.
-    """
-    buf = np.zeros((total_slices * out_h, out_w), np.uint8)
-    records = np.empty((total_slices, 6), np.int64)
-    count = 0
-    slot = 0
-    for m in range(member_first.shape[0]):
-        for k in range(member_count[m]):
-            out_z = member_first[m] + k
-            plane_row = slot * out_h
-            cy0 = out_h
-            cx0 = out_w
-            cy1 = 0
-            cx1 = 0
-            for t in range(source_ptr[out_z], source_ptr[out_z + 1]):
-                src_z = source_index[t]
-                if kinds[src_z] != 1:
-                    continue
-                y0 = y0s[src_z]
-                x0 = x0s[src_z]
-                y1 = y1s[src_z]
-                x1 = x1s[src_z]
-                crop = np.empty((y1 - y0, x1 - x0), np.uint8)
-                _decode_crop_rows_into(chunks, offsets[src_z], packed, y1 - y0, x1 - x0, crop, 0, 0)
-                oy0, ox0, oy1, ox1 = _sparse_resize_region(
-                    y0, x0, y1, x1, in_h, in_w, out_h, out_w,
-                    y_starts, y_stops, x_starts, x_stops, mode,
-                )
-                if oy1 <= oy0 or ox1 <= ox0:
-                    continue
-                restored = np.empty((oy1 - oy0, ox1 - ox0), np.uint8)
-                if not _sparse_resize_into(crop, y0, x0, y1, x1, in_h, in_w, out_h, out_w,
-                                           y_starts, x_starts, mode, oy0, ox0, restored):
-                    continue
-                for r in range(oy1 - oy0):
-                    line = buf[plane_row + oy0 + r]
-                    for c in range(ox1 - ox0):
-                        line[ox0 + c] |= restored[r, c]
-                cy0 = min(cy0, oy0)
-                cx0 = min(cx0, ox0)
-                cy1 = max(cy1, oy1)
-                cx1 = max(cx1, ox1)
-            if cy1 > cy0:
-                records[count, 0] = plane_row + cy0
-                records[count, 1] = cy0
-                records[count, 2] = cx0
-                records[count, 3] = cy1
-                records[count, 4] = cx1
-                records[count, 5] = out_z
-                count += 1
-            slot += 1
-    return buf, records[:count].copy()
+                               member_first, member_count, total_slices, source_ptr, source_index,
+                               in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode):
+    """Restore whole slices and return the records of their temporal union crops."""
+    return _native_cpu.nrrd_fill_restored_member_group(
+        chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
+        member_first, member_count, total_slices, source_ptr, source_index,
+        in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode,
+    )
 
 
-@_numba.njit(nogil=True, cache=False)
 def resize_records_for_tee(buf2d, records, target_ptr, in_h, in_w, out_h, out_w,
                            y_starts, y_stops, x_starts, x_stops, mode):
-    """Phase 1 of the mirror tee (no locks held): resize each recorded crop
-    (``buf2d[row0:row0+h, x0:x1]``) into one mirror geometry.
-
-    Returns ``regions`` (one row per record: ``oy0, ox0, oy1, ox1, offset``) and the
-    packed row-major results. A record without a mirror target, with an empty region,
-    or with an all-zero result gets ``oy1 == oy0`` and is skipped by the OR phase,
-    exactly as the reference tee skips it.
-    """
-    n = records.shape[0]
-    regions = np.zeros((n, 5), np.int64)
-    total = 0
-    for i in range(n):
-        z = records[i, 5]
-        if target_ptr[z + 1] <= target_ptr[z]:
-            continue
-        oy0, ox0, oy1, ox1 = _sparse_resize_region(
-            records[i, 1], records[i, 2], records[i, 3], records[i, 4],
-            in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode,
-        )
-        if oy1 <= oy0 or ox1 <= ox0:
-            continue
-        regions[i, 0] = oy0
-        regions[i, 1] = ox0
-        regions[i, 2] = oy1
-        regions[i, 3] = ox1
-        regions[i, 4] = total
-        total += (oy1 - oy0) * (ox1 - ox0)
-    results = np.empty(total, np.uint8)
-    for i in range(n):
-        oy0 = regions[i, 0]
-        ox0 = regions[i, 1]
-        oy1 = regions[i, 2]
-        ox1 = regions[i, 3]
-        if oy1 <= oy0:
-            continue
-        row0 = records[i, 0]
-        y0 = records[i, 1]
-        x0 = records[i, 2]
-        y1 = records[i, 3]
-        x1 = records[i, 4]
-        crop = buf2d[row0:row0 + (y1 - y0), x0:x1]
-        rh = oy1 - oy0
-        rw = ox1 - ox0
-        restored = np.empty((rh, rw), np.uint8)
-        if not _sparse_resize_into(crop, y0, x0, y1, x1, in_h, in_w, out_h, out_w,
-                                   y_starts, x_starts, mode, oy0, ox0, restored):
-            regions[i, 2] = oy0
-            regions[i, 3] = ox0
-            continue
-        off = regions[i, 4]
-        for r in range(rh):
-            for c in range(rw):
-                results[off + r * rw + c] = restored[r, c]
-    return regions, results
+    """Stage resized crop records before acquiring mirror stripe locks."""
+    return _native_cpu.nrrd_resize_records_for_tee(
+        buf2d, records, target_ptr, in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode,
+    )
 
 
-@_numba.njit(nogil=True, cache=False)
 def or_tee_records(regions, results, records, target_ptr, target_index, volume):
-    """Phase 2 of the mirror tee: OR every resized record into each of its mirror slices.
-    The caller holds the stripe locks of every target slice; this is only the OR.
-    """
-    for i in range(records.shape[0]):
-        oy0 = regions[i, 0]
-        ox0 = regions[i, 1]
-        oy1 = regions[i, 2]
-        ox1 = regions[i, 3]
-        if oy1 <= oy0:
-            continue
-        rw = ox1 - ox0
-        off = regions[i, 4]
-        z = records[i, 5]
-        for t in range(target_ptr[z], target_ptr[z + 1]):
-            mz = target_index[t]
-            for r in range(oy1 - oy0):
-                line = volume[mz, oy0 + r]
-                base = off + r * rw
-                for c in range(rw):
-                    line[ox0 + c] |= results[base + c]
+    """Validate staged records and OR them into the caller's locked mirror slices."""
+    _native_cpu.nrrd_or_tee_records(regions, results, records, target_ptr, target_index, volume)
 
 
 # --------------------------------------------------------------------------------------
@@ -371,7 +122,7 @@ class FusedStoreView:
             return True
         _t, h, w = self.shape
         y0, x0, y1, x1 = self.y0[z], self.x0[z], self.y1[z], self.x1[z]
-        if bool(np.any((y1 <= y0) | (y1 > h) | (x1 <= x0) | (x1 > w))):
+        if bool(np.any((y0 < 0) | (x0 < 0) | (y1 <= y0) | (y1 > h) | (x1 <= x0) | (x1 > w))):
             return False
         crop_h = (y1 - y0).astype(np.uint64)
         crop_w = (x1 - x0).astype(np.uint64)
@@ -636,46 +387,3 @@ def iter_restored_member_groups(view: FusedStoreView, output_shape: Tuple[int, i
             yield ln, members[slot:slot + (b - a)]
             slot += b - a
         del buf
-
-
-# --------------------------------------------------------------------------------------
-# Warmup
-# --------------------------------------------------------------------------------------
-
-def warm_nrrd_producer_kernels() -> Dict[str, object]:
-    """Compile with the readonly payload, index and map types used at runtime."""
-    started = time.perf_counter()
-    h, w = 9, 21
-    crop = np.zeros((h, w), np.uint8)
-    crop[2:7, 3:19] = 1
-    crop[4, 5] = 0
-    chunks = np.frombuffer(crop[2:7, 3:19].tobytes(), dtype=np.uint8)
-    kinds = np.array([1, 0], np.uint8)
-    offsets = np.array([0, 0], np.int64)
-    y0s, x0s = np.array([2, 0], np.int64), np.array([3, 0], np.int64)
-    y1s, x1s = np.array([7, 0], np.int64), np.array([19, 0], np.int64)
-    for values in (kinds, offsets, y0s, x0s, y1s, x1s):
-        values.setflags(write=False)
-    fill_crop_row_batch(chunks, False, offsets, y0s, x0s, y1s, x1s, kinds, 0, 2, w, 5)
-    first = np.array([0], np.int64)
-    count = np.array([2], np.int64)
-    members, records = fill_native_member_group(
-        chunks, False, offsets, y0s, x0s, y1s, x1s, kinds, first, count, 2, h, w)
-    out_h, out_w = 4, 8
-    mode, ys, ye, xs, xe = resize_mode_and_maps(h, w, out_h, out_w)
-    ptr, index = restore_source_csr(2, 2)
-    fill_restored_member_group(
-        chunks, False, offsets, y0s, x0s, y1s, x1s, kinds, first, count, 2,
-        ptr, index, h, w, out_h, out_w, ys, ye, xs, xe, mode)
-    volume = np.zeros((2, out_h, out_w), np.uint8)
-    regions, results = resize_records_for_tee(
-        members, records, ptr, h, w, out_h, out_w, ys, ye, xs, xe, mode)
-    or_tee_records(regions, results, records, ptr, index, volume)
-    return dict(
-        seconds=time.perf_counter() - started,
-        crop_row_signatures=len(fill_crop_row_batch.nopython_signatures),
-        native_signatures=len(fill_native_member_group.nopython_signatures),
-        restored_signatures=len(fill_restored_member_group.nopython_signatures),
-        tee_signatures=len(resize_records_for_tee.nopython_signatures),
-        tee_or_signatures=len(or_tee_records.nopython_signatures),
-    )

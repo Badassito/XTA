@@ -39,7 +39,7 @@ def submission(tmp_path, *, ready=False, staged=True):
         args=SimpleNamespace(imgsz=8,min_conf=.5,min_radius=0,interpolation_distance=5,
             interpolation_walk_back=0,interpolation_candidates=1,interpolation_passes=1,
             interpolation_min_radius=0,interpolation_search_angle=90),
-        input_T=3,input_H=4,input_W=5,temp_dir=tmp_path,dense_tiling_active=True,
+        input_T=3,input_H=4,input_W=5,temp_dir=tmp_path,tiling_active=True,
         parent_transient_admission=mock.Mock(),interpolation_settings=SimpleNamespace(backend='sam',
             extrapolation_enabled=False, extrapolation_distance=0,
             extrapolation_walk_back=1, extrapolation_min_radius=3.),

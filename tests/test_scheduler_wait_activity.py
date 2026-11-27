@@ -144,7 +144,7 @@ def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
         running.append(future)
     future_map = {future: None for future in running + [Future() for _ in range(13)]}
     state = SimpleNamespace(gpu_worker_results_collected=2243, gpu_worker_total_tasks=6111,
-                            gpu_worker_tile_dense_result_bytes_reserved=0)
+                            gpu_worker_tile_result_bytes_reserved=0)
     namespace = dict(vars(pipeline))
     namespace.update(
         runtime_telemetry=lambda: telemetry,
@@ -154,13 +154,14 @@ def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
         parent_transient_admission=SimpleNamespace(condition=threading.Condition(),
                                                  in_use=88, capacity=192),
         postprocessed_tiles_waiting_by_parent={}, residual_tiles_waiting_by_parent={},
-        view_processing_futures=future_map, gpu_worker_pending_task_ids=set(range(3868)),
+        view_processing_futures=future_map,
+        native_detector=SimpleNamespace(snapshot=lambda: {'dispatched': 2243}),
         scheduler_state=state, direct_union_inference_bytes={},
         direct_union_postprocess_bytes={str(n): 10 for n in range(17)},
         direct_union_total_dense_byte_limit=256,
         direct_union_inference_views=set(), direct_union_postprocess_views=set(range(17)),
-        gpu_worker_tile_dense_result_task_limit=4, gpu_worker_tile_dense_result_limit=100,
-        gpu_worker_tile_dense_result_reservations={})
+        gpu_worker_tile_result_task_limit=4, gpu_worker_tile_result_limit=100,
+        gpu_worker_tile_result_reservations={})
     for name in ('physical_view_finalization_futures',
                  'physical_view_union_futures', 'tile_cleanup_futures', 'tile_parent_gate_futures',
                  'tile_bridge_gate_futures', 'tile_consolidation_futures',
@@ -173,6 +174,9 @@ def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
     assert 'inference_received=2243/6111' in output
     assert 'native_projection_active=1' in output
     assert "'completed_planes': 321" in output
+    native_key, native_receipt = telemetry.gauge.call_args_list[0].args
+    assert native_key == 'scheduler.native'
+    assert native_receipt['dispatched'] == 2243 and native_receipt['sample_monotonic_ns'] > 0
     key, receipt = telemetry.gauge.call_args.args
     assert key == 'scheduler.wait_activity'
     assert receipt['dense_retained_bytes'] == 170 and receipt['dense_limit_bytes'] == 256
@@ -183,4 +187,4 @@ def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
     # The regular status interval still suppresses repeated output/gauge updates.
     logger()
     assert capsys.readouterr().out == ''
-    assert telemetry.gauge.call_count == 1
+    assert telemetry.gauge.call_count == 2

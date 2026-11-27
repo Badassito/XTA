@@ -27,6 +27,7 @@ _CROP_OCCUPANCY_BAND_BYTES = 8 * 1024 * 1024
 # decoded batch of one frame live; whole-volume scatter batches whole frames by
 # stored bytes so cancellation and the failure fallback stay frame-granular.
 _INFLATE_DECODED_BATCH_BYTES = 8 * 1024 * 1024
+_INFLATE_DECODED_BATCH_RECORDS = 1024
 _INFLATE_SCATTER_BATCH_BYTES = 8 * 1024 * 1024
 # One positioned read per batch where the platform has it (no seek+read pair).
 _PREADV = getattr(os, 'preadv', None)
@@ -525,7 +526,7 @@ class BlockScoreReader:
         if inflater is None:
             yield from self._python_crops(first,stop)
             return
-        number = first
+        number = window_first = window_stop = first
         while number < stop:
             if self._closed:
                 raise RuntimeError('Confidence block reader is closed')
@@ -533,29 +534,41 @@ class BlockScoreReader:
             # (a concurrent close() would otherwise unmap it under the kernel);
             # it is never held across a yield.
             with self._index_pin():
-                # Plan the batch with GIL-held Python on the frame's index rows:
-                # at least one block, then whole blocks up to the decoded budget.
-                rows,starts,total = [],[],0
-                for row in self.index[number:stop].tolist():
-                    area = row[3]*row[4]
-                    if rows and total+area > _INFLATE_DECODED_BATCH_BYTES:
-                        break
-                    rows.append(row)
-                    starts.append(total)
-                    total += area
-                count = len(rows)
-                base = rows[0][5]
-                payload = self._read_payload(base,rows[-1][5]+rows[-1][6]-base)
+                # Reuse one bounded prefix sum across decode batches. The
+                # copied prefix sum is independent of the pinned index.
+                if number == window_stop:
+                    window_first = number
+                    window_stop = min(stop,number+_INFLATE_DECODED_BATCH_RECORDS)
+                    window = self.index[number:window_stop]
+                    ends = np.multiply(window['h'],window['w'],dtype=np.int64)
+                    np.cumsum(ends,out=ends)
+                    window = None
+                begin = number-window_first
+                decoded_base = int(ends[begin-1]) if begin else 0
+                limit = decoded_base+_INFLATE_DECODED_BATCH_BYTES
+                # A first block above the byte budget still makes progress.
+                end = max(begin+1,int(ends.searchsorted(limit,side='right')))
+                count = end-begin
+                total = int(ends[end-1])-decoded_base
+                starts = np.empty(count,np.int64)
+                starts[0] = 0
+                np.subtract(ends[begin:end-1],decoded_base,out=starts[1:])
+                records = self.index[number:number+count]
+                base = int(records['offset'][0])
+                size = int(records['offset'][-1])+int(records['length'][-1])-base
+                payload = self._read_payload(base,size)
                 if payload is not None:
-                    decoded,done,status = inflater.inflate_blocks(payload,self.index[number:number+count],
-                                                                  base,np.array(starts,np.int64),total)
+                    decoded,done,status = inflater.inflate_blocks(payload,records,base,starts,total)
+                    # Only the independent coordinates survive the index pin.
+                    rows = records[:done][['y','x','h','w']].tolist()
+                records = None
             if payload is None:
                 # Short read: the original decoder owns the exact failure.
                 yield from self._python_crops(number,stop)
                 return
             payload = None
             decoded.setflags(write=False)
-            for (_,y,x,h,w,_,_),start in zip(rows[:done],starts):
+            for (y,x,h,w),start in zip(rows,starts):
                 if self._closed:
                     raise RuntimeError('Confidence block reader is closed')
                 yield y,y+h,x,x+w,decoded[start:start+h*w].reshape(h,w)

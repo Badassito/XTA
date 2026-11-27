@@ -19,7 +19,7 @@ pool, so each worker keeps its share of that pool instead of a full copy (the
 member sequence, and so every byte, does not depend on the pool size).
 
 Workers start with ``spawn`` (never ``fork`` from this multi-threaded producer),
-compile the NRRD producer kernels with one tiny warm-up write, ignore console
+load the prebuilt CPU kernels and validate the member codec, ignore console
 interrupts and exit with the producer. ``XTA_YOLO_SWEEP_NRRD_PROCESSES=0`` keeps sibling files on the
 producer's writer threads. A dead worker breaks the executor for good: the pool
 joins every worker, removes their staging files, and that layer and every later
@@ -152,7 +152,7 @@ def run_nrrd_layer_file_job(job):
         wall_seconds=time.perf_counter() - started, cpu_seconds=time.process_time() - cpu)
 
 
-def _initialize_nrrd_process(producer_pid, gzip_workers, warm=True):
+def _initialize_nrrd_process(producer_pid, gzip_workers):
     import signal
     from .sweep_evidence_processes import _exit_with_producer
     _exit_with_producer(producer_pid)
@@ -169,48 +169,10 @@ def _initialize_nrrd_process(producer_pid, gzip_workers, warm=True):
         os.environ[_GZIP_WORKERS_ENV] = str(int(gzip_workers))
     from . import outputs  # noqa: F401  (imported once, before the first job)
     nrrd_codec_identity()  # select and self-test the member codec once
-    if warm:
-        try:
-            _warm_layer_write()
-        except Exception as error:  # a first real job compiles lazily instead
-            print(f'NRRD worker warm-up write failed ({type(error).__name__}: {error})',
-                  file=sys.stderr, flush=True)
+    from .native_cpu import load_native_cpu
+    load_native_cpu()
 
 
-def _warm_layer_write():
-    """Compile the producer kernels a sibling write uses by writing one tiny layer.
-
-    The kernels are not disk-cached. A projected-store-shaped write (packed CVOL,
-    crop-row stream, sparse LQ tee, both layouts) compiles exactly the signatures a
-    sibling job needs in ~4 s, beside inference, instead of inside the first job.
-    """
-    import contextlib
-    import io
-    import tempfile
-    import numpy as np
-    from . import outputs
-    from .interpolation import INTERNAL_PACKED_CVOL_FORMAT, NrrdLayerRef, write_raw_bbox_mask_store
-    shape = (4, 24, 28)
-    volume = np.zeros(shape, np.uint8)
-    volume[1:3, 4:20, 5:23] = 1
-    volume[2, 9, 6:20] = 0
-    with tempfile.TemporaryDirectory(prefix='xta-nrrd-warm-', ignore_cleanup_errors=True) as tmp:
-        root = Path(tmp)
-        with contextlib.redirect_stdout(io.StringIO()):
-            stats = write_raw_bbox_mask_store(volume, root / 'warm.cvol',
-                format_name=INTERNAL_PACKED_CVOL_FORMAT, desc='NRRD worker warm-up', workers=1)
-            ref = NrrdLayerRef(key='warm', name='warm', path=root / 'warm.cvol', shape=shape,
-                storage_format=INTERNAL_PACKED_CVOL_FORMAT,
-                segment_extent_ijk=tuple(stats['segment_extent_ijk']), segment_extent_shape_tyx=shape,
-                segment_extent_source='raw_bbox_cvol_index', view_name='warm', source='fullframe',
-                mask_kind='yolo')
-            for layout in (outputs.NRRD_LAYER_LAYOUT_CROPPED, outputs.NRRD_LAYER_LAYOUT_FULL):
-                outputs.write_sink_layer_files(ref, shape, root / f'{layout}.seg.nrrd',
-                    (((2, 12, 14), root / 'low_quality' / f'{layout}.seg.nrrd'),),
-                    segment_name='warm', segment_color=(1.0, 0.0, 0.0), z_shards=1, layout=layout,
-                    raster_plan=outputs._nrrd_raster_plan(ref, shape, layout=layout),
-                    mirror_raster_plans={}, plan_receipt={})
-        gc.collect()
 
 
 def _report_ready():
@@ -227,7 +189,7 @@ class SweepNrrdProcessPool:
     for.
     """
 
-    def __init__(self, processes, *, gzip_workers=None, warm=True):
+    def __init__(self, processes, *, gzip_workers=None):
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor
         self.processes = int(processes)
@@ -246,10 +208,10 @@ class SweepNrrdProcessPool:
         self._seen_pids = set()
         self._executor = ProcessPoolExecutor(max_workers=self.processes,
             mp_context=multiprocessing.get_context('spawn'),
-            initializer=_initialize_nrrd_process, initargs=(os.getpid(), int(gzip_workers), bool(warm)))
+            initializer=_initialize_nrrd_process, initargs=(os.getpid(), int(gzip_workers)))
         started = time.perf_counter()
         try:
-            # Start and warm every worker now, beside inference, not in a writer thread.
+            # Start each worker and validate its prebuilt CPU extension beside inference.
             for _ in range(self.processes):
                 future = self._executor.submit(_report_ready)
                 future.add_done_callback(lambda done, began=started: self._ready(done, began))

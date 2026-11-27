@@ -48,11 +48,10 @@ class RadialProjectionHandoffTests(unittest.TestCase):
             project=lambda z,n: self.expected[z:z+n].copy(), close=mock.Mock())
         seen = []
         def cpu(*args):
-            self.assertEqual(args[-3], 0, 'CPU must only compile an empty block')
+            self.assertEqual(args[-3], 0, 'CPU must only admit an empty block')
             return np.empty((0,9,11), np.uint8)
         with redirect_stdout(io.StringIO()), \
              mock.patch.object(cp, '_try_radial_cuda_stage', side_effect=[None, stage]) as admission, \
-             mock.patch.object(cp, '_numba', object()), \
              mock.patch.object(cp, 'radial_cuda_backproject_enabled', return_value=True), \
              mock.patch.object(cp, '_project_radial_block', side_effect=cpu):
             self.call(lambda z,block: seen.extend(range(z,z+len(block))))
@@ -125,7 +124,6 @@ class RadialProjectionHandoffTests(unittest.TestCase):
                 with ExitStack() as stack:
                     stack.enter_context(redirect_stdout(log))
                     stack.enter_context(mock.patch.object(cp, '_try_radial_cuda_stage', side_effect=[None,None,stage]))
-                    stack.enter_context(mock.patch.object(cp, '_numba', object()))
                     stack.enter_context(mock.patch.object(cp, 'radial_cuda_backproject_enabled', return_value=True))
                     stack.enter_context(mock.patch.object(cp, '_radial_block_schedule', return_value=(1,3)))
                     stack.enter_context(mock.patch.object(cp, '_CUDA_RECHECK_SLICES', 1))
@@ -177,7 +175,6 @@ class RadialProjectionHandoffTests(unittest.TestCase):
                     project_encoded=mock.Mock(side_effect=encode), close=mock.Mock())
                 with redirect_stdout(io.StringIO()), \
                      mock.patch.object(cp, '_try_radial_cuda_stage', side_effect=[None,None,stage]), \
-                     mock.patch.object(cp, '_numba', object()), \
                      mock.patch.object(cp, 'radial_cuda_backproject_enabled', return_value=True), \
                      mock.patch.object(cp, '_radial_block_schedule', return_value=(1,1)), \
                      mock.patch.object(cp, '_CUDA_RECHECK_SLICES', 1), \
@@ -195,7 +192,6 @@ class RadialProjectionHandoffTests(unittest.TestCase):
             return None
         with redirect_stdout(io.StringIO()), \
              mock.patch.object(cp, '_try_radial_cuda_stage', side_effect=admit) as admission, \
-             mock.patch.object(cp, '_numba', object()), \
              mock.patch.object(cp, 'radial_cuda_backproject_enabled', return_value=True), \
              mock.patch.object(cp, '_radial_block_schedule', return_value=(1,1)), \
              mock.patch.object(cp, '_CUDA_RECHECK_SLICES', 1), \
@@ -215,7 +211,6 @@ class RadialProjectionHandoffTests(unittest.TestCase):
             return self.expected[z:z+count].copy()
         with redirect_stdout(io.StringIO()), \
              mock.patch.object(cp, '_try_radial_cuda_stage', side_effect=[None,None,stage]), \
-             mock.patch.object(cp, '_numba', object()), \
              mock.patch.object(cp, 'radial_cuda_backproject_enabled', return_value=True), \
              mock.patch.object(cp, '_radial_block_schedule', return_value=(1,1)), \
              mock.patch.object(cp, '_CUDA_RECHECK_SLICES', 1000), \

@@ -20,7 +20,8 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import cv2, _numba
+from ._deps import cv2
+from .native_cpu import kernels as _native_cpu_kernels
 from .geometry_quality import radial_columns_requested, spherical_fp32_requested, spherical_fp32_shape_eligible
 
 from .config import (
@@ -48,7 +49,7 @@ from .geometry import (
     AugJob,
     BatchResultFrameSpec,
     ChannelFormattedFrameRenderer,
-    DenseTileJob,
+    TileJob,
     GpuPrefetchedYoloBatch,
     AZIMUTHAL_FILTER_LABEL,
     AZIMUTHAL_FILTER_MODE,
@@ -68,7 +69,7 @@ from .geometry import (
     is_spherical_view,
     is_tilted_azimuthal_view,
     is_tilted_view,
-    make_dense_tile_channel_renderer,
+    make_tile_channel_renderer,
     make_fullframe_channel_renderer,
     physical_view_name,
     azimuthal_base_view_name,
@@ -173,17 +174,6 @@ def _azimuthal_linear_native_kernel(device_index=None):
 def open_existing_gray_memmap(path: object, shape: Sequence[int], dtype: object = np.uint8, mode: str = 'r') -> np.memmap:
     return np.memmap(Path(path), dtype=np.dtype(dtype), mode=str(mode), shape=tuple(int(x) for x in shape))
 
-@_numba.njit(cache=True, nogil=True)
-def _union_conf_slice_inplace(dst_mask, dst_conf, src_mask, src_conf):
-    for y in range(dst_mask.shape[0]):
-        for x in range(dst_mask.shape[1]):
-            mask = src_mask[y, x]
-            confidence = src_conf[y, x]
-            if mask != 0 and (dst_mask[y, x] == 0 or confidence > dst_conf[y, x]):
-                dst_mask[y, x] = mask
-                dst_conf[y, x] = confidence
-
-
 def _union_conf_fused_eligible(arrays) -> bool:
     """Use direct writes only for disjoint contiguous byte volumes."""
     if any(not isinstance(array, np.ndarray) or array.dtype != np.uint8
@@ -238,12 +228,8 @@ def union_conf_volume_into_volume_inplace(
     use_fused = use_conf and _union_conf_fused_eligible(
         (dst_mask_mm, dst_conf_mm, src_mask_mm, src_conf_mm)
     )
-    if use_fused:
-        # Validate the required compiled signature before any destination writes.
-        # Aliased, strided and conversion-dependent layouts retain the native-array
-        # implementation below; compiler failure is not a layout fallback.
-        _union_conf_slice_inplace(*(np.asarray(array[0, :0]) for array in
-                                   (dst_mask_mm, dst_conf_mm, src_mask_mm, src_conf_mm)))
+    # Resolve the compiled entry before any worker can mutate a destination.
+    merge_native = _native_cpu_kernels.union_conf_slice_inplace if use_fused else None
 
     def _merge_slice(idx: int) -> None:
         i = int(idx)
@@ -254,8 +240,8 @@ def union_conf_volume_into_volume_inplace(
         dst_mask = np.asarray(dst_mask_mm[i], dtype=np.uint8)
         dst_conf = np.asarray(dst_conf_mm[i], dtype=np.uint8)
         src_conf = np.asarray(src_conf_mm[i], dtype=np.uint8)
-        if use_fused:
-            _union_conf_slice_inplace(dst_mask, dst_conf, src_mask, src_conf)
+        if merge_native is not None:
+            merge_native(dst_mask, dst_conf, src_mask, src_conf)
             return
         # A source pixel wins where it is foreground and strictly more confident than the
         # current destination (ties keep the existing pixel, matching first-writer-wins).
@@ -5002,7 +4988,7 @@ class GpuTileRenderedYoloSource:
         self,
         engine: _GpuWorkerRenderEngine,
         view: ViewInfo,
-        tile_job: DenseTileJob,
+        tile_job: TileJob,
         *,
         slice_offset: int,
         num_frames: int,
@@ -5330,7 +5316,7 @@ def _worker_render_callable(
     # local index -> absolute view slice index (sub-range tasks render a contiguous slice window).
     off = int(slice_offset)
     if str(kind) == 'tile':
-        formatted = make_dense_tile_channel_renderer(
+        formatted = make_tile_channel_renderer(
             volume_rgb,
             view,
             job,  # type: ignore[arg-type]

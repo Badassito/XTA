@@ -140,13 +140,12 @@ def run(args):
     report_path = output / 'cpu-backends.json'
     if report_path.exists():
         raise FileExistsError(f'Use a new output directory: {report_path}')
-    for variable, folder in (('NUMBA_CACHE_DIR', 'numba-cache'), ('YOLO_CONFIG_DIR', 'ultralytics')):
-        location = output / folder
-        location.mkdir(exist_ok=True)
-        os.environ[variable] = str(location)
+    config = output / 'ultralytics'
+    config.mkdir(exist_ok=True)
+    os.environ['YOLO_CONFIG_DIR'] = str(config)
     # Configure native pools before importing NumPy or any XTA numerical module.
     for variable in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
-                     'NUMEXPR_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+                     'NUMEXPR_NUM_THREADS'):
         os.environ[variable] = str(args.threads)
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
     os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
@@ -154,7 +153,7 @@ def run(args):
                   local_time=datetime.now().astimezone().isoformat(), completed=False,
                   thread_limit=args.threads, contention_note=args.contention_note,
                   platform=platform.platform(), python=sys.version, logical_cpus=os.cpu_count(),
-                  versions={name: _version(name) for name in ('numpy', 'numba', 'scipy', 'opencv-python')},
+                  versions={name: _version(name) for name in ('numpy', 'scipy', 'opencv-python')},
                   source_sha256=_source_identity(), cases=[],
                   limitations=['Synthetic bounded CPU stages; not end-to-end pipeline performance.',
                                'Other processes can distort timings; a thread limit does not isolate this process.',
@@ -164,16 +163,16 @@ def run(args):
         report['git_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
         with ExitStack() as stack:
             import cv2
-            import numba
+            from tools.native_cpu_provenance import native_cpu_provenance
             cv2.setNumThreads(args.threads)
-            numba.set_num_threads(args.threads)
+            report['native_cpu'] = native_cpu_provenance()
             try:
                 from threadpoolctl import threadpool_limits
             except ImportError:
-                report['native_pool_control'] = 'environment variables plus OpenCV/Numba setters'
+                report['native_pool_control'] = 'environment variables plus OpenCV thread control'
             else:
                 stack.enter_context(threadpool_limits(limits=args.threads))
-                report['native_pool_control'] = 'threadpoolctl plus OpenCV/Numba setters'
+                report['native_pool_control'] = 'threadpoolctl plus OpenCV thread control'
             families = args.family or list(FAMILIES)
             cases = []
             for name in families:

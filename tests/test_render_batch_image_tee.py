@@ -112,14 +112,14 @@ class CanonicalRenderBatchImageTests(unittest.TestCase):
             self.assertEqual(saved[0].read_bytes(), model_images[0][:, :, 0].tobytes())
             self.assertEqual(saved[1].read_bytes(), model_images[1][:, :, 0].tobytes())
 
-    def test_materialized_dense_tile_saves_real_centers_and_not_tail_padding(self) -> None:
+    def test_materialized_tile_saves_real_centers_and_not_tail_padding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             view = geometry.ViewInfo('coronal__tta_am12p5', 2, 2, 3, 'clamp')
             identity = np.asarray(
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32,
             )
-            tile_job = geometry.DenseTileJob(
+            tile_job = geometry.TileJob(
                 view=view.name,
                 aug_id='am12p5',
                 config_id='s256_st128',
@@ -145,7 +145,7 @@ class CanonicalRenderBatchImageTests(unittest.TestCase):
                 backend='openvino_cpu',
             )
             tee = _CaptureThenSave(sink)
-            raster_plan = geometry.build_dense_tile_raster_plan(view, tile_job)
+            raster_plan = geometry.build_tile_raster_plan(view, tile_job)
             materialized = np.asarray(
                 [
                     [[1, 2, 3], [4, 5, 6]],

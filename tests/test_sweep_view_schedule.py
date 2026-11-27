@@ -40,10 +40,14 @@ def test_completed_view_is_published_or_retained_for_independent_suffix(
     monkeypatch.setattr(sweep_views, 'seal_view_family', seal)
     monkeypatch.setattr(sweep_views, 'retire_view_payloads', retire)
     reader = SimpleNamespace(read_mask_plane=lambda z: np.full((2, 2), z, np.uint8))
-    monkeypatch.setattr(sweep_views, 'open_view', lambda *args, **kwargs: nullcontext(reader))
+    family = SimpleNamespace(readers={60: reader}, native_crops=Mock(),
+                             metadata={'prediction_counts': {'50': 2, '60': 3}})
+    acquire = Mock(side_effect=lambda *args, **kwargs: nullcontext(family))
+    monkeypatch.setattr(sweep_views, 'open_sibling_views', acquire)
 
     def publish(_view, *, read_mask_plane, **kwargs):
         np.testing.assert_array_equal(read_mask_plane(60, 1), np.ones((2,2)))
+        assert kwargs['counts_by_cutoff'] == {50: 2, 60: 3}
         return {60: 'ref'} if projection_supported else None
 
     publication = Mock()
@@ -52,6 +56,8 @@ def test_completed_view_is_published_or_retained_for_independent_suffix(
     plan.close()
     seal.assert_called_once_with('model','transverse',(2,2,2),(50,60),receipts=[receipt],identity=None)
     assert publication.publish_view_family.call_count == int(not interpolate)
+    if not interpolate:
+        acquire.assert_called_once_with('model', 'transverse', (50, 60), native_shape=(2, 2, 2), identity=None)
     assert retire.call_count == int(projection_supported)
     assert plan.summary(1)['produced_views'] == 1
 

@@ -9,11 +9,12 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import weakref
 from unittest import mock
 
 import numpy as np
 
-from XTA import assembly, backprojection, geometry
+from XTA import assembly, backprojection, geometry, runtime
 from XTA.confidence_evidence import (
     ConfidenceEvidenceRef, capture_prediction_confidence, configure_confidence_evidence,
     lookup_confidence_evidence, write_block_confidence_evidence, write_confidence_evidence,
@@ -330,10 +331,31 @@ class ConfidenceEvidenceTests(unittest.TestCase):
                     finally:
                         # Retirement preserves live consumers; release this last
                         # local and await deletion before TemporaryDirectory cleanup.
+                        binary_identity = binary_path.stat()
+                        owner = runtime._root_memmap_for_array(binary)
+                        mapping = None if owner is None else weakref.ref(owner._mmap)
+                        del owner
                         close_memmap_array_without_flush(binary, unlink_path=binary_path)
                         binary = None
                         wait_for_retired_memmap_unlinks(path=binary_path)
-                    self.assertFalse(binary_path.exists())
+                    if binary_path.exists():
+                        try:
+                            observed = binary_path.stat()
+                            current_identity = (observed.st_dev, observed.st_ino)
+                        except FileNotFoundError:
+                            current_identity = None
+                        with runtime._MEMMAP_RETIREMENT_LOCK, runtime._MEMMAP_UNLINK_LOCK:
+                            active = any(entry[0] == binary_path
+                                         for _, _, state in runtime._MEMMAP_RETIREMENTS.values()
+                                         for entry in state['unlink_paths'])
+                            queued = any(entry[0] == binary_path
+                                         for entry in runtime._MEMMAP_PENDING_UNLINKS)
+                        self.fail(
+                            f'Binary oracle temp path remains after retirement at level {level}. '
+                            f'Original=(device={binary_identity.st_dev}, inode={binary_identity.st_ino}) '
+                            f'current={current_identity}, mapping_live={mapping is not None and mapping() is not None}, '
+                            f'active={active}, queued={queued}, path={binary_path}'
+                        )
                 np.testing.assert_array_equal(actual, expected)
 
 

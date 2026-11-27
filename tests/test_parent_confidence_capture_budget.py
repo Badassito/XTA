@@ -33,7 +33,7 @@ def test_eager_parent_charges_source_projection_before_dispatch(tmp_path):
     credit = confidence_evidence.SOURCE_SCORE_PROJECTION_WORKSPACE_BYTES
     assert cutoff_plan.workspace_bytes == cutoff_plan.source_projection_workspace_bytes == credit
 
-    function, ns, view, _, _, _, executor, _, _ = submission(tmp_path, ready=True, staged=False)
+    function, ns, view, _, _, _, executor, _ = submission(tmp_path, ready=True, staged=False)
     ns['defer_score_projection'] = False
     ns['args'].reconciliation_retain_confidence = True
     ns['interpolation_settings'].backend = 'sdf'
@@ -98,7 +98,7 @@ def test_actual_and_policy_reservations_share_exact_workspace_charge(view_name, 
 
 
 def test_submitted_capture_scope_runs_inside_exact_parent_reservation(tmp_path):
-    function, ns, view, key, _leases, _captured, executor, _future, _dispatch = submission(
+    function, ns, view, key, _leases, _captured, executor, _future = submission(
         tmp_path, ready=True, staged=False)
     ns['args'].reconciliation_retain_confidence = True
     ns['parent_slice_postprocess_workers'] = 32
@@ -141,7 +141,7 @@ def test_submitted_capture_scope_runs_inside_exact_parent_reservation(tmp_path):
 
 
 def test_capture_preflight_failure_preserves_original_dense_owner(tmp_path):
-    function, ns, view, key, leases, _captured, executor, _future, _dispatch = submission(
+    function, ns, view, key, leases, _captured, executor, _future = submission(
         tmp_path, ready=True, staged=False)
     original_mask = ns['baseline_union_by_model_view'][key]
     original_scores = ns['baseline_confmap_by_model_view'][key]
@@ -160,7 +160,7 @@ def test_capture_preflight_failure_preserves_original_dense_owner(tmp_path):
 ])
 def test_disabled_missing_score_or_d1_published_parent_has_zero_capture_charge(
         tmp_path, disabled, score_missing, d1_published):
-    function, ns, view, key, _leases, _captured, executor, _future, _dispatch = submission(
+    function, ns, view, key, _leases, _captured, executor, _future = submission(
         tmp_path, ready=True, staged=False)
     ns['args'].reconciliation_retain_confidence = not disabled
     if score_missing:

@@ -99,17 +99,9 @@ class EnvironmentCleanupTests(unittest.TestCase):
             self.assertTrue(geometry.gpu_input_staging_enabled(cfg))
 
     def test_retired_runtime_toggles_preserve_default_behavior(self) -> None:
-        with (
-            mock.patch.object(
-                workspace,
-                '_read_meminfo_bytes',
-                return_value={'MemAvailable': 120, 'SwapFree': 30},
-            ),
-            mock.patch.object(
-                workspace,
-                '_cgroup_memory_headroom_bytes',
-                return_value=80,
-            ),
+        with mock.patch.object(
+            workspace, '_memory_sample',
+            return_value=({'MemAvailable': 120, 'SwapFree': 30}, 80, None),
         ):
             self.assertEqual(workspace.available_anon_work_bytes(), 80)
 

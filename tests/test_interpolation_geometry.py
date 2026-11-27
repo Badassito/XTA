@@ -58,8 +58,8 @@ class MembershipPainterTests(unittest.TestCase):
         top = 1 << 63
         dest = np.array([[1, top]], dtype=np.uint64)
         with (
-            mock.patch.object(interpolation, '_numba_paste_packed_or_kernel',
-                              wraps=interpolation._numba_paste_packed_or_kernel) as kernel,
+            mock.patch.object(interpolation.kernels, 'interpolation_paste_packed_or',
+                              wraps=interpolation.kernels.interpolation_paste_packed_or) as kernel,
         ):
             added = interpolation._paste_local_mask_onto_slice(
                 dest, np.ones((1, 2), bool), (0, 1), paint_value=top, binary_destination=False,
@@ -366,7 +366,7 @@ class BridgeGeometryTests(unittest.TestCase):
                 volume[1 + k, 19:22, 25:28] = 2
                 cache = interpolation.SliceComponentTableCache(volume)
                 try:
-                    found = interpolation._find_slice_projection_candidates_numba(
+                    found = interpolation._find_slice_projection_candidates_native(
                         labels_real=volume,
                         seed=interpolation.SliceEndpointSeed(1, (1, 20, 20), 1),
                         max_slice_distance=k, search_angle_deg=15.0, max_candidates=4,

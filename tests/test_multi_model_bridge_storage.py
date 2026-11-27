@@ -99,7 +99,7 @@ class MultiModelBridgeStorageTests(unittest.TestCase):
                 else:
                     result = assembly.prepare_view_volume_after_fullframe(
                         union_mm=volume, confmap_mm=None, union_path=root / model / 'union.dat',
-                        confmap_path=None, dense_tiling_active=False, min_conf=0, min_radius=0,
+                        confmap_path=None, tiling_active=False, min_conf=0, min_radius=0,
                         precleaned_slice_cleanup=True, hole_fill_done_on_device=True,
                         preinterpolation_layer_already_published=True, **shared)
                 data = (np.array(result.final_view_volume_mm, copy=True)

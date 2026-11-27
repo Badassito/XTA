@@ -173,8 +173,8 @@ caller worker budget, owns disjoint native planes, and delivers callbacks in
 order. Read-only packed angular lookup has a separate 64 MiB plan/build default;
 the 256 MiB transient default accounts for pending planes, worker strips, and a
 consumer-held plane. Larger lookup geometry uses bounded strips. These are
-per-projection explicit-buffer limits, separate from dense credits and JIT
-runtime memory. Confidence retains a scalar-max plan within its own admission,
+per-projection explicit-buffer limits, separate from dense credits and runtime
+memory. Confidence retains a scalar-max plan within its own admission,
 with the exact bounded sampler for small budgets and no reader thread pool.
 Projection telemetry exposes progress and admitted workers; scheduler wait
 records distinguish executor activity, queued preparation, pending inference
@@ -228,11 +228,13 @@ supported detector configurations.
 
 ## Required compiled CPU backends
 
-Numerical runtimes require Numba alongside NumPy, OpenCV and SciPy. Missing or
-broken Numba imports raise a diagnostic instead of selecting interpreted bulk
-work. Compiled topology, interpolation, Spherical/Radial CPU projection, sparse
-scatter and packed publication propagate kernel failures. Configuration and CLI
-help/version discovery keep their lightweight import boundary.
+Bulk CPU kernels use the ahead-of-time C++ extension alongside NumPy, OpenCV
+and SciPy. The extension releases the GIL during numerical work. Source
+checkouts need a matching artifact prepared before numerical execution. Wheels
+include it. Compiled topology, interpolation, Spherical/Radial CPU projection,
+sparse scatter and packed publication propagate kernel failures. CLI help and
+version discovery do not load the extension. See the
+[native CPU guide](docs/native_cpu.md) for the source build and ABI checks.
 
 TTA also requires the C++17 prepared scheduler extension. Platform wheels
 supply it. A complete source checkout can build and cache it outside the
@@ -577,7 +579,7 @@ crops on CPU, and binds cache/feature identity to the captured content and
 physical recipe. Within-canvas enlargement and cyclic mirrors use the existing
 geometry. A per-cohort decoded-chunk LRU is bounded to 64 MiB and charged to its
 workspace. Missing, incomplete or source-incompatible caches use the ordinary renderer;
-CPU steals can leave a view incomplete. Ordinary Cartesian and dense optional tile
+CPU steals can leave a view incomplete. Ordinary Cartesian and optional tile
 capture are outside this route. Run-scratch cleanup retires the cache root.
 Compression savings are data-dependent; capture
 declines when its 16 GiB free-space floor cannot be preserved, retaining the
@@ -758,7 +760,7 @@ retries no sooner than half a second later. Cancellation and detector retirement
 are rechecked after the probe. SAM planning runs under fresh admission and reuses
 matching regular-disk image caches.
 Cleanup runs once; confidence capture, tile support and publication retain their
-normal order. Dense tiling and bounded policy groups use ordinary preparation.
+normal order. Tiling and bounded policy groups use ordinary preparation.
 `sam_resources` reserves additional SAM CPU workspace atomically with the
 parent's base reservation, using actual physical/cgroup/SLURM headroom and the
 resolved pool limit. Temporary pool or promised-RAM contention waits without

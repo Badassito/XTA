@@ -11,7 +11,7 @@ import time
 def loaded_runtime_versions():
     """Describe already imported numerical libraries without loading anything."""
     versions = {"python": sys.version.split()[0]}
-    for name in ("numpy", "numba", "llvmlite", "torch", "cupy", "tensorrt", "openvino"):
+    for name in ("numpy", "torch", "cupy", "tensorrt", "openvino"):
         module = sys.modules.get(name)
         version = vars(module).get("__version__") if module is not None else None
         if isinstance(version, str):

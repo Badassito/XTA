@@ -3,8 +3,8 @@
 The per-block ``zlib.decompressobj`` reader re-acquires the GIL several times
 for every 128x128 block. In a busy main process each re-acquisition waits about
 one switch interval, so one parent's restore took tens of seconds. This module
-calls zlib's ``uncompress2`` from one ``@njit(nogil=True)`` kernel per batch of
-blocks; the GIL is released once per batch.
+calls zlib's ``uncompress2`` from a compiled loop that releases the GIL once
+for a complete batch of blocks.
 
 Acceptance is the exact ``BlockScoreReader`` contract: a block is accepted
 only when its zlib stream (default 15-bit window, no preset dictionary) ends
@@ -21,96 +21,17 @@ import ctypes
 import ctypes.util
 import os
 import threading
-import time
 import zlib
 
 import numpy as np
 
-from ._deps import _numba
-from .confidence_native_codec import _void_pointer
+from .confidence_storage import BLOCK_DTYPE
+from .native_cpu import kernels
+from .native_cpu_build import NativeCpuBuildError
 
 
 _LOCK = threading.Lock()
 _CACHE = {}
-_STATUS_BOUNDS = -100
-_STATUS_LENGTH = -101
-
-
-def _make_kernels(inflater, ulong_dtype):
-    @_numba.njit(nogil=True, cache=False)
-    def inflate_blocks(payload, records, base, decoded, starts):
-        """Inflate index records into contiguous segments (one guard byte at the end).
-
-        ``records`` is the block index slice; ``payload`` holds its stored
-        bytes starting at absolute offset ``base``.
-        """
-        dest_length = np.empty(1, ulong_dtype)
-        source_length = np.empty(1, ulong_dtype)
-        for item in range(records.shape[0]):
-            record = records[item]
-            area = np.int64(record['h'])*np.int64(record['w'])
-            offset = np.int64(record['offset'])-base
-            length, start = np.int64(record['length']), starts[item]
-            if (area <= 0 or length <= 0 or offset < 0 or offset+length > payload.shape[0]
-                    or start < 0 or start+area+1 > decoded.shape[0]):
-                return item, _STATUS_BOUNDS
-            dest_length[0] = area+1
-            source_length[0] = length
-            status = inflater(_void_pointer(decoded.ctypes.data+np.uintp(start)),
-                _void_pointer(dest_length.ctypes.data),
-                _void_pointer(payload.ctypes.data+np.uintp(offset)),
-                _void_pointer(source_length.ctypes.data))
-            if status != 0:
-                return item, np.int64(status)
-            if np.int64(dest_length[0]) != area or np.int64(source_length[0]) != length:
-                return item, _STATUS_LENGTH
-        return records.shape[0], 0
-
-    @_numba.njit(nogil=True, cache=False)
-    def inflate_scatter(payload, records, base, output):
-        """Inflate records and assign each crop into output in record order.
-
-        Returns (completed records, status, decoded crop bytes assigned).
-        """
-        largest = 1
-        for item in range(records.shape[0]):
-            largest = max(largest, np.int64(records[item]['h'])*np.int64(records[item]['w'])+1)
-        scratch = np.empty(largest, np.uint8)
-        dest_length = np.empty(1, ulong_dtype)
-        source_length = np.empty(1, ulong_dtype)
-        decoded = 0
-        for item in range(records.shape[0]):
-            record = records[item]
-            z, y, x = np.int64(record['z']), np.int64(record['y']), np.int64(record['x'])
-            h, w = np.int64(record['h']), np.int64(record['w'])
-            area = h*w
-            offset = np.int64(record['offset'])-base
-            length = np.int64(record['length'])
-            if (h <= 0 or w <= 0 or length <= 0 or offset < 0 or offset+length > payload.shape[0]
-                    or not 0 <= z < output.shape[0] or y < 0 or y+h > output.shape[1]
-                    or x < 0 or x+w > output.shape[2]):
-                return item, _STATUS_BOUNDS, decoded
-            dest_length[0] = area+1
-            source_length[0] = length
-            status = inflater(_void_pointer(scratch.ctypes.data),
-                _void_pointer(dest_length.ctypes.data),
-                _void_pointer(payload.ctypes.data+np.uintp(offset)),
-                _void_pointer(source_length.ctypes.data))
-            if status != 0:
-                return item, np.int64(status), decoded
-            if np.int64(dest_length[0]) != area or np.int64(source_length[0]) != length:
-                return item, _STATUS_LENGTH, decoded
-            at = 0
-            for row in range(y, y+h):
-                for column in range(x, x+w):
-                    output[z, row, column] = scratch[at]
-                    at += 1
-            decoded += area
-        return records.shape[0], 0, decoded
-
-    return inflate_blocks, inflate_scatter
-
-
 class NativeConfidenceInflater:
     """Retain one probed zlib library and its two nogil batch kernels."""
 
@@ -127,9 +48,9 @@ class NativeConfidenceInflater:
         inflater.argtypes = [ctypes.c_void_p]*4
         inflater.restype = ctypes.c_int
         self._inflater = inflater
-        self._ulong = np.uint32 if ctypes.sizeof(ctypes.c_ulong) == 4 else np.uint64
-        self._inflate_blocks, self._inflate_scatter = _make_kernels(inflater, self._ulong)
+        self._address = ctypes.cast(inflater, ctypes.c_void_p).value
         self._probe()
+        self._probe_batches()
 
     def _call(self, encoded, capacity):
         source = ctypes.create_string_buffer(encoded, max(1, len(encoded)))
@@ -190,23 +111,21 @@ class NativeConfidenceInflater:
         supplies the segment starts and their total so no small numpy
         operation (each a GIL round trip under load) runs here.
         """
+        if records.dtype != BLOCK_DTYPE:
+            raise ValueError('Invalid confidence block record layout')
         decoded = np.empty(int(decoded_bytes)+1, np.uint8)
-        count, status = self._inflate_blocks(payload, records, int(base), decoded, starts)
+        count, status = kernels.inflate_confidence_blocks(self._address, payload, records, int(base), decoded, starts)
         return decoded, int(count), int(status)
 
     def inflate_scatter(self, payload, records, base, output):
         """Return (count, status, decoded bytes); records before count were assigned."""
-        count, status, decoded = self._inflate_scatter(payload, records, int(base), output)
+        if records.dtype != BLOCK_DTYPE:
+            raise ValueError('Invalid confidence block record layout')
+        count, status, decoded = kernels.inflate_confidence_scatter(self._address, payload, records, int(base), output)
         return int(count), int(status), int(decoded)
 
-    def warm(self):
-        """Compile both kernels for the only argument types production passes.
-
-        Records are a readonly C-contiguous slice of the BLOCK_DTYPE index
-        memmap (a readonly ndarray types identically); payload and decode
-        buffers are fresh uint8 arrays; output is a writable C uint8 3-D grid.
-        """
-        from .confidence_storage import BLOCK_DTYPE
+    def _probe_batches(self):
+        """Check the selected provider through each compiled batch entry point."""
         raw = np.arange(6, dtype=np.uint8)+11
         encoded = zlib.compress(raw.tobytes(), 3)
         payload = np.empty(len(encoded)+5, np.uint8)
@@ -243,10 +162,11 @@ def _load_backend(key):
     for filename, source in candidates:
         try:
             inflater = NativeConfidenceInflater(ctypes.CDLL(filename), source=source)
-            inflater.warm()
             return inflater, dict(backend='native_uncompress2', codec_version=inflater.version,
                 python_zlib_version=zlib.ZLIB_RUNTIME_VERSION, library_source=source,
                 fallback_reason=None)
+        except NativeCpuBuildError:
+            raise
         except Exception as exc:
             errors.append(f'{source}:{type(exc).__name__}:{str(exc)[:160]}')
     reason = ';'.join(errors) if errors else 'native_zlib_library_not_available'
@@ -268,21 +188,4 @@ def native_confidence_inflater():
     return inflater, dict(receipt)
 
 
-def warm_confidence_inflate_kernels():
-    """Load, probe and compile the score-block inflate kernels before the process is busy.
-
-    Production passes a readonly BLOCK_DTYPE index-memmap slice, fresh uint8
-    payload/decode buffers, int64 starts, and a writable C uint8 3-D restore
-    destination (np.memmap and memfd-backed ndarray type identically).
-    """
-    started = time.perf_counter()
-    inflater, receipt = native_confidence_inflater()
-    if inflater is not None:
-        inflater.warm()
-        receipt.update(blocks_signatures=len(inflater._inflate_blocks.nopython_signatures),
-                       scatter_signatures=len(inflater._inflate_scatter.nopython_signatures))
-    receipt['seconds'] = time.perf_counter()-started
-    return receipt
-
-
-__all__ = ['NativeConfidenceInflater', 'native_confidence_inflater', 'warm_confidence_inflate_kernels']
+__all__ = ['NativeConfidenceInflater', 'native_confidence_inflater']

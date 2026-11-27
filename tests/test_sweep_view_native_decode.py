@@ -534,3 +534,98 @@ def test_decoder_disabled_by_configuration_reports_python_route(monkeypatch):
     monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_DECODE', 'python')
     decoder, receipt = decode.native_view_decoder()
     assert decoder is None and receipt['fallback_reason'] == 'disabled_by_configuration'
+
+
+@pytest.mark.parametrize('case', CASES, ids=lambda case: f'seed{case[0]}')
+def test_sibling_family_matches_cutoff_readers_and_skips_consumed_iterators(
+        family, monkeypatch, route, case, tmp_path):
+    seed, shape, cuts, tasks, padding, scalar_owned, background, verify, chunk_bytes = case
+    if chunk_bytes is not None:
+        monkeypatch.setattr(views, '_CHUNK_BYTES', chunk_bytes)
+    monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_VERIFY', str(int(verify)))
+    build(family, np.random.default_rng(seed), shape, cuts, tasks=tasks, padding=padding,
+          scalar_owned=scalar_owned, background=background)
+    with ExitStack() as stack:
+        ordinary = {c: stack.enter_context(views.open_view('detector', VIEW, c, native_shape=shape, root=family))
+                    for c in cuts[1:]}
+        opened, verified = [], []
+        decision, check_range = views._decision, views._range
+        with monkeypatch.context() as audit:
+            def acquire(*args, **kwargs):
+                opened.append(1)
+                return decision(*args, **kwargs)
+            def validate(root, receipt, product, cutoffs):
+                verified.append(receipt['path'])
+                return check_range(root, receipt, product, cutoffs)
+            audit.setattr(views, '_decision', acquire)
+            audit.setattr(views, '_range', validate)
+            joint = stack.enter_context(views.open_sibling_views('detector', VIEW, cuts,
+                                                                 native_shape=shape, root=family))
+        assert len(opened) == 1
+        assert verified == [receipt['path'] for receipt in joint.metadata['ranges']]
+        ordinary_wrappers, family_wrappers = [], []
+        new_iterator = views._MaskFrameCrops.__init__
+        def count_iterator(iterator, reader, z):
+            counts = family_wrappers if reader is joint.readers[reader.cutoff] else ordinary_wrappers
+            counts.append((reader.cutoff, z))
+            new_iterator(iterator, reader, z)
+        monkeypatch.setattr(views._MaskFrameCrops, '__init__', count_iterator)
+        subsets = (cuts[1:], cuts[-1:], cuts[1::2])
+        for selected in subsets:
+            separate = rank_input(selected, shape, tmp_path, lambda c, z: ordinary[c].iter_mask_crops(z))
+            grouped = rank_input(selected, shape, tmp_path, joint)
+            if separate[0] is None:
+                assert grouped[0] is None
+            else:
+                np.testing.assert_array_equal(grouped[0], separate[0])
+            np.testing.assert_array_equal(grouped[1], separate[1])
+            assert grouped[2:] == separate[2:]
+        assert len(ordinary_wrappers) == shape[0]*sum(map(len, subsets))
+        if route == 'native' and not verify:
+            padded = set().union(*(reader._padding for reader in joint.readers.values()))
+            assert all(z in padded for _, z in family_wrappers)
+            assert len(family_wrappers) < len(ordinary_wrappers)
+        assert {c: r.io_metrics for c, r in joint.readers.items()} == {c: r.io_metrics for c, r in ordinary.items()}
+        with pytest.raises(ValueError):
+            joint.rank_merger((cuts[-1], cuts[-1]), shape)
+        with pytest.raises(ValueError):
+            joint.rank_merger((cuts[0],), shape)
+        merge = joint.rank_merger(cuts[1:], shape)
+        with pytest.raises(ValueError, match='gap check'):
+            merge(0, None, np.empty(0, bool))
+        joint.readers[cuts[-1]].close()
+        with pytest.raises(RuntimeError, match='closed'):
+            merge(0, None, np.zeros(len(cuts)-1, bool))
+
+
+def test_sibling_family_declines_corrupt_late_lane_without_writing_or_charging(family, route, tmp_path):
+    shape = (2, 3, 5)
+    cuts = (50, 70, 90)
+    writer = views.NativeTaskFanoutWriter(family, 'detector', VIEW, shape, cuts, frame_start=0,
+                                          expected_frames=2, backend='test')
+    for c in cuts:
+        writer.put_empty_range(c, 0, 1)
+        writer.put(c, 1, np.ones((2, 3), np.uint8), bbox=(0, 2, 1, 4))
+    offset = int(writer.index[-1, 1]['offset'])
+    receipt = writer.finish()
+    views.seal_view_family('detector', VIEW, shape, cuts, receipts=[receipt], root=family)
+    payload = Path(receipt['path']) / 'payload.bin'
+    with payload.open('r+b') as stream:
+        stream.seek(offset + views._CHUNK.size)
+        stream.write(b'\x00\x00')
+    with views.open_sibling_views('detector', VIEW, cuts, native_shape=shape, root=family) as joint:
+        merge = joint.rank_merger(cuts[1:], shape)
+        checks = np.array([False, True])
+        empty = merge(0, None, checks)
+        assert empty is not None and empty[0] is None
+        plane = np.full(shape[1:], 7, np.uint8)
+        assert merge(1, plane, checks) is None
+        assert (plane == 7).all()
+        assert all(r.io_metrics['payload_read_bytes'] == 0 for r in joint.readers.values())
+        with pytest.raises(views.SweepViewIntegrityError) as failure:
+            rank_input(cuts[1:], shape, tmp_path, joint)
+    with ExitStack() as stack:
+        separate = {c: stack.enter_context(views.open_view('detector', VIEW, c, root=family)) for c in cuts[1:]}
+        with pytest.raises(views.SweepViewIntegrityError) as expected:
+            rank_input(cuts[1:], shape, tmp_path, lambda c, z: separate[c].iter_mask_crops(z))
+    assert str(failure.value) == str(expected.value)

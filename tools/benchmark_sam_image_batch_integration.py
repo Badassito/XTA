@@ -194,7 +194,7 @@ def available_host_bytes():
 def verify_metadata_fixtures(config):
     """Run the actual metadata planner while refusing all GPU-package imports."""
     import importlib.abc
-    forbidden=('torch','cupy','pycuda','cuda','numba.cuda','nvidia')
+    forbidden=('torch','cupy','pycuda','cuda','nvidia')
     def gpu_module(name):
         return any(name==prefix or name.startswith(prefix+'.') for prefix in forbidden)
     if any(gpu_module(name) for name in sys.modules):
@@ -301,10 +301,10 @@ def run_qualification(config, initial, output, config_sha256):
         (output/'results.json').write_text(json.dumps(report, indent=2, default=str)+'\n', encoding='utf-8')
     save()
     for key, folder in (('TEMP','temp'),('TMP','temp'),('CUDA_CACHE_PATH','cuda-cache'),
-                        ('CUPY_CACHE_DIR','cupy-cache'),('NUMBA_CACHE_DIR','numba-cache'),('YOLO_CONFIG_DIR','yolo-config')):
+                        ('CUPY_CACHE_DIR','cupy-cache'),('YOLO_CONFIG_DIR','yolo-config')):
         path=output/folder;path.mkdir(exist_ok=True);os.environ[key]=str(path)
     os.environ.update(CUDA_VISIBLE_DEVICES='0',PYTHONDONTWRITEBYTECODE='1',OMP_NUM_THREADS='1',
-        MKL_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',NUMBA_NUM_THREADS='1',
+        MKL_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',
         YOLO_TTA_TELEMETRY='0',YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER='0',YOLO_TTA_TASK_TRACE='0',
         YOLO_TTA_SAM_GPU_IMAGES='1',YOLO_TTA_SAM_RENDER_MAX_BYTES=str(config['scratch_bytes']))
     sys.dont_write_bytecode=True

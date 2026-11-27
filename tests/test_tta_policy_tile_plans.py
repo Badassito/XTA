@@ -6,7 +6,7 @@ import pytest
 
 from XTA.geometry import (
     TileConfig, _build_cartesian_view, build_aug_job_for_variant,
-    build_dense_tile_jobs_for_aug, build_dense_tile_raster_plan,
+    build_tile_jobs_for_aug, build_tile_raster_plan,
     expand_views_into_policy_variants, expand_views_into_tta_variants,
 )
 
@@ -20,13 +20,13 @@ def test_policy_tile_plan_uses_explicit_angle_and_preserves_output_identity(angl
     plan_ids = set()
     for view in variants:
         job = build_aug_job_for_variant(view, 128)
-        tiles = build_dense_tile_jobs_for_aug(view, job, TileConfig(32, 32, 'cfg1'), 128)
+        tiles = build_tile_jobs_for_aug(view, job, TileConfig(32, 32, 'cfg1'), 128)
         assert tiles
         if reference_tiles is None:
             reference_tiles = tiles
         assert len(tiles) == len(reference_tiles)
         for reference, tile in zip(reference_tiles, tiles):
-            plan = build_dense_tile_raster_plan(view, tile)
+            plan = build_tile_raster_plan(view, tile)
             assert plan.in_plane_variant.angle_deg == pytest.approx(angle % 360.)
             assert plan.metadata['runtime_view_id'] == view.name
             assert plan.metadata['runtime_job_id'] == tile.tile_id

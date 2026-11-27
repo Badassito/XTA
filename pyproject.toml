@@ -9,7 +9,6 @@ description = "Volume test-time, pretraining, and label-time augmentation"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
-  "numba>=0.61.2",
   "opencv-python",
   "scipy",
   "tifffile",
@@ -46,7 +45,7 @@ version = {attr = "XTA.__version__"}
 "share/xta" = [
   "README.md",
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v26.2.0_SLURM.py",
+  "GPT-6-Astra-Ultra_v26.2.1_SLURM.py",
 ]
 "share/xta/docs" = ["docs/*.md"]
 "share/xta/tools/slicer" = ["tools/slicer/*.py"]

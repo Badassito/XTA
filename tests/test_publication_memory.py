@@ -12,7 +12,7 @@ import numpy as np
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from XTA import publication_memory as memory
-from XTA import interpolation
+from XTA import interpolation, workspace
 from XTA.config import GIB
 from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter, RawBBoxMaskStore, INTERNAL_PACKED_CVOL_FORMAT
 from XTA.runtime import release_memfd_owners_under
@@ -262,7 +262,7 @@ class PublicationMemoryPlanTests(unittest.TestCase):
             with self.subTest(confidence=confidence, tiles=tiles, layers=layers):
                 self.assertEqual(memory.native_fullframe_dense_reserve(tasks,
                     total_dense_limit=10000, min_conf=confidence,
-                    dense_tiling=tiles, nrrd_layers=layers), 2*3*7*4*canvases)
+                    tiling=tiles, nrrd_layers=layers), 2*3*7*4*canvases)
 
     def test_policy_group_must_fit_the_simultaneous_dense_window(self):
         for mode in ('file', 'direct_union'):
@@ -602,25 +602,45 @@ for task,a in zip(json.loads(sys.argv[1]), _cache_export_volumes()):
         self.assertEqual(actual['worker_buffer_reserve_bytes'],host)
 
     def test_swap_is_never_counted_as_ram_headroom(self):
-        with mock.patch.object(memory, '_read_meminfo_bytes', return_value={'MemAvailable': 10, 'SwapFree': 1000}), \
-                mock.patch.object(memory, 'available_anon_work_bytes', return_value=1010):
+        sample = mock.Mock(side_effect=[
+            ({'MemAvailable': 10, 'SwapFree': 1000}, None, None),
+            ({'MemAvailable': 1000}, 20, None),
+            ({'MemAvailable': 1000, 'SwapFree': 1000}, 0, None),
+        ])
+        with mock.patch.object(workspace, '_memory_sample', sample), \
+                mock.patch.object(memory, 'os', SimpleNamespace(name='posix')):
             self.assertEqual(memory.publication_ram_headroom(), 10)
-        with mock.patch.object(memory, '_read_meminfo_bytes', return_value={'MemAvailable': 1000}), \
-                mock.patch.object(memory, 'available_anon_work_bytes', return_value=20):
             self.assertEqual(memory.publication_ram_headroom(), 20)
+            self.assertEqual(memory.publication_ram_headroom(), 0)
+        self.assertEqual(sample.call_args_list, [
+            mock.call(include_meminfo=True, include_cgroup=True)] * 3)
 
     def test_windows_headroom_uses_physical_available_without_swap(self):
         psutil = SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=1234),
                                  swap_memory=lambda: SimpleNamespace(free=987654321))
-        with mock.patch.object(memory, '_read_meminfo_bytes', return_value={}), \
-                mock.patch.object(memory.os, 'name', 'nt'), \
-                mock.patch.dict(sys.modules, {'psutil': psutil}), \
-                mock.patch.object(memory, 'available_anon_work_bytes', return_value=99999999):
+        with mock.patch.object(workspace, '_memory_sample', return_value=({}, None, None)) as sample, \
+                mock.patch.object(memory, 'os', SimpleNamespace(name='nt')), \
+                mock.patch.dict(sys.modules, {'psutil': psutil}):
             self.assertEqual(memory.publication_ram_headroom(), 1234)
-        with mock.patch.object(memory, '_read_meminfo_bytes', return_value={}), \
-                mock.patch.object(memory.os, 'name', 'nt'), \
+        sample.assert_called_once_with(include_meminfo=True, include_cgroup=False)
+        with mock.patch.object(workspace, '_memory_sample', return_value=({}, None, None)) as sample, \
+                mock.patch.object(memory, 'os', SimpleNamespace(name='nt')), \
                 mock.patch.dict(sys.modules, {'psutil': None}):
             self.assertEqual(memory.publication_ram_headroom(), 0)
+        sample.assert_called_once_with(include_meminfo=True, include_cgroup=False)
+
+    def test_windows_meminfo_availability_keeps_cgroup_clamp(self):
+        sample = mock.Mock(side_effect=[
+            ({'MemAvailable': 1234, 'SwapFree': 987654321}, None, None),
+            ({}, 678, None),
+        ])
+        with mock.patch.object(workspace, '_memory_sample', sample), \
+                mock.patch.object(memory, 'os', SimpleNamespace(name='nt')):
+            self.assertEqual(memory.publication_ram_headroom(), 678)
+        self.assertEqual(sample.call_args_list, [
+            mock.call(include_meminfo=True, include_cgroup=False),
+            mock.call(include_meminfo=False, include_cgroup=True, verify_enforcement=False),
+        ])
 
     def test_private_payload_spill_preserves_bytes_and_releases_original_backing(self):
         volume = np.random.default_rng(13).integers(0, 2, (5, 17, 43), dtype=np.uint8)

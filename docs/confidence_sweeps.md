@@ -1,19 +1,24 @@
 # TTA confidence sweeps
 
-The `--conf` range form selects multiple operating points in one TTA invocation.
+The `--conf` sweep form selects multiple operating points in one TTA invocation.
 For example, run this on a GPU with an instance model:
 
 ```text
 python -m XTA --mode tta --input sample.mkv --model gpu:best.pt --device 0 --enable_cartesian transverse sagittal coronal --conf 0.50:0.10:1.00 --interpolation_backend sdf --interpolation_distance 30 --save low_quality:0.20:nrrd,xtareview,video full_quality:images,labels,voxel_volume --output sample_sweep
 ```
 
-The form is `START:STEP:END`. Use values from 0 through 1 on the hundredth
+Each range has the form `START:STEP:END`. Use values from 0 through 1 on the hundredth
 grid and a positive step that lands on the end. Both endpoints are included.
-The example computes 0.50, 0.60, 0.70, 0.80, 0.90 and 1.00. The single-value
-form retains its original precision and defaults. In a range, the secondary
-gate `--min_conf` defaults to zero. If supplied explicitly, the same secondary
-gate applies to every branch. For comparisons with existing scalar runs,
-specify the same gate explicitly in those runs.
+The example computes 0.50, 0.60, 0.70, 0.80, 0.90 and 1.00. To combine
+ranges and individual hundredth cutoffs in one sweep, give them as separate
+arguments after one `--conf`. For example, `--conf 0.1:0.1:1.0 0.9:0.02:1.0`
+uses steps of 0.10 up to 0.90 and steps of 0.02 from 0.90 to 1.00.
+Cutoffs run in ascending order and overlapping values run once.
+
+The single scalar form retains its original precision and defaults. In a
+sweep, the secondary gate `--min_conf` defaults to zero. If supplied
+explicitly, the same secondary gate applies to every branch. For comparisons
+with existing scalar runs, specify the same gate explicitly in those runs.
 
 For `--task segment`, the primary cutoff applies to detection confidence. For
 `--task semantic`, it applies to foreground probability. Each backend uses its
@@ -24,7 +29,7 @@ An empty result at a high cutoff is a valid computed branch.
 
 ## Compute and output
 
-For eligible ranges the lowest-cutoff child dispatches **view batches**. The
+For eligible sweeps the lowest-cutoff child dispatches **view batches**. The
 worker renders and preprocesses the batch once, evaluates the model once, and
 uses the live outputs to produce each cutoff's native mask and any requested observed scores.
 The scalar writer already owns the lowest-cutoff pixels, so its entry in the

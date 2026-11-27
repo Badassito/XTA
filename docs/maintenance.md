@@ -98,6 +98,18 @@ variable.
 
 ## Packaging checks
 
+Numerical work needs the native CPU extension. With the interpreter that
+runs the launcher, prepare an artifact outside the source checkout:
+
+```text
+python -B tools/build_native_cpu.py --artifacts-dir ../Scratch/Temp/xta-native-cpu
+```
+
+Set `XTA_NATIVE_CPU_ARTIFACTS` to that directory for source launches and
+tests. Without an override, the tool and loader use the platform's per-user
+cache. Release qualification builds its own artifact before running tests.
+See the [native CPU guide](native_cpu.md) for artifact and wheel details.
+
 TTA requires the compiled `XTA._prepared_scheduler` extension. Standard XTA
 wheels carry it. Build a wheel from source with setuptools, the CPython
 development headers, and a C++17 toolchain. On Windows use MSVC Build Tools and
@@ -123,7 +135,7 @@ PTA, and LTA do not need a scheduler build.
 The packaging integration tests build an sdist, build a wheel from that sdist,
 and install it into an isolated target outside the checkout. They check that
 test helpers and fixtures survive source packaging, that the installed wheel
-loads its native scheduler, that companion scripts accompany installed user
+loads its native CPU kernels and scheduler, that companion scripts accompany installed user
 tools, and that `tests` is not installed as a runtime Python package.
 Keep this artifact check when changing packaging patterns: a list of filenames
 in metadata does not prove the built package contains a working tool.

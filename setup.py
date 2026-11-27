@@ -1,4 +1,4 @@
-"""Build the required TTA scheduler and optional Intel accelerator extensions.
+"""Build the required native CPU kernels and TTA scheduler, plus optional Intel support.
 
 The scheduler requires a C++17 compiler. Source builds on an Intel accelerator image
 discover QATzip/QPL through pkg-config and the kernel DSA user ABI through
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import platform
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -42,6 +43,27 @@ def _prepared_scheduler() -> Extension:
         libraries=libraries,
         extra_compile_args=compile_args,
         extra_link_args=link_args,
+    )
+
+
+def _cpu_kernels() -> Extension:
+    recipe = runpy.run_path(str(Path(__file__).resolve().parent / "XTA" / "native_cpu_build.py"))
+    source_sha256 = recipe["cpu_source_identity"]()
+    return Extension(
+        "_xta_cpu_kernels",
+        sources=recipe["cpu_extension_sources"](),
+        depends=recipe["cpu_extension_dependencies"](),
+        language="c++",
+        define_macros=[
+            ("XTA_CPU_SOURCE_SHA256", f'"{source_sha256}"'),
+            *((f"XTA_CPU_DIGEST_{domain}", f'"{digest}"')
+              for domain, digest in recipe["cpu_domain_identities"]().items()),
+        ],
+        extra_compile_args=(
+            ["/std:c++17", "/EHsc", "/fp:strict"] if sys.platform == "win32" else
+            ["-std=c++17", "-fno-fast-math", "-ffp-contract=off", "-pthread"]
+        ),
+        extra_link_args=[] if sys.platform == "win32" else ["-pthread"],
     )
 
 
@@ -255,4 +277,15 @@ def _intel_extensions() -> List[Extension]:
     return extensions
 
 
-setup(ext_modules=[_prepared_scheduler(), *_intel_extensions()], zip_safe=False)
+def _extensions() -> List[Extension]:
+    selected = os.environ.get("XTA_BUILD_EXTENSION", "") if sys.argv[1:2] == ["build_ext"] else ""
+    if selected == "cpu":
+        return [_cpu_kernels()]
+    if selected == "scheduler":
+        return [_prepared_scheduler()]
+    if selected:
+        raise RuntimeError(f"Unknown XTA native build target: {selected!r}")
+    return [_cpu_kernels(), _prepared_scheduler(), *_intel_extensions()]
+
+
+setup(ext_modules=_extensions(), zip_safe=False)

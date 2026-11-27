@@ -46,7 +46,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
     def arguments(self, original):
         return dict(model_name='model', view=self.view, union_mm=original, confmap_mm=None,
                     union_path=self.root / 'original.dat', confmap_path=None, temp_dir=self.root,
-                    dense_tiling_active=False, min_conf=0, min_radius=0, interpolate=3,
+                    tiling_active=False, min_conf=0, min_radius=0, interpolate=3,
                     interpolation_walk_back=1, interpolation_candidates=2, interpolate_passes=1,
                     interpolate_min_radius=0, interpolation_search_angle=0,
                     slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,
@@ -135,7 +135,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
         original = self.mapping('tile-original.dat')
         supports = []
         args = self.arguments(original)
-        args.update(dense_tiling_active=True,
+        args.update(tiling_active=True,
                     parent_mask_ready_callback=lambda model, view, support: supports.append(support))
         with mock.patch.object(assembly, 'cleanup_view_volume_after_prediction_inplace'), \
              mock.patch.object(assembly, 'allocate_workspace_array',
@@ -174,7 +174,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
             model_name='model', view=self.view, union_mm=None if materialized else local,
             confmap_mm=None, d1_shadow_path=self.root / 'input.cvol',
             union_path=Path(local.filename), confmap_path=None, temp_dir=self.root,
-            dense_tiling_active=False, min_conf=0, min_radius=0,
+            tiling_active=False, min_conf=0, min_radius=0,
             interpolation_distance=3, interpolation_walk_back=1,
             interpolation_candidates=2, interpolation_passes=1,
             interpolation_min_radius=0, interpolation_search_angle=0,

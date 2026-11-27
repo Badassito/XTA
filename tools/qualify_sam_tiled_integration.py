@@ -185,7 +185,7 @@ def seam(args):
             prepared = assembly.prepare_view_volume_after_fullframe(
                 model_name="actual_detector", view=view, union_mm=observations, confmap_mm=None,
                 union_path=runroot / "original.uint8.dat", confmap_path=None, temp_dir=runroot / "temporary",
-                dense_tiling_active=True, min_conf=0., min_radius=0., interpolate=15,
+                tiling_active=True, min_conf=0., min_radius=0., interpolate=15,
                 interpolation_walk_back=0, interpolation_candidates=1, interpolate_passes=1,
                 interpolate_min_radius=3., interpolation_search_angle=30.,
                 slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,

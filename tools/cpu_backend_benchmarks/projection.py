@@ -1,6 +1,6 @@
 """Bounded production CPU projection cases; this module does not time them.
 
-Factories build deterministic mask geometry and compile optional kernels before
+Factories build deterministic mask geometry and load the native extension before
 the runner starts trials. Every case returns one small output block. Neither a
 full native output volume nor a GPU is allocated here.
 """
@@ -18,7 +18,7 @@ from XTA.spherical_geometry import build_spherical_view_infos
 from XTA.spherical_projection_bounds import spherical_output_bounds
 from XTA.spherical_projection_cpu import (
     SphericalCpuProjectionUnavailable,
-    prepare_spherical_chunk_numba,
+    prepare_spherical_chunk_native,
 )
 from tests.reference_backends.spherical import project_spherical_block as reference_spherical_block
 from tests.reference_backends.radial import pull_radial_chunk as reference_radial_chunk
@@ -62,7 +62,7 @@ def _spherical_case(workload: str) -> Case:
     bounds = spherical_output_bounds(view, output_shape, boxes)
     first = min(max(0, (int(bounds.z0) + int(bounds.z1) - count) // 2), output_shape[0] - count)
     try:
-        compiled_pull = prepare_spherical_chunk_numba(
+        compiled_pull = prepare_spherical_chunk_native(
             source, view, radii, rotation, output_shape, boxes,
         )
     except SphericalCpuProjectionUnavailable as exc:
@@ -81,7 +81,7 @@ def _spherical_case(workload: str) -> Case:
         )
 
     return Case(
-        name=f'spherical_{workload}_numpy_vs_numba',
+        name=f'spherical_{workload}_numpy_vs_native',
         reference=reference,
         compiled=compiled,
         work_units=count * output_shape[1] * output_shape[2],
@@ -89,7 +89,7 @@ def _spherical_case(workload: str) -> Case:
         metadata={
             'family': 'spherical', 'workload': workload,
             'reference': 'tests.reference_backends.spherical.project_spherical_block',
-            'production_compiled': 'XTA.spherical_projection._project_spherical_block(cpu_pull=prepare_spherical_chunk_numba(...))',
+            'production_compiled': 'XTA.spherical_projection._project_spherical_block(cpu_pull=prepare_spherical_chunk_native(...))',
             'setup_included_in_trials': False,
             'working_shape': list(working_shape), 'output_shape': list(output_shape),
             'source_shape': list(source.shape), 'first_z': first, 'block_depth': count,
@@ -127,7 +127,7 @@ def _spherical_native_plane_case() -> Case:
     if not int(bounds.z0) <= first < int(bounds.z1):
         raise RuntimeError('Native Spherical sample plane lies outside analytic output bounds')
     try:
-        compiled_pull = prepare_spherical_chunk_numba(
+        compiled_pull = prepare_spherical_chunk_native(
             source, view, radii, rotation, output_shape,
         )
     except SphericalCpuProjectionUnavailable as exc:
@@ -146,7 +146,7 @@ def _spherical_native_plane_case() -> Case:
         )
 
     return Case(
-        name='spherical_native_plane_numpy_vs_numba',
+        name='spherical_native_plane_numpy_vs_native',
         reference=reference,
         compiled=compiled,
         work_units=output_shape[1] * output_shape[2],
@@ -154,7 +154,7 @@ def _spherical_native_plane_case() -> Case:
         metadata={
             'family': 'spherical', 'workload': 'scaled_native_plane',
             'reference': 'tests.reference_backends.spherical.project_spherical_block',
-            'production_compiled': 'XTA.spherical_projection._project_spherical_block(cpu_pull=prepare_spherical_chunk_numba(...))',
+            'production_compiled': 'XTA.spherical_projection._project_spherical_block(cpu_pull=prepare_spherical_chunk_native(...))',
             'setup_included_in_trials': False,
             'working_shape': list(working_shape), 'output_shape': list(output_shape),
             'source_shape': list(source.shape), 'source_allocated_bytes': int(source_plane.nbytes),
@@ -174,8 +174,6 @@ def _radial_case(workload: str) -> Case:
         working_shape, output_shape, patch_size, count = (43, 65, 67), (37, 69, 71), 32, 1
     else:
         working_shape, output_shape, patch_size, count = (513, 547, 571), (389, 563, 557), 256, 4
-    if radial._numba is None or not hasattr(radial._project_radial_block, 'signatures'):
-        raise RuntimeError('Radial compiled CPU benchmark requires Numba')
     views = geometry.get_view_infos(
         *working_shape, cartesian_views=(), radial_views=('transverse',),
         radial_patch_size=patch_size,
@@ -198,7 +196,7 @@ def _radial_case(workload: str) -> Case:
         int(output_shape[1]), int(output_shape[2]),
     )
     first = output_shape[0] // 2
-    # The pipeline compiles this exact signature before publishing the first slice.
+    # Validate the native binding before timing the first output block.
     radial._project_radial_block(*arguments, first, 0, boxes, True)
 
     def reference() -> np.ndarray:
@@ -216,7 +214,7 @@ def _radial_case(workload: str) -> Case:
         return radial._project_radial_block(*arguments, first, count, boxes, True)
 
     return Case(
-        name=f'radial_{workload}_numpy_reference_vs_numba_factored',
+        name=f'radial_{workload}_numpy_reference_vs_native_factored',
         reference=reference,
         compiled=compiled,
         work_units=count * output_shape[1] * output_shape[2],

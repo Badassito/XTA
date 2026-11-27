@@ -39,19 +39,21 @@ def test_large_native_inputs_mix_with_old_suppliers_and_reserved_cheap_lanes(tmp
         assert [r['policy_turn'] for r in expensive] == ['size', 'age', 'age', 'age'] * 4 + ['size', 'age', 'age']
         assert records[0]['cost_bytes'] == 300 and records[0]['size_rank'] == 1
         assert records[0]['age_rank'] == 25 and records[0]['queue_age_seconds'] >= 0
-        assert len(records) == 21 and all('candidate_denials_dense_limit' in r for r in records)
+        assert len(records) == 21 and all('candidate_denials_native_dense' in r for r in records)
     finally:
         cleanup(stage, leases)
 
 
-@pytest.mark.parametrize('reason', ['dense_limit', 'startup_headroom', 'parent_condition'])
+@pytest.mark.parametrize('reason', ['native_dense', 'startup_headroom', 'parent_condition'])
 def test_denied_long_input_does_not_consume_turn_or_block_fitting_candidate(tmp_path, monkeypatch, reason):
     stage, _writer, _prepare, leases = mixed_queue(tmp_path, workers=2, cap=100)
     first, _ = parent(stage, tmp_path, 'largest', 'radial', 90)
     second, _ = parent(stage, tmp_path, 'fitting', 'spherical', 10)
-    if reason == 'dense_limit':
-        # The existing cheap dense protection leaves only 80 for expensive work.
-        parent(stage, tmp_path, 'cheap', 'orthogonal', 20)
+    expected = [second]
+    if reason == 'native_dense':
+        # The scheduler reserves 20 bytes for the cheap parent before the expensive grant.
+        cheap, _ = parent(stage, tmp_path, 'cheap', 'orthogonal', 20)
+        expected = [cheap, second]
     elif reason == 'startup_headroom':
         monkeypatch.setattr(staging, '_dense_startup_budget_locked', lambda task, _amount:
             dict(remaining_startup_bytes=1, physical_headroom_bytes=0,
@@ -63,10 +65,19 @@ def test_denied_long_input_does_not_consume_turn_or_block_fitting_candidate(tmp_
         monkeypatch.setattr(staging, '_try_parent_condition', condition)
     try:
         resumed, _ = stage.pump()
-        assert first not in resumed.values() and second in resumed.values()
+        assert list(resumed.values()) == expected
         assert stage._expensive_admissions == 1
         assert stage._prepare_arrivals[first]['denials'][reason] == 1
         assert first not in leases.leases
+        if reason == 'native_dense':
+            run = stage._dense_owner.run
+            ledger = run.native.snapshot()
+            assert (ledger['byte_capacity'], ledger['bytes_used'], ledger['blocked_parents']) == (100, 30, 1)
+            assert leases.postprocess_bytes == {cheap: 20, second: 10}
+            grant = stage._native_restore_grants[first]
+            parent_id = run.scheduler._host_requests[grant.namespace, first]
+            assert grant.state == 'Pending'
+            assert run.scheduler._parents[parent_id].admission_reserve == 20
     finally:
         cleanup(stage, leases)
 

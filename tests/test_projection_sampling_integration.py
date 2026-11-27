@@ -251,8 +251,8 @@ class ProjectionSamplingIntegrationTests(unittest.TestCase):
         self.assertIn('projection_sampling', dict(coverage_plan.metadata))
         tile = SimpleNamespace(out_size=32, tile_size=16, tile_stride=8,
                                tile_id='tile0', config_id='tiles16_8', tile_x=0, tile_y=0)
-        dense_tile = g.build_dense_tile_raster_plan(dense, tile)
-        coverage_tile = g.build_dense_tile_raster_plan(coverage, tile)
+        dense_tile = g.build_tile_raster_plan(dense, tile)
+        coverage_tile = g.build_tile_raster_plan(coverage, tile)
         self.assertNotEqual(dense_tile.digest, coverage_tile.digest)
         self.assertNotIn('projection_sampling', dict(dense_tile.metadata))
         self.assertIn('projection_sampling', dict(coverage_tile.metadata))

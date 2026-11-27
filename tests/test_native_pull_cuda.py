@@ -352,3 +352,21 @@ def test_actual_cuda_empty_encoded_payload_never_reads_unallocated_source():
         assert stats['indexed_input_byte_reads']==0
         assert stats['contribution_addresses']>0
     assert not output.any()
+
+
+@_gpu
+def test_actual_cuda_last_valid_tilted_half_step_clamps_frame():
+    view = replace(_views()[0], full_t=1, full_h=3, full_w=1, src_h=3, src_w=1,
+                   num_slices=1, tilt_frame_start=0, tilt_frame_stop=0)
+    source = np.array([[[173], [0], [0]]], np.uint8)
+    plan = prepare_native_pull_plan(view, source.shape, source.shape, max_plan_bytes=1024**2)
+    coeff = plan.coefficients.copy()
+    coeff[0] = np.nextafter(np.float64(.5), np.float64(0))
+    assert coeff[0] < .5 and np.floor(coeff[0] + .5) == 1.
+    coeff.setflags(write=False)
+    plan = replace(plan, coefficients=coeff)
+    output = np.zeros(1, np.uint8)
+    with NativePullCudaSession(source, plan, device_index=0, max_device_bytes=16*1024**2,
+                               max_output_voxels=1, scalar_max=True) as session:
+        session.pull_flat_into(output, first_flat=0)
+    assert output.tolist() == [173]

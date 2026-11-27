@@ -11,8 +11,7 @@ with ``SweepObservedConfidenceWriter.complete_view``. The written bytes depend
 only on the journal crops and the request, so they equal the thread path's.
 
 Workers start with ``spawn`` on every platform (never ``fork`` from this
-multi-threaded producer), warm their compiled kernels once (Numba caches are
-shared through NUMBA_CACHE_DIR), ignore console interrupts (the producer owns
+multi-threaded producer), load the prebuilt CPU extension, ignore console interrupts (the producer owns
 teardown) and exit when the producer process disappears.
 ``XTA_YOLO_SWEEP_EVIDENCE_PROCESSES=0`` keeps evidence on producer threads.
 
@@ -77,7 +76,7 @@ class NativeJournalView:
     decision_sha256: str
 
 
-def resolve_native_journal_view(model_name, view_name, native_shape, cutoffs, identity):
+def resolve_native_journal_view(model_name, view_name, native_shape, cutoffs, identity, *, crops=None):
     """Return the sealed journal decision for this producer view, or raise.
 
     ``identity`` is the one the caller opened its own native readers with: the
@@ -87,13 +86,23 @@ def resolve_native_journal_view(model_name, view_name, native_shape, cutoffs, id
     decision. The decision check (schema, state, family, model, view, shape,
     identity) is the journal's own, the one every reader passes.
     """
+    from types import MethodType
     from . import sweep_views
     cents = tuple(int(c) for c in cutoffs)
     if not cents:
         raise ValueError('Sweep evidence needs at least one sibling cutoff')
-    # sweep_views has no public decision lookup; _decision is the check open_view runs.
-    root, metadata = sweep_views._decision(model_name, view_name, cents[0],
-                                           native_shape=tuple(native_shape), identity=identity)
+    # The producer's own live family already acquired this decision at the
+    # publication boundary. A separate job still reopens and verifies its digest.
+    if (type(crops) is MethodType and type(crops.__self__) is sweep_views._SiblingMaskCrops
+            and crops.__func__ is sweep_views._SiblingMaskCrops.native_crops):
+        family = crops.__self__
+        root, metadata = family.root, family.metadata
+        if (family._closed or any(c not in family.readers for c in cents)
+                or metadata['product'] != sweep_views._product(model_name, view_name, native_shape, identity)):
+            raise sweep_views.SweepViewIntegrityError('Evidence request differs from its open native view family')
+    else:
+        root, metadata = sweep_views._decision(model_name, view_name, cents[0],
+                                               native_shape=tuple(native_shape), identity=identity)
     if metadata is None:
         raise sweep_views.SweepViewIntegrityError(
             f'Sweep evidence found no sealed native view decision for {view_name}')
@@ -184,11 +193,8 @@ def _initialize_evidence_process(producer_pid):
     if hasattr(signal, 'SIGBREAK'):
         signal.signal(signal.SIGBREAK, signal.SIG_IGN)
     from . import sweep_views  # noqa: F401  (imported once, before the first job)
-    from .sweep_confidence import warm_sweep_confidence_kernels
-    warm_sweep_confidence_kernels()
-    # Each job reopens its journal view; load the row kernels before the first.
-    from .sweep_view_decode import warm_native_view_decode_kernels
-    warm_native_view_decode_kernels()
+    from .native_cpu import load_native_cpu
+    load_native_cpu()
 
 
 def _report_ready():
@@ -232,7 +238,7 @@ def widen_evidence_worker_affinity(cpus):
 
 
 def _pool_worker_pids(pool):
-    """Every process the pool's executor spawned (including ones still warming)."""
+    """Every process the pool's executor spawned (including ones still initializing)."""
     pids = set()
     try:
         pids.update(int(pid) for pid in (getattr(pool._executor, '_processes', None) or {}))
@@ -301,7 +307,7 @@ class SweepEvidenceProcessPool:
         started = time.perf_counter()
         try:
             # Each submission without an idle worker starts one: all workers spawn
-            # now and warm while inference starts, not inside a publisher thread.
+            # now and initialize while inference starts, not inside a publisher thread.
             for _ in range(self.processes):
                 future = self._executor.submit(_report_ready)
                 future.add_done_callback(lambda done, began=started: self._ready(done, began))
@@ -326,7 +332,7 @@ class SweepEvidenceProcessPool:
         if future.cancelled() or future.exception() is not None:
             return
         with self._state_lock:
-            # Two warm-up calls can land on one worker; list every live worker.
+            # Two readiness calls can land on one worker; list every live worker.
             try:
                 running = list(getattr(self._executor, '_processes', None) or ())
             except RuntimeError:  # the executor is changing its worker table

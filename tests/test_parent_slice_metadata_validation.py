@@ -45,7 +45,7 @@ class ParentSliceMetadataValidationTests(unittest.TestCase):
             result = assembly.prepare_view_volume_after_fullframe(
                 model_name='model', view=self.view, union_mm=volume, confmap_mm=None,
                 union_path=root / 'union.dat', confmap_path=None, temp_dir=root,
-                dense_tiling_active=False, min_conf=0, min_radius=0, interpolate=0,
+                tiling_active=False, min_conf=0, min_radius=0, interpolate=0,
                 interpolation_walk_back=1, interpolation_candidates=1, interpolate_passes=1,
                 interpolate_min_radius=0, interpolation_search_angle=0,
                 slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,

@@ -179,19 +179,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(observed, arguments)
 
     def test_detector_and_semantic_sweeps_dispatch_before_scalar_pipeline(self) -> None:
-        for task in ("segment", "semantic"):
+        cases = (
+            ("segment", ["--conf", "0.1:0.1:1.0", "0.9:0.02:1.0"],
+             (10, 20, 30, 40, 50, 60, 70, 80, 90, 92, 94, 96, 98, 100)),
+            ("semantic", ["--conf=0.50:0.10:0.70"], (50, 60, 70)),
+        )
+        for task, confidence, cutoffs in cases:
             with self.subTest(task=task):
                 arguments = [
                     "--task", task, "--input", "volume.mkv", "--device", "cpu",
                     "--model", "cpu:detector.xml", "--output", "review",
-                    "--temp", "work", "--conf=0.50:0.10:0.70", "--min_conf=0.20",
+                    "--temp", "work", *confidence, "--min_conf=0.20",
                     "--save=summary,voxel_volume",
                 ]
                 with mock.patch("XTA.confidence_sweep.run_confidence_sweep") as sweep:
                     with mock.patch("XTA.tta_mode.run") as scalar:
                         cli.run(["--mode", "tta", *arguments])
                 sweep.assert_called_once_with(
-                    arguments, cutoffs_hundredths=(50, 60, 70),
+                    arguments, cutoffs_hundredths=cutoffs,
                     output_root=Path("review"), temp_root=Path("work"), min_conf=0.2,
                     save_request=SaveRequest(("summary", "voxel_volume")),
                 )

@@ -7,67 +7,17 @@ an explicit run/pair cap and return to the existing bounded pixel hash.
 from __future__ import annotations
 
 import numpy as np
-from ._deps import _numba
+from .native_cpu import kernels
 
 _TOPOLOGY_RUNS_DISABLED = False
 
 
-@_numba.njit(cache=True, nogil=True)
 def _topology_label_runs(plane, capacity):
-    runs = np.empty((capacity, 3), np.uint32)
-    rows = np.empty(plane.shape[0] + 1, np.int64)
-    count = 0
-    for y in range(plane.shape[0]):
-        rows[y] = count
-        x = 0
-        while x < plane.shape[1]:
-            value = plane[y, x]
-            if value <= 0:
-                x += 1
-                continue
-            first = x
-            x += 1
-            while x < plane.shape[1] and plane[y, x] == value:
-                x += 1
-            if count == capacity:
-                return runs, rows, -1
-            runs[count, 0] = first
-            runs[count, 1] = x
-            runs[count, 2] = value
-            count += 1
-    rows[plane.shape[0]] = count
-    return runs, rows, count
+    return kernels.topology_label_runs(plane, capacity)
 
-@_numba.njit(cache=True, nogil=True)
+
 def _topology_run_intersections(a, arows, b, brows, groups, ao, bo, capacity):
-    codes = np.empty(capacity, np.uint64)
-    count = 0
-    last = np.uint64(0)
-    height = len(arows) - 1
-    for group in groups:
-        dy, dx0, dx1 = group
-        for y in range(height):
-            cy = y + dy
-            if cy < 0 or cy >= height:
-                continue
-            first_b = brows[cy]
-            stop_b = brows[cy + 1]
-            for i in range(arows[y], arows[y + 1]):
-                left = np.int64(a[i, 0]) + dx0
-                right = np.int64(a[i, 1]) + dx1
-                while first_b < stop_b and np.int64(b[first_b, 1]) <= left:
-                    first_b += 1
-                j = first_b
-                while j < stop_b and np.int64(b[j, 0]) < right:
-                    code = ((np.uint64(a[i, 2]) + ao) << np.uint64(32)) | (np.uint64(b[j, 2]) + bo)
-                    if code != last:
-                        if count == capacity:
-                            return codes, -1
-                        codes[count] = code
-                        count += 1
-                        last = code
-                    j += 1
-    return codes, count
+    return kernels.topology_run_intersections(a, arows, b, brows, groups, ao, bo, capacity)
 
 
 def _run_adjacent_pair_codes(prev, curr, offsets, prev_offset=0, curr_offset=0, *,
@@ -103,7 +53,7 @@ def _run_adjacent_pair_codes(prev, curr, offsets, prev_offset=0, curr_offset=0, 
 
 def run_adjacent_pair_codes(prev, curr, offsets, prev_offset=0, curr_offset=0, *,
                             run_cap=65536, pair_cap=262144):
-    """A failed optional compiler falls back before any topology mutation."""
+    """A failed optional run scan falls back before any topology mutation."""
     global _TOPOLOGY_RUNS_DISABLED
     if _TOPOLOGY_RUNS_DISABLED:
         return None

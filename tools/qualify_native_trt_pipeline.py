@@ -36,11 +36,13 @@ def run_case(args, label, ordinal, source_root=None):
         YOLO_TTA_FAST_GEOMETRY='1', YOLO_TTA_TASK_TRACE='1', YOLO_TTA_TELEMETRY='1',
         YOLO_TTA_TELEMETRY_DIR=str(output / 'telemetry'),
         YOLO_TTA_TELEMETRY_SAMPLE_SECONDS='1', YOLO_TTA_TELEMETRY_FLUSH_SECONDS='2',
-        NUMBA_CACHE_DIR=str(args.cache_dir / 'numba-cache'),
         CUPY_CACHE_DIR=str(args.cache_dir / 'cupy-cache'),
         OMP_NUM_THREADS='2', MKL_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2',
         SLURM_CPUS_PER_TASK=str(args.workers), YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND='0')
     environment.pop('YOLO_TTA_TELEMETRY_PATH', None)
+    if label == 'baseline' and not (source_root / 'XTA/native_cpu.py').is_file():
+        # Historical source owns its own compiler and cache policy.
+        environment['NUMBA_CACHE_DIR'] = str(args.cache_dir / 'historical-numba-cache')
     command = [sys.executable, '-B', '-u', '-m', 'XTA', '--mode', 'tta',
         '--input', str(args.input), '--model', 'gpu:' + str(args.engine), '--device', '0',
         '--output', str(output / 'outputs'), '--temp', str(output / 'runtime'),
@@ -55,7 +57,7 @@ def run_case(args, label, ordinal, source_root=None):
         '--save', 'nrrd', 'summary']
     write_json(output / 'invocation.json', {'argv': command, 'mode': label, 'source_root': str(source_root),
         'environment': {k: v for k, v in environment.items()
-                        if k.startswith(('YOLO_', 'NUMBA_', 'CUPY_', 'SLURM_'))
+                        if k.startswith(('YOLO_', 'NUMBA_', 'XTA_NATIVE_CPU_', 'CUPY_', 'SLURM_'))
                         or k in ('PYTHONPATH', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS')}})
     started = time.perf_counter()
     with (output / 'pipeline.log').open('w', encoding='utf-8') as handle:
@@ -86,7 +88,7 @@ def main():
     parser.add_argument('--engine', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--dependency-path', type=Path, action='append', default=[])
-    parser.add_argument('--cache-dir', type=Path, help='Reuse already-warmed compilation caches in Scratch')
+    parser.add_argument('--cache-dir', type=Path, help='Reuse kernel caches in Scratch')
     parser.add_argument('--baseline-root', type=Path,
                         help='Compare this source tree with a baseline, with native TensorRT enabled in both')
     parser.add_argument('--imgsz', type=int, default=256)

@@ -97,7 +97,7 @@ class SphericalMathPreflightCudaTests(unittest.TestCase):
         view = build_spherical_view_infos(*work, targets=('transverse',), min_radius=243.,
                                           patch_size=3072, tilted_views=())[0]
         data = np.random.default_rng(142765).integers(0, 2, (view.num_slices, 9, 9), dtype=np.uint8)
-        prepare = cpu.prepare_spherical_chunk_numba
+        prepare = cpu.prepare_spherical_chunk_native
         visits = []
         def recorded_prepare(*args):
             pull = prepare(*args)
@@ -106,7 +106,7 @@ class SphericalMathPreflightCudaTests(unittest.TestCase):
                 return pull(*pull_args, **pull_kwargs)
             return recorded
         with mock.patch.dict(os.environ, {'YOLO_TTA_SPHERICAL_FULL_MATH_PREFLIGHT': '0'}), \
-                mock.patch.object(cpu, 'prepare_spherical_chunk_numba', side_effect=recorded_prepare):
+                mock.patch.object(cpu, 'prepare_spherical_chunk_native', side_effect=recorded_prepare):
             projector = SphericalCudaProjector(data, view, shape, reserve_bytes=0)
         try:
             self.assertEqual(projector.preflight_mode, 'bounded_windows')

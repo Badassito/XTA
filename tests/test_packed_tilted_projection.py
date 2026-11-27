@@ -140,7 +140,7 @@ def _task(root, *, external_alias=False, fail_once=False):
         admission=SimpleNamespace(reserve=lambda *_a: nullcontext()), transient_bytes=1,
         model_name='model', view=view, union_mm=volume, confmap_mm=None,
         d1_shadow_path=None, union_path=path, confmap_path=None, temp_dir=root,
-        dense_tiling_active=False, min_conf=0., min_radius=0., interpolation_distance=0,
+        tiling_active=False, min_conf=0., min_radius=0., interpolation_distance=0,
         interpolation_walk_back=1, interpolation_candidates=1, interpolation_passes=1,
         interpolation_min_radius=0., interpolation_search_angle=0.,
         slice_workers=2, interpolation_task_workers=1, component_layers_needed=True,
@@ -335,8 +335,8 @@ def test_packed_memfd_counts_actual_bytes_and_spills_between_callbacks(tmp_path,
             assert block.shape == (1, 8, 17)
             self.consumed.append(z)
             self._next_offset += 8 * 3
-        def consume_encoded_block(self, first, records, payload, *, packed):
-            assert packed and len(records) == 1 and payload.size == 8 * 3
+        def consume_encoded_fields(self, first, fields, payload, *, packed):
+            assert packed and fields.shape == (1, 8) and payload.size == 8 * 3
             self.consumed.append(first)
             self._next_offset += payload.size
         def spill_payload_to_disk(self):
@@ -410,7 +410,7 @@ def test_source_pack_separates_probe_progress_setup_and_finalize_timing(tmp_path
         _ram_payload = True
         def __init__(self, **kwargs):
             clock[0] += 3.
-        def consume_encoded_block(self, first, crops, payload, *, packed):
+        def consume_encoded_fields(self, first, crops, payload, *, packed):
             assert first == 0 and len(crops) == 4 and payload.size == 96 and packed
             clock[0] += 11.
         def finalize(self):
@@ -420,7 +420,7 @@ def test_source_pack_separates_probe_progress_setup_and_finalize_timing(tmp_path
     def encode(volume, first, count, *, payload_buffer):
         clock[0] += 7.
         return (None,) * count, payload_buffer
-    monkeypatch.setattr(packed_dense_source, 'encode_dense_u8_packed_block', encode)
+    monkeypatch.setattr(packed_dense_source, 'encode_dense_fields', encode)
     stats = encoded.pack_terminal_native_source(np.ones((4, 8, 17), np.uint8),
         tmp_path/'source.cvol', desc='phase timing')
     assert stats['packing_ram_probe_seconds'] == 4.

@@ -1,4 +1,6 @@
 """Bounded SAM radius work must retain the original complete-component result."""
+import inspect
+
 import numpy as np
 import pytest
 from scipy import ndimage
@@ -68,7 +70,7 @@ def test_overlapping_component_rectangles_use_one_full_transform(monkeypatch):
     actual = filtering._component_inscribed_radii(raw, labels, len(expected))
     np.testing.assert_array_equal(actual, expected)
     assert calls == [(raw.shape[0]+2, raw.shape[1]+2)]
-    assert filtering._component_maxima.nopython_signatures
+    assert inspect.isbuiltin(filtering.kernels.sam_component_maxima)
 
 
 def test_sparse_foreground_does_not_transform_empty_full_canvas(monkeypatch):

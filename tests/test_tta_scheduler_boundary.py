@@ -95,16 +95,31 @@ def test_delayed_publication_holds_ticket_not_unrelated_dispatch(tmp_path):
         views = [_view(name=name, physical_view_name=name) for name in ('first', 'second', 'third')]
         run.declare(*(detector_task(i+1, view=view) for i, view in enumerate(views)), ticket_limit=2)
         run.drain_until(lambda: run.native.snapshot()['dispatched'] >= 1)
-        finish_actor(actor, run.take(0))
+        first = run.take(0)
+        assert first['task_id'] == 1
+        held_ticket = actor.leases[first['task_id']].lease.parent_id
+        finish_actor(actor, first)
         following = run.take(0)
         assert following['task_id'] == 2
-        finish_actor(actor, following)
-        run.drain_until(lambda: len(run.results) == 2 and run.native.snapshot()['dispatched'] == 3)
+        following_ticket = actor.leases[following['task_id']].lease.parent_id
+        run.drain_until(lambda: len(run.results) == 1)
+        snapshot = run.native.snapshot()
+        assert (snapshot['tickets_used'], snapshot['blocked_parents'], snapshot['dispatched']) == (2, 1, 2)
         assert not pending.done()
-        finish_actor(actor, run.take(0))
-        run.drain_until(lambda: len(run.results) == 3)
+        finish_actor(actor, following)
+        run.drain_until(lambda: following_ticket not in run.scheduler.process_quiescence_issues().get(
+            'outstanding_parent_tickets', ()))
+        assert len(run.results) == 2 and not pending.done()
+        third = run.take(0)
+        assert third['task_id'] == 3 and run.native.snapshot()['dispatched'] == 3
+        finish_actor(actor, third)
+        # The science callback and native publication receipt arrive on separate ports.
+        run.drain_until(lambda: run.scheduler.process_quiescence_issues().get(
+            'outstanding_parent_tickets') == [held_ticket])
+        assert len(run.results) == 3 and not pending.done()
         assert run.scheduler.publication_outstanding()
-        assert run.native.snapshot()['tickets_used'] == 1
+        snapshot = run.native.snapshot()
+        assert (snapshot['tickets_used'], snapshot['blocked_parents'], snapshot['active']) == (1, 0, 0)
         pending.set_result(None)
         run.drain_until(lambda: not run.scheduler.publication_outstanding())
         assert run.native.snapshot()['tickets_used'] == 0

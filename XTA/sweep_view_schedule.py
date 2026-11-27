@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from concurrent.futures import CancelledError, ThreadPoolExecutor
-from contextlib import ExitStack
 from dataclasses import asdict
 import hashlib
 import json
@@ -216,7 +215,7 @@ class SweepViewSchedule:
             self.progress.view_ready(f'{model}/{view.name}', nframes=int(view.num_slices))
             if self.eager_projection:
                 self._check_publication(view)
-                if self._publish_view(publication, model, view, shape, decision, retain_empty_orthogonal):
+                if self._publish_view(publication, model, view, shape, retain_empty_orthogonal):
                     return 'projected'
             return 'native'
         except BaseException as error:
@@ -239,19 +238,18 @@ class SweepViewSchedule:
             except Exception:
                 pass
 
-    def _publish_view(self, publication, model, view, shape, decision, retain_empty_orthogonal):
+    def _publish_view(self, publication, model, view, shape, retain_empty_orthogonal):
         from . import sweep_views
-        with ExitStack() as stack:
-            readers = {c: stack.enter_context(sweep_views.open_view(model, str(view.name), c,
-                       native_shape=tuple(shape), identity=self.identities.get(str(view.name))))
-                       for c in self.cutoffs if c != self.cent}
+        identity = self.identities.get(str(view.name))
+        with sweep_views.open_sibling_views(model, str(view.name), self.cutoffs,
+                                            native_shape=tuple(shape), identity=identity) as family:
+            readers = family.readers
             projected = publication.publish_view_family(view, native_shape=tuple(shape),
                 read_mask_plane=lambda c,z: readers[c].read_mask_plane(z),
                 read_score_plane=lambda c,z: readers[c].read_score_plane(z),
-                read_mask_crops=lambda c,z: readers[c].iter_mask_crops(z),
-                read_native_crops=lambda c,z: readers[c].iter_crops(z),
-                native_journal_identity=self.identities.get(str(view.name)),
-                counts_by_cutoff={int(c): int(n) for c,n in decision['prediction_counts'].items()},
+                read_mask_crops=family, read_native_crops=family.native_crops,
+                native_journal_identity=identity,
+                counts_by_cutoff={int(c): int(n) for c,n in family.metadata['prediction_counts'].items()},
                 retain_empty_orthogonal=retain_empty_orthogonal,
                 primary_already_published=True)
         if projected is None:

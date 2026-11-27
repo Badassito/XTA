@@ -337,7 +337,7 @@ def _retire_store(path, expected, parent, cutoff):
             if os.name != "nt":
                 raise
             # Windows cannot delete a mapped file. A reader's frame can outlive
-            # its read inside an exception traceback cycle (numba raises and
+            # its read inside an exception traceback cycle (the decoder raises and
             # catches while it compiles a kernel lazily on a writer thread), so
             # collect such cycles once before failing.
             import gc
@@ -511,21 +511,25 @@ class ViewMajorPublication:
                 from .sweep_nrrd_processes import (SweepNrrdProcessPool, nrrd_codec_identity,
                                                    sweep_nrrd_process_count)
                 nrrd_processes = sweep_nrrd_process_count(self.publishers, siblings_count)
-                try:
-                    codec = nrrd_codec_identity()
-                except Exception as error:
-                    codec, codec_error = None, f"{type(error).__name__}: {error}"
-                else:
-                    codec_error = "a hardware or substituted codec" if codec is None else None
-                # A codec a worker cannot reproduce (hardware sessions) keeps threads.
                 if not nrrd_processes:
                     print("Sweep NRRD files: producer threads (XTA_YOLO_SWEEP_NRRD_PROCESSES=0).", flush=True)
-                elif codec is None:
-                    print(f"Sweep NRRD files: producer threads ({codec_error}).", flush=True)
+                elif self.scalar_sink.has_review_archives:
+                    # Every sibling view mirrors its selected review grids. The sink
+                    # writes those layers locally, so no process can receive a job.
+                    print("Sweep NRRD files: producer threads for editable review layers.", flush=True)
                 else:
-                    self._nrrd_processes = _start_worker_pool(
-                        "NRRD files", lambda: SweepNrrdProcessPool(nrrd_processes),
-                        f"{nrrd_processes} worker processes, codec {codec[0]} level {codec[1]}")
+                    try:
+                        codec = nrrd_codec_identity()
+                    except Exception as error:
+                        codec, codec_error = None, f"{type(error).__name__}: {error}"
+                    else:
+                        codec_error = "a hardware or substituted codec" if codec is None else None
+                    if codec is None:
+                        print(f"Sweep NRRD files: producer threads ({codec_error}).", flush=True)
+                    else:
+                        self._nrrd_processes = _start_worker_pool(
+                            "NRRD files", lambda: SweepNrrdProcessPool(nrrd_processes),
+                            f"{nrrd_processes} worker processes, codec {codec[0]} level {codec[1]}")
             for cent in self.cutoffs[1:]:
                 root = self._branch_dir(cent)
                 nrrd_root = self._nrrd_branch_dir(cent)
@@ -745,7 +749,7 @@ class ViewMajorPublication:
             # producer's GIL. A broken pool sends every view to producer threads.
             from .sweep_evidence_processes import resolve_native_journal_view
             journal = resolve_native_journal_view(self.model_name, view.name, native_shape,
-                                                  siblings, native_journal_identity)
+                                                  siblings, native_journal_identity, crops=read_native_crops)
 
         def publish_confidence(cent):
             started = time.perf_counter()

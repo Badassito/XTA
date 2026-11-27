@@ -126,14 +126,17 @@ def test_invalid_bounded_dense_parent_still_fails_while_executor_full(tmp_path):
         external.cancel()
 
 
-@pytest.mark.parametrize('reason', ['parent_condition', 'dense_limit', 'startup_headroom'])
+@pytest.mark.parametrize('reason', ['parent_condition', 'native_dense', 'startup_headroom'])
 def test_candidate_specific_refusal_still_backfills_under_one_probe_budget(tmp_path, monkeypatch, reason):
-    stage, _writer, _prepare, leases = mixed_queue(tmp_path, workers=2, cap=100)
+    stage, _writer, prepare, leases = mixed_queue(tmp_path, workers=2, cap=100)
     caller = {}
-    if reason == 'dense_limit':
+    if reason == 'native_dense':
         parent(stage, tmp_path, 'completed-but-still-funded', 'radial', 20)
         caller, _ = stage.pump()
-        next(iter(caller)).set_result(None)
+        completed = next(iter(caller))
+        execute, (_task, key, lease), options = prepare.entries.pop(completed)
+        assert completed.set_running_or_notify_cancel()
+        completed.set_result(execute(lambda: None, key, lease, **options))
     denied, _ = parent(stage, tmp_path, 'denied', 'radial', 90)
     fitting, _ = parent(stage, tmp_path, 'fitting', 'spherical', 5)
     if reason == 'parent_condition':
@@ -150,8 +153,18 @@ def test_candidate_specific_refusal_still_backfills_under_one_probe_budget(tmp_p
         assert stage.pump(budget=OneProbe(), resumed_futures=caller) == ({}, False)
         assert stage._prepare_arrivals[denied]['denials'][reason] == 1
         assert denied not in leases.leases and stage._expensive_admissions == before_turn
+        native = stage._dense_owner.run.native
+        if reason == 'native_dense':
+            # Finishing the task released a worker lane, but finalization still owns 20 bytes.
+            ledger = native.snapshot()
+            assert (ledger['byte_capacity'], ledger['bytes_used'], ledger['blocked_parents']) == (100, 20, 1)
+            assert stage._native_restore_grants[denied].state == 'Pending'
         admitted, _ = stage.pump(budget=OneProbe(), resumed_futures=caller)
         assert list(admitted.values()) == [fitting]
         assert stage._expensive_admissions == before_turn + 1
+        if reason == 'native_dense':
+            ledger = native.snapshot()
+            assert (ledger['bytes_used'], ledger['blocked_parents']) == (25, 1)
+            assert denied not in leases.leases
     finally:
         cleanup(stage, leases)

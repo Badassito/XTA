@@ -93,7 +93,8 @@ class ImportSurfaceTests(unittest.TestCase):
     def test_config_import_does_not_load_native_or_accelerator_runtimes(self) -> None:
         program = (
             "import sys; import XTA.config; "
-            "forbidden={'cv2','scipy','numba','torch','cupy','openvino','ultralytics','jax'}; "
+            "forbidden={'cv2','scipy','numba','llvmlite','torch','cupy','openvino','ultralytics','jax',"
+            "'_xta_cpu_kernels'}; "
             "loaded={name.split('.')[0] for name in sys.modules}; "
             "assert not (forbidden & loaded), forbidden & loaded"
         )

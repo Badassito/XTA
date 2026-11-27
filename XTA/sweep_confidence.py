@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 import hashlib
 from pathlib import Path
 import threading
@@ -10,7 +11,7 @@ import zlib
 
 import numpy as np
 
-from ._deps import _numba
+from .native_cpu import kernels as _cpu
 from .confidence_evidence import (
     SCHEMA,
     _json_value,
@@ -26,141 +27,14 @@ _NO_RECORDS = np.empty(0, BLOCK_DTYPE)
 _NO_RECORDS.setflags(write=False)
 
 
-# Kernel loops index zero-based slice views: an offset index (``row[x0+c]``)
-# carries Numba's negative-index wraparound and stops LLVM vectorizing, which
-# measured ~10x slower on detector bounding boxes much larger than support.
-
-@_numba.njit(nogil=True, cache=True)
 def _merge_masked_crop(plane, touched, mask, scores, y0, x0, block):
-    """Max-merge one strip's masked scores into the frame plane; mark its grid cells.
-
-    ``plane[y0+r, x0+c] = max(plane, scores[r, c] if mask[r, c] else 0)``.
-    Cells overlapped by the strip are marked even when it contributes nothing:
-    an all-zero cell later yields no block, exactly like the per-cell scan.
-    """
-    rows, columns = mask.shape
-    for row in range(rows):
-        target = plane[y0 + row, x0:x0 + columns]
-        support = mask[row]
-        source = scores[row]
-        for column in range(columns):
-            value = source[column] & (np.uint8(0) - np.uint8(support[column] != 0))
-            target[column] = max(value, target[column])
-    for cell_row in range(y0 // block, (y0 + rows - 1) // block + 1):
-        for cell_column in range(x0 // block, (x0 + columns - 1) // block + 1):
-            touched[cell_row, cell_column] = 1
+    """Max-merge one strip's masked scores into the frame plane; mark its grid cells."""
+    return _cpu.merge_masked_crop(plane, touched, mask, scores, y0, x0, block)
 
 
-@_numba.njit(nogil=True, cache=True)
 def _take_frame_cells(plane, touched, block):
-    """Pop every marked grid cell in row-major order as an exact tight crop.
-
-    Returns ``(table, raw)``: one ``(y, x, h, w, known, start)`` row per cell
-    with a nonzero score, trimmed to its nonzero bounding box, and the crops'
-    C-order bytes concatenated in ``raw``. The marks and every popped crop are
-    zeroed so the plane and marks are clean for the next frame.
-    """
-    height, width = plane.shape
-    cell_rows, cell_columns = touched.shape
-    marked = 0
-    for cell_row in range(cell_rows):
-        for cell_column in range(cell_columns):
-            marked += touched[cell_row, cell_column] != 0
-    table = np.empty((marked, 6), np.int64)
-    count = 0
-    total = 0
-    for cell_row in range(cell_rows):
-        for cell_column in range(cell_columns):
-            if touched[cell_row, cell_column] == 0:
-                continue
-            touched[cell_row, cell_column] = 0
-            a = cell_row * block
-            b = min(a + block, height)
-            c = cell_column * block
-            d = min(c + block, width)
-            top = bottom = -1
-            left, right = d, c
-            known = 0
-            for row in range(a, b):
-                values = plane[row, c:d]
-                seen = np.uint8(0)
-                for column in range(values.size):
-                    seen |= values[column]
-                if seen == 0:
-                    continue
-                first = 0
-                while values[first] == 0:
-                    first += 1
-                last = values.size - 1
-                while values[last] == 0:
-                    last -= 1
-                occupied = 0
-                segment = values[first:last + 1]
-                for column in range(segment.size):
-                    occupied += segment[column] != 0
-                known += occupied
-                if top < 0:
-                    top = row
-                bottom = row + 1
-                left = min(left, c + first)
-                right = max(right, c + last + 1)
-            if known:
-                table[count, 0] = top
-                table[count, 1] = left
-                table[count, 2] = bottom - top
-                table[count, 3] = right - left
-                table[count, 4] = known
-                table[count, 5] = total
-                total += (bottom - top) * (right - left)
-                count += 1
-    raw = np.empty(total, np.uint8)
-    for item in range(count):
-        y, x, h, w, start = table[item, 0], table[item, 1], table[item, 2], table[item, 3], table[item, 5]
-        for row in range(h):
-            values = plane[y + row, x:x + w]
-            output = raw[start + row * w:start + (row + 1) * w]
-            for column in range(w):
-                output[column] = values[column]
-                values[column] = 0
-    return table[:count], raw
-
-
-def _make_cell_compressor(compressor, ulong_dtype):
-    """One nogil call compresses a frame's cells with zlib ``compress2`` (level 3).
-
-    ``compress2`` is ``deflateInit(level)`` + ``deflate(Z_FINISH)``, the same
-    stream parameters as ``zlib.compress(data, 3)``; the library itself is
-    accepted only when it is Python's own zlib (see ``_native_cell_compressor``).
-    Returns ``(payload, lengths, done, status)``; a nonzero status leaves the
-    frame to the Python zlib path.
-    """
-    from .confidence_native_codec import _void_pointer
-
-    @_numba.njit(nogil=True, cache=False)
-    def compress_cells(raw, table):
-        count = table.shape[0]
-        capacity = 0
-        for item in range(count):
-            size = table[item, 2] * table[item, 3]
-            capacity += size + (size >> 12) + (size >> 14) + (size >> 25) + 13
-        payload = np.empty(max(1, capacity), np.uint8)
-        lengths = np.zeros(count, np.int64)
-        length = np.empty(1, ulong_dtype)
-        used = 0
-        for item in range(count):
-            size = table[item, 2] * table[item, 3]
-            length[0] = size + (size >> 12) + (size >> 14) + (size >> 25) + 13
-            status = compressor(_void_pointer(payload.ctypes.data + np.uintp(used)),
-                                _void_pointer(length.ctypes.data),
-                                _void_pointer(raw.ctypes.data + np.uintp(table[item, 5])), size, 3)
-            if status != 0:
-                return payload[:used], lengths, item, int(status)
-            # int(): an unsigned 64-bit c_ulong must not promote ``used`` to float.
-            written = int(length[0])
-            lengths[item] = written
-            used += written
-        return payload[:used], lengths, count, 0
-    return compress_cells
+    """Pop every marked grid cell in row-major order as an exact tight crop."""
+    return _cpu.take_frame_cells(plane, touched, block)
 
 
 _NATIVE_LOCK = threading.Lock()
@@ -206,8 +80,8 @@ def _native_cell_compressor():
     with _NATIVE_LOCK:
         entry = _NATIVE_COMPRESSORS.get(id(codec))
         if entry is None or entry[0] is not codec:
-            kernel = _make_cell_compressor(codec._compressor,
-                np.uint32 if ctypes.sizeof(ctypes.c_ulong) == 4 else np.uint64)
+            address = ctypes.cast(codec._compressor, ctypes.c_void_p).value
+            kernel = partial(_cpu.sweep_compress_cells, address)
             try:
                 qualified = _probe_cell_compressor(kernel)
             except Exception:
@@ -218,35 +92,6 @@ def _native_cell_compressor():
                   f'{"native_compress2" if qualified else "python_zlib"} '
                   f'(library_source={receipt.get("library_source")}, version={codec.version}).', flush=True)
     return (entry[1], 'native_compress2') if entry[1] is not None else (None, 'python_zlib')
-
-
-_WARM_LOCK = threading.Lock()
-_WARMED = False
-
-
-def warm_sweep_confidence_kernels():
-    """Compile (or load) every production signature before publishers are busy.
-
-    Production strips are C-contiguous uint8 masks (bool masks are viewed as
-    uint8) and uint8 scores, each either writable or read-only (journal
-    decodes are read-only). Compiling under later thread load needs the GIL.
-    The native cell compressor (when qualified) is compiled by its probe.
-    """
-    global _WARMED
-    with _WARM_LOCK:
-        if not _WARMED:
-            plane = np.zeros((3, 5), np.uint8)
-            touched = np.zeros((1, 1), np.uint8)
-            for mask_readonly in (False, True):
-                for scores_readonly in (False, True):
-                    mask = np.ones((2, 3), np.uint8)
-                    scores = np.full((2, 3), 7, np.uint8)
-                    mask.setflags(write=not mask_readonly)
-                    scores.setflags(write=not scores_readonly)
-                    _merge_masked_crop(plane, touched, mask, scores, 1, 1, 128)
-                    _take_frame_cells(plane, touched, 128)
-            _WARMED = True
-    _native_cell_compressor()
 
 
 class _MaskedScorePlanes:
@@ -303,7 +148,6 @@ class _MaskedCropFrameEncoder:
         block = self.block_size
         self._plane = np.zeros((height, width), np.uint8)
         self._touched = np.zeros(((height + block - 1) // block, (width + block - 1) // block), np.uint8)
-        warm_sweep_confidence_kernels()
         self._compress_cells, self.codec_backend = (
             _native_cell_compressor() if block <= _NATIVE_MAX_BLOCK else (None, 'python_zlib'))
         self.native_fallback_frames = 0
@@ -460,8 +304,6 @@ class SweepObservedConfidenceWriter:
         self._lock = threading.Lock()
         if self.manifest_path.exists():
             raise FileExistsError(f'Confidence catalogue already exists: {self.manifest_path}')
-        # Writers start with the sweep, before publishers compete for the GIL.
-        warm_sweep_confidence_kernels()
 
     @property
     def manifest_path(self):

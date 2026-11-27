@@ -30,11 +30,11 @@ def main():
         parser.error('Use a fresh output directory to preserve qualification evidence')
     out.mkdir(parents=True, exist_ok=True)
     for key, folder in [('TEMP','temp'),('TMP','temp'),('CUDA_CACHE_PATH','cuda-cache'),
-                        ('NUMBA_CACHE_DIR','numba-cache'),('YOLO_CONFIG_DIR','yolo-config')]:
+                        ('YOLO_CONFIG_DIR','yolo-config')]:
         path = out/folder; path.mkdir(exist_ok=True); os.environ[key] = str(path)
     os.environ.update(CUDA_VISIBLE_DEVICES='0',YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER='0',
         YOLO_TTA_TELEMETRY='0',YOLO_TTA_TASK_TRACE='0',PYTHONDONTWRITEBYTECODE='1',
-        OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',MKL_NUM_THREADS='1',NUMBA_NUM_THREADS='1',
+        OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',MKL_NUM_THREADS='1',
         XTA_RUN_CUDA_RENDER_INTEGRATION='1')
     sys.dont_write_bytecode = True
     sys.path.insert(0,str(repo))

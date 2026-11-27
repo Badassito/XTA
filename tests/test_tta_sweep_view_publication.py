@@ -27,13 +27,15 @@ def view():
                     full_t=3, full_h=8, full_w=8, tta_aug_id="a0")
 
 
-def make_owner(root, cent, progress=None, *, retain_confidence=True, staged=False):
+def make_owner(root, cent, progress=None, *, retain_confidence=True, staged=False,
+               native_formats=('nrrd',), mirror_formats=()):
     family, work = root/"family", root/"work"
     nrrd_stage_root = work / "nrrd_sources" if staged else None
     branch = (nrrd_stage_root if staged else family / "confidence_cutoffs") / f"conf_{cent:03d}"
     sink = outputs.NrrdLayerSink(nrrd_dir=branch/"nrrd", stem="case",
         output_shape_tyx=SHAPE, max_workers=2,
-        low_quality_specs=[outputs.LowQualityDownbinSpec("0.5","half",.5,(2,4,4))],
+        low_quality_specs=[outputs.LowQualityDownbinSpec("0.5","half",.5,(2,4,4), formats=mirror_formats)],
+        full_quality_formats=native_formats,
         low_quality_root=branch/"low_quality", run_id=branch_run_id("family-one",cent),
         relative_artifact_paths=not staged)
     owner = ViewMajorPublication(family_root=family, workspace=work, sweep_id="family-one",
@@ -287,3 +289,36 @@ def test_opt_in_zero_projected_store_budget_falls_back_before_writing(tmp_path,v
     finally:
         producer.close(); sink.shutdown()
 
+
+
+@pytest.mark.parametrize('native_formats,mirror_formats,worker_count,expect_pool', [
+    (('nrrd', 'xtareview'), ('nrrd',), '2', False),
+    (('nrrd',), ('xtareview',), '2', False),
+    (('nrrd',), ('nrrd',), '2', True),
+])
+def test_view_major_process_pool_only_starts_with_eligible_sibling_layers(
+        tmp_path, monkeypatch, native_formats, mirror_formats, worker_count, expect_pool):
+    from XTA import sweep_nrrd_processes as processes
+
+    monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_ROLE', 'produce')
+    monkeypatch.setenv(processes.PROCESSES_ENV, worker_count)
+    identity = Mock(return_value=('zlib', 3, 'codec'))
+    construct = Mock()
+    monkeypatch.setattr(processes, 'nrrd_codec_identity', identity)
+    monkeypatch.setattr(processes, 'SweepNrrdProcessPool', construct)
+    owner, sink = make_owner(tmp_path, 50, retain_confidence=False, native_formats=native_formats,
+                             mirror_formats=mirror_formats)
+    try:
+        assert identity.called is expect_pool
+        assert construct.called is expect_pool
+        assert (owner._nrrd_processes is not None) is expect_pool
+    finally:
+        owner.close()
+        sink.shutdown()
+
+
+def test_view_major_mixed_review_still_validates_worker_count(tmp_path, monkeypatch):
+    monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_ROLE', 'produce')
+    monkeypatch.setenv('XTA_YOLO_SWEEP_NRRD_PROCESSES', '-1')
+    with pytest.raises(ValueError, match='nonnegative'):
+        make_owner(tmp_path, 50, retain_confidence=False, mirror_formats=('xtareview',))

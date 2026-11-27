@@ -68,9 +68,10 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn('dynamic = ["version"]', project)
         self.assertIn('version = {attr = "XTA.__version__"}', dynamic)
         self.assertIn('"ultralytics>=8.4.128,<8.5"', project)
-        self.assertIn('"numba>=0.61.2"', project)
         optional = _toml_section(source, "project.optional-dependencies")
-        self.assertNotIn('numba', optional)
+        for runtime_compiler in ("numba", "llvmlite"):
+            self.assertNotIn(runtime_compiler, project)
+            self.assertNotIn(runtime_compiler, optional)
         self.assertIn('"deflate>=0.9.0"', optional)
         self.assertIn('xta = "XTA.cli:run"', scripts)
         self.assertIn(

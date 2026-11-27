@@ -398,7 +398,7 @@ def execute_backend(capture, work_dir, backend, workers):
               'shape': replay.output_shape, 'workspace': str(work_dir),
               'result_store': str(destination), 'stats': stats,
               'process_cpu_seconds': process_cpu, 'phase_timings': phase_timings,
-              'timing_scope': 'fresh-process projection through closed store publication; checksum validation and comparison excluded; initialization/JIT may be included'}
+              'timing_scope': 'fresh-process projection through closed store publication; checksum validation and comparison excluded; runtime initialization may be included'}
     if backend == 'sam_cpu':
         result['resource_observations'] = resources.report()
         result['cuda_visible_devices'] = os.environ.get('CUDA_VISIBLE_DEVICES')

@@ -16,7 +16,7 @@ import zlib
 
 import numpy as np
 
-from ._deps import _numba
+from .native_cpu import kernels as _cpu
 from .confidence_storage import ConfidenceStageLimit
 from .json_publication import write_json_atomic
 from .run_transport import _stamp
@@ -82,17 +82,9 @@ def _write_native_proof(path, shape, read_native, limit, native_boxes=None):
     return used
 
 
-@_numba.njit(cache=True, nogil=True)
 def _changed_scores(original, current):
     """Compare a nonempty packet in one pass without temporary mask arrays."""
-    largest_dropped, smallest_kept = 0, 256
-    mismatch = False
-    for index in range(original.size):
-        before, after = int(original[index]), int(current[index])
-        largest_dropped = max(largest_dropped, before if after == 0 else 0)
-        smallest_kept = min(smallest_kept, after if after != 0 else 256)
-        mismatch |= after != 0 and before != after
-    return largest_dropped, smallest_kept, mismatch
+    return _cpu.changed_scores(original, current)
 
 
 def _threshold_for_native_scores(path, shape, read_native, native_boxes=None):

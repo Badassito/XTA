@@ -147,12 +147,12 @@ def test_native_identity_changes_actual_image_cache_key(tmp_path, monkeypatch):
         context.close()
 
 
-def test_kernel_identity_records_actual_compiler_and_has_no_parallel_pool():
+def test_kernel_identity_records_actual_native_build():
     identity = sampler.radial_gray8_sampling_identity()
-    assert identity['backend'] == 'numba_nogil_f64_radial_f32_trilinear'
+    assert identity['backend'] == 'cpp_nogil_f64_radial_f32_trilinear'
     assert identity['implementation_sha256'] == sampler.IMPLEMENTATION_SHA256
-    assert identity['numba_version'] and identity['llvmlite_version'] and identity['llvm_version']
-    assert identity['host_cpu_name'] and isinstance(identity['using_svml'], bool)
-    assert sampler._compiled_render.targetoptions['nogil'] is True
-    assert sampler._compiled_render.targetoptions['fastmath'] is False
-    assert not sampler._compiled_render.targetoptions.get('parallel', False)
+    native = identity['native_kernel']
+    assert len(native['source_sha256']) == len(native['binary_sha256']) == 64
+    assert native['compiler']
+    assert native['fp_contract'] == 'explicit_fma_only'
+    assert identity['fastmath'] is False

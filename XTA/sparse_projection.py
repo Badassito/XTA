@@ -22,7 +22,7 @@ import weakref
 from typing import Dict, Iterator, Tuple
 
 import numpy as np
-from ._deps import _numba
+from .native_cpu import kernels
 from .geometry import (ViewInfo, is_azimuthal_view, is_tilted_azimuthal_view,
                        azimuthal_base_view_name, azimuthal_plane_shape,
                        azimuthal_source_tilted_view)
@@ -38,7 +38,6 @@ _CACHE: OrderedDict[tuple, '_UprightInverseMap'] = OrderedDict()
 _CACHE_BYTES = 0
 _CACHE_LOCK = threading.Lock()
 _MAP_BUILDS_IN_FLIGHT: Dict[tuple, Future] = {}
-_BYTE_POPCOUNT = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(axis=1).astype(np.uint8)
 
 
 @contextmanager
@@ -116,11 +115,6 @@ def _project_encoded_native_planes(store, sampler, view, output_shape, bbox, wri
             last_update_monotonic=time.monotonic(),plan_bytes=int(plan.persistent_bytes),
             worker_workspace_bytes=per_worker,plan_build_peak_bytes=int(plan.workspace_bytes),
             consumer_plane_bytes=0,consumer_writer_bytes=writer_bytes))
-    # Compile one signature before workers share immutable buffers.
-    pull_native_encoded_flat_into(sampler.encoded,store.index,store._packbits_payload,plan,
-        np.empty(0,np.uint8),first_flat=0,destination_bbox_tyx=bbox)
-    # Warm the bbox scanner and encoder before launching concurrent workers.
-    encode_owned_u8_projection_plane(np.ones((1, 8), np.uint8), 0, packed=packed)
     def project_plane(index):
         z = first_z + index
         plane = np.zeros((out_h,out_w),np.uint8)
@@ -189,34 +183,11 @@ def _project_encoded_native_planes(store, sampler, view, output_shape, bbox, wri
 
 def _sample_encoded_mask(encoded, index, angles, rows, columns, valid, packed):
     """Gather a bounded address vector directly from immutable bbox payloads."""
-    result = np.zeros(angles.size, dtype=np.uint8)
-    reads = 0
-    for position in range(angles.size):
-        if not valid[position]:
-            continue
-        record = index[int(angles[position])]
-        if record['kind'] == 0:
-            continue
-        row, column = np.int64(rows[position]), np.int64(columns[position])
-        y0, x0 = np.int64(record['y0']), np.int64(record['x0'])
-        y1, x1 = np.int64(record['y1']), np.int64(record['x1'])
-        if row < y0 or row >= y1 or column < x0 or column >= x1:
-            continue
-        width = x1 - x0
-        stride = (width + 7) // 8 if packed else width
-        local_column = column - x0
-        address = np.int64(record['offset']) + (row - y0) * stride
-        address += local_column // 8 if packed else local_column
-        value = encoded[address]
-        reads += 1
-        if packed:
-            result[position] = (value >> (local_column & 7)) & 1
-        else:
-            result[position] = value != 0
-    return result, reads
+    from .projection_coverage_cpu import _encoded_record_bytes
 
-
-_sample_encoded_mask = _numba.njit(cache=True, nogil=True)(_sample_encoded_mask)
+    return kernels.sparse_inverse_sample_encoded_mask(
+        encoded, _encoded_record_bytes(index), angles, rows, columns, valid, packed,
+    )
 
 
 class _SparseMaskSampler:
@@ -284,27 +255,9 @@ class _SparseMaskSampler:
             self._owned_mapping = None
 
 
-@_numba.njit(cache=True, nogil=True)
 def _encoded_input_totals(encoded, index, packed):
-    """Count validated raw/packed records directly without expanding source pixels."""
-    size = foreground = 0
-    for record in index:
-        if record['kind'] == 0:
-            continue
-        start = np.int64(record['offset'])
-        count = np.int64(record['payload_size'])
-        size += count
-        if packed:
-            width = np.int64(record['x1']) - np.int64(record['x0'])
-            stride = (width + 7) // 8
-            tail_mask = (1 << (1 + (width - 1) % 8)) - 1
-            for row in range(start, start + count, stride):
-                for address in range(row, row + stride - 1):
-                    foreground += _BYTE_POPCOUNT[encoded[address]]
-                foreground += _BYTE_POPCOUNT[encoded[row + stride - 1] & tail_mask]
-        else:
-            foreground += np.count_nonzero(encoded[start:start + count])
-    return size, foreground
+    from .projection_coverage_cpu import _encoded_record_bytes
+    return kernels._encoded_input_totals(encoded, _encoded_record_bytes(index), packed)
 
 
 def clear_sparse_projection_cache() -> None:
@@ -336,71 +289,24 @@ class _UprightInverseMap:
 
 
 def _count_keys(keys, counts):
-    for key in keys:
-        counts[key] += 1
+    kernels.sparse_inverse_count_keys(keys, counts)
 
 
 def _prefix_counts(counts):
-    offsets = np.empty(len(counts) + 1, dtype=np.uint32)
-    total = np.uint64(0)
-    offsets[0] = 0
-    for index in range(len(counts)):
-        total += np.uint64(counts[index])
-        if total > np.uint64(0xFFFFFFFF):
-            raise ValueError('Sparse projection map exceeds uint32 owner capacity')
-        offsets[index + 1] = np.uint32(total)
-    return offsets
+    return kernels.sparse_inverse_prefix_counts(counts)
 
 
 def _fill_owners(keys, positions, cursors, owners):
-    for index in range(len(keys)):
-        key = keys[index]
-        at = cursors[key]
-        owners[at] = positions[index]
-        cursors[key] = at + 1
+    kernels.sparse_inverse_fill_owners(keys, positions, cursors, owners)
 
 
 def _scatter_upright_crop(crop, azimuth, first_row, first_u, key_offsets, owners,
                           row_offsets, frames, plane_w, processing_width, base_id,
                           out_h, out_w, packed, bounds, slice_counts):
-    foreground = contributions = unique = 0
-    packed_w = (out_w + 7) // 8
-    for row in range(crop.shape[0]):
-        source_row = first_row + row
-        for col in range(crop.shape[1]):
-            if not crop[row, col]:
-                continue
-            foreground += 1
-            key = azimuth * processing_width + first_u + col
-            for frame_at in range(row_offsets[source_row], row_offsets[source_row + 1]):
-                frame = int(frames[frame_at])
-                for owner_at in range(key_offsets[key], key_offsets[key + 1]):
-                    owner = int(owners[owner_at])
-                    v, u = owner // plane_w, owner % plane_w
-                    if base_id == 0:
-                        z, y, x = frame, v, u
-                    elif base_id == 1:
-                        z, y, x = v, frame, u
-                    else:
-                        z, y, x = v, u, frame
-                    address = (z * out_h + y) * packed_w + (x >> 3)
-                    bit = np.uint8(1 << (x & 7))
-                    contributions += 1
-                    if not (packed[address] & bit):
-                        packed[address] |= bit
-                        unique += 1
-                        slice_counts[z] += 1
-                        bounds[z, 0] = min(bounds[z, 0], y)
-                        bounds[z, 1] = max(bounds[z, 1], y + 1)
-                        bounds[z, 2] = min(bounds[z, 2], x)
-                        bounds[z, 3] = max(bounds[z, 3], x + 1)
-    return foreground, contributions, unique
-
-
-_count_keys = _numba.njit(cache=True, nogil=True)(_count_keys)
-_prefix_counts = _numba.njit(cache=True, nogil=True)(_prefix_counts)
-_fill_owners = _numba.njit(cache=True, nogil=True)(_fill_owners)
-_scatter_upright_crop = _numba.njit(cache=True, nogil=True)(_scatter_upright_crop)
+    return kernels.sparse_inverse_scatter_upright_crop(
+        crop, azimuth, first_row, first_u, key_offsets, owners, row_offsets, frames,
+        plane_w, processing_width, base_id, out_h, out_w, packed, bounds, slice_counts,
+    )
 
 
 def _map_key_strips(view, plan, grid, plane_shape):
@@ -768,7 +674,7 @@ def _project_tilted_sparse_planes(store, view, output_shape, staging, workers):
         if int(stats['foreground_voxels']) != unique:
             raise RuntimeError('Packed projection foreground count differs from encoded store')
         return {**stats,
-                'backend': compiled['backend'] if compiled is not None else 'cpu_numba',
+                'backend': compiled['backend'] if compiled is not None else 'cpu_native',
                 'projection_workers': compiled['workers'] if compiled is not None else 1,
                 'projection_worker_workspace_bytes': compiled['worker_workspace_bytes'] if compiled is not None else 0,
                 'compiled_fallback_reason': fallback, 'map_cache_hit': False,
@@ -894,7 +800,7 @@ def project_azimuthal_sparse_store(
                     ))
                     if int(stats['foreground_voxels']) != unique:
                         raise RuntimeError('Packed projection foreground count differs from encoded store')
-                    stats.update(backend='cpu_numba', projection_workers=1, projection_worker_workspace_bytes=0,
+                    stats.update(backend='cpu_native', projection_workers=1, projection_worker_workspace_bytes=0,
                         compiled_fallback_reason=None, map_cache_hit=cache_hit, map_bytes=map_bytes,
                         input_payload_bytes=input_bytes, input_foreground_samples=foreground,
                         projected_contributions=contributions, max_decoded_input_slab_bytes=max_slab,

@@ -31,7 +31,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import _numba, cv2, tqdm
+from ._deps import cv2, tqdm
 
 from .config import (
     GIB,

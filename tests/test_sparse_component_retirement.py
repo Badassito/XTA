@@ -201,9 +201,9 @@ class SparseComponentRetirementTests(unittest.TestCase):
 
     def test_sparse_area_kernel_failure_is_visible(self):
         crop = np.ones((3, 3), dtype=np.uint8)
-        with mock.patch.object(outputs, '_numba_nrrd_area_crop_resize_kernel',
-                               side_effect=RuntimeError('area compiler failed')):
-            with self.assertRaisesRegex(RuntimeError, 'area compiler failed'):
+        with mock.patch.object(outputs, '_nrrd_area_crop_resize_kernel',
+                               side_effect=RuntimeError('area kernel failed')):
+            with self.assertRaisesRegex(RuntimeError, 'area kernel failed'):
                 outputs._resize_sparse_binary_crop_to_output_region(
                     crop, source_shape=(12, 12), source_bbox=(1, 1, 4, 4),
                     output_shape=(6, 6),

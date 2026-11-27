@@ -49,15 +49,18 @@ def _dependency(queue, name, attempts, clock=None, function=None):
     return DeferredComponentProjection(submit)
 
 
-def _drain(parents, leases, budget):
+def _drain(parents, leases, budget, *, service_preparation=None):
+    if service_preparation is None:
+        service_preparation = lambda: None
     scheduler = SimpleNamespace(process_inference_outstanding=lambda: False,
-                                has_pending_process_results=lambda: False)
+                                has_pending_process_results=lambda: False,
+                                service_preparation=service_preparation)
     function = pipeline_drain(None, budget, scheduler,
                               sam_context=SimpleNamespace(_closed=False))
     namespace = function.__globals__
     namespace.update(
         view_processing_futures=parents, view_prepare_leases=leases,
-        tile_expected_by_parent={}, _dispatch_inference_windows=lambda: None)
+        tile_expected_by_parent={})
     namespace['_publish_parent_dense_retired'] = (
         lambda key, lease: namespace['parent_dense_retired_events'].put((key, lease)))
     return function
@@ -97,7 +100,12 @@ def test_one_probe_drain_retires_later_dense_parent_while_head_stays_blocked():
     leases = _lease_state((first, second))
     budget = BackgroundDrainBudget(lambda: None, stages=9, max_completed=1,
                                    seconds=.01, clock=lambda: now[0])
-    drain = _drain(parents, leases, budget)
+    preparation_observations = []
+
+    def service_preparation():
+        preparation_observations.append((set(leases.leases), queue.snapshot()['pending']))
+
+    drain = _drain(parents, leases, budget, service_preparation=service_preparation)
     try:
         drain()
         assert attempts == ['first']
@@ -105,6 +113,7 @@ def test_one_probe_drain_retires_later_dense_parent_while_head_stays_blocked():
         assert not budget.deferred, 'capacity miss must not request an immediate spin'
         assert second.native_support_mm is not None
         assert first_owner() is not None and ('model', 'first') in leases.leases
+        assert not preparation_observations
 
         drain()
         gc.collect()
@@ -112,9 +121,12 @@ def test_one_probe_drain_retires_later_dense_parent_while_head_stays_blocked():
         assert second.native_support_mm is second.final_view_volume_mm is None
         assert second_owner() is None
         assert not second.pending_component_layers[0].done()
+        assert not preparation_observations
 
-        # The normal next drain consumes the actual last-owner receipt.
+        # The next drain consumes the last-owner receipt and offers the returned
+        # capacity to native preparation while the publication queue is blocked.
         drain()
+        assert preparation_observations == [({('model', 'first')}, 1)]
         assert ('model', 'second') not in leases.leases
         assert ('model', 'first') in leases.leases
         assert first_owner() is not None and int(outside[0].sum()) == 60

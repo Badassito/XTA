@@ -72,30 +72,6 @@ def install_stubs() -> None:
         "tifffile": tifffile,
         "tqdm": tqdm_module,
     }
-    numba = _StubModule("numba")
-
-    def njit(*args: object, **kwargs: object) -> object:
-        def decorate(function: object) -> object:
-            return function
-
-        if len(args) == 1 and callable(args[0]) and not kwargs:
-            return args[0]
-        return decorate
-
-    numba.njit = njit  # type: ignore[attr-defined]
-    numba.prange = range  # type: ignore[attr-defined]
-    numba.config = types.SimpleNamespace(DISABLE_JIT=False)  # type: ignore[attr-defined]
-    numba.__path__ = []  # type: ignore[attr-defined]
-    extending = _StubModule("numba.extending")
-    extending.intrinsic = lambda function: function  # type: ignore[attr-defined]
-    modules["numba"] = numba
-    modules["numba.extending"] = extending
-    llvmlite = _StubModule("llvmlite")
-    llvmlite.__path__ = []  # type: ignore[attr-defined]
-    llvm_ir = _StubModule("llvmlite.ir")
-    llvmlite.ir = llvm_ir  # type: ignore[attr-defined]
-    modules["llvmlite"] = llvmlite
-    modules["llvmlite.ir"] = llvm_ir
     sys.modules.update(modules)
 
 

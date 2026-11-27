@@ -106,8 +106,8 @@ def _aug_job(view: geometry.ViewInfo, out_size: int, *, angle_deg: float = 0.0) 
     )
 
 
-def _tile_job(view: geometry.ViewInfo, out_size: int) -> geometry.DenseTileJob:
-    return geometry.DenseTileJob(
+def _tile_job(view: geometry.ViewInfo, out_size: int) -> geometry.TileJob:
+    return geometry.TileJob(
         view=str(view.name),
         aug_id='test',
         config_id='s2_st1',
@@ -249,7 +249,7 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
                         output_height=int(job.aff.out_size),
                         output_width=int(job.aff.out_size),
                     )
-                    tile = geometry.render_categorical_dense_tile_for_job(
+                    tile = geometry.render_categorical_tile_for_job(
                         self.mask, view, _tile_job(view, out_size=3), frame_idx=1,
                     )
                     np.testing.assert_array_equal(full, np.ones((4, 4), dtype=np.uint8))
@@ -355,7 +355,7 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(actual, np.ones((1, 1), dtype=np.uint8))
 
-    def test_fullframe_and_dense_tile_cartesian_affines_are_nearest_and_binary(self) -> None:
+    def test_fullframe_and_tile_cartesian_affines_are_nearest_and_binary(self) -> None:
         view = geometry.get_view_infos(
             1,
             3,
@@ -406,7 +406,7 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
                 output_height=int(job.aff.out_size),
                 output_width=int(job.aff.out_size),
             )
-            tile = geometry.render_categorical_dense_tile_for_job(
+            tile = geometry.render_categorical_tile_for_job(
                 mask, view, tile_job, frame_idx=0,
             )
 

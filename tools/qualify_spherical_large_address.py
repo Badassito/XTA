@@ -34,10 +34,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     temporary = output / 'tmp'
     temporary.mkdir(exist_ok=True)
-    for name in ('cupy', 'numba'):
-        (output / name).mkdir(exist_ok=True)
+    (output / 'cupy').mkdir(exist_ok=True)
     os.environ.setdefault('CUPY_CACHE_DIR', str(output / 'cupy'))
-    os.environ.setdefault('NUMBA_CACHE_DIR', str(output / 'numba'))
 
     import numpy as np
     from XTA.qsc import qsc_inverse

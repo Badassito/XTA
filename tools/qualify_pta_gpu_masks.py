@@ -137,7 +137,7 @@ def cpu_render(array, plan, frame_idx, item_key):
         result, _ = render_plan_frame_mask_source(mask=array, plan=plan, idx=frame_idx, need_canvas=False)
     else:
         tile = next(x for x in plan.tile_layout if x.tile_tag == item_key)
-        result = shared_geometry.render_categorical_dense_tile_for_job(
+        result = shared_geometry.render_categorical_tile_for_job(
             array, plan.view.shared_view, tile.shared_job, frame_idx,
         )
     return np.ascontiguousarray(np.asarray(result) > 0, dtype=np.uint8)
@@ -277,7 +277,7 @@ def main(argv=None):
             with (
                 mock.patch.object(workers, "render_plan_frame_mask_source",
                                   side_effect=AssertionError("CPU full mask render called")),
-                mock.patch.object(workers.shared_geometry, "render_categorical_dense_tile_for_job",
+                mock.patch.object(workers.shared_geometry, "render_categorical_tile_for_job",
                                   side_effect=AssertionError("CPU tile mask render called")),
                 mock.patch.object(workers, "_render_semantic_coverage_item",
                                   side_effect=AssertionError("CPU coverage render called")),

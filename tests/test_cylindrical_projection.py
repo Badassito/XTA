@@ -345,6 +345,30 @@ class CylindricalProjectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'bounding boxes'):
             cp.backproject_radial_volume_to_volume(data, view, self.root / 'invalid.dat', 'bad bbox', known_slice_bboxes=boxes)
 
+    def test_factored_scalar_output_preserves_legacy_rank_conversion(self):
+        limit = 2**31
+        cases = (
+            (np.float64, [np.nextafter(float(limit), -np.inf), limit, limit+47,
+                          -limit+1, -limit-1, 2**48+17, np.nan, np.inf], [255,0,0,1,0,0,0,0]),
+            (np.float32, [np.nextafter(np.float32(limit), np.float32(-np.inf)), limit,
+                          -limit+128, -limit-256, np.inf], [128,0,128,0,0]),
+            (np.int64, [limit+47, -limit-1, 2**48+17], [47,255,17]),
+            (np.uint64, [2**63+7, 2**64-1], [7,255]),
+        )
+        for dtype, values, expected in cases:
+            with self.subTest(dtype=dtype):
+                width = len(values)
+                source = np.asarray(values, dtype=dtype).reshape(1, 1, width)
+                columns = np.arange(width, dtype=np.int32)
+                block = cp._project_radial_block(
+                    source, np.zeros(width, np.int32), np.arange(width + 1, dtype=np.uint32),
+                    columns, np.zeros((1, width), np.float64), np.zeros(1, np.int32), columns,
+                    np.zeros(1, np.float64), np.zeros(width, np.float64),
+                    1, 0, 1, 0, False, width, 1, width, 0, 1,
+                    np.zeros((1, 4), np.int64), False, True,
+                )
+                np.testing.assert_array_equal(block, np.array(expected, np.uint8).reshape(1, 1, width))
+
     def test_callback_failure_waits_for_running_blocks_before_returning_borrowed_input(self):
         view = shells(shape=(7, 9, 11), size=6)[0]
         data = np.ones((view.num_slices, 6, 6), np.uint8)
@@ -366,7 +390,6 @@ class CylindricalProjectionTests(unittest.TestCase):
                 with lock:
                     live[0] -= 1
         with mock.patch.object(cp, '_project_radial_block', side_effect=project), \
-                mock.patch.object(cp, '_numba', object()), \
                 mock.patch.object(cp, '_OUTPUT_BLOCK_BYTES', 99), \
                 mock.patch.object(cp, '_cpu_count', return_value=3):
             with self.assertRaisesRegex(RuntimeError, 'sink rejected'):

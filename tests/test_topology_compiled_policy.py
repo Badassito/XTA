@@ -7,7 +7,8 @@ from unittest import mock
 import numpy as np
 import pytest
 
-from XTA import topology
+from XTA import native_cpu, topology
+from XTA.native_cpu_build import NativeCpuBuildError
 from tests.reference_backends.topology import union_pair_codes_python
 
 
@@ -45,11 +46,11 @@ def test_partial_compiled_failure_aborts_without_scalar_replay() -> None:
     uf = _new_uf(4)
     codes = np.array([(1 << 32) | 2, (3 << 32) | 4], dtype=np.uint64)
 
-    def fail_after_first_link(parent, _rank, _touches, _a_ids, _b_ids):
+    def fail_after_first_link(parent, _rank, _touches, _codes, _gid_base, _counts):
         parent[2] = 1
         raise ValueError('injected mid-batch failure')
 
-    with mock.patch.object(topology, '_numba_union_find_batch_kernel', side_effect=fail_after_first_link) as kernel:
+    with mock.patch.object(topology, '_union_find_batch_kernel', side_effect=fail_after_first_link) as kernel:
         with pytest.raises(RuntimeError, match='batch state is partial'):
             uf.union_pair_codes(codes)
 
@@ -60,9 +61,11 @@ def test_partial_compiled_failure_aborts_without_scalar_replay() -> None:
 
 def test_missing_compiled_bulk_kernel_does_not_use_scalar_reference() -> None:
     uf = _new_uf(2)
-    with mock.patch.object(topology, '_numba_union_find_batch_kernel', None):
-        with pytest.raises(RuntimeError, match='kernel is unavailable'):
+    error = NativeCpuBuildError('Native CPU kernels unavailable')
+    with mock.patch.object(native_cpu, 'load_native_cpu', side_effect=error):
+        with pytest.raises(RuntimeError, match='batch state is partial') as failure:
             uf.union_pair_codes(np.array([(1 << 32) | 2], dtype=np.uint64))
+    assert failure.value.__cause__ is error
     np.testing.assert_array_equal(uf.root_map(), np.array([0, 1, 2], dtype=np.uint32))
 
 

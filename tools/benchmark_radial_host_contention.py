@@ -183,11 +183,11 @@ def main():
                     stop = min(flat.size, first + projection._PULL_CHUNK_VOXELS)
                     flat[first:stop] = pull_radial_chunk(source, view, radii, OUTPUT_SHAPE, z, first, stop)
                 reference[z] = digest(plane)
-            # Warm module compilation, Numba, upload and first CUDA calls outside
+            # Load the CPU extension and warm the CUDA module and upload outside
             # measured runs. Both upload routes still use the same source pages.
             with cuda.RadialCudaProjector(source, plan, metadata, view, OUTPUT_SHAPE,
                                            boxes, True, args.device) as warm:
-                if warm.source_pack_backend != 'numba_nogil':
+                if warm.source_pack_backend != 'native_nogil':
                     raise RuntimeError('Compiled crop packer was not qualified')
             report['heatsoak_seconds'] = heatsoak(args.heat_seconds, args.device)
             load = OutputLoad(workspace, args.load_workers)

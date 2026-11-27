@@ -232,9 +232,9 @@ def _project_spherical_block(source, view, radii, rotation, shape, first_z, coun
 
 def _select_spherical_cpu_pull(source, view, radii, rotation, shape, bboxes):
     """Admit the required compiled CPU pull before any output is published."""
-    from .spherical_projection_cpu import prepare_spherical_chunk_numba, SphericalCpuProjectionUnavailable
+    from .spherical_projection_cpu import prepare_spherical_chunk_native, SphericalCpuProjectionUnavailable
     try:
-        return prepare_spherical_chunk_numba(source, view, radii, rotation, shape, bboxes)
+        return prepare_spherical_chunk_native(source, view, radii, rotation, shape, bboxes)
     except SphericalCpuProjectionUnavailable as exc:
         raise SphericalCpuProjectionUnavailable(
             f'Spherical compiled CPU projection unavailable for {view.name}: {exc}'
@@ -548,7 +548,7 @@ def backproject_spherical_volume_to_volume(
         cpu_pull = (_select_spherical_cpu_pull(source, spherical_view, radii, rotation, shape, bboxes)
                     if stage is None else None)
         cpu_setup_seconds = time.perf_counter() - cpu_setup_started
-        cpu_backend = 'unused' if stage is not None else 'numba_f64_bounded'
+        cpu_backend = 'unused' if stage is not None else 'native_f64_bounded'
         cpu_compact = bool(compact_supported)
         cpu_rectangular = bool(cpu_compact and callable(getattr(cpu_pull, 'rectangle', None)))
         compact = bool(compact_supported and (stage is not None or cpu_compact))

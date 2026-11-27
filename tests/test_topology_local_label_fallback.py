@@ -137,7 +137,7 @@ def test_simultaneous_small_and_overflowing_calls_keep_their_own_dtype_without_m
 
 
 def test_compiled_sparse_projection_lookup_keeps_label_ids_above_uint16(tmp_path):
-    from XTA.interpolation import _numba_find_projection_candidates_kernel
+    from XTA.native_cpu import kernels
     labels = topology.SparseSliceLabelStore((2, 3, 3), np.uint32)
     a = np.zeros((3, 3), np.uint32)
     a[1, 1] = 1
@@ -148,7 +148,7 @@ def test_compiled_sparse_projection_lookup_keeps_label_ids_above_uint16(tmp_path
     labels.finalize()
     sdf = np.full((3, 3), -1., np.float32)
     sdf[1, 1] = 1.
-    result = _numba_find_projection_candidates_kernel(
+    result = kernels.interpolation_find_projection_candidates(
         np.empty((0, 0, 0), np.uint32), labels.flat, labels.offsets, labels.bboxes,
         True, 2, 3, np.zeros((1,), np.uint32), np.zeros((0,), np.int64), sdf,
         0, 0, 0, 1, 1, 1, 1, 1, 0., 1, False, False, 4)

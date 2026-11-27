@@ -77,7 +77,7 @@ def main():
             env.update(PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE='1',
                        PYTHONIOENCODING='utf-8', OMP_NUM_THREADS='2', MKL_NUM_THREADS='2',
                        CUPY_CACHE_DIR=str(out / 'cupy-cache'),
-                       CUPY_CACHE_SAVE_CUDA_SOURCE='1', NUMBA_CACHE_DIR=str(out / 'numba-cache'),
+                       CUPY_CACHE_SAVE_CUDA_SOURCE='1',
                        TORCHINDUCTOR_CACHE_DIR=str(out / 'torchinductor-cache'),
                        YOLO_CONFIG_DIR=str(SCRATCH / 'ultralytics-config'),
                        TEMP=str(out / 'temp'), TMP=str(out / 'temp'))

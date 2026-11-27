@@ -336,7 +336,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 ) as image_tile_render,
                 mock.patch.object(
                     pta.shared_geometry,
-                    "render_categorical_dense_tile_for_job",
+                    "render_categorical_tile_for_job",
                     side_effect=mask_tile,
                 ) as mask_tile_render,
                 mock.patch.object(

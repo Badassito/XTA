@@ -11,7 +11,6 @@ import pytest
 
 from XTA import confidence_evidence as evidence, geometry, pipeline
 from XTA.confidence_capture import confidence_capture_resources
-from XTA.confidence_capture_cpu import warm_confidence_capture_kernels
 from XTA.confidence_publication import ConfidencePublicationQueue
 from XTA.confidence_storage import _ordered_encoded_frames
 from XTA.native_pull_scheduling import (
@@ -53,7 +52,6 @@ def test_shared_window_is_charged_before_admission_without_changing_standalone_w
 
 
 def test_actual_four_staging_slots_share_32_workers_with_21_parent_threads(tmp_path, monkeypatch):
-    warm_confidence_capture_kernels()
     shape = (64, 32, 32)
     scores = np.random.default_rng(160587).integers(0, 256, shape, dtype=np.uint8)
     mask = np.ones(shape, np.uint8)

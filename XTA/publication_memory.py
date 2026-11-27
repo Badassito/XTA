@@ -6,25 +6,28 @@ import math
 from pathlib import Path
 from .config import GIB
 from .runtime import HYBRID_DEFERRED_RESULT_MODE, _register_memfd_owner, memfd_workspace_enabled, workspace_anon_cap_bytes, scratch_dir_is_memory_backed
-from .workspace import _env_flag, _env_float, _read_meminfo_bytes, available_anon_work_bytes
+from . import workspace
+from .workspace import _env_flag, _env_float
 
 
 def publication_ram_headroom():
     """Use physical/cgroup headroom only; spare swap is not a RAM cache budget.
 
-    Always a fresh probe that starts after this call (memfd_ram_headroom relies
-    on that ordering). On Linux its /proc and cgroupfs reads keep the GIL (see
-    ``workspace._probe_read_text``), so the probe stays cheap under contention.
+    The sample starts after this call. Memfd page ownership relies on that order.
     """
-    info = _read_meminfo_bytes()
-    if 'MemAvailable' not in info and os.name == 'nt':
-        try:
-            import psutil
-            return max(0, int(psutil.virtual_memory().available))
-        except (ImportError, OSError, ValueError, AttributeError):
-            return 0
-    return max(0, min(int(info.get('MemAvailable', 0)),
-                      int(available_anon_work_bytes(meminfo=info))))
+    if os.name == 'nt':
+        info = workspace._read_meminfo_bytes()
+        if 'MemAvailable' not in info:
+            try:
+                import psutil
+                return max(0, int(psutil.virtual_memory().available))
+            except (ImportError, OSError, ValueError, AttributeError):
+                return 0
+        anon = workspace.available_anon_work_bytes(meminfo=info)
+    else:
+        info, cgroup, _ = workspace._memory_sample(include_meminfo=True, include_cgroup=True)
+        anon = workspace._anon_headroom(info, cgroup)
+    return max(0, min(int(info.get('MemAvailable', 0)), anon))
 
 
 def d1_score_projection_workers(tasks, *, cpu_count, ram_bytes, scratch_bytes,
@@ -96,7 +99,7 @@ def policy_cpu_worker_buffer_plan(*, worker_count, cache_mib, batch_size, out_si
 
 
 def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
-                                   dense_tiling=False, nrrd_layers=False,
+                                   tiling=False, nrrd_layers=False,
                                    retain_confidence=False):
     """Charge admitted native parents separately from packed D1 publication grants.
 
@@ -109,7 +112,7 @@ def native_fullframe_dense_reserve(tasks, *, total_dense_limit, min_conf=0.,
     parents = {}
     policy_groups = {}
     count = (2 if float(min_conf) > 0 or retain_confidence else 1) + (
-        (3 if nrrd_layers else 1) if dense_tiling else 0)
+        (3 if nrrd_layers else 1) if tiling else 0)
     has_policy_groups = False
     for grouped_task in tasks:
         siblings = grouped_task.get('augmentation_pass_tasks') or ()

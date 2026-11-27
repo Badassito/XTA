@@ -27,23 +27,9 @@ try:
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("tqdm is required: pip install tqdm") from exc
 
-try:
-    import numba as _numba  # type: ignore
-except Exception as exc:  # pragma: no cover
-    raise RuntimeError(
-        "Numba is required for compiled CPU kernels: pip install 'numba>=0.61.2'"
-    ) from exc
-
-if bool(_numba.config.DISABLE_JIT):
-    raise RuntimeError(
-        "Numba JIT compilation is disabled; unset NUMBA_DISABLE_JIT to run compiled CPU kernels"
-    )
-
-
 __all__ = (
     "cv2",
     "ndi",
     "tifffile",
     "tqdm",
-    "_numba",
 )

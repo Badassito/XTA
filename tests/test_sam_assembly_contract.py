@@ -70,7 +70,7 @@ def _prepare(tmp_path, observations, context, *, distance=5, backend='sam', call
             model_name='detector', view=_view(observations.shape),
             union_mm=observations, confmap_mm=None,
             union_path=tmp_path / 'original.u8.dat', confmap_path=None,
-            temp_dir=tmp_path, dense_tiling_active=True, min_conf=0., min_radius=0.,
+            temp_dir=tmp_path, tiling_active=True, min_conf=0., min_radius=0.,
             interpolate=distance, interpolation_walk_back=0, interpolation_candidates=2,
             interpolate_passes=3, interpolate_min_radius=0., interpolation_search_angle=-6.,
             slice_workers=1, interpolation_task_workers=1,

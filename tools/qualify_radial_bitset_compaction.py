@@ -212,9 +212,8 @@ def benchmark_real_abba(fixture_path, shape, output_dir, baseline_cvol, heat_sec
         raise ValueError('fixture size differs from exact source bitset shape')
     words = np.memmap(fixture_path, dtype='<u4', mode='r', shape=(expected_words,))
     sizes = block_capacity(shape)
-    # Warm both JIT paths and CUDA kernels before heatsoak/timing.  The CPU
-    # warmup stays tiny; it exercises both Numba signatures without scanning
-    # the full fixture.  Existing CUDA qualifier already established parity.
+    # Check the native CPU binding on a tiny fixture and initialize the CUDA
+    # encoder before heatsoak and timing. The full fixture remains untouched.
     warm_shape = (2, 3, 37)
     encode_owner_packed_block(_fixture(warm_shape, 'edges'), warm_shape, 0, 2)
     warm_gpu = cp.asarray(_fixture(warm_shape, 'edges'))

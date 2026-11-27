@@ -370,3 +370,29 @@ def test_full_native_plane_with_realistic_model_size_is_exact(monkeypatch):
     assert stats['backend']=='compiled_azimuthal_cached' and stats['kernel_calls']==1
     assert (expected>0).any() and (expected==0).any()
     np.testing.assert_array_equal(actual,expected)
+
+
+def test_last_valid_tilted_half_step_clamps_after_rounding():
+    from XTA import projection_coverage_cpu as cpu
+    from XTA.interpolation import CTILE_INDEX_DTYPE
+    from XTA.packed_tilted_projection import _pull_tilted_encoded
+
+    # A valid coordinate can round to exactly one when adding a half in binary64.
+    frame = np.nextafter(np.float64(.5), np.float64(0))
+    assert frame < .5 and np.floor(frame + .5) == 1.
+    source = np.array([[[173], [0], [0]]], np.uint8)
+    expected_frame = np.clip(np.floor(frame + .5), 0, source.shape[0] - 1).astype(int)
+    dims = np.array((0, 1, 1, 3, 1, 1, 3, 1, 3, 1, 0), np.int64)
+    coeff = np.array((frame, 0., 1., 1., 0., 0., 0., 1., 0., 1., 1., 1.), np.float64)
+    bbox = np.array((0, 0, 0, 1, 3, 1), np.int64)
+    out = np.zeros(1, np.uint8)
+    assert cpu._pull_tilted(source, out, 0, dims, coeff, bbox, True) == (1, 1)
+    assert out[0] == source[expected_frame, 0, 0]
+
+    index = np.zeros(1, CTILE_INDEX_DTYPE)
+    index['kind'] = index['x1'] = index['y1'] = index['payload_size'] = index['payload_nbytes'] = 1
+    for packed in (False, True):
+        out.fill(0)
+        counts = _pull_tilted_encoded(np.ones(1, np.uint8), index, packed,
+                                     np.array(source.shape, np.int64), out, 0, dims, coeff, bbox)
+        assert counts == (1, 1) and out[0] == 1

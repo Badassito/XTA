@@ -52,14 +52,14 @@ def parse_args(argv=None):
 def run(args):
     OUT = args.output_dir
     sys.dont_write_bytecode = True
-    for name in ('temp', 'cuda-cache', 'cupy-cache', 'numba-cache', 'torch-extensions', 'triton-cache', 'yolo-config'):
+    for name in ('temp', 'cuda-cache', 'cupy-cache', 'torch-extensions', 'triton-cache', 'yolo-config'):
         (OUT / name).mkdir(parents=True, exist_ok=True)
     os.environ.update(CUDA_VISIBLE_DEVICES='0', YOLO_TTA_TELEMETRY_SYSTEM_SAMPLER='0',
         YOLO_TTA_TELEMETRY_DIR=str(OUT), OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1',
-        MKL_NUM_THREADS='1', NUMBA_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1',
+        MKL_NUM_THREADS='1', NUMEXPR_NUM_THREADS='1',
         PYTHONDONTWRITEBYTECODE='1', TEMP=str(OUT/'temp'), TMP=str(OUT/'temp'),
         CUDA_CACHE_PATH=str(OUT/'cuda-cache'), CUPY_CACHE_DIR=str(OUT/'cupy-cache'),
-        NUMBA_CACHE_DIR=str(OUT/'numba-cache'), TORCH_EXTENSIONS_DIR=str(OUT/'torch-extensions'),
+        TORCH_EXTENSIONS_DIR=str(OUT/'torch-extensions'),
         TRITON_CACHE_DIR=str(OUT/'triton-cache'), YOLO_CONFIG_DIR=str(OUT/'yolo-config'))
     if args.gpu_tests:
         # Pytest skip markers are evaluated when the renderer helper is first imported.

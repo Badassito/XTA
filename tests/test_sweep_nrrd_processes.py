@@ -54,7 +54,7 @@ def software_codec(monkeypatch):
 
 @pytest.fixture(scope='module')
 def pool():
-    workers = SweepNrrdProcessPool(2, warm=False)
+    workers = SweepNrrdProcessPool(2)
     try:
         yield workers
     finally:
@@ -178,7 +178,7 @@ def test_unmatched_parent_codec_keeps_every_layer_on_threads(tmp_path, monkeypat
 def test_worker_refusing_the_producer_codec_falls_back_with_identical_bytes(tmp_path, monkeypatch):
     layers = _random_layers(tmp_path / 'sources', 7)
     expected = _publish(tmp_path / 'threads', 'cropped', monkeypatch, layers)
-    workers = SweepNrrdProcessPool(1, warm=False)
+    workers = SweepNrrdProcessPool(1)
     try:
         real = sweep_nrrd_processes.nrrd_codec_identity()
         monkeypatch.setattr(sweep_nrrd_processes, 'nrrd_codec_identity', lambda: (real[0], real[1] + 1, real[2]))
@@ -203,7 +203,7 @@ def test_dead_worker_joins_pool_and_thread_rewrites_identical_files(tmp_path, mo
     layers = _random_layers(tmp_path / 'sources', 9)
     expected = _publish(tmp_path / 'threads', 'cropped', monkeypatch, layers)
     expected_first = _publish(tmp_path / 'threads-first', 'cropped', monkeypatch, layers[:1])
-    workers = SweepNrrdProcessPool(1, warm=False)
+    workers = SweepNrrdProcessPool(1)
     try:
         pid = _wait_for_workers(workers)[0]
         os.kill(pid, signal.SIGTERM)
@@ -232,7 +232,7 @@ def test_dead_worker_joins_pool_and_thread_rewrites_identical_files(tmp_path, mo
 
 
 def test_cancelled_pool_starts_no_new_layer(tmp_path, monkeypatch):
-    workers = SweepNrrdProcessPool(1, warm=False)
+    workers = SweepNrrdProcessPool(1)
     try:
         workers.cancel()
         assert workers.closed and not workers.broken
@@ -297,7 +297,7 @@ def test_worker_keeps_its_gzip_share_over_the_producer_setting(tmp_path, monkeyp
     expected = _publish(tmp_path / 'threads', 'cropped', monkeypatch, layers)
     # The producer's explicit pool size is inherited at spawn and was replayed by every job.
     monkeypatch.setenv('YOLO_TTA_NRRD_GZIP_WORKERS', '64')
-    workers = SweepNrrdProcessPool(1, gzip_workers=3, warm=False)
+    workers = SweepNrrdProcessPool(1, gzip_workers=3)
     try:
         _wait_for_workers(workers)
         assert workers._executor.submit(os.getenv, 'YOLO_TTA_NRRD_GZIP_WORKERS').result() == '3'
@@ -419,11 +419,28 @@ def test_pool_that_cannot_spawn_every_worker_stops_the_ones_it_started(monkeypat
 
     monkeypatch.setattr(ProcessPoolExecutor, 'submit', failing_submit)
     monkeypatch.setattr(ProcessPoolExecutor, 'shutdown', recording_shutdown)
-    for start in (lambda: SweepNrrdProcessPool(2, gzip_workers=1, warm=False),
+    for start in (lambda: SweepNrrdProcessPool(2, gzip_workers=1),
                   lambda: sweep_evidence_processes.SweepEvidenceProcessPool(2)):
         with pytest.raises(OSError, match='temporarily unavailable'):
             start()
     assert shut == [True, True]
+
+
+@pytest.mark.parametrize(
+    ("in_t", "out_t", "source_z0", "source_z1", "expected"),
+    [
+        (5, 3, 1, 1, (0, 1)),
+        (5, 3, 3, 3, (1, 2)),
+        (3, 9, 1, 1, (3, 5)),
+        (4, 4, -2, -3, (0, 0)),
+        (4, 4, 7, 5, (3, 3)),
+        (4, 4, 3, 1, None),
+        (4, 4, -2, 5, (0, 3)),
+        (0, 0, -2, 5, (0, 0)),
+    ],
+)
+def test_extent_inversion_keeps_inclusive_restore_boundaries(in_t, out_t, source_z0, source_z1, expected):
+    assert outputs._nrrd_output_z_extent_for_source_extent(in_t, out_t, source_z0, source_z1) == expected
 
 
 def test_extent_inversion_matches_the_per_slice_restore_walk():

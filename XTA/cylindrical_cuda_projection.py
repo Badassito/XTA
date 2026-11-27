@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 
-from ._deps import _numba
+from .native_cpu import kernels
 
 _BLOCK_BYTES = 64 * 1024 * 1024
 _UPLOAD_BYTES = 64 * 1024 * 1024
@@ -31,35 +31,11 @@ _CROP_METADATA_DTYPE = np.dtype([
 
 
 def _pack_radial_source_block(source, bboxes, offsets, first, destination):
-    """Copy an arbitrary interval of concatenated source rectangles, without GIL handoffs.
-
-    Inputs are validated by the CUDA contract. No normalization or floating point
-    addressing occurs, and a block may start/end inside a row or cross empty shells.
-    """
-    position = np.int64(first)
-    source_flat = source.reshape(-1)
-    cursor = 0
-    shell = 0
-    while cursor < destination.size:
-        while np.int64(offsets[shell + 1]) <= position:
-            shell += 1
-        y0, y1, x0, x1 = bboxes[shell]
-        width = x1 - x0
-        within = position - np.int64(offsets[shell])
-        row = y0 + within // width
-        column = x0 + within % width
-        count = min(destination.size - cursor, x1 - column)
-        # Validated nonnegative linear indices avoid per-byte negative-index
-        # correction and let LLVM generate contiguous vector loads/stores.
-        source_first = np.uint64((shell * source.shape[1] + row) * source.shape[2] + column)
-        output_first = np.uint64(cursor)
-        for at in range(count):
-            destination[output_first + np.uint64(at)] = source_flat[source_first + np.uint64(at)]
-        cursor += count
-        position += count
+    """Copy one interval of concatenated source rectangles directly into the upload lane."""
+    kernels.pack_radial_source_block(source, bboxes, offsets, first, destination)
 
 
-_pack_radial_source_block_compiled = _numba.njit(cache=True, nogil=True)(_pack_radial_source_block)
+_pack_radial_source_block_compiled = _pack_radial_source_block
 
 
 @dataclass(frozen=True)
@@ -702,9 +678,9 @@ class RadialCudaProjector:
         self.source_upload_lane_wait_seconds = 0.0
         pack = _pack_radial_source_block_compiled
         boxes, offsets = self.contract.arrays['bboxes'], self.contract.arrays['source_offsets']
-        # Compile before source copy so failures cannot publish a partial upload.
+        # Validate the native upload buffers before enqueuing the first transfer.
         pack(source, boxes, offsets, 0, self._upload_stage[:0])
-        self.source_pack_backend = 'numba_nogil'
+        self.source_pack_backend = 'native_nogil'
         events = None
         if capacity >= 2 and self.source_h2d_bytes > capacity:
             try:
@@ -714,7 +690,7 @@ class RadialCudaProjector:
                 events = None
         if events is not None:
             self.source_upload_pipeline = True
-            self.source_pack_backend = 'numba_nogil_pipelined'
+            self.source_pack_backend = 'native_nogil_pipelined'
             half = capacity // 2
             pending = [False, False]
             # Constructor cleanup already retains this dictionary, the pinned
@@ -762,6 +738,8 @@ class RadialCudaProjector:
         self.cuda_graph_blocks = 0
         self.cuda_graph_seconds = 0.0
         self.empty_encoded_blocks = 0
+        self.output_metadata_fence_seconds = self.output_payload_fence_seconds = 0.0
+        self.output_offset_plan_seconds = self.output_host_detach_seconds = 0.0
 
     def _record(self, phase, boundary):
         self._events[f'{phase}_{boundary}'].record(self._stream)
@@ -864,7 +842,9 @@ class RadialCudaProjector:
         self._record('graph', 'start')
         self._graphs[count].launch(stream=self._stream)
         self._record('graph', 'end')
+        wait_started = time.perf_counter()
         self._stream.synchronize()
+        self.output_metadata_fence_seconds += time.perf_counter() - wait_started
         self.cuda_graph_blocks += 1
         self.cuda_graph_seconds += self._elapsed('graph')
 
@@ -873,14 +853,18 @@ class RadialCudaProjector:
         height, width = self.contract.output_shape[1:]
         if not metadata_ready:
             self._enqueue_crop_metadata(count)
+            wait_started = time.perf_counter()
             self._stream.synchronize()
+            self.output_metadata_fence_seconds += time.perf_counter() - wait_started
         metadata_bytes = count * _CROP_METADATA_DTYPE.itemsize
         if not metadata_ready:
             self.metadata_seconds += self._elapsed('metadata')
             self.d2h_seconds += self._elapsed('copy')
         self.metadata_d2h_bytes += metadata_bytes
+        offset_started = time.perf_counter()
         records, offsets, total, largest = _encoded_records(first_z, self._metadata_stage[:count],
             packed, (height, width), self.compact_buffer_bytes)
+        self.output_offset_plan_seconds += time.perf_counter() - offset_started
         if total == 0 and self._skip_empty_blocks:
             # Metadata is already fenced and establishes every plane as empty.
             # Do not upload offsets, launch a no-op encoder or fence it again.
@@ -901,13 +885,17 @@ class RadialCudaProjector:
             cp.cuda.runtime.memcpyAsync(int(self._output_pin.ptr), int(self._compact_gpu.data.ptr), total,
                 cp.cuda.runtime.memcpyDeviceToHost, int(self._stream.ptr))
             self._record('copy', 'end')
+        wait_started = time.perf_counter()
         self._stream.synchronize()
+        self.output_payload_fence_seconds += time.perf_counter() - wait_started
         self.pack_seconds += self._elapsed('pack')
         if total:
             self.d2h_seconds += self._elapsed('copy')
         self.payload_d2h_bytes += total
+        detach_started = time.perf_counter()
         payload = self._output_stage.reshape(-1)[:total].copy()
         payload.flags.writeable = False
+        self.output_host_detach_seconds += time.perf_counter() - detach_started
         return RadialEncodedBlock(first_z, records, payload, bool(packed))
 
     @staticmethod

@@ -30,7 +30,7 @@ from typing import (
 )
 import numpy as np
 from .cylindrical_cuda_projection import RadialEncodedBlock, RadialEncodedSlice
-from .packed_publication import encode_owner_packed_block
+from .packed_publication import encode_owner_packed_fields
 from .publication_memory import publication_ram_headroom
 
 from .geometry import (
@@ -883,9 +883,9 @@ def _d1_finalize_bitset_layer(
                 writer.consume_empty_range(int(z0), int(z1 - z0))
                 continue
             if packed:
-                records, payload = encode_owner_packed_block(words, output_shape, z0, z1 - z0)
-                writer.consume_encoded_block(z0, records, payload, packed=True)
-                del records, payload
+                fields, payload = encode_owner_packed_fields(words, output_shape, z0, z1 - z0)
+                writer.consume_encoded_fields(z0, fields, payload, packed=True)
+                del fields, payload
                 continue
             block = _d1_unpack_bitset_z_block(words, output_shape, int(z0), int(z1))
             writer.consume(int(z0), block)
@@ -2150,7 +2150,13 @@ def tile_intermediate_accumulator_reserve_bytes() -> int:
     proportional = int(float(max(0, available_anon_work_bytes())) * float(fraction))
     return int(min(max(floor_bytes, proportional), max(floor_bytes, cap_bytes)))
 
-def tile_dense_worker_result_limit_bytes() -> int:
+def tile_environment_name(suffix: str) -> str:
+    """Prefer the current tile setting when a run script supplies both names."""
+    name = f'YOLO_TTA_TILE_{suffix}'
+    return name if name in os.environ else f'YOLO_TTA_TILE_DENSE_{suffix}'
+
+
+def tile_worker_result_limit_bytes() -> int:
     """Bound live array-backed per-tile GPU-worker results before sparse retirement.
 
     The limit is a hard scheduling backpressure budget, not a storage target. A single tile
@@ -2158,15 +2164,15 @@ def tile_dense_worker_result_limit_bytes() -> int:
     geometries cannot deadlock. Waiting parent/bridge masks are always converted to crop-local
     raw-bbox stores; there is no array-backed waiting compatibility path in v16.4.3.
     """
-    return int(max(1.0, _env_float('YOLO_TTA_TILE_DENSE_RESULT_MAX_GIB', 96.0)) * GIB)
+    return int(max(1.0, _env_float(tile_environment_name('RESULT_MAX_GIB'), 96.0)) * GIB)
 
-def tile_dense_worker_result_limit_tasks() -> int:
+def tile_worker_result_limit_tasks() -> int:
     """Bound live tile-result mappings/file descriptors even when each crop is individually small."""
-    return max(1, _env_int('YOLO_TTA_TILE_DENSE_RESULT_MAX_TASKS', 64))
+    return max(1, _env_int(tile_environment_name('RESULT_MAX_TASKS'), 64))
 
-def tile_dense_worker_result_warn_seconds() -> float:
+def tile_worker_result_warn_seconds() -> float:
     """Retention age that emits a diagnostic warning; zero disables the warning."""
-    return max(0.0, _env_float('YOLO_TTA_TILE_DENSE_RESULT_WARN_SECONDS', 120.0))
+    return max(0.0, _env_float(tile_environment_name('RESULT_WARN_SECONDS'), 120.0))
 
 def _retire_temporary_binary_volume(volume: object, raw_path: Optional[Path], *, delete_raw: bool) -> None:
     """Delete a raw scratch backing only after its last mapped view is released."""

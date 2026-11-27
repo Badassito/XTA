@@ -126,7 +126,7 @@ class SphericalModeIntegrationTests(unittest.TestCase):
                             self.assertEqual(tile_mask.shape, (8, 8))
                             self.assertIsNotNone(tile.canonical_plan.tile_layout)
                             self.assertEqual(tile.canonical_plan.metadata["spherical_shell"], plan.canonical_plan.metadata["spherical_shell"])
-                            np.testing.assert_array_equal(tile_mask, geometry.render_categorical_dense_tile_for_job(mask, view.shared_view, tile.shared_job, 0))
+                            np.testing.assert_array_equal(tile_mask, geometry.render_categorical_tile_for_job(mask, view.shared_view, tile.shared_job, 0))
 
     @unittest.skipIf(type(cv2).__name__ == '_StubModule', 'requires real OpenCV numerical runtime')
     def test_pta_partial_labels_and_encoded_gaps_remove_spherical_requests_before_compilation(self):

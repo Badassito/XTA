@@ -679,80 +679,81 @@ class ProtoUnionOptimizationTests(unittest.TestCase):
         ))
 
     def test_resident_fp16_32_mask_post_uses_packed_tiled_union(self) -> None:
-        class FakeKernel:
-            def __init__(self) -> None:
-                self.calls = []
+        import torch
 
-            def __call__(self, grid, block, args, *, stream) -> None:
-                self.calls.append((grid, block, args, stream))
-
-        dtype_f16 = object()
-        compact_tiled = FakeKernel()
-        union_tiled = FakeKernel()
-        compact_fallback = FakeKernel()
-        union_fallback = FakeKernel()
-        quantize = FakeKernel()
+        stream = object()
         executor = object.__new__(backprojection._ResidentTensorRTRingExecutor)
-        executor.torch = SimpleNamespace(float16=dtype_f16)
+        executor.torch = torch
         executor.kernels = SimpleNamespace(
-            cp=object(),
-            compact_f16_tiled=compact_tiled,
-            union_f16_f16_tiled=union_tiled,
-            compact_f16=compact_fallback,
-            union_f16_f16=union_fallback,
-            upsample_quantize=quantize,
+            cp=SimpleNamespace(asarray=lambda tensor: tensor),
+            compact_f16_tiled=mock.Mock(),
+            union_f16_f16_tiled=mock.Mock(),
+            compact_f16=mock.Mock(),
+            union_f16_f16=mock.Mock(),
+            proto_threshold_signed=mock.Mock(),
+            proto_dilate_signed=mock.Mock(),
+            proto_erode_signed=mock.Mock(),
+            upsample_quantize=mock.Mock(),
         )
         executor.confidence_threshold = 0.25
-        executor.out_size = 65
-        executor.native_h = 65
-        executor.native_w = 65
-        executor.proto_hole_treatment_active = False
+        executor.out_size = executor.native_h = executor.native_w = 65
+        executor.post_policy = 'legacy_proto'
+        executor.track_conf = executor.retain_confidence = False
         executor.collect_slice_bboxes = False
-        head = SimpleNamespace(shape=(1, 37, 4), dtype=dtype_f16)
-        proto = SimpleNamespace(shape=(1, 32, 5, 66), dtype=dtype_f16)
-        compact_count = mock.Mock()
-        refs = {
-            'head': object(),
-            'proto': object(),
-            'indices': object(),
-            'count': object(),
-            'compact_coeff': object(),
-            'compact_proto_boxes': object(),
-            'compact_confs': object(),
-            'max_logit': object(),
-            'native_union': object(),
-            'native_bbox': object(),
-        }
+        with (mock.patch.object(backprojection, 'proto_hole_treatment_mode', return_value='close'),
+              mock.patch.object(backprojection, 'proto_hole_treatment_radius', return_value=1)):
+            mode, executor.proto_hole_radius = backprojection._resident_trt_proto_policy(
+                executor.post_policy, executor.compute_confidence,
+            )
+        executor.proto_hole_treatment_active = mode == 'close' and executor.proto_hole_radius > 0
         slot = SimpleNamespace(
             slot_id=0,
-            head=head,
-            proto=proto,
-            compact_count=compact_count,
+            head=torch.zeros((1, 37, 4), dtype=torch.float16),
+            proto=torch.zeros((1, 32, 5, 66), dtype=torch.float16),
             post_stream=object(),
             unit_descriptor=object(),
             identity_native_warp=True,
-            _cupy_refs=refs,
         )
+        executor._allocate_post_buffers(slot)
+        self.assertIsNone(slot.retina_workspace)
+        refs = slot._cupy_refs
+        self.assertEqual((tuple(slot.compact_coeff.shape), slot.compact_coeff.dtype), ((4, 32), torch.float16))
+        self.assertEqual((tuple(slot.compact_proto_boxes.shape), slot.compact_proto_boxes.dtype), ((4, 4), torch.float32))
+        self.assertEqual((tuple(slot.compact_confs.shape), slot.compact_confs.dtype), ((4,), torch.float32))
+        slot.compact_count.fill_(9)
 
-        with mock.patch.object(
-            backprojection, '_cupy_external_stream', return_value='external-stream',
-        ):
+        def capture_compaction(grid, block, args, *, stream):
+            self.assertEqual(int(args[4][0]), 0)
+
+        executor.kernels.compact_f16_tiled.side_effect = capture_compaction
+        with mock.patch.object(backprojection, '_cupy_external_stream', return_value=stream):
             executor._launch_post(slot)
 
-        compact_count.zero_.assert_called_once_with()
-        self.assertEqual(len(compact_tiled.calls), 1)
-        self.assertEqual(compact_tiled.calls[0][0:2], ((1,), (256,)))
-        self.assertEqual(compact_tiled.calls[0][2][-3:], (
-            refs['compact_coeff'], refs['compact_proto_boxes'], refs['compact_confs'],
-        ))
-        self.assertEqual(len(union_tiled.calls), 1)
-        self.assertEqual(union_tiled.calls[0][0:2], ((2, 2), (32, 4)))
-        self.assertEqual(union_tiled.calls[0][2][0:5], (
-            refs['proto'], refs['compact_coeff'], refs['compact_proto_boxes'],
-            refs['compact_confs'], refs['count'],
-        ))
-        self.assertEqual(compact_fallback.calls, [])
-        self.assertEqual(union_fallback.calls, [])
+        compact = executor.kernels.compact_f16_tiled
+        compact.assert_called_once()
+        self.assertEqual(compact.call_args.args[:2], ((1,), (256,)))
+        self.assertEqual(compact.call_args.kwargs, {'stream': stream})
+        compact_args = compact.call_args.args[2]
+        self.assertEqual(compact_args[1:3], (4, np.float32(.25)))
+        self.assertEqual(compact_args[5:13], (65, 65, 0, 32, 5, 66, 65, 65))
+        for actual, key in zip(compact_args[-3:], ('compact_coeff', 'compact_proto_boxes', 'compact_confs')):
+            self.assertIs(actual, refs[key])
+        union = executor.kernels.union_f16_f16_tiled
+        union.assert_called_once()
+        self.assertEqual(union.call_args.args[:2], ((2, 2), (32, 4)))
+        self.assertEqual(union.call_args.kwargs, {'stream': stream})
+        union_args = union.call_args.args[2]
+        for actual, key in zip(union_args[:5], ('proto', 'compact_coeff', 'compact_proto_boxes', 'compact_confs', 'count')):
+            self.assertIs(actual, refs[key])
+        self.assertEqual(union_args[5:8], (32, 5, 66))
+        self.assertIs(union_args[8], refs['max_logit'])
+        executor.kernels.compact_f16.assert_not_called()
+        executor.kernels.union_f16_f16.assert_not_called()
+        executor.kernels.proto_threshold_signed.assert_called_once()
+        executor.kernels.proto_dilate_signed.assert_called_once()
+        executor.kernels.proto_erode_signed.assert_called_once()
+        executor.kernels.upsample_quantize.assert_called_once()
+        self.assertIs(executor.kernels.upsample_quantize.call_args.args[2][0], refs['proto_tmp'])
 
     def test_resident_kernel_bundle_contains_packed_tiled_sources(self) -> None:
         source = inspect.getsource(inference._resident_mask_kernels)
@@ -831,62 +832,80 @@ class D1BackprojectionOptimizationTests(unittest.TestCase):
         )
 
     def test_resident_quantizer_uses_2d_launch_and_initializes_bbox(self) -> None:
-        class FakeKernel:
-            def __init__(self) -> None:
-                self.calls = []
+        import torch
 
-            def __call__(self, grid, block, args, *, stream) -> None:
-                self.calls.append((grid, block, args, stream))
+        events = []
+        stream = object()
 
-        dtype_f16 = object()
-        compact = FakeKernel()
-        union = FakeKernel()
-        quantize = FakeKernel()
+        def compact(grid, block, args, *, stream):
+            _, _, _, _, count, height, width, bbox = args
+            self.assertEqual(int(count[0]), 0)
+            # Compaction thread 0 initializes the bounds before any mask writes.
+            bbox[:] = torch.tensor([int(height), 0, int(width), 0], dtype=torch.int32)
+            events.append('compact')
+
+        def decode(*, stream):
+            events.append('decode')
+            return retina_union, None
+
+        def quantize(grid, block, args, *, stream):
+            self.assertEqual(args[-1].tolist(), [65, 0, 65, 0])
+            events.append('quantize')
+
         executor = object.__new__(backprojection._ResidentTensorRTRingExecutor)
-        executor.torch = SimpleNamespace(float16=dtype_f16)
+        executor.torch = torch
         executor.kernels = SimpleNamespace(
-            cp=object(),
-            compact_f16=compact,
-            union_f16_f16=union,
-            upsample_quantize=quantize,
+            cp=SimpleNamespace(asarray=lambda tensor: tensor),
+            compact_f16=mock.Mock(side_effect=compact),
+            union_f16_f16=mock.Mock(),
+            upsample_quantize=mock.Mock(side_effect=quantize),
         )
         executor.confidence_threshold = 0.25
-        executor.out_size = 65
-        executor.native_h = 65
-        executor.native_w = 65
+        executor.out_size = executor.native_h = executor.native_w = 65
+        executor.post_policy = 'legacy_proto'
         executor.proto_hole_treatment_active = False
+        executor.track_conf = executor.retain_confidence = False
         executor.collect_slice_bboxes = True
-        head = SimpleNamespace(shape=(1, 6, 4), dtype=dtype_f16)
-        proto = SimpleNamespace(shape=(1, 1, 2, 2), dtype=dtype_f16)
-        compact_count = mock.Mock()
+        retina_union = torch.zeros((65, 65), dtype=torch.float32)
+        workspace = SimpleNamespace(decode=mock.Mock(side_effect=decode))
         slot = SimpleNamespace(
             slot_id=0,
-            head=head,
-            proto=proto,
-            compact_count=compact_count,
+            head=torch.zeros((1, 6, 4), dtype=torch.float16),
+            proto=torch.zeros((1, 1, 2, 2), dtype=torch.float16),
             post_stream=object(),
             unit_descriptor=object(),
             identity_native_warp=True,
-            _cupy_refs={
-                'head': object(),
-                'proto': object(),
-                'indices': object(),
-                'count': object(),
-                'max_logit': object(),
-                'native_union': object(),
-                'native_bbox': object(),
-            },
         )
-
-        with mock.patch.object(
-            backprojection, '_cupy_external_stream', return_value='external-stream',
-        ):
+        with mock.patch.object(backprojection, '_retina_workspace', return_value=workspace) as allocate:
+            executor._allocate_post_buffers(slot)
+        allocate.assert_called_once()
+        self.assertIs(allocate.call_args.args[2], slot.compact_indices)
+        self.assertIs(allocate.call_args.args[3], slot.compact_count)
+        self.assertEqual(allocate.call_args.args[4], (65, 65))
+        self.assertEqual(allocate.call_args.kwargs, {'track_confidence': False})
+        slot.compact_count.fill_(9)
+        slot.native_bbox.fill_(-1)
+        with mock.patch.object(backprojection, '_cupy_external_stream', return_value=stream):
             executor._launch_post(slot)
 
-        compact_count.zero_.assert_called_once_with()
-        self.assertIs(compact.calls[0][2][-1], slot._cupy_refs['native_bbox'])
-        self.assertEqual(quantize.calls[0][0:2], ((3, 9), (32, 8)))
-        self.assertIs(quantize.calls[0][2][-1], slot._cupy_refs['native_bbox'])
+        self.assertEqual(events, ['compact', 'decode', 'quantize'])
+        refs = slot._cupy_refs
+        compact_launch = executor.kernels.compact_f16
+        compact_launch.assert_called_once()
+        self.assertEqual(compact_launch.call_args.args[:2], ((1,), (256,)))
+        self.assertEqual(compact_launch.call_args.kwargs, {'stream': stream})
+        self.assertIs(compact_launch.call_args.args[2][-1], refs['native_bbox'])
+        workspace.decode.assert_called_once_with(stream=stream)
+        executor.kernels.union_f16_f16.assert_not_called()
+        quantize_launch = executor.kernels.upsample_quantize
+        quantize_launch.assert_called_once()
+        self.assertEqual(quantize_launch.call_args.args[:2], ((3, 9), (32, 8)))
+        self.assertEqual(quantize_launch.call_args.kwargs, {'stream': stream})
+        quantize_args = quantize_launch.call_args.args[2]
+        self.assertIs(quantize_args[0], retina_union)
+        self.assertEqual(quantize_args[1:7], (0, 0, 65, 65, 65, 65))
+        self.assertIs(quantize_args[7], refs['native_union'])
+        self.assertIs(quantize_args[-1], refs['native_bbox'])
 
     def test_d1_kernel_warp_aggregates_output_word_atomics(self) -> None:
         source = inspect.getsource(cuda_d1._d1_backproject_kernels)

@@ -619,7 +619,7 @@ def test_native_tile_policy_configuration_refuses_before_loader(monkeypatch):
     from XTA.scheduler_preflight import preflight_tta_scheduler
     entered=[]
     monkeypatch.setattr('XTA.native_scheduler._load_native',lambda:entered.append(True))
-    with pytest.raises(ValueError,match='dense tile'):
+    with pytest.raises(ValueError,match='tile ownership'):
         preflight_tta_scheduler(gpu_device_count=1,cpu_enabled=False,
                                 tile_configs=({'augmentation_passes':3},),d1_owner_groups=False)
     assert not entered

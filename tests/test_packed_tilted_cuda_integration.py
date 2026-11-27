@@ -59,7 +59,10 @@ def _hashes(path):
 
 
 @pytest.fixture
-def actual_cuda(monkeypatch,tmp_path):
+def actual_cuda(monkeypatch,tmp_path,request):
+    from tests.native_stage_test_support import native_coordinator
+
+    native_coordinator(request, monkeypatch)
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES','0')
     for flag in ('YOLO_TTA_GPU_BACKPROJECT','YOLO_TTA_NATIVE_PULL_CUDA',
                  'YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT','YOLO_TTA_PACKED_PARENT'):
@@ -88,7 +91,7 @@ def actual_cuda(monkeypatch,tmp_path):
     bp._reset_main_process_gpu_stage_coordinator()
 
 
-def _assert_cuda_telemetry(view,target):
+def _assert_cuda_telemetry(view,target,*,gpu_interval=None):
     telemetry=runtime.runtime_telemetry()
     with telemetry.lock:
         records=[value for key,value in telemetry.gauges.items()
@@ -97,7 +100,10 @@ def _assert_cuda_telemetry(view,target):
     record=records[-1]
     assert record['state']=='complete'
     assert record['backend']=='cuda_native_encoded'
-    assert record['gpu_planes']==target[0] and record['cuda_handoff_plane']==0
+    start, stop = (0, target[0]) if gpu_interval is None else gpu_interval
+    assert 0 <= start < stop <= target[0]
+    assert record['completed_planes'] == target[0]
+    assert record['gpu_planes'] == stop - start and record['cuda_handoff_plane'] == start
 
 
 @pytest.mark.parametrize('view',_views(),ids=lambda v:v.name)
@@ -138,7 +144,7 @@ def _task(root,view):
     retired=[]
     task=AdmittedViewPrepare(admission=SimpleNamespace(reserve=lambda *_a:nullcontext()),
         transient_bytes=1,model_name='model',view=view,union_mm=volume,confmap_mm=None,
-        d1_shadow_path=None,union_path=path,confmap_path=None,temp_dir=root,dense_tiling_active=False,
+        d1_shadow_path=None,union_path=path,confmap_path=None,temp_dir=root,tiling_active=False,
         min_conf=0.,min_radius=0.,interpolation_distance=0,interpolation_walk_back=1,
         interpolation_candidates=1,interpolation_passes=1,interpolation_min_radius=0.,
         interpolation_search_angle=0.,slice_workers=2,
@@ -158,6 +164,23 @@ def test_actual_tta_prepare_retires_dense_before_encoded_cuda_publication(tmp_pa
     target=(27,97,111)
     monkeypatch.setattr(assembly,'_FINAL_SOURCE_OUTPUT_SHAPE_TYX',target)
     expected=_oracle(source,view,target)
+    from XTA import projection_coverage_cpu
+
+    blocks = []
+    project_encoded = NativePullCudaSession.project_encoded
+
+    def track_cuda(session, first, count, *, destination_bbox_tyx=None):
+        block = project_encoded(session, first, count, destination_bbox_tyx=destination_bbox_tyx)
+        assert block.packed and block.first_z == first and len(block.records) == count
+        blocks.append((first, count, tuple(destination_bbox_tyx)))
+        return block
+
+    def forbid_cpu(*args, **kwargs):
+        pytest.fail('Certified GPU projection entered the encoded CPU path')
+
+    monkeypatch.setattr(NativePullCudaSession, 'project_encoded', track_cuda)
+    monkeypatch.setattr(packed, '_pull_tilted_encoded', forbid_cpu)
+    monkeypatch.setattr(projection_coverage_cpu, 'pull_native_encoded_flat_into', forbid_cpu)
     original=packed.project_tilted_sparse_store
     def require_retired(*args,**kwargs):
         assert task.union_mm is None and owner_ref() is None and retired
@@ -169,7 +192,15 @@ def test_actual_tta_prepare_retires_dense_before_encoded_cuda_publication(tmp_pa
     assert result.final_view_volume_mm is None and result.native_support_mm is None
     assert result._packed_native_source_retired and len(result.nrrd_layers)==1
     np.testing.assert_array_equal(_decode(result.nrrd_layers[0].path),expected)
-    _assert_cuda_telemetry(view,target)
+    assert blocks
+    start, stop = blocks[0][2][0], blocks[0][2][3]
+    next_z = start
+    for first, count, bbox in sorted(blocks):
+        assert (bbox[0], bbox[3]) == (start, stop)
+        assert first == next_z and count > 0
+        next_z += count
+    assert next_z == stop
+    _assert_cuda_telemetry(view,target,gpu_interval=(start,stop))
     assert actual_cuda[-1].encoded_input
     assert not (tmp_path/'packed_native_parents'/'model'/view.name).exists()
 

@@ -15,8 +15,8 @@ import time
 
 import numpy as np
 
-from ._deps import _numba
-from .projection_coverage_cpu import _axis_bounds, _axis_value
+from .native_cpu import kernels
+from .projection_coverage_cpu import _encoded_record_bytes
 
 
 def terminal_native_source_packing_eligible(view, *, native_bytes, retire_dense,
@@ -49,7 +49,7 @@ def pack_terminal_native_source(volume, store_dir, *, desc):
                           release_memfd_owners_under, runtime_telemetry)
     from .publication_memory import publication_ram_headroom
     from .workspace import _env_int
-    from .packed_dense_source import (encode_dense_u8_packed_block,
+    from .packed_dense_source import (encode_dense_fields,
         DENSE_PACKED_PAYLOAD_BYTES, DENSE_PACKED_CONTROL_BYTES, MAX_DENSE_PACKED_BLOCK_SLICES)
 
     imports_seconds = time.perf_counter() - started
@@ -146,13 +146,13 @@ def pack_terminal_native_source(volume, store_dir, *, desc):
                 release_memfd_owners_under(path)
             if block_encoder:
                 phase_started = time.perf_counter()
-                records, payload = encode_dense_u8_packed_block(volume, z, count,
+                fields, payload = encode_dense_fields(volume, z, count,
                     payload_buffer=payload_slot)
                 encode_seconds += time.perf_counter() - phase_started
                 phase_started = time.perf_counter()
-                writer.consume_encoded_block(z, records, payload, packed=True)
+                writer.consume_encoded_fields(z, fields, payload, packed=True)
                 writer_seconds += time.perf_counter() - phase_started
-                records = payload = None
+                fields = payload = None
             else:
                 phase_started = time.perf_counter()
                 writer.consume(z, volume[z:z + 1])
@@ -196,72 +196,8 @@ def pack_terminal_native_source(volume, store_dir, *, desc):
             final_timing(progress('failed'))
 
 
-@_numba.njit(nogil=True, cache=False)
-def _pull_tilted_encoded(encoded, index, packed, source_shape, output, first,
-                         integer, coefficient, bbox):
-    base, vertical = integer[0], integer[1]
-    wt, wh, ww, ot, oh, ow = integer[2:8]
-    nh, nw = integer[8], integer[9]
-    tangent, origin, shear_center = coefficient[0:3]
-    addresses = reads = 0
-    local_start = 0
-    while local_start < output.size:
-        at = first + local_start
-        z, y, row_x = at // (oh * ow), (at // ow) % oh, at % ow
-        row_count = min(ow - row_x, output.size - local_start)
-        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4]):
-            output[local_start:local_start + row_count] = 0
-            local_start += row_count
-            continue
-        z0, z1 = _axis_bounds(z, wt, ot)
-        y0, y1 = _axis_bounds(y, wh, oh)
-        for row_offset in range(row_count):
-            x = row_x + row_offset
-            if not bbox[2] <= x < bbox[5]:
-                output[local_start + row_offset] = 0
-                continue
-            value = 0
-            x0, x1 = _axis_bounds(x, ww, ow)
-            for iz in range(z0, z1):
-                cz = _axis_value(z, iz, wt, ot, coefficient[9])
-                for iy in range(y0, y1):
-                    cy = _axis_value(y, iy, wh, oh, coefficient[10])
-                    for ix in range(x0, x1):
-                        cx = _axis_value(x, ix, ww, ow, coefficient[11])
-                        nv = cy if base == 0 else cz
-                        nu = cx if base != 2 else cy
-                        stack = cz if base == 0 else (cy if base == 1 else cx)
-                        axis = nv if vertical else nu
-                        frame = stack - tangent * (axis - shear_center) - origin
-                        if frame < -.5 or frame >= source_shape[0] - .5:
-                            continue
-                        if nv < -.5 or nv >= nh - .5 or nu < -.5 or nu >= nw - .5:
-                            continue
-                        row = coefficient[6] * nu + coefficient[7] * nv + coefficient[8]
-                        column = coefficient[3] * nu + coefficient[4] * nv + coefficient[5]
-                        f = int(math.floor(frame + .5))
-                        r = min(source_shape[1] - 1, max(0, int(math.floor(row + .5))))
-                        c = min(source_shape[2] - 1, max(0, int(math.floor(column + .5))))
-                        addresses += 1
-                        record = index[f]
-                        if (record['kind'] == 0 or r < record['y0'] or r >= record['y1']
-                                or c < record['x0'] or c >= record['x1']):
-                            continue
-                        width = np.int64(record['x1']) - np.int64(record['x0'])
-                        local_column = c - np.int64(record['x0'])
-                        stride = (width + 7) // 8 if packed else width
-                        address = (np.int64(record['offset'])
-                                   + (r - np.int64(record['y0'])) * stride)
-                        address += local_column // 8 if packed else local_column
-                        pixel = encoded[address]
-                        reads += 1
-                        if packed:
-                            pixel = (pixel >> (local_column % 8)) & 1
-                        if pixel:
-                            value = 1
-            output[local_start + row_offset] = value
-        local_start += row_count
-    return addresses, reads
+def _pull_tilted_encoded(encoded, index, *args):
+    return kernels._pull_tilted_encoded(encoded, _encoded_record_bytes(index), *args)
 
 
 def _encoded_destination_bbox(store, view, output_shape, *, trajectory=None):
@@ -366,7 +302,7 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
     succeeded = False
     started = time.perf_counter()
     timings = dict(source_validation=0., plan_preparation=0., destination_bounds=0.,
-                   cpu_warmup=0., cpu_warmup_calls=0, gpu_admission=0., cpu_reader_join=0.,
+                   gpu_admission=0., cpu_reader_join=0.,
                    gpu_projection=0., gpu_producer_wait=0., writer_consume=0., writer_finalize=0.)
     telemetry = runtime_telemetry()
     prepare_key = ('projection.native_prepare.live.' + str(view.name)
@@ -432,23 +368,6 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
         count = min(limit, remaining_planes,
                     max(0, (allowance - plane_bytes - gpu_host_reserve) // per_worker))
         source_shape = np.asarray(store.shape, np.int64)
-        def warm_cpu():
-            # A CUDA-ready parent must not wait for an unused CPU signature's
-            # global compiler lock. Warm only after GPU admission declines.
-            preparing('cpu_warmup')
-            phase_started = time.perf_counter()
-            try:
-                if angular:
-                    pull_native_encoded_flat_into(sampler.encoded, store.index, store._packbits_payload,
-                        plan, np.empty(0, np.uint8), first_flat=0, destination_bbox_tyx=destination_bbox)
-                else:
-                    _pull_tilted_encoded(sampler.encoded, store.index, store._packbits_payload,
-                        source_shape, np.empty(0, np.uint8), 0,
-                        plan.integers, plan.coefficients, bbox_array)
-            finally:
-                timings['cpu_warmup'] += time.perf_counter() - phase_started
-                timings['cpu_warmup_calls'] += 1
-                preparing('ready')
         target.parent.mkdir(parents=True, exist_ok=True)
         completed = gpu_planes = 0
         gpu_encoded_blocks = gpu_payload_d2h_bytes = gpu_dense_d2h_bytes = 0
@@ -565,7 +484,6 @@ def project_tilted_sparse_store(source, view, store_dir: Path, *, out_shape_tyx,
                     try:
                         stage = acquire(first_z)
                         if stage is None:
-                            warm_cpu()
                             cpu_stream = _native_pull_ordered_planes(remaining_planes,
                                 lambda index: project_plane(first_z + index), count, scheduler=scheduler)
                             next_probe = time.monotonic() + 1.

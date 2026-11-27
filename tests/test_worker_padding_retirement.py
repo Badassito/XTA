@@ -53,7 +53,7 @@ def test_later_seam_parity_failure_retires_both_unpublished_groups(tmp_path, mon
             namespace = {**vars(pipeline), 'temp_dir': tmp_path,
                 'args': SimpleNamespace(min_conf=0, min_radius=0),
                 'angle_variant_streaming_cleanup_active': False,
-                'tile_dense_retirement_executor': executor, 'tile_dense_retirement_slice_workers': 1,
+                'tile_result_retirement_executor': executor, 'tile_result_retirement_slice_workers': 1,
                 'tile_cleanup_futures': {}}
             exec(compile(ast.Module(body=[function], type_ignores=[]), str(pipeline.__file__), 'exec'),
                 namespace)

@@ -1,8 +1,7 @@
 """Diagnose the real CPU packed encoder without inference or GPU initialization.
 
-All generated files, including Numba caches, go beneath a new --output directory.
-The default matrix exercises cold threaded compilation, a fresh-process cache hit,
-and concurrent processes sharing a fresh cache. Existing caches are only inventoried.
+The matrix exercises the same native binary in a serial worker, a threaded
+worker, and concurrent processes. Each checks independent packed-byte oracles.
 """
 from __future__ import annotations
 
@@ -10,6 +9,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import astuple
 import hashlib
+import inspect
 from importlib import metadata
 import json
 import os
@@ -21,12 +21,11 @@ import sys
 import threading
 import time
 import traceback
-import warnings
 
 
 REPO = Path(__file__).resolve().parents[1]
-GPU_MODULES = ('torch', 'cupy', 'pycuda', 'cuda', 'numba.cuda')
-SOURCE_FILES = ('XTA/packed_publication.py', 'XTA/_deps.py', 'XTA/cuda_d1.py',
+GPU_MODULES = ('torch', 'cupy', 'pycuda', 'cuda')
+SOURCE_FILES = ('XTA/packed_publication.py', 'native/cpu_packing.cpp', 'native/cpu_kernels.hpp', 'XTA/cuda_d1.py',
                 'XTA/d1_confidence_retirement.py', 'XTA/workers.py',
                 'tools/diagnose_packed_publication.py')
 
@@ -39,55 +38,32 @@ def _hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _file_info(path: Path, *, content: bool = True) -> dict:
+def _file_info(path: Path) -> dict:
     try:
         stat = path.stat()
-        result = {'path': str(path), 'bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
-        if content:
-            result['sha256'] = _hash(path)
-        return result
+        return {'path': str(path), 'bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
+                'sha256': _hash(path)}
     except OSError as error:
         return {'path': str(path), 'error': repr(error)}
 
 
-def _cache_inventory(root: Path) -> list[dict]:
-    """Read metadata/hashes only, never deserialize or remove pre-existing caches."""
-    if not root.is_dir():
-        return []
-    paths = sorted(root.glob('packed_publication.*.nb?'))
-    paths += sorted(root.glob('*/packed_publication.*.nb?'))
-    records = []
-    for path in paths[:128]:
-        record = _file_info(path, content=False)
-        if 'bytes' in record and record['bytes'] <= 8 * 1024 * 1024:
-            record = _file_info(path)
-        records.append(record)
-    return records
-
-
 def runtime_metadata() -> dict:
     versions = {}
-    for package in ('numpy', 'numba', 'llvmlite', 'scipy', 'opencv-python', 'torch'):
+    for package in ('numpy', 'scipy', 'opencv-python', 'torch'):
         try:
             versions[package] = metadata.version(package)
         except metadata.PackageNotFoundError:
             versions[package] = None
     env_names = ('PYTHONPATH', 'PYTHONHOME', 'PYTHONMALLOC', 'PYTHONFAULTHANDLER',
                  'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
-                 'SLURM_JOB_ID', 'SLURM_CPUS_PER_TASK')
-    env = {key: value for key, value in os.environ.items()
-           if key.startswith('NUMBA_') or key in env_names}
-    original_cache = os.environ.get('NUMBA_CACHE_DIR')
+                 'SLURM_JOB_ID', 'SLURM_CPUS_PER_TASK', 'XTA_NATIVE_CPU_ARTIFACTS', 'XTA_NATIVE_CPU_BINARY')
+    env = {key: value for key, value in os.environ.items() if key in env_names}
     return {
         'python': sys.version, 'executable': sys.executable,
         'platform': platform.platform(), 'machine': platform.machine(),
         'pointer_bits': struct.calcsize('P') * 8, 'packages': versions,
         'environment': env,
         'sources': {name: _file_info(REPO / name) for name in SOURCE_FILES},
-        'existing_caches': {
-            'source_local': _cache_inventory(REPO / 'XTA' / '__pycache__'),
-            'configured': _cache_inventory(Path(original_cache)) if original_cache else [],
-        },
         'gpu_modules_imported': [name for name in GPU_MODULES if name in sys.modules],
         'numerical_modules_imported': [name for name in ('numpy', 'numba', 'llvmlite')
                                        if name in sys.modules],
@@ -136,42 +112,23 @@ def _make_cases(np) -> list:
     return cases
 
 
-def _callback_evidence(callback, output: Path, label: str) -> dict:
-    if callback is None:
-        return {'compiled': False}
-    result = {'compiled': True, 'abi': 'cfunc', 'signature': str(callback._sig),
-              'native_name': callback.native_name, 'cache_hits': int(callback._cache_hits)}
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter('always')
-        try:
-            llvm = callback.inspect_llvm()
-            llvm_path = output / f'{label}.ll'
-            llvm_path.write_text(llvm, encoding='utf-8')
-            result['llvm'] = _file_info(llvm_path)
-            result['definition_available'] = f'@{callback.native_name}(' in llvm
-            result['unpack_tuple_occurrences'] = llvm.count('PyArg_UnpackTuple')
-        except Exception as error:
-            result['llvm_error'] = repr(error)
-        result['inspection_warnings'] = [str(w.message) for w in caught]
-    return result
-
-
-def _worker(output: Path, cache: Path, workers: int, repeat: int) -> dict:
-    os.environ['NUMBA_CACHE_DIR'] = str(cache)
+def _worker(output: Path, workers: int, repeat: int) -> dict:
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
-    for key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+    for key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
         os.environ[key] = '1'
     sys.path.insert(0, str(REPO))
     import numpy as np
-    import numba
-    import llvmlite
     from XTA import packed_publication as packed
+    from XTA.native_cpu import load_native_cpu
 
+    module = load_native_cpu()
+    methods = ('bitset_mask_fields', 'bitset_mask_encode')
+    if not all(inspect.isbuiltin(getattr(module, name)) for name in methods):
+        raise RuntimeError('The packed encoder requires native built-in entry points')
     result = {'status': 'running', 'workers': workers, 'repeat': repeat,
-              'runtime': runtime_metadata(), 'effective_cache': str(cache),
-              'loaded_versions': {'numpy': np.__version__, 'numba': numba.__version__,
-                                  'llvmlite': llvmlite.__version__},
-              'cache_before': _cache_inventory(cache)}
+              'runtime': runtime_metadata(), 'native_binary': _file_info(Path(module.__file__)),
+              'native_abi': module.ABI_VERSION, 'build_source_sha256': module.SOURCE_SHA256,
+              'native_symbols': list(methods)}
     cases = _make_cases(np)
     result['fixture_count'] = len(cases)
     result['fixture_shapes'] = sorted(set(shape for _, shape, *_ in cases))
@@ -200,28 +157,24 @@ def _worker(output: Path, cache: Path, workers: int, repeat: int) -> dict:
         result['traceback'] = traceback.format_exc()
     finally:
         result['elapsed_seconds'] = time.perf_counter() - started
-        metadata, encoder = packed._kernels or (None, None)
-        result['metadata_callback'] = _callback_evidence(metadata, output, 'metadata')
-        result['encoder_callback'] = _callback_evidence(encoder, output, 'encoder')
         result['gpu_modules_imported'] = [name for name in GPU_MODULES if name in sys.modules]
         if result['gpu_modules_imported']:
             result['status'] = 'failed'
             result['gpu_import_error'] = 'CPU diagnostic imported a forbidden GPU module'
-        result['cache_after'] = _cache_inventory(cache)
-        result['loaded_native_files'] = {
-            name: _file_info(Path(module.__file__))
-            for name in ('numba._dispatcher', 'numba._dynfunc', 'numba._helperlib',
-                         'numpy._core._multiarray_umath')
-            if (module := sys.modules.get(name)) is not None and getattr(module, '__file__', None)
-        }
+        result['runtime_compilers_imported'] = [
+            name for name in ('numba', 'llvmlite', 'Cython') if name in sys.modules
+        ]
+        if result['runtime_compilers_imported']:
+            result['status'] = 'failed'
+            result['validation_error'] = 'CPU diagnostic loaded a runtime compiler'
         _write(output / 'result.json', result)
     return result
 
 
-def _child(output: Path, cache: Path, workers: int, repeat: int, timeout: int) -> dict:
+def _child(output: Path, workers: int, repeat: int, timeout: int) -> dict:
     command = [sys.executable, '-X', 'faulthandler', '-B', str(Path(__file__).resolve()),
                '--mode', 'threaded', '--output', str(output), '--workers', str(workers),
-               '--repeat', str(repeat), '--cache', str(cache)]
+               '--repeat', str(repeat)]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES='', PYTHONFAULTHANDLER='1')
     try:
         done = subprocess.run(command, env=env, capture_output=True, text=True,
@@ -251,7 +204,6 @@ def main(argv=None) -> int:
     parser.add_argument('--repeat', type=int, default=64)
     parser.add_argument('--processes', type=int, default=4)
     parser.add_argument('--timeout', type=int, default=180)
-    parser.add_argument('--cache', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if not (1 <= args.workers <= 16 and 1 <= args.repeat <= 1000
             and 1 <= args.processes <= 4 and 1 <= args.timeout <= 600):
@@ -268,41 +220,33 @@ def main(argv=None) -> int:
         print(json.dumps({'status': 'metadata_only', 'output': str(output)}))
         return 0
     if args.mode in ('single', 'threaded'):
-        cache = args.cache.resolve() if args.cache else output / 'numba-cache'
-        if not _outside_repo(cache):
-            parser.error('Cache must be outside the repository')
-        if args.cache and (cache.parent != output.parent or
-                           cache.name not in ('cold-then-warm-cache', 'shared-cold-cache') or
-                           not (output.parent / 'environment-before.json').is_file()):
-            parser.error('Explicit cache is reserved for children of this diagnostic matrix')
         try:
-            result = _worker(output, cache, 1 if args.mode == 'single' else args.workers, args.repeat)
+            result = _worker(output, 1 if args.mode == 'single' else args.workers, args.repeat)
         except BaseException:
             result = {'status': 'failed', 'phase': 'setup_or_evidence',
                       'traceback': traceback.format_exc()}
             _write(output / 'result.json', result)
     else:
-        cache = output / 'cold-then-warm-cache'
-        runs = {'cold_threaded': _child(output / 'cold-threaded', cache, args.workers, args.repeat, args.timeout),
-                'warm_threaded': _child(output / 'warm-threaded', cache, args.workers, args.repeat, args.timeout)}
-        shared = output / 'shared-cold-cache'
+        runs = {'serial': _child(output / 'serial', 1, args.repeat, args.timeout),
+                'threaded': _child(output / 'threaded', args.workers, args.repeat, args.timeout)}
         with ThreadPoolExecutor(max_workers=args.processes) as pool:
-            futures = {i: pool.submit(_child, output / f'shared-{i}', shared,
-                                     args.workers, args.repeat, args.timeout)
+            futures = {i: pool.submit(_child, output / f'concurrent-{i}',
+                                      args.workers, args.repeat, args.timeout)
                        for i in range(args.processes)}
-            runs.update({f'shared_cold_{i}': future.result() for i, future in futures.items()})
+            runs.update({f'concurrent_{i}': future.result() for i, future in futures.items()})
         result = {'status': 'passed' if all(value.get('returncode') == 0 and
                                            value.get('result', {}).get('status') == 'passed'
                                            for value in runs.values()) else 'failed',
                   'runs': runs, 'exact_checks': sum(value.get('result', {}).get('exact_checks', 0)
                                                    for value in runs.values())}
         if result['status'] == 'passed':
-            # A warm test is useful only if it really reloaded both saved kernels.
-            warm = runs['warm_threaded']['result']
-            if any(warm[name].get('cache_hits', 0) < 1
-                   for name in ('metadata_callback', 'encoder_callback')):
+            fingerprints = {
+                (entry['result']['native_binary'].get('sha256'), entry['result']['build_source_sha256'])
+                for entry in runs.values()
+            }
+            if len(fingerprints) != 1 or not all(next(iter(fingerprints))):
                 result['status'] = 'failed'
-                result['validation_error'] = 'Warm process did not reuse both compiled kernels'
+                result['validation_error'] = 'Processes did not load the same verifiable CPU binary'
         _write(output / 'result.json', result)
     print(json.dumps({'status': result['status'], 'output': str(output),
                       'exact_checks': result.get('exact_checks', 0)}))

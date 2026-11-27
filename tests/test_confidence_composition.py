@@ -42,9 +42,11 @@ class ConfidenceCompositionTests(unittest.TestCase):
         expected_mask, expected_conf = dm.copy(), dc.copy()
         numpy_reference(expected_mask, expected_conf, sm, sc)
         self.assertTrue(backend._union_conf_fused_eligible((dm, dc, sm, sc)))
-        with mock.patch.object(backend, '_union_conf_slice_inplace', wraps=backend._union_conf_slice_inplace) as fused:
+        native = backend._native_cpu_kernels.union_conf_slice_inplace
+        bindings = mock.Mock(union_conf_slice_inplace=mock.Mock(wraps=native))
+        with mock.patch.object(backend, '_native_cpu_kernels', bindings):
             backend.union_conf_volume_into_volume_inplace(dm, dc, sm, sc, workers=3)
-        self.assertEqual(fused.call_count, 10)
+        self.assertEqual(bindings.union_conf_slice_inplace.call_count, len(dm))
         np.testing.assert_array_equal(dm, expected_mask)
         np.testing.assert_array_equal(dc, expected_conf)
 
@@ -85,7 +87,8 @@ class ConfidenceCompositionTests(unittest.TestCase):
                 expected_mask, expected_conf = arrays[0].copy(), arrays[1].copy()
                 numpy_reference(expected_mask, expected_conf, *arrays[2:])
                 self.assertFalse(backend._union_conf_fused_eligible(arrays))
-                with mock.patch.object(backend, '_union_conf_slice_inplace', side_effect=AssertionError('ineligible compiled call')):
+                with mock.patch.object(type(backend._native_cpu_kernels), 'union_conf_slice_inplace',
+                                       create=True, new_callable=mock.PropertyMock, side_effect=AssertionError('ineligible compiled call')):
                     backend.union_conf_volume_into_volume_inplace(*arrays, workers=2)
                 np.testing.assert_array_equal(arrays[0], expected_mask)
                 np.testing.assert_array_equal(arrays[1], expected_conf)
@@ -125,7 +128,8 @@ class ConfidenceCompositionTests(unittest.TestCase):
                 numpy_reference(expected_dm, expected_dc, expected_sm, sc)
                 self.assertFalse(np.may_share_memory(dm, sm))
                 self.assertFalse(backend._union_conf_fused_eligible((dm, dc, sm, sc)))
-                with mock.patch.object(backend, '_union_conf_slice_inplace', side_effect=AssertionError('aliased compiled call')):
+                with mock.patch.object(type(backend._native_cpu_kernels), 'union_conf_slice_inplace',
+                                       create=True, new_callable=mock.PropertyMock, side_effect=AssertionError('aliased compiled call')):
                     backend.union_conf_volume_into_volume_inplace(dm, dc, sm, sc)
                 np.testing.assert_array_equal(dm, expected_dm)
                 np.testing.assert_array_equal(dc, expected_dc)
@@ -144,25 +148,24 @@ class ConfidenceCompositionTests(unittest.TestCase):
                     sc = None
                 expected_mask, expected_conf = dm.copy(), None if dc is None else dc.copy()
                 numpy_reference(expected_mask, expected_conf, sm, sc)
-                with mock.patch.object(backend, '_union_conf_slice_inplace', side_effect=AssertionError('binary union needs no confidence kernel')):
+                with mock.patch.object(type(backend._native_cpu_kernels), 'union_conf_slice_inplace',
+                                       create=True, new_callable=mock.PropertyMock, side_effect=AssertionError('binary union needs no confidence kernel')):
                     backend.union_conf_volume_into_volume_inplace(dm, dc, sm, sc, workers=2)
                 np.testing.assert_array_equal(dm, expected_mask)
                 if dc is not None:
                     np.testing.assert_array_equal(dc, expected_conf)
 
-    def test_required_compiler_failure_propagates_before_mutating_destinations(self):
+    def test_missing_native_kernel_propagates_before_mutating_destinations(self):
         rng = np.random.default_rng(22417)
         arrays = [rng.integers(0, 256, (2, 7, 9), dtype=np.uint8) for _ in range(4)]
         expected_mask, expected_conf = arrays[0].copy(), arrays[1].copy()
 
-        def unavailable(*planes):
-            self.assertTrue(all(plane.shape == (0, 9) for plane in planes))
-            raise RuntimeError('required compiler unavailable')
-
-        with mock.patch.object(backend, '_union_conf_slice_inplace', side_effect=unavailable) as compiled:
-            with self.assertRaisesRegex(RuntimeError, 'required compiler unavailable'):
+        with mock.patch.object(type(backend._native_cpu_kernels), 'union_conf_slice_inplace',
+                               create=True, new_callable=mock.PropertyMock,
+                               side_effect=RuntimeError('native kernel unavailable')) as resolve:
+            with self.assertRaisesRegex(RuntimeError, 'native kernel unavailable'):
                 backend.union_conf_volume_into_volume_inplace(*arrays, workers=2)
-        self.assertEqual(compiled.call_count, 1)
+        resolve.assert_called_once_with()
         np.testing.assert_array_equal(arrays[0], expected_mask)
         np.testing.assert_array_equal(arrays[1], expected_conf)
 

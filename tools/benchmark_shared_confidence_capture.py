@@ -27,7 +27,8 @@ def source_pins():
         'XTA/confidence_capture.py', 'XTA/confidence_capture_cpu.py',
         'XTA/confidence_evidence.py', 'XTA/confidence_storage.py',
         'XTA/confidence_publication.py', 'XTA/native_pull_scheduling.py',
-        'tools/benchmark_shared_confidence_capture.py', 'XTA/tta_prepare_planning.py')}
+        'tools/benchmark_shared_confidence_capture.py', 'tools/native_cpu_provenance.py',
+        'XTA/tta_prepare_planning.py')}
     return result
 
 
@@ -66,7 +67,7 @@ def main():
     from XTA import confidence_evidence as evidence, geometry, tta_prepare_planning
     from XTA import confidence_storage as storage
     from XTA.confidence_capture import confidence_capture_resources
-    from XTA.confidence_capture_cpu import warm_confidence_capture_kernels
+    from tools.native_cpu_provenance import native_cpu_provenance
     from XTA.confidence_publication import ConfidencePublicationQueue
     from XTA.native_pull_scheduling import configure_native_pull_scheduler, shutdown_native_pull_scheduler
     from tools.benchmark_native_pull_projection import heatsoak, PeakRss
@@ -105,8 +106,8 @@ def main():
             reference_exception_binding='Frozen writer uses production ConfidenceStageLimit identity for unchanged queue fallback',
             legacy_scope='Frozen pre-bulk writer using the same configured shared CPU scheduler',
             candidate_scope='Current bulk writer using the same configured shared CPU scheduler')
-    warm_confidence_capture_kernels()
-    print('Confidence kernels warm; starting CPU heatsoak', flush=True)
+    report['native_cpu'] = native_cpu_provenance('masked_cell_bounds', 'copy_masked_cells_batch')
+    print('Native CPU extension loaded; starting CPU heatsoak', flush=True)
     report['heatsoak'] = heatsoak(args.heatsoak_seconds, min(8, workers))
     rng = np.random.default_rng(160587)
     for pattern in ('sparse', 'noisy'):

@@ -21,6 +21,7 @@ import numpy as np
 
 from XTA import backprojection, cuda_backend, cuda_d1, inference, workers
 from XTA.native_scheduler import GPU, PreparedWorkScheduler
+from XTA.spherical_host_cache import install_spherical_host_cache, spherical_host_cache_stats
 
 
 def _native_worker_transport(cleanup, worker):
@@ -93,6 +94,7 @@ class _Cuda:
 def _renderer(events, host_source=None, fail=False):
     engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
     engine._stream = _Stream(events, fail=fail)
+    engine.device = 'cuda:0'
     engine._azimuthal_texture_lock = threading.RLock()
     engine._inference_assets_released = False
     engine._volume_mm = host_source
@@ -272,6 +274,8 @@ class GpuAssetRetirementTests(unittest.TestCase):
 
     def test_worker_release_drains_first_then_drops_model_and_reports_memory(self):
         assets, engine, model, references, events, cuda = self._worker_context()
+        cache = install_spherical_host_cache(engine, owner_count=4, budget_bytes=1 << 20)
+        initial_cache_epoch = cache.snapshot()['epoch']
         grid = _Owner()
         grid_ref = weakref.ref(grid)
         inference._AFFINE_GRID_CACHE['grid'] = grid
@@ -287,6 +291,8 @@ class GpuAssetRetirementTests(unittest.TestCase):
         self.assertIsNone(assets.model)
         self.assertIsNone(model.predictor)
         self.assertTrue(result['released'])
+        self.assertFalse(cache.snapshot()['enabled'])
+        self.assertEqual(cache.snapshot()['epoch'], initial_cache_epoch + 1)
         self.assertEqual(result['driver_free_delta_bytes'], 8000)
         repeated = workers._release_gpu_worker_inference_assets(
             assets, inference_drained=True, wait_for_publications=lambda: self.fail('idempotent release waited again'))
@@ -315,6 +321,7 @@ class GpuAssetRetirementTests(unittest.TestCase):
 
     def test_preflight_stream_failure_preserves_inference_owners(self):
         assets, engine, model, references, events, cuda = self._worker_context(fail_fence=True)
+        cache = install_spherical_host_cache(engine, budget_bytes=1 << 20)
         inference._arm_worker_gpu_union_retirement_manager('cuda:0', 16)
         with self.assertRaisesRegex(RuntimeError, 'fence failed'):
             workers._release_gpu_worker_inference_assets(assets, inference_drained=True, wait_for_publications=lambda: None)
@@ -324,6 +331,7 @@ class GpuAssetRetirementTests(unittest.TestCase):
         self.assertTrue(all(reference() is not None for reference in references))
         self.assertEqual(inference._GPU_UNION_RETIREMENT_WORKER_CONFIG, ('cuda:0', 16))
         self.assertFalse(inference._GPU_UNION_RETIREMENT_WORKER_RELEASED)
+        self.assertTrue(cache.snapshot()['enabled'])
 
     def test_destructive_release_failure_seals_unused_lazy_lanes(self):
         assets, _engine, _model, _references, _events, _cuda = self._worker_context()
@@ -358,7 +366,9 @@ class GpuAssetRetirementTests(unittest.TestCase):
         for task_id in (1, 2):
             native.submit_prepared(task_id, 1, pickle.dumps({'task_id': task_id, 'slice_count': 1}), GPU)
         init = {'imgsz': 16, 'conf': 0.5, 'batch': 1, 'quantize': 16,
-                'cpu_workers': 1, 'task': 'semantic'}
+                'cpu_workers': 1, 'task': 'semantic',
+                'spherical_host_cache_budget_bytes': 1 << 20,
+                'spherical_host_cache_owner_count': 4}
         replacements = {
             'configure_pipeline_modes': None, 'initialize_runtime_observability': None,
             'set_retina_mask_processor': None, 'set_gpu_worker_fused_preflight_specs': None,
@@ -372,11 +382,18 @@ class GpuAssetRetirementTests(unittest.TestCase):
             stack.enter_context(mock.patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0'}))
             for name, result in replacements.items():
                 stack.enter_context(mock.patch.object(workers, name, return_value=result))
+            def fail_prediction(*_args, **_kwargs):
+                cache = spherical_host_cache_stats(engine)
+                self.assertTrue(cache['enabled'])
+                self.assertEqual(cache['budget_bytes'], 1 << 20)
+                self.assertEqual(cache['owner_count'], 4)
+                raise SemanticTrtRingConsumedError('renderer stream could not be fenced')
+
             prediction = stack.enter_context(mock.patch.object(
-                workers, 'run_prediction_volume_in_worker',
-                side_effect=SemanticTrtRingConsumedError('renderer stream could not be fenced')))
+                workers, 'run_prediction_volume_in_worker', side_effect=fail_prediction))
             workers._gpu_inference_worker_main(0, 'model.engine', init, actor, outgoing)
             self.assertEqual(prediction.call_count, 1)
+            self.assertFalse(spherical_host_cache_stats(engine)['enabled'])
         with self.assertRaisesRegex(RuntimeError, 'renderer stream could not be fenced'):
             native.wait_publication(2)
         state = native.snapshot()

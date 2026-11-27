@@ -208,7 +208,7 @@ def build_affine(
     )
 
 
-def dense_tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
+def tile_positions(length: int, tile_size: int, stride: int) -> List[int]:
     length = int(length)
     tile_size = int(tile_size)
     stride = int(stride)
@@ -291,8 +291,8 @@ def build_render_plan(
     for cfg in tile_configs:
         out_side = int(imgsz) if int(imgsz) > 0 else int(cfg.tile_size)
         if view.shared_view is not None and shared_aug_job is not None:
-            shared_jobs: Sequence[Optional[shared_geometry.DenseTileJob]] = tuple(
-                shared_geometry.build_dense_tile_jobs_for_aug(
+            shared_jobs: Sequence[Optional[shared_geometry.TileJob]] = tuple(
+                shared_geometry.build_tile_jobs_for_aug(
                     view.shared_view,
                     shared_aug_job,
                     cfg,
@@ -302,8 +302,8 @@ def build_render_plan(
         else:
             shared_jobs = tuple(
                 None
-                for _y in dense_tile_positions(aff.canvas_h, cfg.tile_size, cfg.tile_stride)
-                for _x in dense_tile_positions(aff.canvas_w, cfg.tile_size, cfg.tile_stride)
+                for _y in tile_positions(aff.canvas_h, cfg.tile_size, cfg.tile_stride)
+                for _x in tile_positions(aff.canvas_w, cfg.tile_size, cfg.tile_stride)
             )
         if shared_jobs and shared_jobs[0] is not None:
             positions = (
@@ -314,8 +314,8 @@ def build_render_plan(
         else:
             positions = (
                 (int(x), int(y), None)
-                for y in dense_tile_positions(aff.canvas_h, cfg.tile_size, cfg.tile_stride)
-                for x in dense_tile_positions(aff.canvas_w, cfg.tile_size, cfg.tile_stride)
+                for y in tile_positions(aff.canvas_h, cfg.tile_size, cfg.tile_stride)
+                for x in tile_positions(aff.canvas_w, cfg.tile_size, cfg.tile_stride)
             )
         for x, y, shared_job in positions:
             tile_tag = f"{tag}_tile_{cfg.config_id}_x{int(x):04d}_y{int(y):04d}"

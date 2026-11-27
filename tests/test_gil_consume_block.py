@@ -12,12 +12,15 @@ import operator
 from pathlib import Path
 import random
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import numpy as np
 import pytest
 
 from XTA import interpolation as ip
-from XTA.packed_dense_source import encode_dense_u8_packed_block
+from XTA.packed_dense_source import encode_dense_fields, encode_dense_u8_packed_block
+from XTA.packed_publication import encode_owner_packed_fields
 
 
 class LegacyWriter(ip.IncrementalRawBBoxMaskStoreWriter):
@@ -368,33 +371,108 @@ def test_empty_block_and_all_empty_slices(tmp_path):
     assert finalize_bytes(new) == finalize_bytes(old)
 
 
-def test_warm_compiles_every_production_signature():
-    info = ip.warm_encoded_block_kernels()
-    assert info['validate_signatures'] >= 2  # writable and readonly payloads
-    assert info['commit_signatures'] >= 1
-    for kernel in (ip._encoded_block_validate_kernel, ip._encoded_block_commit_kernel):
-        assert kernel.targetoptions.get('nogil') is True
-        assert type(kernel._cache).__name__ == 'NullCache'
-    before = (len(ip._encoded_block_validate_kernel.nopython_signatures),
-              len(ip._encoded_block_commit_kernel.nopython_signatures))
-    # A production-shaped call (writer index, readonly encoder payload) adds no signature.
-    shape = (64, 33, 45)
-    rng = np.random.default_rng(1)
-    vol = random_volume(rng, shape)
-    records, payload = encode_dense_u8_packed_block(vol, 0, 64)
-    with contextlib.ExitStack() as stack:
-        import tempfile
-        root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
-        w = ip.IncrementalRawBBoxMaskStoreWriter(shape=shape, store_dir=root / 's',
-                                                 format_name=ip.INTERNAL_PACKED_CVOL_FORMAT, desc='w')
-        payload.flags.writeable = False
-        w.consume_encoded_block(0, records, payload, packed=True)
-        raw = ip.IncrementalRawBBoxMaskStoreWriter(shape=shape, store_dir=root / 'r',
-                                                   format_name=ip.CVOL_FORMAT, desc='w')
-        rr, rd = encode(vol, 0, False)
-        raw.consume_encoded_block(0, rr, rd, packed=False)
-        w.discard()
-        raw.discard()
-    after = (len(ip._encoded_block_validate_kernel.nopython_signatures),
-             len(ip._encoded_block_commit_kernel.nopython_signatures))
-    assert after == before
+def test_native_field_producers_share_exact_cvol_contract(tmp_path):
+    shape = (97, 4, 13)
+    volume = random_volume(np.random.default_rng(584), shape)
+    words = np.packbits(volume.ravel(), bitorder='little')
+    words = np.pad(words, (0, -words.size % 4)).view(np.uint32)
+    new, old = make_pair(tmp_path, shape, True)
+    # A local review slab starts at zero in its input, but targets absolute z=4.
+    slab = volume[4:22]
+    fields, data = encode_dense_fields(slab, 0, len(slab), output_first=4)
+    for first, records, payload in ((4, fields, data), (0, *encode_owner_packed_fields(words, shape, 0, 4)),
+                                   (22, *encode_owner_packed_fields(words, shape, 22, 75))):
+        reference, expected = encode(volume[first:first + len(records)], first, True)
+        assert records.dtype == np.int64 and records.flags.c_contiguous and records.flags.owndata
+        np.testing.assert_array_equal(records, [[getattr(r, k) for k in FIELDS] for r in reference])
+        assert payload.tobytes() == expected.tobytes()
+        new.consume_encoded_fields(first, records, payload, packed=True)
+        old.consume_encoded_block(first, reference, expected, packed=True)
+    assert finalize_bytes(new) == finalize_bytes(old)
+    assert Path(new.meta_path).read_bytes() == Path(old.meta_path).read_bytes()
+
+
+def test_numeric_fields_snapshot_and_validation_precede_publication(tmp_path, monkeypatch):
+    vol = np.array([[[0, 7, 0]], [[12, 0, 9]]], np.uint8)
+    fields, data = encode_dense_fields(vol, 0, len(vol))
+    new, old = make_pair(tmp_path, vol.shape, True)
+    before = state(new)
+    malformed = fields.copy()
+    malformed[-1, 7] += 1
+    with pytest.raises(ValueError, match='size/count/offset'):
+        new.consume_encoded_fields(0, malformed, data, packed=True)
+    with pytest.raises(ValueError, match='contiguous .*int64'):
+        new.consume_encoded_fields(0, fields.astype(np.int32), data, packed=True)
+    with pytest.raises(IndexError):
+        new.consume_encoded_fields(1, fields, data, packed=True)
+    assert state(new) == before and Path(new.chunks_path).read_bytes() == b''
+    new.consume_encoded_fields(2, fields[:0], data[:0], packed=True)
+    assert state(new) == before
+
+    exposed = fields.view()
+    exposed.setflags(write=False)
+    write = new._pwrite_all
+    def change_controls(fd, payload, offset):
+        fields[-1, 5] = 0
+        fields[-1, 0] = 987654  # Original controls are no longer valid.
+        write(fd, payload, offset)
+
+    monkeypatch.setattr(new, '_pwrite_all', change_controls)
+    new.consume_encoded_fields(0, exposed, data, packed=True)
+    reference, expected = encode(vol, 0, True)
+    old.consume_encoded_block(0, reference, expected, packed=True)
+    correct, data = encode_dense_fields(vol, 0, len(vol))
+    with pytest.raises(ValueError, match='more than once'):
+        new.consume_encoded_fields(0, correct, data, packed=True)
+    assert finalize_bytes(new) == finalize_bytes(old)
+    with pytest.raises(RuntimeError, match='after store closure'):
+        new.consume_encoded_fields(2, correct[:0], data[:0], packed=True)
+
+
+def test_numeric_fields_write_error_invalidates_whole_store(tmp_path, monkeypatch):
+    source = np.ones((2, 2, 17), np.uint8)
+    fields, data = encode_dense_fields(source, 0, 2)
+    writer, reference = make_pair(tmp_path, source.shape, True)
+    reference.discard()
+    write = writer._pwrite_all
+    def fail_partway(fd, payload, offset):
+        write(fd, payload[:1], offset)
+        raise OSError('injected partial write')
+    monkeypatch.setattr(writer, '_pwrite_all', fail_partway)
+    with pytest.raises(OSError, match='partial write'):
+        writer.consume_encoded_fields(0, fields, data, packed=True)
+    assert writer.failed and writer._active_callbacks == 0
+    assert np.all(writer._slice_state == 1)
+    with pytest.raises(RuntimeError, match='invalidated'):
+        writer.finalize()
+    writer.discard()
+    assert not Path(writer.chunks_path).exists()
+
+
+def test_numeric_fields_concurrent_reservations_are_independent(tmp_path, monkeypatch):
+    volume = np.array([[[7, 0, 2]], [[0, 0, 0]], [[0, 0, 21]], [[0, 13, 0]]], np.uint8)
+    new, old = make_pair(tmp_path, volume.shape, True)
+    first_entered, release_first = Event(), Event()
+    write = new._pwrite_all
+    def pause_first(fd, payload, offset):
+        if offset == 0:
+            first_entered.set()
+            assert release_first.wait(10)
+        write(fd, payload, offset)
+    monkeypatch.setattr(new, '_pwrite_all', pause_first)
+    fields0, data0 = encode_dense_fields(volume, 0, 2)
+    fields2, data2 = encode_dense_fields(volume, 2, 2)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(new.consume_encoded_fields, 0, fields0, data0, packed=True)
+        try:
+            assert first_entered.wait(10)
+            new.consume_encoded_fields(2, fields2, data2, packed=True)
+            with pytest.raises(ValueError, match='more than once'):
+                new.consume_encoded_fields(0, fields0, data0, packed=True)
+        finally:
+            release_first.set()
+        pending.result(timeout=10)
+    for first in (0, 2):
+        rows, payload = encode(volume[first:first + 2], first, True)
+        old.consume_encoded_block(first, rows, payload, packed=True)
+    assert finalize_bytes(new) == finalize_bytes(old)

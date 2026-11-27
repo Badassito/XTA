@@ -17,7 +17,7 @@ import sys
 import time
 import tracemalloc
 
-for variable in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+for variable in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
     os.environ[variable] = '2'
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -29,6 +29,7 @@ from XTA import spherical_projection_cpu as candidate
 from tests.reference_backends.spherical import pull_spherical_chunk as reference_pull_spherical_chunk
 from XTA.spherical_geometry import build_spherical_view_infos, cube_rotation
 from XTA.spherical_projection_bounds import spherical_output_bounds
+from tools.native_cpu_provenance import native_cpu_provenance
 
 
 def render_plane(pull, source, view, shape, z, boxes):
@@ -68,9 +69,10 @@ def main():
                  ('horizontal-23', cube_rotation('horizontal', -23)))
     warm_view = built[0]
     started = time.perf_counter()
-    candidate.pull_spherical_chunk_numba(source, warm_view, np.asarray(warm_view.spherical_radii),
+    native_cpu = native_cpu_provenance()
+    candidate.pull_spherical_chunk_native(source, warm_view, np.asarray(warm_view.spherical_radii),
         np.asarray(warm_view.spherical_rotation_xyz).reshape(3, 3), shape, shape[0] // 2, 0, 1)
-    compile_seconds = time.perf_counter() - started
+    native_first_call_seconds = time.perf_counter() - started
     rows = []
     for face in range(6):
         initial = next(view for view in (built if face % 2 == 0 else built[::-1]) if view.spherical_face == face)
@@ -84,14 +86,14 @@ def main():
             if face >= 3:
                 boxes = np.zeros((view.num_slices, 4), np.int64)
                 boxes[len(boxes) // 5:4 * len(boxes) // 5] = (1, size - 1, 2, size - 2)
-            calls = {'numpy': reference_pull_spherical_chunk, 'numba_f64': candidate.pull_spherical_chunk_numba}
-            outputs, timings = {}, {'numpy': [], 'numba_f64': []}
+            calls = {'numpy': reference_pull_spherical_chunk, 'native_f64': candidate.pull_spherical_chunk_native}
+            outputs, timings = {}, {'numpy': [], 'native_f64': []}
             for repeat in range(args.repeats):
-                for name in (('numpy', 'numba_f64') if repeat % 2 == 0 else ('numba_f64', 'numpy')):
+                for name in (('numpy', 'native_f64') if repeat % 2 == 0 else ('native_f64', 'numpy')):
                     started = time.perf_counter()
                     outputs[name] = render_plane(calls[name], source, view, shape, z, boxes)
                     timings[name].append(time.perf_counter() - started)
-            expected, actual = outputs['numpy'], outputs['numba_f64']
+            expected, actual = outputs['numpy'], outputs['native_f64']
             different = actual != expected
             difference_count = int(np.count_nonzero(different))
             boundary_shift = 0.0
@@ -113,17 +115,17 @@ def main():
                    'output_pixels': int(expected.size), 'reference_foreground': int(np.count_nonzero(expected)),
                    'candidate_foreground': int(np.count_nonzero(actual)), 'different_voxels': difference_count,
                    'max_changed_label_distance_pixels': boundary_shift, 'timings_seconds': timings,
-                   'speedup': statistics.median(timings['numpy']) / statistics.median(timings['numba_f64']),
+                   'speedup': statistics.median(timings['numpy']) / statistics.median(timings['native_f64']),
                    'peak_traced_bytes': peaks,
                    'numpy_sha256': hashlib.sha256(expected).hexdigest(),
-                   'numba_sha256': hashlib.sha256(actual).hexdigest()}
+                   'native_sha256': hashlib.sha256(actual).hexdigest()}
             rows.append(row)
             print(json.dumps({key: row[key] for key in ('face', 'rotation', 'different_voxels', 'speedup')}), flush=True)
     report = {
         'working_shape': working, 'output_shape': shape, 'native_patch': [size, size],
         'shells': built[0].num_slices, 'source_allocated_bytes': source_plane.nbytes,
-        'source_logical_bytes': source.nbytes, 'thread_limit': 2, 'parallel_numba': False,
-        'compile_or_cache_load_seconds': compile_seconds, 'repeats': args.repeats,
+        'source_logical_bytes': source.nbytes, 'thread_limit': 2, 'native_cpu': native_cpu,
+        'native_first_call_seconds': native_first_call_seconds, 'repeats': args.repeats,
         'numerics': 'float64, fastmath=False, unchanged nearest categorical rules',
         'limitations': 'Broadcast mask reuses one plane across radii; timings isolate synthetic CPU computation, not full production mask bandwidth or pipeline walltime.',
         'source_sha256': hashlib.sha256(Path(candidate.__file__).read_bytes()).hexdigest(),

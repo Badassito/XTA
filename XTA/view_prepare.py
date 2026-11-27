@@ -286,7 +286,7 @@ class AdmittedViewPrepare:
     union_path: Path
     confmap_path: Path | None
     temp_dir: Path
-    dense_tiling_active: bool
+    tiling_active: bool
     min_conf: float
     min_radius: float
     interpolation_distance: int
@@ -548,7 +548,7 @@ class AdmittedViewPrepare:
                 from .packed_tilted_projection import terminal_native_source_packing_eligible
                 transfer_packed_source = terminal_native_source_packing_eligible(self.view,
                     native_bytes=input_nbytes, retire_dense=True,
-                    component_layers=self.component_layers_needed, tiled=self.dense_tiling_active,
+                    component_layers=self.component_layers_needed, tiled=self.tiling_active,
                     prepublished=self.preinterpolation_layer_already_published,
                     interpolate=self.interpolation_distance, interpolation_passes=self.interpolation_passes,
                     extrapolate=self.extrapolation_distance,
@@ -574,7 +574,7 @@ class AdmittedViewPrepare:
                     union_path=self.union_path,
                     confmap_path=self.confmap_path,
                     temp_dir=self.temp_dir,
-                    dense_tiling_active=bool(self.dense_tiling_active),
+                    tiling_active=bool(self.tiling_active),
                     min_conf=float(self.min_conf),
                     min_radius=float(self.min_radius),
                     interpolate=int(self.interpolation_distance),
@@ -598,10 +598,10 @@ class AdmittedViewPrepare:
                         self.fuse_azimuthal_component_layers()
                     ),
                     parent_mask_ready_callback=(
-                        self.parent_mask_ready_callback if self.dense_tiling_active else None
+                        self.parent_mask_ready_callback if self.tiling_active else None
                     ),
                     internal_final_layer_enabled=bool(not self.component_layers_needed),
-                    retire_dense_after_prepare=bool(not self.dense_tiling_active),
+                    retire_dense_after_prepare=bool(not self.tiling_active),
                     preinterpolation_layer_already_published=bool(
                         self.preinterpolation_layer_already_published
                     ),

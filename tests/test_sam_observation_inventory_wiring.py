@@ -190,7 +190,7 @@ def test_assembly_shares_one_inventory_and_clears_on_success_or_error(tmp_path, 
         if source == 'fullframe':
             return assembly.prepare_view_volume_after_fullframe(**kwargs,
                 union_mm=observed, confmap_mm=None, union_path=tmp_path/'source.dat',
-                confmap_path=None, dense_tiling_active=False, min_conf=0., min_radius=0.)
+                confmap_path=None, tiling_active=False, min_conf=0., min_radius=0.)
         return assembly.finalize_consolidated_tile_volume_for_parent(**kwargs,
             tile_accumulator_mm=observed, destination_mm=np.zeros_like(observed),
             destination_lock=threading.Lock(), sam_upstream_lineage={'gate': 'frozen'})
@@ -225,7 +225,7 @@ def test_assembly_does_not_retain_inventory_when_extrapolation_disabled(tmp_path
     if source == 'fullframe':
         assembly.prepare_view_volume_after_fullframe(**kwargs,
             union_mm=observed, confmap_mm=None, union_path=tmp_path/'source.dat',
-            confmap_path=None, dense_tiling_active=False, min_conf=0., min_radius=0.)
+            confmap_path=None, tiling_active=False, min_conf=0., min_radius=0.)
     else:
         assembly.finalize_consolidated_tile_volume_for_parent(**kwargs,
             tile_accumulator_mm=observed, destination_mm=np.zeros_like(observed),

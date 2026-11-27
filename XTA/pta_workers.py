@@ -794,7 +794,7 @@ def _render_semantic_coverage_item(
     tile = next((item for item in plan.tile_layout if item.tile_tag == item_key), None)
     if tile is not None and tile.shared_job is not None:
         assert plan.view.shared_view is not None
-        return np.ascontiguousarray((shared_geometry.render_categorical_dense_tile_for_job(
+        return np.ascontiguousarray((shared_geometry.render_categorical_tile_for_job(
             coverage, plan.view.shared_view, tile.shared_job, int(frame_idx),
         ) > 0).astype(np.uint8))
     full, canvas = render_plan_frame_mask_source(
@@ -2328,7 +2328,7 @@ def _render_gpu_item_group(
                         cropped = extract_padded_tile(canvas, tile.x, tile.y, tile.cfg.tile_size)
                         item_mask = resize_centered(cropped, tile.out_w, tile.out_h, cv2.INTER_NEAREST_EXACT)
                     else:
-                        item_mask = shared_geometry.render_categorical_dense_tile_for_job(
+                        item_mask = shared_geometry.render_categorical_tile_for_job(
                             mask,
                             plan.view.shared_view,
                             tile.shared_job,
@@ -2368,7 +2368,7 @@ def _render_gpu_item_group(
                 idx=int(frame_idx),
             )
             tile_mask = (
-                shared_geometry.render_categorical_dense_tile_for_job(
+                shared_geometry.render_categorical_tile_for_job(
                     mask,
                     plan.view.shared_view,
                     tile.shared_job,

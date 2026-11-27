@@ -397,12 +397,20 @@ def test_native_compression_requires_python_zlib_identity(monkeypatch, version, 
     assert sweep_confidence._native_cell_compressor() == (None, 'python_zlib')
 
 
-def test_compiled_kernels_release_the_gil():
-    for kernel in (sweep_confidence._merge_masked_crop, sweep_confidence._take_frame_cells):
-        assert kernel.targetoptions.get('nogil') is True
-    sweep_confidence.warm_sweep_confidence_kernels()
-    # Writable/read-only mask x scores: every production signature is compiled up front.
-    assert len(sweep_confidence._merge_masked_crop.nopython_signatures) >= 4
+@pytest.mark.parametrize('mask_readonly', [False, True])
+@pytest.mark.parametrize('score_readonly', [False, True])
+def test_sweep_crop_kernels_accept_readonly_inputs(mask_readonly, score_readonly):
+    mask = np.array([[1, 0], [2, 255]], np.uint8)
+    scores = np.array([[7, 9], [0, 13]], np.uint8)
+    mask.setflags(write=not mask_readonly)
+    scores.setflags(write=not score_readonly)
+    plane = np.zeros((6, 8), np.uint8)
+    touched = np.zeros((2, 2), np.uint8)
+    sweep_confidence._merge_masked_crop(plane, touched, mask, scores, 1, 4, 4)
+    table, raw = sweep_confidence._take_frame_cells(plane, touched, 4)
+    np.testing.assert_array_equal(table, [[1, 4, 2, 2, 2, 0]])
+    assert raw.tobytes() == bytes((7, 0, 0, 13))
+    assert not np.any(plane) and not np.any(touched)
 
 
 @pytest.mark.parametrize('bad', ['outside', 'shape', 'mask_dtype', 'score_dtype'])

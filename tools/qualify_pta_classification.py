@@ -30,8 +30,8 @@ def canonical_classification(mask, coverage, plan, index):
     result = {'full': bool(np.any(full if known is None else np.logical_and(full, known)))}
     for tile in plan.tile_layout:
         if tile.shared_job is not None:
-            plane = geometry.render_categorical_dense_tile_for_job(mask, plan.view.shared_view, tile.shared_job, index)
-            support = None if coverage is None else geometry.render_categorical_dense_tile_for_job(
+            plane = geometry.render_categorical_tile_for_job(mask, plan.view.shared_view, tile.shared_job, index)
+            support = None if coverage is None else geometry.render_categorical_tile_for_job(
                 coverage, plan.view.shared_view, tile.shared_job, index)
         else:
             plane = pta_rendering.resize_centered(

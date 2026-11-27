@@ -1,7 +1,6 @@
 """CPU SAM publication from encoded masks through unchanged shell kernels.
 
-Only input point access changes: a Numba source lends the validated CVOL's
-packed bytes instead of a decoded native volume. Geometry remains owned by
+The native source borrows the validated CVOL index and packed payload. Geometry remains owned by
 the ordinary Radial/Spherical projectors.
 """
 from __future__ import annotations
@@ -13,7 +12,7 @@ import time
 
 import numpy as np
 
-from ._deps import _numba
+from .native_cpu import kernels
 from .interpolation import CTILE_INDEX_DTYPE, INTERNAL_PACKED_CVOL_FORMAT, RawBBoxMaskStore, IncrementalRawBBoxMaskStoreWriter
 from .sparse_projection import _SparseMaskSampler
 
@@ -36,62 +35,46 @@ def encoded_shell_has_unused_canvas(store):
     return occupied < math.prod(store.shape)
 
 
-class _EncodedSource:
-    def __init__(self, shape, encoded, index, packed):
-        self.shape, self.encoded, self.index, self.packed = shape, encoded, index, packed
+class _EncodedSource(tuple):
+    """Lend a read-only CVOL index and payload to the native shell kernels."""
 
-    def __getitem__(self, key):
-        shell, row, column = key
-        record = self.index[shell]
-        if record['kind'] == 0:
-            return np.uint8(0)
-        y0, x0 = np.int64(record['y0']), np.int64(record['x0'])
-        y1, x1 = np.int64(record['y1']), np.int64(record['x1'])
-        if row < y0 or row >= y1 or column < x0 or column >= x1:
-            return np.uint8(0)
-        width, local = x1-x0, column-x0
-        stride = (width+7)//8 if self.packed else width
-        at = np.int64(record['offset'])+(row-y0)*stride
-        at += local//8 if self.packed else local
-        value = self.encoded[at]
-        return np.uint8((value >> (local & 7)) & 1) if self.packed else np.uint8(value != 0)
+    def __new__(cls, shape, encoded, index, packed):
+        wire_index = index.view(np.uint8).reshape(len(index), CTILE_INDEX_DTYPE.itemsize)
+        wire_index.flags.writeable = False
+        return super().__new__(cls, (tuple(map(int, shape)), encoded, wire_index, bool(packed)))
+
+    @property
+    def shape(self):
+        return self[0]
 
 
-_SOURCE_TYPE = None
-_SOURCE_TYPE_LOCK = threading.Lock()
-
-
-def _source_type():
-    global _SOURCE_TYPE
-    with _SOURCE_TYPE_LOCK:
-        if _SOURCE_TYPE is None:
-            _SOURCE_TYPE = _numba.experimental.jitclass([
-                ('shape', _numba.types.UniTuple(_numba.int64, 3)),
-                ('encoded', _numba.types.Array(_numba.uint8, 1, 'C', readonly=True)),
-                ('index', _numba.types.Array(_numba.from_dtype(CTILE_INDEX_DTYPE), 1, 'C', readonly=True)),
-                ('packed', _numba.boolean),
-            ])(_EncodedSource)
-        return _SOURCE_TYPE
+def _require_shell_kernel(name):
+    try:
+        return getattr(kernels, name)
+    except AttributeError as error:
+        raise SparseShellProjectionUnavailable('Native encoded shell kernel unavailable') from error
 
 
 def _prepare_spherical(source, shape_only, view, shape, boxes):
     from .spherical_projection import _validate_spherical_projection, _project_spherical_encoded_block
     from .spherical_projection_bounds import spherical_output_bounds
-    from .spherical_projection_cpu import _spherical_cpu_kernel_arguments, _compiled_pull_spherical_f64
+    from .spherical_projection_cpu import _spherical_cpu_kernel_arguments
     radii, rotation, shape, boxes = _validate_spherical_projection(shape_only, view, shape, boxes)
     bounds = spherical_output_bounds(view, shape, boxes)
     arguments = _spherical_cpu_kernel_arguments(shape_only, view, radii, rotation, shape, 0, 0, 0, boxes)
     fixed = (source, *arguments[1:-7])
+    compiled_pull = _require_shell_kernel('spherical_pull')
+
     def pull(_source, _view, _radii, _rotation, _shape, z, first, stop, _boxes):
-        return _compiled_pull_spherical_f64(*fixed, z, first, stop, 0, 0, 0, False)
+        return compiled_pull(*fixed, z, first, stop, 0, 0, 0, False)
     def rectangle(_source, _view, _radii, _rotation, _shape, z, first, stop, _boxes, *, bounds_yx):
         y0, y1, x0, x1 = bounds_yx
-        return _compiled_pull_spherical_f64(*fixed, z, first, stop, x1-x0, x0, y0, False)
+        return compiled_pull(*fixed, z, first, stop, x1-x0, x0, y0, False)
     pull.rectangle = rectangle
     def project(z):
         return _project_spherical_encoded_block(source, view, radii, rotation, shape, z, 1,
             boxes, packed=True, output_bounds=bounds, cpu_pull=pull)
-    return project, lambda:pull(source, view, radii, rotation, shape, 0, 0, 0, boxes)
+    return project
 
 
 def _prepare_radial(source, shape_only, view, shape, boxes):
@@ -120,6 +103,7 @@ def _prepare_radial(source, shape_only, view, shape, boxes):
         arguments = (source, plan.shell_index, plan.column_offsets, plan.native_columns,
             sampled, rows, columns, centers, ideal, int(stack), int(view.radial_height_origin),
             int(view.src_h), plan.base_id, bool(vertical), int(plan.plane_shape[1]), shape[1], shape[2])
+        _require_shell_kernel('project_radial_block')
         # Existing integer shell ownership can prove sagittal/coronal Z planes empty.
         occupied = (boxes[:,1] > boxes[:,0]) & (boxes[:,3] > boxes[:,2])
         plane_shells = plan.shell_index.reshape(plan.plane_shape)
@@ -130,7 +114,8 @@ def _prepare_radial(source, shape_only, view, shape, boxes):
                 if not np.any(occupied[shells[valid]]):
                     return None
             return _project_radial_block(*arguments, z, 1, boxes, True)
-        return project, lambda:_project_radial_block(*arguments, 0, 0, boxes, True)
+        return project
+    _require_shell_kernel('pull_radial_range_into')
     arguments = _radial_planfree_arguments(shape_only, view, radii, shape, boxes)
     def project(z):
         plane = np.zeros((1, shape[1], shape[2]), np.uint8)
@@ -139,8 +124,7 @@ def _prepare_radial(source, shape_only, view, shape, boxes):
             _pull_radial_range_into(flat[first:first+_PULL_CHUNK_VOXELS], source, arguments[1],
                 z, first, *arguments[2:], False)
         return plane
-    return project, lambda:_pull_radial_range_into(np.empty(0,np.uint8), source, arguments[1],
-        0, 0, *arguments[2:], False)
+    return project
 
 
 def project_shell_sparse_store(source, view, store_dir, *, out_shape_tyx, workers=1):
@@ -157,7 +141,7 @@ def project_shell_sparse_store(source, view, store_dir, *, out_shape_tyx, worker
         raise FileExistsError('Projected store must be fresh')
     owned = not isinstance(source, RawBBoxMaskStore)
     store = RawBBoxMaskStore.open(Path(source), mmap_payload=True) if owned else source
-    sampler = encoded = index = adapter = project = warm = iterator = writer = None
+    sampler = encoded = index = adapter = project = iterator = writer = None
     started = time.perf_counter()
     progress = None
     try:
@@ -173,18 +157,11 @@ def project_shell_sparse_store(source, view, store_dir, *, out_shape_tyx, worker
         present = store.index['kind'] == 1
         for column, field in enumerate(('y0','y1','x0','x1')):
             boxes[present,column] = store.index[field][present]
-        # Shape-only broadcast owns one byte; neither validation nor warmup reads it.
-        shape_only = np.broadcast_to(np.array(0,np.uint8), tuple(store.shape))
-        try:
-            adapter = _source_type()(tuple(store.shape), encoded, index, store._packbits_payload)
-        except Exception as error:
-            raise SparseShellProjectionUnavailable('Encoded CPU source could not be compiled') from error
-        project, warm = (_prepare_spherical if family=='spherical' else _prepare_radial)(
+        # The shape-only broadcast owns one byte and is used only for validation.
+        shape_only = np.broadcast_to(np.array(0, np.uint8), tuple(store.shape))
+        adapter = _EncodedSource(store.shape, encoded, index, store._packbits_payload)
+        project = (_prepare_spherical if family == 'spherical' else _prepare_radial)(
             adapter, shape_only, view, shape, boxes)
-        try:
-            warm()
-        except Exception as error:
-            raise SparseShellProjectionUnavailable('Encoded shell kernel could not be compiled') from error
         workspace = max(1,_env_int('YOLO_TTA_NATIVE_PULL_WORKSPACE_MIB',256))*1024**2
         per_plane = 2*shape[1]*shape[2]+shape[1]*((shape[2]+7)//8)+1024**2
         count = min(max(1,int(workers)), _cpu_count(), shape[0], max(0,workspace//per_plane-1))
@@ -245,7 +222,7 @@ def project_shell_sparse_store(source, view, store_dir, *, out_shape_tyx, worker
     finally:
         if iterator is not None:
             iterator.close()  # Join every reader before retiring mapped input.
-        iterator = project = warm = adapter = encoded = index = None
+        iterator = project = adapter = encoded = index = None
         if sampler is not None:
             sampler.close()
         if owned:

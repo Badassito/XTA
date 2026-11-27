@@ -70,9 +70,9 @@ class PackedPublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / 'failed.cvol'
             with mock.patch.dict(os.environ, {'YOLO_TTA_PACKED_OWNER_PUBLICATION': '1'}), \
-                    mock.patch.object(cuda_d1, 'encode_owner_packed_block', side_effect=RuntimeError('compiler failed')), \
+                    mock.patch.object(cuda_d1, 'encode_owner_packed_fields', side_effect=RuntimeError('encoder failed')), \
                     mock.patch.object(cuda_d1, '_d1_unpack_bitset_z_block', side_effect=AssertionError('no slow replay')):
-                with self.assertRaisesRegex(RuntimeError, 'compiler failed'):
+                with self.assertRaisesRegex(RuntimeError, 'encoder failed'):
                     cuda_d1._d1_finalize_bitset_layer(words=source_words(volume), output_shape=volume.shape,
                                                     store_dir=target, model_name='model', view=view)
             self.assertFalse(target.exists())

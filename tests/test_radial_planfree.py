@@ -36,7 +36,7 @@ class RadialPlanfreeTests(unittest.TestCase):
                 out_shape_tyx=shape, workers=2, sink_only=True,
                 known_slice_bboxes=boxes, projection_block_callback=consume,
             )
-        self.assertIn('backend=cpu_numba_planfree', output.getvalue())
+        self.assertIn('backend=cpu_native_planfree', output.getvalue())
         self.assertEqual(result.shape, shape)
         self.assertEqual([first for first, _ in blocks], sorted(first for first, _ in blocks))
         return np.concatenate([block for _, block in blocks], axis=0)

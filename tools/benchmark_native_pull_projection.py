@@ -34,7 +34,7 @@ SOURCE_FILES = ('XTA/backprojection.py', 'XTA/projection_coverage.py',
     'XTA/workspace.py', 'XTA/publication_memory.py', 'XTA/confidence_projection.py',
     'XTA/pipeline.py',
     'tools/qualify_release.py',
-    'tools/benchmark_native_pull_projection.py')
+    'tools/benchmark_native_pull_projection.py', 'tools/native_cpu_provenance.py')
 
 
 def source_identity():
@@ -106,10 +106,9 @@ def cpu_environment(output):
     os.environ.pop('YOLO_TTA_TELEMETRY_PATH',None)
     os.environ.update(environment)
     output.mkdir(parents=True, exist_ok=True)
-    cache = output/'numba-cache'; cache.mkdir(exist_ok=True)
     os.environ.update(CUDA_VISIBLE_DEVICES='-1', YOLO_TTA_GPU_BACKPROJECT='0',
         YOLO_TTA_GPU_BACKPROJECT_RESIDENT='0', YOLO_TTA_GPU_RADIAL_BACKPROJECT='0',
-        YOLO_TTA_GPU_SPHERICAL_BACKPROJECT='0', NUMBA_CACHE_DIR=str(cache),
+        YOLO_TTA_GPU_SPHERICAL_BACKPROJECT='0',
         OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1',
         NUMEXPR_NUM_THREADS='1', PYTHONDONTWRITEBYTECODE='1', YOLO_TTA_TELEMETRY='1')
     os.environ['YOLO_TTA_TELEMETRY_DIR']=str(output/'telemetry')
@@ -476,15 +475,20 @@ def run(args):
         if before['XTA/projection_coverage_cpu.py'] is None:raise RuntimeError('Compiled projection module is not available')
         cpu_environment(args.output_dir)
         import psutil,numpy as np
-        from XTA._deps import _numba
+        from tools.native_cpu_provenance import native_cpu_provenance
         from XTA.publication_memory import publication_ram_headroom
         resource=admit_resources(args,publication_ram_headroom(),psutil.cpu_count(logical=True) or 1)
         receipt['resources']=resource;workers=resource['effective_worker_cap']
+        symbols = {'_pull_tilted' if family == 'tilted' else '_pull_azimuthal'
+                   for family in args.families}
+        if args.four_parent_probe:
+            symbols.update(('_pull_tilted', '_pull_azimuthal'))
+        receipt['compiled_kernel_proof'] = native_cpu_provenance(*sorted(symbols))
         receipt['hardware']=dict(platform=platform.platform(),python=sys.version,numpy=np.__version__,
-            numba=_numba.__version__,processor=platform.processor(),
+            processor=platform.processor(),
             logical_cpus=psutil.cpu_count(logical=True),physical_cpus=psutil.cpu_count(logical=False))
         receipt['environment']={key:os.environ.get(key) for key in ('CUDA_VISIBLE_DEVICES',
-            'YOLO_TTA_GPU_BACKPROJECT','TEMP','TMP','TMPDIR','NUMBA_CACHE_DIR',
+            'YOLO_TTA_GPU_BACKPROJECT','TEMP','TMP','TMPDIR','XTA_NATIVE_CPU_ARTIFACTS','XTA_NATIVE_CPU_BINARY',
             'YOLO_TTA_TELEMETRY_DIR','YOLO_TTA_TELEMETRY_PATH')}
         receipt['heatsoak']=(heatsoak(args.heatsoak_seconds,workers) if args.execute else dict(performed=False,reason='functional check only'))
         for scope in args.scopes:
@@ -507,15 +511,6 @@ def run(args):
                             case=make_case(scope,family,base,direction,'random',args,tiny=args.check_only)
                             receipt['reader_measurements'].append(compare_reader(case,args,reference_module,functional=args.check_only));del case
                             if identity()!=before:raise RuntimeError('Source changed during scalar reader measurements')
-        from XTA import projection_coverage_cpu as compiled_module
-        receipt['compiled_kernel_proof']={name:dict(
-            nopython_signatures=[str(v) for v in getattr(getattr(compiled_module,name),'nopython_signatures',())],
-            target_options=getattr(getattr(compiled_module,name),'targetoptions',{}))
-            for name in ('_pull_tilted','_pull_azimuthal')}
-        required={'_pull_tilted' if family=='tilted' else '_pull_azimuthal' for family in args.families}
-        if args.four_parent_probe:required.update(('_pull_tilted','_pull_azimuthal'))
-        if not all(receipt['compiled_kernel_proof'][name]['nopython_signatures'] for name in required):
-            raise RuntimeError('Requested actual nopython CPU kernels were not compiled')
         receipt['success']=True;return receipt
     except BaseException as error:
         receipt['error']=f'{type(error).__name__}: {error}';raise

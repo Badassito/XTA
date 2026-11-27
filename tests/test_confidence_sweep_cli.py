@@ -62,6 +62,27 @@ def test_ranges_use_inclusive_integer_hundredths(value, levels):
     assert args.conf_sweep_min_conf_implicit
 
 
+def test_grouped_confidence_combines_ranges_and_cutoffs_in_ascending_order():
+    args = parse('--conf', '.90:.02:1', '.80', '.50:.10:.90', '.94')
+    levels = (50, 60, 70, 80, 90, 92, 94, 96, 98, 100)
+    assert args.conf_sweep.levels_hundredths == levels
+    assert args.conf_sweep.values == tuple(level / 100 for level in levels)
+    assert args.conf == args.conf_sweep.floor == .50
+    assert args.conf_sweep.highest == 1.0
+    assert args.min_conf == 0.0
+    assert args.conf_sweep_min_conf_implicit
+
+
+@pytest.mark.parametrize('invalid_group', ['.90:.03:1', '.123'])
+def test_every_group_must_use_the_exact_hundredth_grid(invalid_group):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), pytest.raises(SystemExit) as error:
+        parse('--conf', '.5:.1:1', invalid_group)
+    assert error.value.code == 2
+    assert '--conf' in stderr.getvalue()
+    assert invalid_group in stderr.getvalue()
+
+
 @pytest.mark.parametrize('value', [
     '.5:.1', '.5:.1:1:1', ':.1:1', '.5::1', '.5:.1:',
     '.5:0:1', '.5:-.1:1', '.8:.1:.5', '-.1:.1:1', '.5:.1:1.01',
@@ -96,7 +117,7 @@ def test_explicit_min_conf_is_fixed_even_below_sweep_cutoffs(value, before):
 
 
 def test_duplicate_confidence_flags_reset_stale_sweep_and_keep_last_value():
-    scalar = parse('--conf=.5:.1:1', '--conf=.12345678901234567')
+    scalar = parse('--conf', '.5:.1:1', '.9:.02:1', '--conf=.12345678901234567')
     assert scalar.conf == float('.12345678901234567')
     assert scalar.conf_sweep is None
     assert scalar.min_conf == .30

@@ -88,6 +88,9 @@ def build_runtime_options(config: PtaConfig) -> argparse.Namespace:
 def run(config: PtaConfig, *, argv: Sequence[str] | None = None) -> None:
     """Enter the PTA engine with an already validated configuration."""
 
+    from .native_cpu import load_native_cpu
+
+    load_native_cpu()
     from . import pta
 
     arguments = None if argv is None else [str(value) for value in argv]

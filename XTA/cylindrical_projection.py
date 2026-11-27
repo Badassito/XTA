@@ -20,7 +20,7 @@ import numpy as np
 
 from .geometry import ViewInfo
 from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure
-from ._deps import _numba
+from .native_cpu import kernels
 from .env_flags import env_flag
 from .runtime import allocate_workspace_array, close_memmap_array_without_flush, runtime_telemetry
 from .workspace import _cpu_count
@@ -331,67 +331,17 @@ def _radial_projection_metadata(view, source_shape, output_shape, plan, *, chunk
     return stack_centers, ideal, sampled, row_map, column_map, stack_length, vertical
 
 
-def _gather_radial_pixel(source, shells, offsets, columns, sampled, row_map, column_map,
-                         p, stack, ideal_shear, stack_length, height_origin, native_height,
-                         bboxes, use_bboxes, scalar_max=False):
-    shell = shells[p]
-    if shell < 0:
-        return np.uint8(0)
-    if use_bboxes and (bboxes[shell, 1] <= bboxes[shell, 0] or bboxes[shell, 3] <= bboxes[shell, 2]):
-        return np.uint8(0)
-    ideal_height = stack - ideal_shear
-    # Rectilinear samples own half-open voxel cells, including the first/last
-    # half cell during source-grid upscaling. The physical annulus check stays
-    # in the plane plan; this is height coverage, not radius dilation.
-    if ideal_height < -0.5 or ideal_height >= stack_length - 0.5:
-        return np.uint8(0)
-    best_score = np.uint8(0)
-    for at in range(offsets[p], offsets[p + 1]):
-        column = columns[at]
-        height = stack - sampled[shell, column]
-        height = min(max(height, 0.0), float(stack_length - 1))
-        row = int(np.rint(height)) - height_origin
-        if row < 0 or row >= native_height:
-            continue
-        pr, pc = row_map[row], column_map[column]
-        if use_bboxes and (pr < bboxes[shell, 0] or pr >= bboxes[shell, 1]
-                           or pc < bboxes[shell, 2] or pc >= bboxes[shell, 3]):
-            continue
-        if source[shell, pr, pc] != 0:
-            if not scalar_max:
-                return np.uint8(1)
-            best_score = max(best_score, np.uint8(source[shell, pr, pc]))
-    return best_score
-
-
 def _project_radial_block(source, shells, offsets, columns, sampled, row_map, column_map,
                           stack_centers, ideal_axis, stack_length, height_origin, native_height,
                           base_id, vertical, plane_width, out_h, out_w, first_z, count,
                           bboxes, use_bboxes, scalar_max=False):
-    result = np.zeros((count, out_h, out_w), np.uint8)
-    for dz in range(count):
-        z = first_z + dz
-        for y in range(out_h):
-            for x in range(out_w):
-                if base_id == 0:
-                    p, stack_index, v, u = y * plane_width + x, z, y, x
-                elif base_id == 1:
-                    p, stack_index, v, u = z * plane_width + x, y, z, x
-                else:
-                    p, stack_index, v, u = z * plane_width + y, x, z, y
-                result[dz, y, x] = _gather_radial_pixel(
-                    source, shells, offsets, columns, sampled, row_map, column_map,
-                    p, stack_centers[stack_index], ideal_axis[v if vertical else u],
-                    stack_length, height_origin, native_height, bboxes, use_bboxes, scalar_max,
-                )
-    return result
+    return kernels.project_radial_block(
+        source, shells, offsets, columns, sampled, row_map, column_map, stack_centers,
+        ideal_axis, stack_length, height_origin, native_height, base_id, vertical,
+        plane_width, out_h, out_w, first_z, count, bboxes, use_bboxes, scalar_max,
+    )
 
 
-_gather_radial_pixel = _numba.njit(cache=True, nogil=True, inline='always', fastmath=False)(_gather_radial_pixel)
-_project_radial_block = _numba.njit(cache=True, nogil=True, fastmath=False)(_project_radial_block)
-
-
-@_numba.njit(cache=True, nogil=True, fastmath=False)
 def _pull_radial_range_into(
         result, source, radii, z, first, out_t, out_h, out_w,
         work_t, work_h, work_w, base_id, center_x, center_y,
@@ -399,98 +349,12 @@ def _pull_radial_range_into(
         native_height, height_origin, tilted, tangent, vertical,
         bboxes, use_bboxes, scalar_max, rectangle_width=0, rectangle_x=0, rectangle_y=0):
     """Evaluate exact shell/wrap coordinates into one caller-owned flat strip."""
-    stack_length = work_t if base_id == 0 else (work_h if base_id == 1 else work_w)
-    two_pi = 2.0 * math.pi
-    wt = ((2.0*z + 1.0 - out_t)*work_t)/(2.0*out_t) + (work_t-1.0)*.5
-    for offset in range(result.size):
-        pixel = first + offset
-        y, x = pixel // out_w, pixel % out_w
-        if rectangle_width:
-            y, x = pixel // rectangle_width + rectangle_y, pixel % rectangle_width + rectangle_x
-        wy = ((2.0*y + 1.0 - out_h)*work_h)/(2.0*out_h) + (work_h-1.0)*.5
-        wx = ((2.0*x + 1.0 - out_w)*work_w)/(2.0*out_w) + (work_w-1.0)*.5
-        if base_id == 0:
-            stack, py, px = wt, wy, wx
-        elif base_id == 1:
-            stack, py, px = wy, wt, wx
-        else:
-            stack, py, px = wx, wt, wy
-        # The direct fallback must use the same centered coordinate order as
-        # the shared plane plan, including rational source-grid restoration.
-        if base_id == 0:
-            dx = ((2.0*x + 1.0 - out_w)*work_w)/(2.0*out_w) + ((work_w-1.0)*.5-center_x)
-            dy = ((2.0*y + 1.0 - out_h)*work_h)/(2.0*out_h) + ((work_h-1.0)*.5-center_y)
-        elif base_id == 1:
-            dx = ((2.0*x + 1.0 - out_w)*work_w)/(2.0*out_w) + ((work_w-1.0)*.5-center_x)
-            dy = ((2.0*z + 1.0 - out_t)*work_t)/(2.0*out_t) + ((work_t-1.0)*.5-center_y)
-        else:
-            dx = ((2.0*y + 1.0 - out_h)*work_h)/(2.0*out_h) + ((work_h-1.0)*.5-center_x)
-            dy = ((2.0*z + 1.0 - out_t)*work_t)/(2.0*out_t) + ((work_t-1.0)*.5-center_y)
-        radius = math.hypot(dx, dy)
-        lower_tolerance = _RADIAL_CLOSED_BOUND_EPS * max(abs(radius), abs(min_radius))
-        upper_tolerance = _RADIAL_CLOSED_BOUND_EPS * max(abs(radius), abs(max_radius))
-        if radius < min_radius - lower_tolerance or radius > max_radius + upper_tolerance:
-            continue
-        ideal_height = stack - tangent * (dy if vertical else dx) if tilted else stack
-        if ideal_height < -0.5 or ideal_height >= stack_length - 0.5:
-            continue
-        # searchsorted(left): an exact midpoint belongs to the inner shell.
-        lo, hi = 0, len(radii)
-        while lo < hi:
-            middle = (lo + hi) // 2
-            if radii[middle] < radius:
-                lo = middle + 1
-            else:
-                hi = middle
-        right = min(lo, len(radii) - 1)
-        left = max(0, right - 1)
-        global_shell = (left if radius - radii[left] <= radii[right] - radius else right)
-        shell = global_shell - shell_start
-        if shell < 0 or shell >= source.shape[0]:
-            continue
-        if use_bboxes and (bboxes[shell, 1] <= bboxes[shell, 0] or
-                           bboxes[shell, 3] <= bboxes[shell, 2]):
-            continue
-        selected_radius = radii[global_shell]
-        period = two_pi * selected_radius
-        if period <= 1.0:
-            column_float = 0.0
-        else:
-            theta = math.atan2(dy, dx) % two_pi
-            column_float = ((theta * selected_radius - arc_origin + 0.5) % period) - 0.5
-        if tilted and selected_radius == 0.0:
-            continue
-        for candidate in range(native_width):
-            if period <= 1.0:
-                column = candidate
-            else:
-                column = int(np.rint(column_float))
-                if column >= native_width:
-                    break
-                column_float += period
-            if column < 0 or column >= native_width:
-                continue
-            height = stack
-            if tilted:
-                angle = ((arc_origin + column) / selected_radius) % two_pi
-                sample_axis = selected_radius * (math.sin(angle) if vertical else math.cos(angle))
-                height -= tangent * sample_axis
-            height = min(max(height, 0.0), float(stack_length - 1))
-            row = int(np.rint(height)) - height_origin
-            if row < 0 or row >= native_height:
-                continue
-            pr = min(int((row + 0.5) * source.shape[1] / native_height), source.shape[1] - 1)
-            pc = min(int((column + 0.5) * source.shape[2] / native_width), source.shape[2] - 1)
-            if use_bboxes and (pr < bboxes[shell, 0] or pr >= bboxes[shell, 1] or
-                               pc < bboxes[shell, 2] or pc >= bboxes[shell, 3]):
-                continue
-            value = source[shell, pr, pc]
-            if scalar_max:
-                if value > result[offset]:
-                    result[offset] = value
-            elif value != 0:
-                result[offset] = 1
-                break
+    kernels.pull_radial_range_into(
+        result, source, radii, z, first, out_t, out_h, out_w, work_t, work_h, work_w,
+        base_id, center_x, center_y, min_radius, max_radius, shell_start, arc_origin,
+        native_width, native_height, height_origin, tilted, tangent, vertical, bboxes,
+        use_bboxes, scalar_max, rectangle_width, rectangle_x, rectangle_y,
+    )
 
 
 def _radial_planfree_arguments(source, view, radii, output_shape, bboxes=None):
@@ -865,7 +729,7 @@ def backproject_radial_volume_to_volume(
         plan_seconds = setup_seconds = sink_seconds = metadata_host_seconds = cuda_admission_seconds = 0.0
         plan_bytes = 0
         cache_hit = False
-        backend_name = 'cpu_numba_factored'
+        backend_name = 'cpu_native_factored'
         started = time.perf_counter()
         try:
             plan, cache_hit = _radial_plane_plan(radial_view, radii, shape)
@@ -909,13 +773,11 @@ def backproject_radial_volume_to_volume(
                         _pull_radial_range_into(flat[pixel:stop], arguments[0], arguments[1],
                             int(first) + dz, pixel, *arguments[2:], False)
                 return result
-            # A zero-slice wrapper would skip the kernel entirely. Compile the
-            # exact mask signature now, before allocating or publishing output.
+            # Validate the native strip arguments before allocating or publishing output.
             _pull_radial_range_into(np.empty(0, np.uint8), arguments[0], arguments[1],
                                     0, 0, *arguments[2:], False)
-            backend_name = 'cpu_numba_planfree'
-        # Compile before output allocation or executor threads. A kernel error
-        # must never follow partial delivery and silently select another path.
+            backend_name = 'cpu_native_planfree'
+        # Native buffer admission precedes output allocation and executor startup.
         setup_seconds = time.perf_counter() - started
         telemetry = runtime_telemetry()
         telemetry.gauge('projection.radial.plan_seconds', plan_seconds)

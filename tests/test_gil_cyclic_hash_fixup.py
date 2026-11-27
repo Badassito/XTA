@@ -40,7 +40,12 @@ def old_filtering(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("XTA._old_sam_filtering_for_gil_test", path)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
+    # Run the pinned legacy Python kernel without its optional JIT dependency.
+    # Keep the original file bytes so its historical source guard still applies.
+    legacy = source.replace(b"from ._deps import _numba\n", b"\n", 1)
+    legacy = legacy.replace(b"@_numba.njit(nogil=True, cache=False)\n", b"\n", 1)
+    assert b"_numba" not in legacy
+    exec(compile(legacy, str(path), "exec"), module.__dict__)
     return module
 
 
@@ -70,8 +75,8 @@ def test_effective_masks_match_v25_filter_on_bundle_and_reader(tmp_path, old_fil
     bundle = bundle_at(tmp_path)
     new_spec = sam_filtering.build_mask_filter(bundle, min_radius=radius)
     old_spec = old_filtering.build_mask_filter(bundle, min_radius=radius)
-    assert {k: v for k, v in new_spec.items() if k not in ("implementation_sha256", "sha256")} == \
-        {k: v for k, v in old_spec.items() if k not in ("implementation_sha256", "sha256")}
+    assert {k: v for k, v in new_spec.items() if k not in ("implementation_sha256", "native_implementation", "sha256")} == \
+        {k: v for k, v in old_spec.items() if k not in ("implementation_sha256", "native_implementation", "sha256")}
     frames = _frames(bundle)
     assert frames
     for disabled in (False, True):

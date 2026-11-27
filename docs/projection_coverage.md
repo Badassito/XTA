@@ -126,8 +126,9 @@ GPU/model throughput and quality require separate qualification.
 ## Bounded CPU execution
 
 The CPU Tilted and Azimuthal routes use prepared geometry and compiled
-destination-owned OR/MAX loops in `projection_coverage_cpu.py`. Numba releases
-the GIL without fastmath or a disk compilation cache. Angular ownership retains
+destination-owned OR/MAX loops in `projection_coverage_cpu.py`. The native
+extension releases the GIL and uses strict floating-point compiler settings.
+Angular ownership retains
 the exact prepared NumPy address rules. Initialization and angle records are
 checked against their conservative build allowance before table allocation.
 Plans retain local read-only numeric tables, with packed uint32 or uint64 owners
@@ -181,7 +182,7 @@ OR semantics are unchanged, including partial flat spans and strided sources.
 | `YOLO_TTA_NATIVE_PULL_GPU_UPLOAD_MIB` | `8` | Maximum input chunk for packing/upload; the whole host volume is never copied to a second dense staging array |
 
 The plan and workspace caps are separate. Source/dense-destination credits,
-other concurrent views, and runtime/JIT compiler memory remain separate from
+other concurrent views, and runtime memory remain separate from
 these explicit geometry and buffer bounds. A workspace too small for one worker
 and the consumer plane is refused. Production uint8 masks/scores use the
 compiled route; other historical array dtypes retain the exact NumPy route
@@ -359,15 +360,13 @@ capture queue is required before adding preparation work; synchronous-only runs
 retain their original path. The existing capture plan funds metadata before
 encoding workers start. No new codec or worker pool is introduced.
 
-Masking runs as one compiled, GIL-free numba call (`zero_unmasked_scores_flat`
+Masking runs as one compiled native call that releases the GIL (`zero_unmasked_scores_flat`
 or `zero_unmasked_scores_boxes` in `confidence_capture_cpu.py`), branch-free and
 without scratch. A per-box numpy loop would make about 12,000 calls per large
 view, each re-acquiring the GIL from the main process's other threads; on the
 cluster that cost 26-72 s per view (locally, 1.25 s became 310 s with six busy
-Python threads, against 0.27 s for the compiled call). Every argument signature
-is compiled at startup, when the terminal capture queue is configured
-(`confidence.terminal_score_only.kernel_warmup`, about 1 s), because an
-in-process compile under the same contention can take minutes.
+Python threads, against 0.27 s for the compiled call). The extension is compiled ahead of time, so enabling terminal capture adds
+no kernel compilation step.
 `YOLO_TTA_TERMINAL_SCORE_PREPARE_THREADS` (default 1) splits the work across
 threads, one piece each. Each extra thread must win the GIL to start and
 finish, so it helps only when the main process is otherwise idle. Results are
@@ -408,8 +407,8 @@ hints retain the original serial path. Deferred tile/native pieces and merged
 source confidence remain on that compatible reader path. Scores are preserved where
 the mask is nonzero, quantized zero remains unknown, frame/cell order is stable,
 and each crop retains zlib level 3. Output payload, index and metadata semantics
-are unchanged. Compiler/code-cache initialization is separate process overhead;
-the helper changes neither global Numba thread settings nor disk caching.
+are unchanged. The compiled helpers use the capture plan's worker and memory
+limits.
 
 Confidence payload/index writes are batched within the charged consumer window.
 Per-frame wait and consumption telemetry includes both wall time and thread CPU

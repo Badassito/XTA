@@ -489,7 +489,6 @@ def _child_environment(output: Path, mode: tuple[str, str, str]) -> dict[str, st
         'YOLO_TTA_SEMANTIC_TRT_RING': mode[2],
         'YOLO_TTA_SEMANTIC_TRT_TRACE': '1' if mode[0] == 'ring' else '0',
         'CUPY_CACHE_DIR': str(output / 'cupy-cache'),
-        'NUMBA_CACHE_DIR': str(output / 'numba-cache'),
         'OMP_NUM_THREADS': '2', 'MKL_NUM_THREADS': '2', 'OPENBLAS_NUM_THREADS': '2',
         'SLURM_CPUS_PER_TASK': '4', 'YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND': '0',
     })
@@ -697,14 +696,12 @@ def main(argv: list[str] | None = None) -> int:
         faulthandler.enable()
         faulthandler.dump_traceback_later(60, repeat=True)
         os.environ['CUPY_CACHE_DIR'] = str(output / 'cupy-cache')
-        os.environ['NUMBA_CACHE_DIR'] = str(output / 'numba-cache')
         os.environ['TEMP'] = str(output / 'temp')
         os.environ['TMP'] = str(output / 'temp')
         os.environ['OMP_NUM_THREADS'] = '2'
         os.environ['MKL_NUM_THREADS'] = '2'
         os.environ['OPENBLAS_NUM_THREADS'] = '2'
         (output / 'cupy-cache').mkdir()
-        (output / 'numba-cache').mkdir()
         (output / 'temp').mkdir()
         print('GPU lock acquired; importing Torch and initializing CUDA', flush=True)
         import torch  # type: ignore
@@ -759,7 +756,7 @@ def main(argv: list[str] | None = None) -> int:
                         key: environment[key] for key in (
                             'YOLO_TTA_SEMANTIC_GPU_CLEANUP', 'YOLO_TTA_SEMANTIC_TRT_RING',
                             'YOLO_TTA_SEMANTIC_TRT_TRACE',
-                            'YOLO_CONFIG_DIR', 'CUPY_CACHE_DIR', 'NUMBA_CACHE_DIR',
+                            'YOLO_CONFIG_DIR', 'CUPY_CACHE_DIR',
                         )
                     },
                 })

@@ -244,36 +244,78 @@ class RadialTorchNumericalTests(unittest.TestCase):
 
     def test_compaction_launch_supplies_complete_kernel_contract_for_both_head_dtypes(self):
         import torch
+
+        class CpuBackedCudaHead(torch.Tensor):
+            @property
+            def is_cuda(self):
+                return True
+
+        stream = object()
         for dtype in (torch.float16, torch.float32):
-            calls = []
             def compact(grid, block, args, *, stream):
                 head, anchors, threshold, indices, count, height, width, bbox = args
-                calls.append((int(height), int(width), int(bbox)))
                 chosen = torch.nonzero(head[4] >= float(threshold)).flatten()
                 indices[:len(chosen)] = chosen.to(torch.int32)
                 count[0] = len(chosen)
-            def union(grid, block, args, *, stream):
-                args[10].fill_(8.0 if int(args[3][0]) else -16.0)
-            kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda x: x),
-                compact_f16=compact, compact_f32=compact,
-                union_f16_f32=union, union_f32_f32=union)
-            head = torch.zeros((7, 3), dtype=dtype)
+
+            def create_workspace(head, proto, indices, count, image_hw, *, track_confidence):
+                self.assertFalse(track_confidence)
+                self.assertEqual(image_hw, (8, 12))
+                self.assertEqual((tuple(proto.shape), proto.dtype), ((2, 4, 6), torch.float32))
+
+                def decode(*, stream):
+                    # The mock decoder consumes only results written by compaction.
+                    n = int(count[0])
+                    self.assertEqual(indices[:n].tolist(), [1, 2] if n else [])
+                    return torch.full(image_hw, float(n != 0)), None
+
+                return SimpleNamespace(
+                    _input_ptrs=(head, proto, indices, count), device_id=0,
+                    _boxes=object(), _owners=object(), decode=mock.Mock(side_effect=decode),
+                )
+
+            kernel_f16, kernel_f32 = mock.Mock(side_effect=compact), mock.Mock(side_effect=compact)
+            chosen_kernel, other_kernel = ((kernel_f16, kernel_f32) if dtype == torch.float16
+                                           else (kernel_f32, kernel_f16))
+            device = mock.Mock(return_value=nullcontext())
+            kernels = SimpleNamespace(cp=SimpleNamespace(cuda=SimpleNamespace(Device=device)),
+                                      compact_f16=kernel_f16, compact_f32=kernel_f32)
+            head = torch.zeros((7, 3), dtype=dtype).as_subclass(CpuBackedCudaHead)
             head[4] = torch.tensor([0.1, 0.5, 0.75], dtype=dtype)
             proto = torch.ones((2, 4, 6), dtype=torch.float32)
             image = torch.zeros((1, 1, 8, 12))
             with self.subTest(dtype=dtype), ExitStack() as stack:
                 stack.enter_context(mock.patch.object(inference, '_resident_mask_kernels', return_value=kernels))
-                stack.enter_context(mock.patch.object(inference, '_cupy_external_stream', return_value=None))
+                stack.enter_context(mock.patch.object(inference, '_cupy_external_stream', return_value=stream))
                 stack.enter_context(mock.patch.object(inference, 'gpu_flatten_conf_tracking_enabled', return_value=False))
                 stack.enter_context(mock.patch.object(inference, 'angle_variant_gpu_fastpath', return_value=None))
-                stack.enter_context(mock.patch.object(torch.cuda, 'current_stream', return_value=None))
-                stack.enter_context(mock.patch.object(torch.cuda, 'Event', return_value=SimpleNamespace(record=lambda stream: None)))
+                stack.enter_context(mock.patch.object(torch.cuda, 'current_stream', return_value=stream))
+                stack.enter_context(mock.patch.object(torch.cuda, 'Event', side_effect=lambda: mock.Mock()))
+                stack.enter_context(mock.patch.object(inference, '_retina_workspace', side_effect=create_workspace))
                 for threshold, expected_count in ((0.3, 2), (0.95, 0)):
                     payload = inference._build_direct_device_compacted_payload(head, proto, image, threshold)
                     self.assertIsNotNone(payload)
+                    self.assertEqual(payload.compaction_kernel, 'exact_retina')
                     self.assertEqual(int(payload.instance_count_device[0]), expected_count)
                     self.assertEqual(int(payload.union_gpu.count_nonzero()), 96 if expected_count else 0)
-                self.assertEqual(calls, [(8, 12, 0), (8, 12, 0)])
+                    payload.ready_event.record.assert_called_once_with(stream)
+                    workspace = payload.device_refs[4]
+                    workspace.decode.assert_called_once_with(stream=stream)
+
+                    grid, block, args = chosen_kernel.call_args.args
+                    self.assertEqual((grid, block), ((1,), (256,)))
+                    self.assertEqual(chosen_kernel.call_args.kwargs, {'stream': stream})
+                    self.assertEqual(len(args), 8)
+                    self.assertIs(args[0], workspace._input_ptrs[0])
+                    self.assertIs(args[3], workspace._input_ptrs[2])
+                    self.assertIs(args[4], payload.instance_count_device)
+                    self.assertEqual((type(args[1]), args[1]), (np.int32, 3))
+                    self.assertEqual((type(args[2]), args[2]), (np.float32, np.float32(threshold)))
+                    self.assertEqual(args[5:], (np.int32(8), np.int32(12), np.uintp(0)))
+                    self.assertEqual(tuple(map(type, args[5:])), (np.int32, np.int32, np.uintp))
+                self.assertEqual(chosen_kernel.call_count, 2)
+                self.assertEqual(device.call_args_list, [mock.call(0), mock.call(0)])
+                other_kernel.assert_not_called()
 
 
 @unittest.skipUnless(os.environ.get('XTA_RUN_CYLINDRICAL_CUDA_SMOKE') == '1', 'explicit CUDA smoke only')

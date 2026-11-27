@@ -119,19 +119,15 @@ def test_sampler_refuses_lazy_source_without_materializing_it():
 
 def test_numerical_sampler_identity_tracks_compiler_and_source(monkeypatch):
     identity = sampler.spherical_gray8_sampling_identity()
-    assert identity['backend'] == 'numba_nogil_f64_qsc_f32_trilinear'
+    assert identity['backend'] == 'cpp_nogil_f64_qsc_f32_trilinear'
     assert identity['implementation_sha256'] == sampler.IMPLEMENTATION_SHA256
-    assert identity['numba_version'] and identity['llvmlite_version'] and identity['host_cpu_name']
-    assert identity['llvm_version'] and isinstance(identity['using_svml'], bool)
-    assert 'host_cpu_features' in identity and identity['fastmath'] is False
-    monkeypatch.setattr(sampler, 'IMPLEMENTATION_SHA256', 'changed native bytes')
+    native = identity['native_kernel']
+    assert len(native['source_sha256']) == len(native['binary_sha256']) == 64
+    assert native['compiler']
+    assert native['fp_contract'] == 'explicit_fma_only'
+    assert identity['fastmath'] is False
+    monkeypatch.setattr(sampler, 'IMPLEMENTATION_SHA256', 'changed wrapper bytes')
     assert sampler.spherical_gray8_sampling_identity()['implementation_sha256'] != identity['implementation_sha256']
-
-
-def test_kernel_is_serial_nogil_and_keeps_float_order():
-    assert sampler._compiled_render.targetoptions['nogil'] is True
-    assert sampler._compiled_render.targetoptions['fastmath'] is False
-    assert not sampler._compiled_render.targetoptions.get('parallel', False)
 
 
 def test_native_sampler_source_change_changes_actual_image_cache_identity(tmp_path, monkeypatch):

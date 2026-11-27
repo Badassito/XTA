@@ -537,7 +537,7 @@ and its host-buffer reservation; SAM retains its ordinary source-rendering path.
 This switch controls the YOLO-produced greyscale cache, independently of
 `YOLO_TTA_SAM_GPU_IMAGES`. Capture uses the first selected YOLO model's
 angle-zero base full frames for compatible Tilted, Azimuthal, Radial and Spherical
-views. Ordinary Cartesian and dense optional tile inputs are not captured.
+views. Ordinary Cartesian and optional tile inputs are not captured.
 Generic CUDA inference and the direct prediction ring use the actual normalized
 center-channel tensor: float32 clamp to [0,1], multiply by 255 and round to uint8.
 CUDA events fence input-buffer reuse after the last source read and separately

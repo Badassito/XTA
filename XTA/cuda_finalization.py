@@ -225,39 +225,6 @@ class KeepGraphDecision:
     root_areas: np.ndarray = field(repr=False, compare=False)
 
 
-def _offset_pair_codes(
-    codes: np.ndarray,
-    high_offset: int,
-    low_offset: int,
-    *,
-    high_count: Optional[int] = None,
-    low_count: Optional[int] = None,
-    context: str = "component pair",
-) -> np.ndarray:
-    values = np.asarray(codes, dtype=np.uint64).reshape(-1)
-    if int(values.size) <= 0:
-        return np.zeros((0,), dtype=np.uint64)
-    high_local = values >> np.uint64(32)
-    low_local = values & np.uint64(0xFFFFFFFF)
-    if high_count is not None and (
-        bool(np.any(high_local == 0))
-        or bool(np.any(high_local > np.uint64(int(high_count))))
-    ):
-        raise ValueError(
-            f"{context} high ids must be in 1..{int(high_count)}"
-        )
-    if low_count is not None and (
-        bool(np.any(low_local == 0))
-        or bool(np.any(low_local > np.uint64(int(low_count))))
-    ):
-        raise ValueError(
-            f"{context} low ids must be in 1..{int(low_count)}"
-        )
-    high = high_local + np.uint64(int(high_offset))
-    low = low_local + np.uint64(int(low_offset))
-    return np.ascontiguousarray((high << np.uint64(32)) | low, dtype=np.uint64)
-
-
 def resolve_keep_graph(
     shards: Sequence[KeepGraphShard],
     cross_shard_pairs: Sequence[CrossShardPairCodes],
@@ -297,27 +264,23 @@ def resolve_keep_graph(
     uf = _UnionFind()
     uf.new_ids(int(total_components))
     for rank, shard in enumerate(shards):
-        codes = _offset_pair_codes(
-            np.asarray(shard.internal_pair_codes, dtype=np.uint64),
-            int(offsets[rank]), int(offsets[rank]),
-            high_count=int(counts[rank]), low_count=int(counts[rank]),
+        uf.union_pair_codes(
+            np.asarray(shard.internal_pair_codes, dtype=np.uint64).reshape(-1),
+            gid_base=-offsets[rank],
+            member_counts=(counts[rank], counts[rank]),
             context=f"shard {rank} internal pair",
         )
-        if int(codes.size) > 0:
-            uf.union_pair_codes(codes)
     for boundary in cross_shard_pairs:
         left = int(boundary.left_rank)
         right = int(boundary.right_rank)
         if not (0 <= left < len(shards) and 0 <= right < len(shards)):
             raise IndexError(f"invalid cross-shard ranks {left}->{right}")
-        codes = _offset_pair_codes(
-            np.asarray(boundary.pair_codes, dtype=np.uint64),
-            int(offsets[left]), int(offsets[right]),
-            high_count=int(counts[left]), low_count=int(counts[right]),
+        uf.union_pair_codes(
+            np.asarray(boundary.pair_codes, dtype=np.uint64).reshape(-1),
+            gid_base=(-offsets[left], -offsets[right]),
+            member_counts=(counts[left], counts[right]),
             context=f"cross-shard pair {left}->{right}",
         )
-        if int(codes.size) > 0:
-            uf.union_pair_codes(codes)
 
     root_map = np.ascontiguousarray(uf.root_map(), dtype=np.uint32)
     global_areas = np.zeros((int(total_components) + 1,), dtype=np.int64)

@@ -15,7 +15,7 @@ from types import MappingProxyType
 import numpy as np
 from scipy import ndimage
 
-from ._deps import _numba
+from .native_cpu import kernels as _native_cpu
 from .file_hashing import source_sha256
 from .sam_cyclic import IMPLEMENTATION_SHA256 as _CYCLIC_IMPLEMENTATION_SHA256
 from .sam_evidence import (SamEvidenceBundle, TILE_EVIDENCE_SCHEMA, _freeze, _plain, _group_shape,
@@ -456,30 +456,8 @@ def _crop_contact_diagnostic(raw, effective, group, scope):
     return result
 
 
-@_numba.njit(nogil=True, cache=False)
 def _containment_counts_kernel(raw, effective, acceptance):
-    raw_foreground = foreground = raw_outside = outside = raw_touch = touch = 0
-    height, width = raw.shape
-    for y in range(height):
-        for x in range(width):
-            r, e = raw[y, x], effective[y, x]
-            raw_foreground += int(r)
-            foreground += int(e)
-            if not r and not e:
-                continue
-            if not acceptance[y, x]:
-                raw_outside += int(r)
-                outside += int(e)
-                continue
-            boundary = y == 0 or x == 0 or y == height - 1 or x == width - 1
-            if not boundary:
-                boundary = not (acceptance[y-1, x-1] and acceptance[y-1, x] and acceptance[y-1, x+1]
-                    and acceptance[y, x-1] and acceptance[y, x+1]
-                    and acceptance[y+1, x-1] and acceptance[y+1, x] and acceptance[y+1, x+1])
-            if boundary:
-                raw_touch += int(r)
-                touch += int(e)
-    return raw_foreground, foreground, raw_outside, outside, raw_touch, touch
+    return _native_cpu.containment_counts(raw, effective, acceptance)
 
 
 def _containment_counts(raw, effective, acceptance):

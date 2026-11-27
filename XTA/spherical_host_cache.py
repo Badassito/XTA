@@ -1,7 +1,7 @@
 """Bound exact host QSC tables independently of the small device direction LRUs.
 
-PTA installs one cache on its render engine. Leases cover blocking CUDA copies;
-the CPU reference path is excluded because its tensors can alias NumPy owners.
+GPU render engines can keep one host cache. Leases cover blocking CUDA copies.
+The CPU reference path can alias NumPy owners and does not borrow this cache.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import numpy as np
 
 
 _DEFAULT_CACHE_MIB = 3072
+_TTA_CACHE_MAX_BYTES = 672 * 1024**2  # Six 2048² FP64 tables and one build strip.
 _ROW_BLOCK = 64
 _ROW_SCRATCH_BYTES_PER_PIXEL = 512
 
@@ -295,8 +296,9 @@ class HostDirectionCache:
 
     def close(self):
         with self._condition:
-            self._closed = True
-            self.clear()
+            if not self._closed or self._cached or self._building:
+                self._closed = True
+                self.clear()
 
     def snapshot(self):
         with self._condition:
@@ -313,17 +315,28 @@ class HostDirectionCache:
                 entries=len(self._cached))
 
 
-def install_spherical_host_cache(engine, owner_count=1):
+def tta_spherical_host_cache_budget(*, available_bytes, reserved_bytes, worker_count):
+    """Return one worker's equal share after existing TTA host commitments."""
+    workers = int(worker_count)
+    if workers <= 0:
+        return 0
+    surplus = max(0, int(available_bytes) - int(reserved_bytes))
+    return min(_TTA_CACHE_MAX_BYTES, surplus // workers)
+
+
+def install_spherical_host_cache(engine, owner_count=1, *, budget_bytes=None):
     if engine is None or not str(getattr(engine, 'device', '')).startswith('cuda'):
         return None
     cache = getattr(engine, '_spherical_host_direction_cache', None)
     if cache is None:
-        raw = os.environ.get('YOLO_TTA_PTA_SPHERICAL_HOST_CACHE_MIB', str(_DEFAULT_CACHE_MIB))
-        try:
-            mib = max(0, int(raw))
-        except (TypeError, ValueError):
-            mib = _DEFAULT_CACHE_MIB
-        cache = HostDirectionCache(mib * 1024**2, owner_count=owner_count)
+        if budget_bytes is None:
+            raw = os.environ.get('YOLO_TTA_PTA_SPHERICAL_HOST_CACHE_MIB', str(_DEFAULT_CACHE_MIB))
+            try:
+                mib = max(0, int(raw))
+            except (TypeError, ValueError):
+                mib = _DEFAULT_CACHE_MIB
+            budget_bytes = mib * 1024**2
+        cache = HostDirectionCache(budget_bytes, owner_count=owner_count)
         engine._spherical_host_direction_cache = cache
     return cache
 

@@ -75,12 +75,12 @@ class GeometryIdentityProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "provenance does not match"):
             workers._canonical_raster_plan_for_task(_task(a[2], a[0], job))
 
-    def test_dense_tile_binds_physical_sweep_and_actual_transform(self):
+    def test_tile_binds_physical_sweep_and_actual_transform(self):
         tiles = []
         for step in (30, 31):
             view, job, plan = _item(_physical(sweep=step))
-            tile = g.build_dense_tile_jobs_for_aug(view, job, g.TileConfig(8, 8, "tiles8"), 8)[0]
-            plan = g.build_dense_tile_raster_plan(view, tile)
+            tile = g.build_tile_jobs_for_aug(view, job, g.TileConfig(8, 8, "tiles8"), 8)[0]
+            plan = g.build_tile_raster_plan(view, tile)
             tiles.append((view, tile, plan))
             accepted = workers._canonical_raster_plan_for_task(_task(plan, view, tile, kind="tile"))
             self.assertEqual(accepted.digest, plan.digest)
@@ -90,7 +90,7 @@ class GeometryIdentityProvenanceTests(unittest.TestCase):
         matrix = tiles[0][1].M_out_to_src.copy()
         matrix[0, 2] += 1
         changed = dataclasses.replace(tiles[0][1], M_out_to_src=matrix)
-        self.assertNotEqual(g.build_dense_tile_raster_plan(tiles[0][0], changed).digest, tiles[0][2].digest)
+        self.assertNotEqual(g.build_tile_raster_plan(tiles[0][0], changed).digest, tiles[0][2].digest)
 
     def test_plan_snapshots_mutable_matrices_and_ignores_presentation_fields(self):
         view, job, plan = _item(_physical())

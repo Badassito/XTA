@@ -1,9 +1,9 @@
 """Deterministic topology cases for compiled-versus-reference CPU benchmarks.
 
 The adjacency cases call the compiled dispatcher directly. Coherent planes admit its
-Numba row-run algorithm; fragmented planes refuse that route and use its bounded
-Numba hash. The reference is the NumPy pair-code implementation. Union cases call
-the Numba batch kernel and Python graph loop on identical prepared pairs.
+native row-run algorithm; fragmented planes refuse that route and use its bounded
+native hash. The reference is the NumPy pair-code implementation. Union cases call
+the native batch kernel and Python graph loop on identical prepared pairs.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from XTA import topology
+from XTA.native_cpu import kernels
 from tests.reference_backends.topology import union_pair_codes_python
 
 from .contracts import Case
@@ -98,6 +99,8 @@ def _union_case(name: str, node_count: int, a_ids: np.ndarray, b_ids: np.ndarray
     b_ids = np.ascontiguousarray(b_ids, dtype=np.int64)
     a_ids.setflags(write=False)
     b_ids.setflags(write=False)
+    codes = (a_ids.astype(np.uint64) << np.uint64(32)) | b_ids.astype(np.uint64)
+    codes.setflags(write=False)
     boundary_nodes = np.arange(1, node_count + 1, max(1, node_count // 97), dtype=np.int64)
     initial = topology._UnionFind()
     initial.new_ids(node_count)
@@ -117,11 +120,9 @@ def _union_case(name: str, node_count: int, a_ids: np.ndarray, b_ids: np.ndarray
         return _canonical_union_result(uf, node_count)
 
     def compiled() -> np.ndarray:
-        if topology._numba_union_find_batch_kernel is None:
-            raise RuntimeError('Numba union-find batch kernel is unavailable')
         uf = initial_union()
-        topology._numba_union_find_batch_kernel(
-            uf.parent, uf.rank, uf.touches_boundary, a_ids, b_ids,
+        kernels.topology_union_find_batch(
+            uf.parent, uf.rank, uf.touches_boundary, codes,
         )
         return _canonical_union_result(uf, node_count)
 
@@ -136,7 +137,7 @@ def _union_case(name: str, node_count: int, a_ids: np.ndarray, b_ids: np.ndarray
             'nodes': node_count,
             'pairs': int(a_ids.size),
             'marked_boundary_nodes': int(boundary_nodes.size),
-            'compiled_path': '_numba_union_find_batch_kernel',
+            'compiled_path': '_xta_cpu_kernels.topology_union_find_batch',
             'reference_path': 'tests.reference_backends.topology.union_pair_codes_python',
             'timed_common_work': 'copy initial UF arrays and canonicalize output',
         },
@@ -170,11 +171,11 @@ def make_cases(workload: str = 'smoke') -> list[Case]:
     sparse_b = np.concatenate((disjoint_b, disjoint_b))
 
     return [
-        _adjacency_case('adjacency-coherent-run', *coherent, expected_compiled_path='numba-row-runs'),
-        _adjacency_case('adjacency-patches-run', *patches, expected_compiled_path='numba-row-runs'),
-        _adjacency_case('adjacency-fragmented-hash', *fragmented, expected_compiled_path='numba-hash-after-run-refusal'),
+        _adjacency_case('adjacency-coherent-run', *coherent, expected_compiled_path='native-row-runs'),
+        _adjacency_case('adjacency-patches-run', *patches, expected_compiled_path='native-row-runs'),
+        _adjacency_case('adjacency-fragmented-hash', *fragmented, expected_compiled_path='native-hash-after-run-refusal'),
         _adjacency_case(
-            'adjacency-hash-spills', *spill, expected_compiled_path='numba-hash-spill',
+            'adjacency-hash-spills', *spill, expected_compiled_path='native-hash-spill',
             max_capacity=1024,
         ),
         _union_case('union-chain-and-repeats', union_nodes, chain_a, chain_b),

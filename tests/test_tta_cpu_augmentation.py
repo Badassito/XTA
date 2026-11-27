@@ -245,19 +245,45 @@ def test_custom_cpu_contract_validates_support_and_retains_input():
     assert restored.sum() == 24
 
 
-def test_restore_occurs_before_processing_affine(monkeypatch):
+@pytest.mark.parametrize('retain_confidence', [False, True])
+def test_restore_occurs_before_processing_affine(monkeypatch, retain_confidence):
     from XTA import inference
+
     original = np.zeros((24, 24), np.uint8)
     original[4:12, 5:10] = 1
-    augmented, replay = CpuPolicyAdapter(TranslationPolicy()).apply([original * 255], [1])
-    monkeypatch.setattr(inference, '_accumulate_cpu_retina_payload_to_prediction_frame',
-                        lambda *_args: ((augmented[0] > 0).astype(np.uint8), augmented[0], 1))
-    dest, conf = np.zeros((1, 12, 12), np.uint8), np.zeros((1, 12, 12), np.uint8)
+    original_scores = original * 157
+    original_scores[6:8, 5:10] = 231
+    augmented, replay = CpuPolicyAdapter(TranslationPolicy()).apply([original_scores], [1])
+    augmented_scores = augmented[0]
+    augmented_union = (augmented_scores > 0).astype(np.uint8)
+    payload = object()
+    calls = []
+
+    def accumulate(provided_payload, out_size, *, track_confidence):
+        assert provided_payload is payload and out_size == 24
+        # Replay needs the score plane even when the caller saves only the mask.
+        assert track_confidence is True
+        calls.append('accumulate')
+        return augmented_union, augmented_scores, 1
+
+    def restore(planes):
+        assert len(planes) == 2
+        assert planes[0] is augmented_union and planes[1] is augmented_scores
+        calls.append('restore')
+        return replay[0].restore_planes(planes)
+
+    monkeypatch.setattr(inference, '_accumulate_cpu_retina_payload_to_prediction_frame', accumulate)
+    dest = np.zeros((1, 12, 12), np.uint8)
+    conf = np.zeros_like(dest) if retain_confidence else None
     affine = np.asarray([[.5, 0., 0.], [0., .5, 0.]], np.float32)
     count = inference._process_cpu_retina_prediction_frame(
-        0, object(), 24, dest, conf, affine, 12, 12, restore_planes=replay[0].restore_planes)
+        0, payload, 24, dest, conf, affine, 12, 12, restore_planes=restore)
     assert count == (1, 1)
+    assert calls == ['accumulate', 'restore']
     np.testing.assert_array_equal(dest[0], cv2.warpAffine(original, affine, (12, 12), flags=cv2.INTER_NEAREST))
+    if conf is not None:
+        np.testing.assert_array_equal(conf[0], cv2.warpAffine(
+            original_scores, affine, (12, 12), flags=cv2.INTER_NEAREST))
 
 
 class BatchSource:

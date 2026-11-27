@@ -10,7 +10,7 @@ import tempfile
 import pytest
 
 
-_DEPENDENCY_MODULES = ('cv2', 'scipy', 'scipy.ndimage', 'tifffile', 'tqdm', 'numba')
+_DEPENDENCY_MODULES = ('cv2', 'scipy', 'scipy.ndimage', 'tifffile', 'tqdm')
 _REPO_SETTINGS = Path(__file__).resolve().parents[1] / 'Ultralytics' / 'settings.json'
 
 # On Windows, importing Ultralytics replaces cv2.imread/imwrite/imshow for the

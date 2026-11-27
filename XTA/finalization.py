@@ -30,7 +30,8 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import _numba, cv2, ndi, tqdm
+from ._deps import cv2, ndi, tqdm
+from .native_cpu import kernels as _native_cpu
 
 from .config import (
     GIB,
@@ -114,25 +115,8 @@ class PackedFinalUnion:
     foreground_voxels: int
 
 
-@_numba.njit(nogil=True, cache=False)
 def _or_packed_crop_into_plane(destination, crop, y0, x0, width):
-    first_byte = x0 // 8
-    shift = x0 % 8
-    columns = crop.shape[1]
-    stop_byte = (x0 + width + 7) // 8
-    last_byte_mask = (1 << ((width - 1) % 8 + 1)) - 1
-    for row in range(crop.shape[0]):
-        carry = 0
-        for column in range(columns):
-            value = int(crop[row, column])
-            if column == columns - 1:
-                # Older stores need not guarantee zero-valued row padding.
-                value &= last_byte_mask
-            shifted = (value << shift) | carry
-            destination[y0 + row, first_byte + column] |= shifted & 255
-            carry = shifted >> 8
-        if first_byte + columns < stop_byte:
-            destination[y0 + row, first_byte + columns] |= carry
+    return _native_cpu.or_packed_crop_into_plane(destination, crop, y0, x0, width)
 
 
 def try_assemble_preprojected_packed_union(
@@ -2079,7 +2063,7 @@ def apply_keep_largest_objects_inplace(
     apply_started = time.perf_counter()
     try:
         if isinstance(labels_mm, SparseSliceLabelStore):
-            print(f'keep_objects: applying keep-largest-{keep_n} from sparse labels via numba nogil kernel')
+            print(f'keep_objects: applying keep-largest-{keep_n} from sparse labels with a native CPU kernel')
             _numba_sparse_keep_lut_apply_kernel(
                 labels_mm.flat,
                 labels_mm.offsets,
@@ -2090,7 +2074,7 @@ def apply_keep_largest_objects_inplace(
                 np.asarray(mask_mm),
             )
         else:
-            print(f'keep_objects: applying keep-largest-{keep_n} via numba nogil kernel')
+            print(f'keep_objects: applying keep-largest-{keep_n} with a native CPU kernel')
             _numba_keep_lut_apply_kernel(
                 np.asarray(labels_mm),
                 keep_flat,

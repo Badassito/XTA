@@ -136,7 +136,9 @@ def run_case(source, output, args, *, fast_geometry=None):
     env['PYTHONPATH'] = str(source)
     env['PYTHONDONTWRITEBYTECODE'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
-    env['NUMBA_CACHE_DIR'] = str(args.output_dir / 'numba-cache')
+    if args.baseline_root and source == args.baseline_root.resolve() and not (source / 'XTA/native_cpu.py').is_file():
+        # Historical source owns its own compiler and cache policy.
+        env['NUMBA_CACHE_DIR'] = str(args.output_dir / 'historical-numba-cache')
     env['CUPY_CACHE_DIR'] = str(args.output_dir / 'cupy-cache')
     env['YOLO_TTA_TELEMETRY'] = '0'
     env['YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND'] = '0'
@@ -199,8 +201,7 @@ def main():
     if args.heat_seconds < 0 or args.workers < 1 or args.device < 0:
         parser.error('Heat/device must be nonnegative and workers positive')
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    for name in ('NUMBA_CACHE_DIR', 'CUPY_CACHE_DIR'):
-        os.environ[name] = str(args.output_dir / name.lower().replace('_dir', ''))
+    os.environ['CUPY_CACHE_DIR'] = str(args.output_dir / 'cupy-cache')
     report = {'scope': 'Local real-model parity and timing; not cluster throughput or accuracy.',
               'runs': [], 'all_decoded_layers_equal': None}
     if args.heat_seconds:

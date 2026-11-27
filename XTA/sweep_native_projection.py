@@ -15,11 +15,11 @@ import os
 
 import numpy as np
 
-from ._deps import _numba
+from .native_cpu import kernels as _cpu
 from .env_flags import env_flag
 from .geometry import physical_view_name, is_tilted_view
 from .projection_coverage_cpu import (
-    _angular_keys, _geometry, _pull_azimuthal, _pull_tilted, NativePullPlanUnavailable,
+    _angular_keys, _geometry, NativePullPlanUnavailable,
     prepare_native_pull_plan,
 )
 
@@ -42,212 +42,26 @@ def _tilted_margin(tangent):
     return _TILTED_BOUND_MARGIN*(1.+magnitude+(1./magnitude if magnitude > 0. else 0.))
 
 
-@_numba.njit(nogil=True, cache=True)
 def _contributor_hull(index, working, output, scale):
     """Closed range of the kernel's working coordinates for one output index."""
-    if output < working:
-        first = index*working//output
-        stop = ((index+1)*working+output-1)//output
-        return float(first), float(stop-1)
-    value = (index+.5)*scale-.5
-    return value, value
+    return _cpu.contributor_hull(index, working, output, scale)
 
 
-@_numba.njit(nogil=True, cache=True)
 def _output_index_range(lower, upper, working, output, scale):
-    """Half-open output indices whose contributor set meets closed ``[lower, upper]``.
-
-    Contraction uses the kernel's integer contributor tables exactly. Centered
-    expansion re-evaluates the kernel's float expression at both ends, so the
-    result is the exact preimage of the supplied closed interval. A NaN end is
-    unbounded, keeping the result a superset.
-    """
-    if lower != lower:
-        lower = -np.inf
-    if upper != upper:
-        upper = np.inf
-    if lower > upper:
-        return 0, 0
-    if output < working:
-        if lower > working-1 or upper < 0:
-            return 0, 0
-        first = 0 if lower <= 0 else int(math.ceil(lower))
-        last = working-1 if upper >= working-1 else int(math.floor(upper))
-        if first > last:
-            return 0, 0
-        return first*output//working, ((last+1)*output-1)//working+1
-    smallest = .5*scale-.5
-    largest = (output-.5)*scale-.5
-    if lower > largest or upper < smallest:
-        return 0, 0
-    if lower <= smallest:
-        first = 0
-    else:
-        first = min(output, max(0, int(math.ceil((lower+.5)/scale-.5))))
-        while first > 0 and (first-1+.5)*scale-.5 >= lower:
-            first -= 1
-        while first < output and (first+.5)*scale-.5 < lower:
-            first += 1
-    if upper >= largest:
-        stop = output
-    else:
-        last = min(output-1, max(-1, int(math.floor((upper+.5)/scale-.5))))
-        while last < output-1 and (last+1+.5)*scale-.5 <= upper:
-            last += 1
-        while last >= 0 and (last+.5)*scale-.5 > upper:
-            last -= 1
-        stop = last+1
-    return first, max(first, stop)
+    """Half-open output indices whose contributor set meets closed ``[lower, upper]``."""
+    return _cpu.output_index_range(lower, upper, working, output, scale)
 
 
-@_numba.njit(nogil=True, cache=True)
-def _tree_update(tree, leaves, first, stop, value, minimum):
-    first += leaves
-    stop += leaves
-    while first < stop:
-        if first & 1:
-            tree[first] = min(tree[first], value) if minimum else max(tree[first], value)
-            first += 1
-        if stop & 1:
-            stop -= 1
-            tree[stop] = min(tree[stop], value) if minimum else max(tree[stop], value)
-        first >>= 1
-        stop >>= 1
-
-
-@_numba.njit(nogil=True, cache=True)
 def _tilted_slice_spans(z, frames, regions, integers, coefficients, margin, bbox, spans, trees):
-    """Certified half-open x span of every row of output slice ``z``.
-
-    Each active frame contributes, within this slice, an output-row interval
-    and a closed horizontal working interval ``[x_lo, x_hi]`` intersected with
-    an optional sheared band ``slope*row + [band_lo, band_hi]``. A row keeps the
-    hull ``max(min x_lo, slope*row + min band_lo)`` .. ``min(max x_hi, ...)``
-    over frames that may reach it, which contains every frame's exact interval.
-    Returns the slice hull ``(y0, y1, x0, x1)``; all zeros when nothing projects.
-    """
-    base, vertical = integers[0], integers[1]
-    wt, wh, ww = integers[2], integers[3], integers[4]
-    ot, oh, ow = integers[5], integers[6], integers[7]
-    tangent, origin, center = coefficients[0], coefficients[1], coefficients[2]
-    s_lo, s_hi = _contributor_hull(z, wt, ot, coefficients[9])
-    leaves = trees.shape[1]//2
-    trees[0, :] = np.inf
-    trees[1, :] = -np.inf
-    trees[2, :] = np.inf
-    trees[3, :] = -np.inf
-    spans[:, :] = 0
-    slope = 0.
-    if not vertical and tangent != 0.:
-        if base == 1:
-            slope = 1./tangent
-        elif base == 2:
-            slope = tangent
-    touched = False
-    for k in range(frames.size):
-        low = frames[k]+origin-.5
-        high = frames[k]+origin+.5
-        v_lo, v_hi, u_lo, u_hi = regions[k, 0], regions[k, 1], regions[k, 2], regions[k, 3]
-        band_lo, band_hi = -np.inf, np.inf
-        if base == 0:
-            # Slice z owns the stack; the nearest frame selects a shear-axis band.
-            y_lo, y_hi, x_lo, x_hi = v_lo, v_hi, u_lo, u_hi
-            if tangent == 0.:
-                if high < s_lo-margin or low > s_hi+margin:
-                    continue
-            else:
-                p = (s_lo-high)/tangent
-                q = (s_hi-low)/tangent
-                if vertical:
-                    y_lo = max(y_lo, center+min(p, q)-margin)
-                    y_hi = min(y_hi, center+max(p, q)+margin)
-                else:
-                    x_lo = max(x_lo, center+min(p, q)-margin)
-                    x_hi = min(x_hi, center+max(p, q)+margin)
-        else:
-            # Slice z owns the native vertical coordinate: it gates the box rows.
-            gate_lo = max(v_lo, s_lo-margin)
-            gate_hi = min(v_hi, s_hi+margin)
-            if gate_lo > gate_hi:
-                continue
-            if vertical:
-                p = tangent*(gate_lo-center)
-                q = tangent*(gate_hi-center)
-                stack_lo, stack_hi = low+min(p, q), high+max(p, q)
-                if base == 1:
-                    y_lo, y_hi, x_lo, x_hi = stack_lo, stack_hi, u_lo, u_hi
-                else:
-                    y_lo, y_hi, x_lo, x_hi = u_lo, u_hi, stack_lo, stack_hi
-            elif base == 1:
-                # Rows own the stack; columns are the sheared native horizontal.
-                p = tangent*(u_lo-center)
-                q = tangent*(u_hi-center)
-                y_lo, y_hi, x_lo, x_hi = low+min(p, q), high+max(p, q), u_lo, u_hi
-                if tangent != 0.:
-                    p = center-low/tangent
-                    q = center-high/tangent
-                    band_lo, band_hi = min(p, q), max(p, q)
-            else:
-                # Rows own the native horizontal; columns are the sheared stack.
-                y_lo, y_hi, x_lo, x_hi = u_lo, u_hi, -np.inf, np.inf
-                band_lo, band_hi = low-tangent*center, high-tangent*center
-        if y_lo-margin > y_hi+margin or x_lo-margin > x_hi+margin:
-            continue
-        first, stop = _output_index_range(y_lo-margin, y_hi+margin, wh, oh, coefficients[10])
-        first, stop = max(first, bbox[1]), min(stop, bbox[4])
-        if first >= stop:
-            continue
-        touched = True
-        _tree_update(trees[0], leaves, first, stop, x_lo-margin, True)
-        _tree_update(trees[1], leaves, first, stop, x_hi+margin, False)
-        _tree_update(trees[2], leaves, first, stop, band_lo-margin, True)
-        _tree_update(trees[3], leaves, first, stop, band_hi+margin, False)
-    if not touched:
-        return 0, 0, 0, 0
-    for node in range(1, leaves):
-        for tree in range(4):
-            value = trees[tree, node]
-            for child in (2*node, 2*node+1):
-                if tree & 1:
-                    trees[tree, child] = max(trees[tree, child], value)
-                else:
-                    trees[tree, child] = min(trees[tree, child], value)
-    y0, y1, x0, x1 = oh, 0, ow, 0
-    for y in range(bbox[1], bbox[4]):
-        lower, upper = trees[0, leaves+y], trees[1, leaves+y]
-        if lower > upper:
-            continue
-        w_lo, w_hi = _contributor_hull(y, wh, oh, coefficients[10])
-        p, q = slope*w_lo, slope*w_hi
-        lower = max(lower, min(p, q)+trees[2, leaves+y]-margin)
-        upper = min(upper, max(p, q)+trees[3, leaves+y]+margin)
-        first, stop = _output_index_range(lower, upper, ww, ow, coefficients[11])
-        first, stop = max(first, bbox[2]), min(stop, bbox[5])
-        if first >= stop:
-            continue
-        spans[y, 0], spans[y, 1] = first, stop
-        y0, y1 = min(y0, y), y+1
-        x0, x1 = min(x0, first), max(x1, stop)
-    if y0 >= y1:
-        return 0, 0, 0, 0
-    return y0, y1, x0, x1
+    """Certified half-open x span of every row of output slice ``z``."""
+    return _cpu.tilted_slice_spans(
+        z, frames, regions, integers, coefficients, margin, bbox, spans,
+        trees)
 
 
-@_numba.njit(nogil=True, cache=True)
 def _tilted_span_rows(source, out, z, y0, x0, spans, integers, coefficients, bbox):
     """Exact kernel values on each certified span; the rest of ``out`` stays zero."""
-    oh, ow = integers[6], integers[7]
-    visited = addresses = 0
-    for row in range(out.shape[0]):
-        y = y0+row
-        first, stop = spans[y, 0], spans[y, 1]
-        if first >= stop:
-            continue
-        seen, count = _pull_tilted(source, out[row, first-x0:stop-x0], (z*oh+y)*ow+first,
-                                   integers, coefficients, bbox, True)
-        visited += seen
-        addresses += count
-    return visited, addresses
+    return _cpu.tilted_span_rows(source, out, z, y0, x0, spans, integers, coefficients, bbox)
 
 
 def _tilted_frame_regions(integers, coefficients, source_shape, boxes, margin):
@@ -318,36 +132,14 @@ def _tilted_certificate(view, native_shape, output_shape, boxes):
                            frames=frames, regions=regions, bbox=bbox)
 
 
-@_numba.njit(nogil=True, cache=True)
 def _tilted_rows(source, out, first, z, rect, integers, coeff):
-    ow, oh = integers[7], integers[6]
-    rw = rect[5] - rect[2]
-    pos = addresses = 0
-    while pos < out.size:
-        relative = first + pos
-        y, x = rect[1] + relative // rw, rect[2] + relative % rw
-        take = min(out.size-pos, rect[5]-x)
-        _, count = _pull_tilted(source, out[pos:pos+take], (z*oh+y)*ow+x, integers, coeff, rect, True)
-        addresses += count
-        pos += take
-    return addresses
+    return _cpu.tilted_rank_rows(source, out, first, z, rect, integers, coeff)
 
 
-@_numba.njit(nogil=True, cache=True)
 def _azimuthal_rows(source, out, first, z, rect, integers, coeff, keys, cached, invalid, rows):
-    ow, oh = integers[7], integers[6]
-    rw = rect[5] - rect[2]
-    pos = addresses = 0
-    while pos < out.size:
-        relative = first + pos
-        y, x = rect[1] + relative // rw, rect[2] + relative % rw
-        take = min(out.size-pos, rect[5]-x)
-        row_keys = keys if cached else keys[pos:pos+take]
-        _, count = _pull_azimuthal(source, out[pos:pos+take], (z*oh+y)*ow+x, integers,
-                                   coeff, rect, True, row_keys, cached, invalid, rows)
-        addresses += count
-        pos += take
-    return addresses
+    return _cpu.azimuthal_rank_rows(
+        source, out, first, z, rect, integers, coeff, keys, cached, invalid,
+        rows)
 
 
 def native_rank_bounds(view, native_shape, output_shape, boxes):
@@ -373,16 +165,8 @@ def native_rank_bounds(view, native_shape, output_shape, boxes):
     return tuple(map(int,result)) if result is not None else (0,0,0,0,0,0)
 
 
-@_numba.njit(nogil=True, cache=True)
 def _restore_d1_crop(projected, output, z0, z1, ys, xs, y0, x0):
-    for row in range(output.shape[0]):
-        y = ys[y0+row]
-        for col in range(output.shape[1]):
-            x = xs[x0+col]
-            best = np.uint8(0)
-            for z in range(z0,z1):
-                best = max(best, projected[z,y,x])
-            output[row,col] = best
+    return _cpu.restore_d1_crop(projected, output, z0, z1, ys, xs, y0, x0)
 
 
 def _upright(source, view, target, boxes):

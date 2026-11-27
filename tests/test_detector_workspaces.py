@@ -41,7 +41,7 @@ def workspace(tmp_path):
         np=np, Path=Path, ViewInfo=ViewInfo, weakref=weakref, threading=threading,
         _DirectUnionBackingLease=_DirectUnionBackingLease, temp_dir=tmp_path,
         args=SimpleNamespace(imgsz=8, min_conf=0, reconciliation_retain_confidence=False, interpolation_distance=0),
-        dense_tiling_active=False, component_layers_needed=False, policy_settings=SimpleNamespace(enabled=False),
+        tiling_active=False, component_layers_needed=False, policy_settings=SimpleNamespace(enabled=False),
         worker_direct_union_active=True, sam_context=None, sam_cpu_futures={'source':None},
         sam_parent_staging=None, sam_cpu_max_detector_parent=0, cpu_input_prefetch=None,
         gray_capture_reserve_bytes=0, cpu_input_pinned_reserve_bytes=0,

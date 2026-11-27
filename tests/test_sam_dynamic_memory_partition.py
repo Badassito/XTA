@@ -1,9 +1,11 @@
 """Post-drain transfers conserve promises without recalling live SAM credit."""
 import ast
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 import threading
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -28,18 +30,18 @@ def actual_reclaim():
     ns.update(sam_dynamic_memory_partition_enabled=True,
         scheduler_state=SimpleNamespace(gpu_inference_drain_announced=True),
         sam_context=SimpleNamespace(detector_retirement_ready=True, source_volume=None),
-        gpu_worker_pending_task_ids=[], direct_union_inference_bytes={},
+        fanout_consumers=deque(), direct_union_inference_bytes={},
         detector_workspace_preparation=None,
         sam_parent_staging=SimpleNamespace(ram_first_owners={}, checkpoint_futures={},
             ready_prepares={}, deferred={}),
         scheduler=SimpleNamespace(inputs=Inputs(), cpu_input_prefetch=None,
-            direct_union_task_key=lambda task: None),
+            try_resize_dense_capacity=mock.Mock(return_value=True)),
         gpu_worker_tasks_by_id={0:dict(kind='fullframe', model_name=key[0],
             view=SimpleNamespace(name=key[1]), result_mode='gpu_d1_owner')}, view_processing_submitted={key},
         sam_cpu_futures=dict(runtime=None, source=None), cpu_input_prefetch=None,
         direct_union_backing_leases={key:lease}, direct_union_postprocess_bytes={key:16*GIB},
         parent_transient_admission=pool, direct_union_total_dense_byte_limit=64*GIB)
-    tree = ast.parse(Path(pipeline.__file__).read_text())
+    tree = ast.parse(Path(pipeline.__file__).read_text(encoding='utf-8'))
     function = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
         and node.name == '_reclaim_drained_sam_dense_capacity')
     # Run the production body with its closure state exposed for negative gates.
@@ -83,6 +85,9 @@ def test_actual_retirement_and_restores_release_capacity_monotonically():
     assert ns['parent_transient_admission'].capacity == 78*GIB
     run()
     assert ns['parent_transient_admission'].capacity == 78*GIB
+    assert ns['scheduler'].try_resize_dense_capacity.call_args_list == [
+        mock.call(36*GIB), mock.call(26*GIB), mock.call(18*GIB)
+    ]
 
 
 def test_busy_restore_admission_does_not_park_reclaim_and_later_drain_retries():
@@ -139,7 +144,8 @@ def test_busy_restore_admission_does_not_park_reclaim_and_later_drain_retries():
 
 
 @pytest.mark.parametrize('reason',[
-    'ineligible','detector_not_drained','assets_not_retired','pending_detector','inference_owner',
+    'ineligible','detector_not_drained','assets_not_retired','native_owner_veto','inference_owner',
+    'fanout_native','fanout_projected',
     'workspace_pending','ram_first','checkpoint','ready_parent','unsubmitted_parent',
     'runtime_pending','source_pending','lazy_source','cache_mismatch','cache_charged_bytes',
     'cache_reserved_bytes','cache_pending_packets','cache_building_packets','cache_running_builders',
@@ -151,7 +157,10 @@ def test_uncertain_or_outstanding_rights_block_transfer(reason):
     if reason == 'ineligible': ns['sam_dynamic_memory_partition_enabled'] = False
     elif reason == 'detector_not_drained': ns['scheduler_state'].gpu_inference_drain_announced = False
     elif reason == 'assets_not_retired': ns['sam_context'].detector_retirement_ready = False
-    elif reason == 'pending_detector': ns['gpu_worker_pending_task_ids'].append(1)
+    elif reason == 'native_owner_veto':
+        ns['scheduler'].try_resize_dense_capacity.return_value = False
+    elif reason in ('fanout_native', 'fanout_projected'):
+        ns['fanout_consumers'].append((SimpleNamespace(name=key[1]), reason.split('_')[1]))
     elif reason == 'inference_owner': ns['direct_union_inference_bytes'][key] = 1
     elif reason == 'workspace_pending': ns['detector_workspace_preparation'] = SimpleNamespace(pending=True)
     elif reason in ('ram_first','checkpoint','ready_parent'):
@@ -179,7 +188,18 @@ def test_uncertain_or_outstanding_rights_block_transfer(reason):
             startup_active='_sam_startup_active_bytes')[reason],1)
     run()
     assert ns['direct_union_total_dense_byte_limit'] == 64*GIB
+    assert ns['scheduler'].inputs.direct_union_total_dense_byte_limit == 64*GIB
     assert pool.capacity == 32*GIB
+    resize = ns['scheduler'].try_resize_dense_capacity
+    if reason == 'native_owner_veto':
+        resize.assert_called_once_with(16*GIB)
+        resize.return_value = True
+        run()
+        assert ns['direct_union_total_dense_byte_limit'] == 16*GIB
+        assert ns['scheduler'].inputs.direct_union_total_dense_byte_limit == 16*GIB
+        assert pool.capacity == 80*GIB
+    else:
+        resize.assert_not_called()
 
 
 def test_live_credit_unchanged_and_waiting_parent_wakes_after_transfer():

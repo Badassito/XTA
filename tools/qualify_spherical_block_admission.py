@@ -37,7 +37,7 @@ def main():
     if repo == output or repo in output.parents:
         raise ValueError(f'Qualification output must be outside the repository: {output} (repo {repo})')
     output.mkdir(parents=True, exist_ok=True)
-    for key, folder in (('TEMP','temp'),('TMP','temp'),('CUPY_CACHE_DIR','cupy'),('NUMBA_CACHE_DIR','numba')):
+    for key, folder in (('TEMP','temp'),('TMP','temp'),('CUPY_CACHE_DIR','cupy')):
         target = output/folder
         target.mkdir(exist_ok=True)
         os.environ[key] = str(target)

@@ -198,8 +198,11 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
                     return_value=capture,
                 ),
             ):
-                workers.run_prediction_volume_in_openvino_worker(runner, cfg, task)
+                stats = workers.run_prediction_volume_in_openvino_worker(runner, cfg, task)
 
+        self.assertEqual(stats['render_path'], 'cpu')
+        self.assertEqual(stats['render_frames'], 2)
+        self.assertIs(stats['render_recovered_on_cpu'], False)
         self.assertIsNotNone(runner.source)
         self.assertEqual(runner.source.raster_plan.digest, plan.digest)  # type: ignore[union-attr]
         self._assert_bound_batch(self, capture, plan)
@@ -249,6 +252,9 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
                 stats = workers.run_prediction_volume_in_worker(object(), cfg, task)
 
         self.assertIsInstance(stats, dict)
+        self.assertEqual(stats['render_path'], 'cpu')
+        self.assertEqual(stats['render_frames'], 2)
+        self.assertIs(stats['render_recovered_on_cpu'], False)
         self.assertEqual(len(sources), 1)
         self.assertEqual(sources[0].raster_plan.digest, plan.digest)  # type: ignore[attr-defined]
         self._assert_bound_batch(self, capture, plan)
@@ -265,7 +271,7 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
             root = Path(temp_dir)
             task, _full_plan = self._task(root)
             view = task["view"]
-            tile = geometry.DenseTileJob(
+            tile = geometry.TileJob(
                 view=view.name,  # type: ignore[union-attr]
                 aug_id="a0",
                 config_id="s2_st1",
@@ -280,7 +286,7 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
                 parent_crop=(0, 2, 0, 2),
                 M_out_to_crop=IDENTITY.copy(),
             )
-            plan = geometry.build_dense_tile_raster_plan(view, tile)  # type: ignore[arg-type]
+            plan = geometry.build_tile_raster_plan(view, tile)  # type: ignore[arg-type]
             task.update(
                 {
                     "kind": "tile",
@@ -295,7 +301,7 @@ class WorkerRasterPlanProvenanceTests(unittest.TestCase):
             self.assertIsNotNone(restored)
             self.assertEqual(restored.digest, plan.digest)
 
-            restored_task["job"] = geometry.DenseTileJob(
+            restored_task["job"] = geometry.TileJob(
                 **{**tile.__dict__, "tile_x": 1}
             )
             with self.assertRaisesRegex(RuntimeError, "does not match its render task"):

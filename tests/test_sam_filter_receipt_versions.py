@@ -49,7 +49,8 @@ def _legacy_spec(bundle):
                                            filtering._QUALIFIED_RADIUS_ONLY_IMPLEMENTATION,
                                            filtering._QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION,
                                            filtering._QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION,
-                                           filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION])
+                                           filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION,
+                                           filtering._QUALIFIED_V26_PYTHON_IMPLEMENTATION])
 def test_qualified_legacy_filter_has_exact_current_pixels(implementation):
     bundle = _Bundle()
     current = filtering.effective_candidate_mask(bundle, "r", 0, filtering.build_mask_filter(bundle))
@@ -110,3 +111,26 @@ def test_real_legacy_unfiltered_receipt_keeps_its_meaning():
     receipt = {"schema": "xta.sam_selection/1", "resolved_policy": {"version": 1},
                "policy_name": "sam_conservative_v1"}
     np.testing.assert_array_equal(filtering.effective_candidate_mask(bundle, "r", 0, receipt), bundle.raw)
+
+
+def test_current_filter_receipt_records_native_source_and_issuing_binary():
+    bundle = _Bundle()
+    spec = filtering.build_mask_filter(bundle)
+    native = spec["native_implementation"]
+    assert native == filtering.native_cpu_provenance("retina")
+    assert all(len(native[key]) == 64 for key in ("source_sha256", "binary_sha256"))
+    assert filtering._spec(spec) is spec
+
+    for field, replacement in (("source_sha256", "0" * 64), ("fp_contract", "changed"), ("binary_sha256", None)):
+        changed = dict(spec, native_implementation={**native, field: replacement})
+        changed["sha256"] = filtering._fingerprint({key: value for key, value in changed.items() if key != "sha256"})
+        with pytest.raises(ValueError, match="native implementation differs"):
+            filtering._spec(changed)
+
+
+def test_historical_filter_rejects_unqualified_native_source(monkeypatch):
+    spec = _legacy_spec(_Bundle())
+    native = filtering.native_cpu_provenance("retina")
+    monkeypatch.setattr(filtering, "native_cpu_provenance", lambda _: {**native, "source_sha256": "0" * 64})
+    with pytest.raises(ValueError, match="implementation differs"):
+        filtering._spec(spec)

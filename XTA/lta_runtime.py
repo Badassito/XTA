@@ -595,6 +595,9 @@ def run(config: LtaConfig, *, argv: Sequence[str] | None = None) -> object:
         command = launch.command
     else:
         command = mode_arguments
+    from .native_cpu import load_native_cpu
+
+    load_native_cpu()
     print("LTA phase: input discovery and run planning (GPU workers have not started)", flush=True)
     planning_started = time.monotonic()
     plan = build_lta_run_plan(config, argv=command)

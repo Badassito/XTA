@@ -89,10 +89,10 @@ def _canonical_occupancy(view, plan, mask, coverage, idx):
     expected = {'full': bool(np.any(full_mask & full_coverage))}
     for tile in plan.tile_layout:
         assert tile.shared_job is not None
-        tile_mask = shared_geometry.render_categorical_dense_tile_for_job(
+        tile_mask = shared_geometry.render_categorical_tile_for_job(
             mask, view.shared_view, tile.shared_job, idx,
         )
-        tile_coverage = shared_geometry.render_categorical_dense_tile_for_job(
+        tile_coverage = shared_geometry.render_categorical_tile_for_job(
             coverage, view.shared_view, tile.shared_job, idx,
         )
         expected[tile.tile_tag] = bool(np.any(tile_mask & tile_coverage))

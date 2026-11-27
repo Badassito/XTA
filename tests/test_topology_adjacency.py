@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from types import BuiltinFunctionType
 import unittest
 from unittest import mock
 
 import numpy as np
-from XTA import topology
+from XTA import native_cpu, topology
+from XTA.native_cpu import load_native_cpu
+from XTA.native_cpu_build import NativeCpuBuildError
 
-HAS_COMPILED_ADJACENCY = getattr(topology._numba_adjacency_scan_kernel, 'signatures', None) is not None
 
 def oracle(previous, current, offsets=None, previous_offset=0, current_offset=0):
     """Coordinate enumeration independent of NumPy slicing and the candidate hash."""
@@ -120,8 +122,8 @@ class TopologyAdjacencyTests(unittest.TestCase):
             with self.subTest(layout=index):
                 self.assert_pairs(previous, current, previous_offset=500, current_offset=1200)
 
-    @unittest.skipUnless(HAS_COMPILED_ADJACENCY, "Native Numba unavailable")
     def test_forced_hash_spills_preserve_all_codes_and_resume_positions(self):
+        self.assertIsInstance(load_native_cpu().topology_adjacency_scan, BuiltinFunctionType)
         rng = np.random.default_rng(51773)
         previous = np.arange(1, 256, dtype=np.uint32).reshape(15, 17)
         current = previous[::-1, ::-1].copy()
@@ -144,7 +146,6 @@ class TopologyAdjacencyTests(unittest.TestCase):
             with self.subTest(dtype=dtype):
                 np.testing.assert_array_equal(topology._adjacent_gid_pair_codes(previous, current, **kwargs), topology._adjacent_gid_pair_codes_numpy(previous, current, **kwargs))
 
-    @unittest.skipUnless(HAS_COMPILED_ADJACENCY, "Native Numba unavailable")
     def test_concurrent_calls_do_not_share_mutable_hash_or_result_ownership(self):
         rng = np.random.default_rng(2281)
         previous = rng.integers(0, 12, (71, 83), dtype=np.uint16)
@@ -153,8 +154,7 @@ class TopologyAdjacencyTests(unittest.TestCase):
         current.flags.writeable = False
         variants = [(previous, current), (previous[:, ::-1], current[:, ::-1]),
                     (previous.T, current.T)]
-        # Warm every dtype/layout signature before launching threads; this checks
-        # ownership and native concurrent calls rather than measuring JIT behavior.
+        # Build independent expected results before launching the concurrent calls.
         expected = [self.assert_pairs(a, b, previous_offset=700, current_offset=1900) for a, b in variants]
 
         def call(index):
@@ -174,18 +174,19 @@ class TopologyAdjacencyTests(unittest.TestCase):
     def test_missing_compiled_kernel_does_not_enter_reference_path(self):
         previous = np.array([[0, 1], [2, 0]], dtype=np.uint16)
         current = np.array([[3, 0], [0, 4]], dtype=np.uint16)
-        with mock.patch.object(topology, '_numba_adjacency_scan_kernel', None), \
+        error = NativeCpuBuildError('Native CPU kernels unavailable')
+        with mock.patch.object(native_cpu, 'load_native_cpu', side_effect=error), \
                 mock.patch.object(topology, '_adjacent_gid_pair_codes_numpy', side_effect=AssertionError('reference attempt')):
-            with self.assertRaisesRegex(RuntimeError, 'kernel is unavailable'):
+            with self.assertRaisesRegex(RuntimeError, 'Compiled topology adjacency failed') as failure:
                 topology._adjacent_gid_pair_codes(previous, current)
+        self.assertIs(failure.exception.__cause__, error)
 
     def test_native_failure_is_reported_without_reference_replay(self):
         previous = np.array([[1, 0, 2], [0, 3, 0]], dtype=np.uint16)
         current = np.array([[0, 4, 0], [5, 0, 6]], dtype=np.uint16)
         offsets = ((0, 1), (1, -1), (-1, 0))
         telemetry = mock.Mock()
-        with mock.patch.object(topology, '_numba_adjacency_scan_kernel', object()), \
-                mock.patch.object(topology, 'runtime_telemetry', return_value=telemetry), \
+        with mock.patch.object(topology, 'runtime_telemetry', return_value=telemetry), \
                 mock.patch.object(topology, '_compiled_adjacent_gid_pair_codes', side_effect=RuntimeError('native unavailable')) as native, \
                 mock.patch.object(topology, '_adjacent_gid_pair_codes_numpy', side_effect=AssertionError('reference attempt')):
             for _ in range(2):

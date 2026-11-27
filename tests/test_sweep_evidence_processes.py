@@ -484,6 +484,36 @@ def test_decision_change_before_the_worker_reads_is_an_integrity_error(tmp_path)
     assert not (request.path / "metadata.json").exists()
 
 
+def test_evidence_uses_the_live_family_decision_but_worker_reopens_it(tmp_path, monkeypatch):
+    from XTA import sweep_views
+    view = _view()
+    _seal(view)
+    with sweep_views.open_sibling_views("detector", view.name, (50, 70, 100),
+                                        native_shape=SHAPE, identity="identity-one") as family:
+        with monkeypatch.context() as admission:
+            def unexpected(*args, **kwargs):
+                raise AssertionError("The parent read its open family's decision twice")
+            admission.setattr(sweep_views, "_decision", unexpected)
+            journal = resolve_native_journal_view("detector", view.name, SHAPE, (70, 100), "identity-one",
+                                                  crops=family.native_crops)
+            with pytest.raises(SweepViewIntegrityError):
+                resolve_native_journal_view("detector", view.name, SHAPE, (70,), "different",
+                                            crops=family.native_crops)
+        (path,) = (tmp_path / "journal-work" / "native_fanout" / "views").glob("*/metadata.json")
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        metadata["changed_after_family_open"] = True
+        path.write_text(json.dumps(metadata), encoding="utf-8")
+        writer = SweepObservedConfidenceWriter(tmp_path / "conf_070", cutoff_hundredths=70,
+            source_shape_tyx=SHAPE, run_id="run", task="segment", min_conf=0.0,
+            confidence_floor_by_backend={"gpu": .7})
+        request = writer.begin_view(view, "detector", native_shape=SHAPE)
+        with pytest.raises(SweepViewIntegrityError, match="changed before its evidence worker"):
+            run_sweep_evidence_job(SweepEvidenceJob(journal, 70, request))
+        assert not (request.path / "metadata.json").exists()
+    with pytest.raises(SweepViewIntegrityError):
+        resolve_native_journal_view("detector", view.name, SHAPE, (70,), "identity-one", crops=family.native_crops)
+
+
 def test_receipts_follow_durable_worker_evidence(tmp_path, monkeypatch):
     monkeypatch.setenv(PROCESSES_ENV, "2")
     view = _view()

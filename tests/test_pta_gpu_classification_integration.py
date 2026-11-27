@@ -52,7 +52,7 @@ def test_complete_gpu_jobs_skip_cpu_projection_and_match_original_truth(tmp_path
     pool = CapablePool(expected)
     with mock.patch.object(pta, 'render_plan_frame_mask_source', side_effect=AssertionError('GPU job replayed on CPU')), \
          mock.patch.object(pta, 'classify_semantic_plan_frame', side_effect=AssertionError('GPU job replayed on CPU')), \
-         mock.patch.object(pta.shared_geometry, 'render_categorical_dense_tile_for_job',
+         mock.patch.object(pta.shared_geometry, 'render_categorical_tile_for_job',
                            side_effect=AssertionError('GPU tile replayed on CPU')):
         actual = pta.classify_original_foregrounds_for_volume(prep, workers=1, gpu_pool=pool, generation=9)
     assert actual == expected

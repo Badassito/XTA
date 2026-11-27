@@ -3,7 +3,7 @@
 Geometry remains destination-owned. Exact NumPy angular owners are prepared
 once, while nogil scalar kernels fuse coordinate validation and OR/MAX. The
 caller owns output spans and threading; no source mask or global thread pool
-is copied/created here. Numba compilation never enables fastmath or disk cache.
+is copied/created here. The numerical extension is built ahead of time.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import math
 
 import numpy as np
 
-from ._deps import _numba
+from .native_cpu import kernels
 
 
 _CONTROL_BYTES = 65536
@@ -202,170 +202,8 @@ _AMBIGUOUS_CAPACITY = 4096
 _NO_INDICES = np.empty(0, np.int64)
 
 
-@_numba.njit(nogil=True, cache=False, inline='always')
-def _angular_index(i, first, width, vertical, horizontal, indexed):
-    if indexed:
-        return float(vertical[i]), float(horizontal[i])
-    at = first + i
-    return float(at // width), float(at % width)
-
-
-@_numba.njit(nogil=True, cache=False, inline='always')
-def _roi_offsets(v, h, work_h, work_w, out_h, out_w, center_y, center_x):
-    """``azimuthal_plane_samples`` centered float64 ROI offsets, exact order."""
-    dy = ((2.0 * v + 1.0 - out_h) * work_h / (2.0 * out_h)
-          + ((work_h - 1.0) * .5 - center_y))
-    dx = ((2.0 * h + 1.0 - out_w) * work_w / (2.0 * out_w)
-          + ((work_w - 1.0) * .5 - center_x))
-    return dy, dx
-
-
-@_numba.njit(nogil=True, cache=False, inline='always')
-def _roi_bound(distance, limit, abs_limit):
-    # limit + (8 * float64 eps) * np.maximum(distance, abs(limit)); 8*eps exact.
-    return limit + 1.7763568394002505e-15 * max(distance, abs_limit)
-
-
-@_numba.njit(nogil=True, cache=False)
-def _angular_coordinates(first, width, vertical, horizontal, indexed, work_h, work_w,
-                         out_h, out_w, center_y, center_x, dy32, dx32):
-    """float32 angular offsets: float64 address rounded to float32, then a
-    float32 subtraction of the (weak Python float -> float32) center, i.e.
-    NumPy's ``(...).astype(np.float32) - float(center)``."""
-    scale_h = work_h / out_h
-    scale_w = work_w / out_w
-    center_y32 = np.float32(center_y)
-    center_x32 = np.float32(center_x)
-    for i in range(dy32.size):
-        v, h = _angular_index(i, first, width, vertical, horizontal, indexed)
-        dy32[i] = np.float32((v + .5) * scale_h - .5) - center_y32
-        dx32[i] = np.float32((h + .5) * scale_w - .5) - center_x32
-
-
-@_numba.njit(nogil=True, cache=False, inline='always')
-def _numpy_remainder(a, b):
-    """NumPy/Python float64 ``a % b`` (npy_divmod): fmod, sign fix, signed zero."""
-    mod = np.fmod(a, b)  # exact (LLVM frem == C fmod)
-    if mod != 0.0:
-        if (b < 0.0) != (mod < 0.0):
-            mod += b
-    else:
-        mod = math.copysign(0.0, b)
-    return mod
-
-
-@_numba.njit(nogil=True, cache=False, inline='always')
-def _owner_key(theta, dy32, dx32, radius, diameter, sorted_angles, owner_order,
-               plan_sources, plan_reverses, cos_table, sin_table, column_lookup, source_width):
-    """Nearest owner, signed float32 column and key, in NumPy operation order."""
-    t = np.float64(theta)
-    count = sorted_angles.size
-    # np.searchsorted(side='left'): first index whose value is not < t.
-    low, high = 0, count
-    while low < high:
-        middle = (low + high) >> 1
-        if sorted_angles[middle] < t:
-            low = middle + 1
-        else:
-            high = middle
-    right = low % count
-    left = right - 1 if right > 0 else count - 1
-    dl = abs(_numpy_remainder(t - sorted_angles[left] + 90.0, 180.0) - 90.0)
-    dr = abs(_numpy_remainder(t - sorted_angles[right] + 90.0, 180.0) - 90.0)
-    ol, orr = owner_order[left], owner_order[right]
-    nearest = ol if (dl < dr or (dl == dr and ol < orr)) else orr
-    signed = np.float32(dx32 * cos_table[nearest]) + np.float32(dy32 * sin_table[nearest])
-    if plan_reverses[nearest]:
-        signed = -signed
-    if diameter == 1:
-        column = 0
-    else:
-        last = np.float32(diameter - 1)
-        q = np.rint(np.float32(np.float32(np.float32(signed + np.float32(radius))
-                                          / np.float32(max(1e-6, 2 * radius))) * last))
-        column = int(min(max(q, np.float32(0.)), last))
-    # A radius or center beyond float32 range yields NaN here; NumPy's
-    # column_lookup[...] raised IndexError, so keep that instead of an unchecked read.
-    if column < 0 or column >= column_lookup.size:
-        raise IndexError('Angular key column is out of bounds for the column lookup')
-    # Sources/columns are bound below source_shape[0]/[2], so the int64 value
-    # equals NumPy's unsigned key arithmetic and fits the key dtype.
-    return plan_sources[nearest] * source_width + column_lookup[column]
-
-
-@_numba.njit(nogil=True, cache=False)
-def _angular_keys_kernel(first, width, vertical, horizontal, indexed, work_h, work_w,
-                         out_h, out_w, center_y, center_x, margin, radius, diameter,
-                         theta, dy32, dx32, sorted_angles, owner_order, plan_sources,
-                         plan_reverses, cos_table, sin_table, column_lookup, source_width,
-                         invalid, keys, ambiguous, start):
-    """Exact scalar replay of the NumPy ROI/owner/column/key operations.
-
-    ``theta`` is NumPy's float32 ``degrees(arctan2) % 180`` and the cos/sin
-    tables are ``np.cos/np.sin(np.deg2rad(plan_angles))``; only IEEE-exact
-    arithmetic, comparisons and lookups run here (no fastmath/contraction).
-    ROI validity is decided here only when it holds/fails over the certified
-    interval around np.hypot's value; other points are recorded for an exact
-    NumPy hypot pass. Returns ``(recorded, stop)``: processing stops before
-    the first undecided point that no longer fits ``ambiguous`` (needs size>0).
-    """
-    limit = radius + .5
-    abs_limit = abs(limit)
-    pending = 0
-    for i in range(start, keys.size):
-        v, h = _angular_index(i, first, width, vertical, horizontal, indexed)
-        dy, dx = _roi_offsets(v, h, work_h, work_w, out_h, out_w, center_y, center_x)
-        approx = math.sqrt(dx * dx + dy * dy)
-        lower = approx * (1.0 - margin)
-        upper = approx * (1.0 + margin)
-        if approx != 0.0 and not (1e-100 < approx < 1e100):
-            decided = False
-        elif upper <= _roi_bound(lower, limit, abs_limit):
-            decided = True
-        elif lower > _roi_bound(upper, limit, abs_limit):
-            keys[i] = invalid
-            continue
-        else:
-            decided = False
-        if not decided:
-            if pending == ambiguous.size:
-                return pending, i
-            ambiguous[pending] = i
-            pending += 1
-            continue
-        keys[i] = _owner_key(theta[i], dy32[i], dx32[i], radius, diameter, sorted_angles,
-                             owner_order, plan_sources, plan_reverses, cos_table, sin_table,
-                             column_lookup, source_width)
-    return pending, keys.size
-
-
-@_numba.njit(nogil=True, cache=False)
-def _ambiguous_offsets(indices, first, width, vertical, horizontal, indexed, work_h, work_w,
-                       out_h, out_w, center_y, center_x, dy, dx):
-    for j in range(indices.size):
-        v, h = _angular_index(indices[j], first, width, vertical, horizontal, indexed)
-        dy[j], dx[j] = _roi_offsets(v, h, work_h, work_w, out_h, out_w, center_y, center_x)
-
-
-@_numba.njit(nogil=True, cache=False)
-def _ambiguous_keys(indices, distance, radius, diameter, theta, dy32, dx32, sorted_angles,
-                    owner_order, plan_sources, plan_reverses, cos_table, sin_table,
-                    column_lookup, source_width, invalid, keys):
-    limit = radius + .5
-    abs_limit = abs(limit)
-    for j in range(indices.size):
-        i = indices[j]
-        d = distance[j]
-        if not d <= _roi_bound(d, limit, abs_limit):
-            keys[i] = invalid
-        else:
-            keys[i] = _owner_key(theta[i], dy32[i], dx32[i], radius, diameter, sorted_angles,
-                                 owner_order, plan_sources, plan_reverses, cos_table, sin_table,
-                                 column_lookup, source_width)
-
-
 def _angular_tables(plan):
-    """Small fixed-dtype per-angle tables (one compiled signature).
+    """Fixed-dtype per-angle tables shared across one strip or cached plane.
 
     cos/sin are the exact NumPy float32 values the frozen sampler computes per
     point (``np.cos(np.deg2rad(angle))``); elementwise ufuncs on contiguous
@@ -399,7 +237,7 @@ def _angular_keys_into(plan, tables, keys, first, width, vertical, horizontal, i
     index = (first, width, vertical, horizontal, indexed)
     size = keys.size
     dy32, dx32 = np.empty(size, np.float32), np.empty(size, np.float32)
-    _angular_coordinates(*index, *geometry, dy32, dx32)
+    kernels._angular_coordinates(*index, *geometry, dy32, dx32)
     theta = np.degrees(np.arctan2(dy32, dx32))
     theta %= np.float32(180.)
     point = (float(plan.coefficients[12]), int(plan.integers[9]), theta, dy32, dx32, *tables,
@@ -407,13 +245,13 @@ def _angular_keys_into(plan, tables, keys, first, width, vertical, horizontal, i
     ambiguous = np.empty(min(size, max(1, int(_AMBIGUOUS_CAPACITY))), np.int64)
     start = total = 0
     while start < size:
-        pending, start = _angular_keys_kernel(*index, *geometry, float(_ROI_MARGIN), *point,
-                                              keys, ambiguous, start)
+        pending, start = kernels._angular_keys_kernel(
+            *index, *geometry, float(_ROI_MARGIN), *point, keys, ambiguous, start)
         if pending:
             indices = ambiguous[:pending]
             dy, dx = np.empty(pending, np.float64), np.empty(pending, np.float64)
-            _ambiguous_offsets(indices, *index, *geometry, dy, dx)
-            _ambiguous_keys(indices, np.hypot(dx, dy), *point, keys)
+            kernels._ambiguous_offsets(indices, *index, *geometry, dy, dx)
+            kernels._ambiguous_keys(indices, np.hypot(dx, dy), *point, keys)
             total += pending
             del indices, dy, dx
     return total
@@ -445,42 +283,6 @@ def _fill_angular_key_plane(plan, flat, width, strip_points):
     for first in range(0, flat.size, chunk):
         _angular_keys_into(plan, tables, flat[first:first + chunk], first, int(width),
                            _NO_INDICES, _NO_INDICES, False)
-
-
-def warm_angular_key_kernels():
-    """Compile every angular-key kernel signature production passes.
-
-    Production passes only fresh writable C-contiguous arrays (index arrays and
-    per-angle tables are normalized copies), so one signature per key dtype
-    (uint32/uint64) per kernel suffices; the flat and indexed modes and the
-    ambiguous ROI path share it.
-    """
-    import time
-    started = time.perf_counter()
-    tables = (np.asarray((0., 90.), np.float64), np.asarray((0, 1), np.int64),
-              np.asarray((0, 1), np.int64), np.asarray((False, True), np.bool_),
-              np.ones(2, np.float32), np.zeros(2, np.float32), np.asarray((0, 1), np.int64))
-    geometry = (2., 2., 2., 2., .5, .5)
-    index = (0, 2, _NO_INDICES, _NO_INDICES, False)
-    dy32, dx32 = np.zeros(4, np.float32), np.zeros(4, np.float32)
-    _angular_coordinates(*index, *geometry, dy32, dx32)
-    theta = np.zeros(4, np.float32)
-    indices = np.arange(2, dtype=np.int64)
-    _ambiguous_offsets(indices[:1], *index, *geometry, np.empty(1), np.empty(1))
-    for key_dtype in (np.uint32, np.uint64):
-        point = (1., 2, theta, dy32, dx32, *tables, np.int64(2),
-                 key_dtype(np.iinfo(key_dtype).max))
-        keys = np.empty(4, key_dtype)
-        _angular_keys_kernel(*index, *geometry, float(_ROI_MARGIN), *point, keys,
-                             np.empty(4, np.int64), 0)
-        # A span of the flat cached key buffer has the same C layout.
-        _angular_keys_kernel(*index, *geometry, float(_ROI_MARGIN), *point,
-                             np.empty((2, 4), key_dtype).reshape(-1)[2:6], np.empty(4, np.int64), 0)
-        _ambiguous_keys(indices[:1], np.zeros(1), *point, keys)
-    kernels = (_angular_coordinates, _angular_keys_kernel, _ambiguous_offsets, _ambiguous_keys)
-    return dict(scope='angular key kernels; no scientific input',
-                elapsed_seconds=time.perf_counter() - started,
-                signatures={kernel.__name__: len(kernel.nopython_signatures) for kernel in kernels})
 
 
 def prepare_native_pull_plan(view, source_shape, output_shape, *, max_plan_bytes,
@@ -531,155 +333,12 @@ def prepare_native_pull_plan(view, source_shape, output_shape, *, max_plan_bytes
     return plan
 
 
-@_numba.njit(nogil=True, cache=False)
-def _axis_value(destination, contributor, working, output, scale):
-    return float(contributor) if output < working else (destination + .5) * scale - .5
+def _pull_tilted(*args):
+    return kernels._pull_tilted(*args)
 
 
-@_numba.njit(nogil=True, cache=False)
-def _axis_bounds(destination, working, output):
-    if output < working:
-        return destination * working // output, ((destination + 1) * working + output - 1) // output
-    return 0, 1
-
-
-@_numba.njit(nogil=True, cache=False)
-def _pull_tilted(source, output, first, integer, coefficient, bbox, scalar_max):
-    base, vertical = integer[0], integer[1]
-    wt, wh, ww, ot, oh, ow = integer[2:8]
-    nh, nw = integer[8], integer[9]
-    tangent, origin, shear_center = coefficient[0:3]
-    addresses = 0
-    visited = 0
-    local_start = 0
-    while local_start < output.size:
-        # A caller span can start/end within any row. Decode flat coordinates
-        # and contraction bounds once per contiguous row, rather than once per
-        # voxel; keep the contributor order and floating-point expressions exact.
-        at = first + local_start
-        z, y, row_x = at // (oh * ow), (at // ow) % oh, at % ow
-        row_count = min(ow - row_x, output.size - local_start)
-        local_stop = local_start + row_count
-        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4]):
-            output[local_start:local_stop] = 0
-            local_start = local_stop
-            continue
-        valid_start = min(row_count, max(0, bbox[2] - row_x))
-        valid_stop = max(valid_start, min(row_count, bbox[5] - row_x))
-        output[local_start:local_start + valid_start] = 0
-        output[local_start + valid_stop:local_stop] = 0
-        visited += valid_stop - valid_start
-        z0, z1 = _axis_bounds(z, wt, ot)
-        y0, y1 = _axis_bounds(y, wh, oh)
-        for row_offset in range(valid_start, valid_stop):
-            local_index = local_start + row_offset
-            x = row_x + row_offset
-            value = 0
-            x0, x1 = _axis_bounds(x, ww, ow)
-            for iz in range(z0, z1):
-                cz = _axis_value(z, iz, wt, ot, coefficient[9])
-                for iy in range(y0, y1):
-                    cy = _axis_value(y, iy, wh, oh, coefficient[10])
-                    for ix in range(x0, x1):
-                        cx = _axis_value(x, ix, ww, ow, coefficient[11])
-                        nv = cy if base == 0 else cz
-                        nu = cx if base != 2 else cy
-                        stack = cz if base == 0 else (cy if base == 1 else cx)
-                        axis = nv if vertical else nu
-                        frame = stack - tangent * (axis - shear_center) - origin
-                        if frame < -.5 or frame >= source.shape[0] - .5:
-                            continue
-                        if nv < -.5 or nv >= nh - .5 or nu < -.5 or nu >= nw - .5:
-                            continue
-                        row = coefficient[6] * nu + coefficient[7] * nv + coefficient[8]
-                        column = coefficient[3] * nu + coefficient[4] * nv + coefficient[5]
-                        f = int(math.floor(frame + .5))
-                        r = min(source.shape[1] - 1, max(0, int(math.floor(row + .5))))
-                        c = min(source.shape[2] - 1, max(0, int(math.floor(column + .5))))
-                        pixel = int(source[f, r, c])
-                        addresses += 1
-                        if scalar_max:
-                            value = max(value, pixel)
-                        elif pixel:
-                            value = 1
-            output[local_index] = value
-        local_start = local_stop
-    return visited, addresses
-
-
-@_numba.njit(nogil=True, cache=False)
-def _pull_azimuthal(source, output, first, integer, coefficient, bbox, scalar_max,
-                    keys, keys_are_plane, invalid, rows):
-    base, vertical = integer[0], integer[1]
-    wt, wh, ww, ot, oh, ow = integer[2:8]
-    nh = integer[8]
-    tangent, origin, shear_center = coefficient[0:3]
-    stack_size = wt if base == 0 else (wh if base == 1 else ww)
-    output_stack = ot if base == 0 else (oh if base == 1 else ow)
-    addresses = 0
-    visited = 0
-    local_start = 0
-    while local_start < output.size:
-        at = first + local_start
-        z, y, row_x = at // (oh * ow), (at // ow) % oh, at % ow
-        row_count = min(ow - row_x, output.size - local_start)
-        local_stop = local_start + row_count
-        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4]):
-            output[local_start:local_stop] = 0
-            local_start = local_stop
-            continue
-        valid_start = min(row_count, max(0, bbox[2] - row_x))
-        valid_stop = max(valid_start, min(row_count, bbox[5] - row_x))
-        output[local_start:local_start + valid_start] = 0
-        output[local_start + valid_stop:local_stop] = 0
-        visited += valid_stop - valid_start
-        cz = (z + .5) * coefficient[9] - .5
-        cy = (y + .5) * coefficient[10] - .5
-        for row_offset in range(valid_start, valid_stop):
-            local_index = local_start + row_offset
-            x = row_x + row_offset
-            value = 0
-            if keys_are_plane:
-                plane_index = y * ow + x if base == 0 else (z * ow + x if base == 1 else z * oh + y)
-                key = keys[plane_index]
-            else:
-                key = keys[local_index]
-            if key == invalid:
-                output[local_index] = 0
-                continue
-            cx = (x + .5) * coefficient[11] - .5
-            nv = cy if base == 0 else cz
-            nu = cx if base != 2 else cy
-            stack = cz if base == 0 else (cy if base == 1 else cx)
-            destination_stack = z if base == 0 else (y if base == 1 else x)
-            axis = nv if vertical else nu
-            center = stack - tangent * (axis - shear_center)
-            local_frame = center - origin
-            if nh > output_stack:
-                shift = center - stack - origin
-                lower = max(0, int(math.floor(destination_stack * nh / output_stack
-                                              + shift * nh / stack_size)))
-                upper = min(nh, int(math.ceil((destination_stack + 1) * nh / output_stack
-                                             + shift * nh / stack_size)))
-            else:
-                if local_frame < -.5 or local_frame >= stack_size - .5:
-                    output[local_index] = 0
-                    continue
-                native_row = (local_frame + .5) * nh / stack_size - .5
-                lower = min(nh - 1, max(0, int(np.rint(native_row))))
-                upper = lower + 1
-            angle = int(key // source.shape[2])
-            column = int(key % source.shape[2])
-            for native_row in range(lower, upper):
-                pixel = int(source[angle, rows[native_row], column])
-                addresses += 1
-                if scalar_max:
-                    value = max(value, pixel)
-                elif pixel:
-                    value = 1
-            output[local_index] = value
-        local_start = local_stop
-    return visited, addresses
+def _pull_azimuthal(*args):
+    return kernels._pull_azimuthal(*args)
 
 
 def pull_native_flat_into(source, plan, output_flat, *, first_flat,
@@ -726,89 +385,16 @@ def pull_native_flat_into(source, plan, output_flat, *, first_flat,
                 persistent_bytes=plan.persistent_bytes, temporary_strip_bytes=plan.temporary_strip_bytes)
 
 
-@_numba.njit(nogil=True, cache=False)
-def _pull_azimuthal_encoded(encoded, index, packed_input, source_width, output, first,
-                            integer, coefficient, bbox, keys, keys_are_plane, invalid, rows):
-    """The dense kernel's destination equations with immutable bbox/bit lookup."""
-    base, vertical = integer[0], integer[1]
-    wt, wh, ww, ot, oh, ow = integer[2:8]
-    nh = integer[8]
-    tangent, origin, shear_center = coefficient[0:3]
-    stack_size = wt if base == 0 else (wh if base == 1 else ww)
-    output_stack = ot if base == 0 else (oh if base == 1 else ow)
-    visited = addresses = reads = positive = 0
-    local_start = 0
-    while local_start < output.size:
-        at = first + local_start
-        z, y, row_x = at // (oh * ow), (at // ow) % oh, at % ow
-        row_count = min(ow - row_x, output.size - local_start)
-        local_stop = local_start + row_count
-        if not (bbox[0] <= z < bbox[3] and bbox[1] <= y < bbox[4]):
-            output[local_start:local_stop] = 0
-            local_start = local_stop
-            continue
-        valid_start = min(row_count, max(0, bbox[2] - row_x))
-        valid_stop = max(valid_start, min(row_count, bbox[5] - row_x))
-        output[local_start:local_start + valid_start] = 0
-        output[local_start + valid_stop:local_stop] = 0
-        visited += valid_stop - valid_start
-        cz = (z + .5) * coefficient[9] - .5
-        cy = (y + .5) * coefficient[10] - .5
-        for row_offset in range(valid_start, valid_stop):
-            local_index = local_start + row_offset
-            x = row_x + row_offset
-            value = 0
-            if keys_are_plane:
-                plane_index = y*ow+x if base == 0 else (z*ow+x if base == 1 else z*oh+y)
-                key = keys[plane_index]
-            else:
-                key = keys[local_index]
-            if key == invalid:
-                output[local_index] = 0
-                continue
-            cx = (x+.5)*coefficient[11]-.5
-            nv = cy if base == 0 else cz
-            nu = cx if base != 2 else cy
-            stack = cz if base == 0 else (cy if base == 1 else cx)
-            destination_stack = z if base == 0 else (y if base == 1 else x)
-            axis = nv if vertical else nu
-            center = stack-tangent*(axis-shear_center)
-            local_frame = center-origin
-            if nh > output_stack:
-                shift = center-stack-origin
-                lower = max(0,int(math.floor(destination_stack*nh/output_stack+shift*nh/stack_size)))
-                upper = min(nh,int(math.ceil((destination_stack+1)*nh/output_stack+shift*nh/stack_size)))
-            else:
-                if local_frame < -.5 or local_frame >= stack_size-.5:
-                    output[local_index] = 0
-                    continue
-                native_row = (local_frame+.5)*nh/stack_size-.5
-                lower = min(nh-1,max(0,int(np.rint(native_row))))
-                upper = lower+1
-            angle,column = int(key//source_width),int(key%source_width)
-            record = index[angle]
-            y0,x0,y1,x1 = (np.int64(record['y0']),np.int64(record['x0']),
-                           np.int64(record['y1']),np.int64(record['x1']))
-            for native_row in range(lower,upper):
-                addresses += 1
-                row = np.int64(rows[native_row])
-                if (record['kind'] == 0 or row < y0 or row >= y1 or column < x0 or column >= x1):
-                    continue
-                width = x1-x0
-                local_column = np.int64(column)-x0
-                stride = (width+7)//8 if packed_input else width
-                address = np.int64(record['offset'])+(row-y0)*stride
-                address += local_column//8 if packed_input else local_column
-                pixel = encoded[address]
-                if packed_input:
-                    pixel = (pixel >> (local_column&7))&1
-                reads += 1
-                if pixel:
-                    positive += 1
-                    value = 1
-            output[local_index] = value
-        local_start = local_stop
-    return visited,addresses,reads,positive
+def _encoded_record_bytes(index):
+    from .interpolation import CTILE_INDEX_DTYPE
+    if index.ndim != 1 or index.dtype != CTILE_INDEX_DTYPE:
+        raise ValueError('Encoded projection requires a CVOL slice index')
+    # The singleton dimension keeps the byte view zero-copy even for strided records.
+    return index.reshape(-1, 1).view(np.uint8)
+
+
+def _pull_azimuthal_encoded(encoded, index, *args):
+    return kernels._pull_azimuthal_encoded(encoded, _encoded_record_bytes(index), *args)
 
 
 def pull_native_encoded_flat_into(encoded, index, packed_input, plan, output_flat, *,

@@ -67,7 +67,7 @@ def main() -> int:
                SLURM_CPUS_PER_TASK='4', YOLO_TTA_CPU_SOCKET_RESERVE_CORES='0',
                YOLO_TTA_TAIL_WORKER_BUDGET_EXPAND='0', YOLO_TTA_TELEMETRY='0',
                YOLO_CONFIG_DIR=str(case / 'ultralytics-config'),
-               NUMBA_CACHE_DIR=str(case / 'numba-cache'), NO_ALBUMENTATIONS_UPDATE='1')
+               NO_ALBUMENTATIONS_UPDATE='1')
     (case / 'invocation.json').write_text(json.dumps({'argv': argv}, indent=2))
     with (case / 'pipeline.log').open('w', encoding='utf-8') as log:
         completed = subprocess.run(argv, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)

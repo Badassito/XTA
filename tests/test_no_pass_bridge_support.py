@@ -26,7 +26,7 @@ def _prepare(tmp_path, *, backend='sdf', distance=0, passes=1, augmentation_pass
     result = assembly.prepare_view_volume_after_fullframe(
         model_name='detector', view=view, union_mm=source, confmap_mm=None,
         union_path=path, confmap_path=None, temp_dir=tmp_path,
-        dense_tiling_active=True, min_conf=0., min_radius=0.,
+        tiling_active=True, min_conf=0., min_radius=0.,
         interpolate=distance, interpolation_walk_back=0, interpolation_candidates=1,
         interpolate_passes=passes, interpolate_min_radius=0., interpolation_search_angle=0.,
         slice_workers=1, interpolation_task_workers=1,

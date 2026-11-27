@@ -30,23 +30,21 @@ class ImportRegressionTests(unittest.TestCase):
         self.assertIn("eager package import graph is acyclic", completed.stdout)
         self.assertIn("all function globals resolved", completed.stdout)
 
-    def test_output_test_collection_keeps_real_compiler_dependencies(self) -> None:
+    def test_output_test_collection_keeps_real_numerical_dependencies(self) -> None:
         program = textwrap.dedent(
             """
             from tests import test_output_regressions
-            from XTA import _deps
-            import numba
+            import sys
             import scipy
             import scipy.ndimage
+            from XTA import _deps
+            from XTA.native_cpu_build import MODULE
 
-            assert _deps._numba is numba
             assert _deps.ndi is scipy.ndimage
             assert isinstance(scipy.__version__, str)
-            @numba.njit
-            def compiled(value):
-                return value + 1
-            assert compiled(41) == 42
-            assert compiled.nopython_signatures
+            labels, count = _deps.ndi.label([[1, 0, 1]])
+            assert count == 2 and labels.tolist() == [[1, 0, 2]]
+            assert not {'numba', 'llvmlite', MODULE} & set(sys.modules)
             """
         )
         completed = self.run_python("-c", program)
@@ -108,6 +106,7 @@ class ImportRegressionTests(unittest.TestCase):
             importlib.import_module("XTA." + sys.argv[1])
             forbidden = {
                 "cupy", "jax", "openvino", "torch", "ultralytics",
+                "numba", "llvmlite", "_xta_cpu_kernels",
                 "qatzip", "qpl", "accel_config", "dto", "dml",
             }
             loaded = {name.split(".")[0] for name in sys.modules}
@@ -255,8 +254,7 @@ class ImportRegressionTests(unittest.TestCase):
         self.assertFalse((package / "_stdlib.py").exists())
         for path in package.glob("*.py"):
             source = path.read_text(encoding="utf-8")
-            self.assertNotIn("_latebind", source, path.name)
-            self.assertNotIn("_stdlib", source, path.name)
+            self.assertNotRegex(source, r"\b(?:_latebind|_stdlib)\b", path.name)
             self.assertNotIn("import *", source, path.name)
 
 

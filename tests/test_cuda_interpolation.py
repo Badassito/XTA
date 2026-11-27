@@ -953,7 +953,7 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual(int(np.count_nonzero(mask[1])), 9)
-        self.assertEqual(stats['interpolation_render_backend'], 'cpu_numpy_numba')
+        self.assertEqual(stats['interpolation_render_backend'], 'cpu_numpy_native')
         self.assertFalse(stats['gpu_interpolation_active'])
         self.assertTrue(stats['gpu_interpolation_render_autotune_enabled'])
         self.assertIs(stats['gpu_interpolation_render_selected'], False)
@@ -1072,7 +1072,7 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         self.assertFalse(stats['gpu_interpolation_render_selected'])
         self.assertEqual(
             stats['interpolation_render_backend'],
-            'cuda_cupy_probe+cpu_numpy_numba',
+            'cuda_cupy_probe+cpu_numpy_native',
         )
         self.assertEqual(int(stats['gpu_interpolation_batches']), 1)
         self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
@@ -1141,8 +1141,8 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         self.assertEqual(cpu_estimate.call_count, 1)
         self.assertEqual(renderer.mock_calls, [])
         self.assertEqual(int(np.count_nonzero(mask[1])), 9)
-        self.assertEqual(stats['interpolation_render_backend'], 'cpu_numpy_numba')
-        self.assertEqual(stats['interpolation_radius_backend'], 'cpu_numpy_numba')
+        self.assertEqual(stats['interpolation_render_backend'], 'cpu_numpy_native')
+        self.assertEqual(stats['interpolation_radius_backend'], 'cpu_numpy_native')
         self.assertFalse(stats['gpu_interpolation_active'])
         self.assertFalse(stats['gpu_interpolation_render_autotune_enabled'])
         self.assertFalse(stats['gpu_interpolation_render_selected'])
@@ -1173,7 +1173,7 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
         self.assertEqual(cpu_estimate.call_count, 1)
         self.assertEqual(int(np.count_nonzero(mask[1])), 9)
         self.assertTrue(stats['gpu_interpolation_required'])
-        self.assertEqual(stats['interpolation_radius_backend'], 'cpu_numpy_numba')
+        self.assertEqual(stats['interpolation_radius_backend'], 'cpu_numpy_native')
         self.assertEqual(int(stats['gpu_interpolation_rendered_sections']), 1)
 
     def test_required_mode_bypasses_render_autotune_and_cpu_replay(self) -> None:
@@ -1258,7 +1258,7 @@ class CudaInterpolationPassRoutingTests(unittest.TestCase):
 
         mask, stats = self._run_pass(_FailingRenderer())
         self.assertEqual(int(np.count_nonzero(mask[1])), 9)
-        self.assertEqual(stats['interpolation_render_backend'], 'cpu_numpy_numba')
+        self.assertEqual(stats['interpolation_render_backend'], 'cpu_numpy_native')
         self.assertFalse(stats['gpu_interpolation_active'])
         self.assertEqual(int(stats['gpu_interpolation_fallback_batches']), 1)
         self.assertIn('injected device render failure', str(stats['gpu_interpolation_fallback_reason']))

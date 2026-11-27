@@ -189,11 +189,13 @@ def test_pipeline_invalidates_manifest_and_joins_before_processing(tmp_path, pro
                  if isinstance(node, ast.Assign)
                  and any(isinstance(target, ast.Name) and target.id == 'unified_launch_at_start'
                          for target in node.targets))
-    stop = next(index for index, node in enumerate(main.body)
-                if isinstance(node, ast.AnnAssign)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == 'canonical_images_stage_root')
-    code = compile(ast.Module(body=main.body[start:stop], type_ignores=[]),
+    # Include the first setup step after both startup readers join.
+    stop = next(index for index, node in enumerate(main.body[start:], start=start)
+                if isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == 'choose_scratch_dir')
+    code = compile(ast.Module(body=main.body[start:stop+1], type_ignores=[]),
                    pipeline.__file__, 'exec')
     source = _source(tmp_path)
     capture_started = threading.Event()
@@ -204,6 +206,9 @@ def test_pipeline_invalidates_manifest_and_joins_before_processing(tmp_path, pro
     info = dict(width=3064, height=3023, fps=30., num_frames=1930)
 
     def capture(**kwargs):
+        assert len(manifests) == 1
+        assert manifests[0]['status'] == 'in_progress'
+        assert manifests[0]['inputs'] is None
         capture_started.set()
         assert release_capture.wait(5)
         events.append('identity_done')
@@ -219,11 +224,19 @@ def test_pipeline_invalidates_manifest_and_joins_before_processing(tmp_path, pro
             raise probe_error
         return info
 
+    def choose_scratch(temp, output, stem):
+        assert (temp, output, stem) == (None, tmp_path, source.stem)
+        assert not _threads()
+        assert len(manifests) == 2 and manifests[-1]['inputs'] is not None
+        events.append('processing')
+        return tmp_path / 'work'
+
     scope = dict(vars(pipeline))
     scope.update(
         current_unified_launch=lambda: SimpleNamespace(
             mode='tta', launcher='xta', version='development', command=('tta',)),
         input_path=source, gpu_model_path=None, cpu_model_path=None, out_dir=tmp_path,
+        args=SimpleNamespace(temp=None), choose_scratch_dir=choose_scratch,
         sweep_branch=None, scalar_run_id='fixture-run',
         capture_tta_artifact_identities=capture, ffprobe_info=probe,
         runtime_trace_event=lambda *args, **kwargs: None,
@@ -231,12 +244,8 @@ def test_pipeline_invalidates_manifest_and_joins_before_processing(tmp_path, pro
         write_json_manifest=lambda path, manifest: manifests.append(dict(manifest)),
     )
 
-    def execute_startup_then_process():
-        exec(code, scope)
-        events.append('processing')
-
     with ThreadPoolExecutor(max_workers=1) as caller:
-        future = caller.submit(execute_startup_then_process)
+        future = caller.submit(exec, code, scope)
         try:
             assert probe_completed.wait(5)
             assert not future.done()

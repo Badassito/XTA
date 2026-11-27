@@ -20,8 +20,8 @@ import uuid
 
 import numpy as np
 
-from ._deps import _numba, cv2
-from .cylindrical_cuda_projection import RadialEncodedSlice
+from ._deps import cv2
+from .native_cpu import kernels as _cpu
 from .cuda_d1 import _nrrd_layer_key, _nrrd_layer_name
 from .geometry import physical_view_name
 from .interpolation import (
@@ -74,20 +74,72 @@ def _crops(cent, z, native_hw, read_mask_plane, read_mask_crops):
         yield y, y+h, x, x+w, plane[y:y+h,x:x+w]
 
 
-@_numba.njit(nogil=True, cache=True)
 def _merge_rank_crop(plane, mask, top, left, level, check_previous):
-    populated = gap = False
-    for row in range(mask.shape[0]):
-        for col in range(mask.shape[1]):
-            value = mask[row,col]
-            if value > 1:
-                raise ValueError("Native cutoff masks must be binary")
-            if value:
-                populated = True
-                if check_previous and plane[top+row,left+col] < level-1:
-                    gap = True
-                plane[top+row,left+col] = level
-    return populated, gap
+    return _cpu.merge_rank_crop(plane, mask, top, left, level, check_previous)
+
+
+def _read_rank_crops(cutoffs, z, native_hw, plane, read_mask_plane, read_mask_crops, present, breaks):
+    """Apply the existing generic crop protocol, including partial and declined native rows."""
+    top, bottom, left, right = native_hw[0], 0, native_hw[1], 0
+    frames = ([read_mask_crops(cent, z) for cent in cutoffs] if read_mask_crops is not None
+              else [None]*len(cutoffs))
+    if any(getattr(crops, "wants_rank_plane", False) for crops in frames):
+        # Native journal frames merge every level in one nogil call. A
+        # level's gap test depends only on earlier frames and on itself,
+        # so all tests are known before the frame starts.
+        if plane is None:
+            plane = np.zeros(native_hw, np.uint8)
+        merged = frames[0].merge_rank_frame(frames, plane, [
+            level > 1 and level-1 not in breaks for level in range(1, len(cutoffs)+1)
+        ]) if hasattr(frames[0], "merge_rank_frame") else None
+        if merged is not None:
+            populated, gaps, (y0, y1, x0, x1) = merged
+            for level, cent in enumerate(cutoffs, 1):
+                if gaps[level-1]:
+                    breaks.add(level-1)
+                if populated[level-1]:
+                    present.add(cent)
+            if any(populated):
+                top, bottom, left, right = y0, y1, x0, x1
+    for level, cent in enumerate(cutoffs, 1):
+        crops = (frames[level-1] if read_mask_crops is not None
+                 else _crops(cent,z,native_hw,read_mask_plane,None))
+        if getattr(crops, "wants_rank_plane", False):
+            # A native frame the fused call declined merges this level's
+            # rows in one nogil call per payload, exactly as the per-crop
+            # loop below would; any row it declines is still yielded to it.
+            populated, gap, (y0, y1, x0, x1) = crops.merge_rank_level(
+                plane, level, level > 1 and level-1 not in breaks)
+            if gap:
+                breaks.add(level-1)
+            if populated:
+                present.add(cent)
+                top, bottom = min(top,y0), max(bottom,y1)
+                left, right = min(left,x0), max(right,x1)
+        for y0, y1, x0, x1, raw in crops:
+            y0, y1, x0, x1 = map(operator.index, (y0,y1,x0,x1))
+            mask = np.asarray(raw)
+            if not (0 <= y0 <= y1 <= native_hw[0] and 0 <= x0 <= x1 <= native_hw[1]
+                    and mask.shape == (y1-y0,x1-x0)
+                    and mask.dtype in (np.dtype(np.uint8), np.dtype(bool))):
+                raise ValueError("Invalid native cutoff mask crop")
+            if not mask.size:
+                continue
+            if plane is None:
+                plane = np.zeros(native_hw, np.uint8)
+            # Other contributions to this cutoff may already have assigned
+            # this level. Only a value below the *previous* level is a gap.
+            populated, gap = _merge_rank_crop(plane, mask.view(np.uint8), y0, x0, level,
+                                               level > 1 and level-1 not in breaks)
+            if not populated:
+                continue
+            present.add(cent)
+            if gap:
+                breaks.add(level-1)
+            top, bottom = min(top,y0), max(bottom,y1)
+            left, right = min(left,x0), max(right,x1)
+
+    return plane, (top, bottom, left, right)
 
 
 @contextmanager
@@ -102,65 +154,28 @@ def _rank_input(cutoffs, shape, directory, read_mask_plane, read_mask_crops, bud
         boxes = np.zeros((shape[0],4), dtype=np.int64)
         present = set()
         breaks = set()
+        from .sweep_views import _SiblingMaskCrops
+        family_merge = None
+        if type(read_mask_crops) is _SiblingMaskCrops:
+            family_merge = read_mask_crops.rank_merger(cutoffs, shape)
+            checks = np.ones(len(cutoffs), dtype=np.bool_)
+            checks[0] = False
+            known_breaks = 0
         for z in range(shape[0]):
-            top, bottom, left, right = native_hw[0], 0, native_hw[1], 0
-            frames = ([read_mask_crops(cent, z) for cent in cutoffs] if read_mask_crops is not None
-                      else [None]*len(cutoffs))
-            if any(getattr(crops, "wants_rank_plane", False) for crops in frames):
-                # Native journal frames merge every level in one nogil call. A
-                # level's gap test depends only on earlier frames and on itself,
-                # so all tests are known before the frame starts.
-                if plane is None:
-                    plane = np.zeros(native_hw, np.uint8)
-                merged = frames[0].merge_rank_frame(frames, plane, [
-                    level > 1 and level-1 not in breaks for level in range(1, len(cutoffs)+1)
-                ]) if hasattr(frames[0], "merge_rank_frame") else None
-                if merged is not None:
-                    populated, gaps, (y0, y1, x0, x1) = merged
-                    for level, cent in enumerate(cutoffs, 1):
-                        if gaps[level-1]:
-                            breaks.add(level-1)
-                        if populated[level-1]:
-                            present.add(cent)
-                    if any(populated):
-                        top, bottom, left, right = y0, y1, x0, x1
-            for level, cent in enumerate(cutoffs, 1):
-                crops = (frames[level-1] if read_mask_crops is not None
-                         else _crops(cent,z,native_hw,read_mask_plane,None))
-                if getattr(crops, "wants_rank_plane", False):
-                    # A native frame the fused call declined merges this level's
-                    # rows in one nogil call per payload, exactly as the per-crop
-                    # loop below would; any row it declines is still yielded to it.
-                    populated, gap, (y0, y1, x0, x1) = crops.merge_rank_level(
-                        plane, level, level > 1 and level-1 not in breaks)
-                    if gap:
-                        breaks.add(level-1)
-                    if populated:
-                        present.add(cent)
-                        top, bottom = min(top,y0), max(bottom,y1)
-                        left, right = min(left,x0), max(right,x1)
-                for y0, y1, x0, x1, raw in crops:
-                    y0, y1, x0, x1 = map(operator.index, (y0,y1,x0,x1))
-                    mask = np.asarray(raw)
-                    if not (0 <= y0 <= y1 <= native_hw[0] and 0 <= x0 <= x1 <= native_hw[1]
-                            and mask.shape == (y1-y0,x1-x0)
-                            and mask.dtype in (np.dtype(np.uint8), np.dtype(bool))):
-                        raise ValueError("Invalid native cutoff mask crop")
-                    if not mask.size:
-                        continue
-                    if plane is None:
-                        plane = np.zeros(native_hw, np.uint8)
-                    # Other contributions to this cutoff may already have assigned
-                    # this level. Only a value below the *previous* level is a gap.
-                    populated, gap = _merge_rank_crop(plane, mask.view(np.uint8), y0, x0, level,
-                                                       level > 1 and level-1 not in breaks)
-                    if not populated:
-                        continue
-                    present.add(cent)
-                    if gap:
-                        breaks.add(level-1)
-                    top, bottom = min(top,y0), max(bottom,y1)
-                    left, right = min(left,x0), max(right,x1)
+            merged = None
+            if family_merge is not None:
+                if len(breaks) != known_breaks:
+                    for gap in breaks:
+                        checks[gap] = False
+                    known_breaks = len(breaks)
+                merged = family_merge(z, plane, checks)
+            if merged is None:
+                plane, (top, bottom, left, right) = _read_rank_crops(
+                    cutoffs, z, native_hw, plane, read_mask_plane, read_mask_crops, present, breaks)
+            else:
+                plane, populated, gaps, (top, bottom, left, right) = merged
+                present.update(cutoffs[i] for i in populated)
+                breaks.update(int(i) for i in gaps)
             if bottom:
                 if ranks is None:
                     ranks = _map_native_ranks(backing, shape, budget)
@@ -216,6 +231,7 @@ class _BackingBudget:
         self.dense_native = False
         self.output_bytes = 0
         self.polls = 0
+        self.capacity_poll_seconds = 0.0
         self.until_poll = 0
         self._fund(index_bytes)
 
@@ -226,10 +242,12 @@ class _BackingBudget:
         # Do not statvfs or read cgroups per slice. Reserve small chunks against
         # *current* free space and preserve the same disk floor as the native journals.
         if nbytes > self.until_poll or self.polls == 0:
+            poll_started = time.perf_counter()
             headroom = shutil.disk_usage(self.directory).free - 64*1024**2
             if self.memory_backed:
                 from .workspace import available_anon_work_bytes
                 headroom = min(headroom, available_anon_work_bytes() - self.host_budget - 64*1024**2)
+            self.capacity_poll_seconds += time.perf_counter() - poll_started
             if nbytes > headroom:
                 raise SweepProjectionUnsupported("Insufficient live disk or tmpfs headroom for cutoff projection")
             self.until_poll = min(headroom, max(nbytes, 64*1024**2))
@@ -279,31 +297,9 @@ def _ref(view, model_name, shape, key, path, stats):
         segment_extent_source="raw_bbox_cvol_index")
 
 
-@_numba.njit(nogil=True, cache=True)
 def _cutoff_extents(region, level_count):
     """Measure each rank once, then form all cumulative tight boxes and counts."""
-    height, width = region.shape
-    stats = np.zeros((level_count + 1, 5), np.int64)
-    stats[:, 0] = height
-    stats[:, 2] = width
-    for y in range(height):
-        for x in range(width):
-            rank = region[y, x]
-            if rank:
-                if rank > level_count:
-                    raise ValueError("Projected value exceeds its declared cutoff rank")
-                stats[rank, 0] = min(stats[rank, 0], y)
-                stats[rank, 1] = max(stats[rank, 1], y + 1)
-                stats[rank, 2] = min(stats[rank, 2], x)
-                stats[rank, 3] = max(stats[rank, 3], x + 1)
-                stats[rank, 4] += 1
-    for i in range(level_count-1, 0, -1):
-        stats[i, 0] = min(stats[i, 0], stats[i+1, 0])
-        stats[i, 1] = max(stats[i, 1], stats[i+1, 1])
-        stats[i, 2] = min(stats[i, 2], stats[i+1, 2])
-        stats[i, 3] = max(stats[i, 3], stats[i+1, 3])
-        stats[i, 4] += stats[i+1, 4]
-    return stats
+    return _cpu.cutoff_extents(region, level_count)
 
 
 def _ordered_planes(project, z0, z1, lanes):
@@ -330,38 +326,31 @@ def _ordered_planes(project, z0, z1, lanes):
         pool.shutdown(wait=True, cancel_futures=True)
 
 
-@_numba.njit(nogil=True, cache=True)
 def _pack_rank_level(region, y0, y1, x0, x1, level):
-    """Row-wise little-endian packbits of ``region[y0:y1, x0:x1] >= level``.
-
-    Matches ``np.packbits(..., axis=1, bitorder="little")``: zero tail bits per
-    row. Compiled without the GIL so projection lanes encode in parallel.
-    """
-    height = y1 - y0
-    width = x1 - x0
-    out = np.zeros((height, (width + 7) // 8), np.uint8)
-    for row in range(height):
-        source_row = y0 + row
-        for col in range(width):
-            if region[source_row, x0 + col] >= level:
-                out[row, col >> 3] |= np.uint8(1 << (col & 7))
-    return out
+    """Row-wise little-endian packbits of ``region[y0:y1, x0:x1] >= level``."""
+    return _cpu.pack_rank_level(region, y0, y1, x0, x1, level)
 
 
-def _encode_rank_plane(z, output, read_crop, bounds, shape, level_count, active):
-    """Validate, measure and pack one projected plane on its projection lane.
+def _rank_pack_credit(shape, level_count, count):
+    """Return the payload ceiling, per-plane extent, and shared controls."""
+    height, width = shape[1:]
+    payload = height * ((width + 7) // 8) * count
+    # int64 extent table, selected-level snapshot, records and offsets.
+    controls = 8 * (5 * (level_count + 1) + count + 8 * count + count + 1)
+    # Shared levels and one ordered writer's independent one-record snapshot.
+    shared = 8 * count + 8 * 8
+    return payload, height * width + payload + controls, shared
 
-    Returns (read counters, [(cutoff, record, payload), ...]). The ordered
-    consumer then only appends the already encoded blocks, so per-plane
-    scanning and packing no longer serialize a whole publication.
-    """
+
+def _encode_rank_plane(z, output, read_crop, bounds, shape, level_count, selected, payload_limit):
+    """Validate a crop and encode its nonempty cutoff prefix in one native call."""
     reads = {"rank_crop_reads": 0, "empty_crop_reads": 0, "rank_dense_reads": 0,
              "rank_bbox_scan_pixels": 0, "rank_statistics_pixels": 0}
     if read_crop is not None:
         reads["rank_crop_reads"] = 1
         if output is None:
             reads["empty_crop_reads"] = 1
-            return reads, ()
+            return reads, None
         top, bottom, left, right, region = output
         if (not (0 <= top < bottom <= shape[1] and 0 <= left < right <= shape[2])
                 or region.dtype != np.uint8 or region.shape != (bottom-top, right-left)):
@@ -372,25 +361,14 @@ def _encode_rank_plane(z, output, read_crop, bounds, shape, level_count, active)
         region = output[top:bottom,left:right]
         reads["rank_bbox_scan_pixels"] = int(region.size)
         if not region.size:
-            return reads, ()
+            return reads, None
         x, y, w, h = cv2.boundingRect(region)
         top, left = top+y, left+x
         region = region[y:y+h,x:x+w]
     reads["rank_statistics_pixels"] = int(region.size)
     if not region.size:
-        return reads, ()
-    stats = _cutoff_extents(region, level_count)
-    pieces = []
-    for level, cent in active:
-        y0, y1, x0, x1, count = map(int, stats[level])
-        if not count:
-            break
-        # The stock store consumes the certified tight box and foreground count
-        # without finding them again for every cutoff.
-        payload = _pack_rank_level(region, y0, y1, x0, x1, level)
-        record = RadialEncodedSlice(z, top+y0, top+y1, left+x0, left+x1, count, 0, int(payload.size))
-        pieces.append((cent, record, payload.reshape(-1)))
-    return reads, pieces
+        return reads, None
+    return reads, _cpu.pack_rank_levels(region, z, top, left, level_count, selected, payload_limit)
 
 
 def _project_chain(ranks, boxes, cutoffs, levels, present, view, shape, work, products,
@@ -398,6 +376,18 @@ def _project_chain(ranks, boxes, cutoffs, levels, present, view, shape, work, pr
     active = [(level, cent) for level, cent in zip(levels,cutoffs) if cent in present]
     if not active:
         return
+    level_count = max(levels)
+    payload_limit, lane_credit, shared_credit = _rank_pack_credit(shape, level_count, len(active))
+    available = int(memory_bytes) - shared_credit
+    # Set aside one complete input/packing envelope for each potential lane
+    # before the projection reader divides its own working and queued credit.
+    lane_limit = min(workers, shape[0], max(1, available // (2 * lane_credit)))
+    pack_credit = shared_credit + lane_limit * lane_credit
+    reader_budget = int(memory_bytes) - pack_credit
+    if reader_budget <= 0:
+        raise MemoryError("Rank projection budget cannot fit one packed output lane")
+    selected = np.fromiter((level for level, _ in active), dtype=np.int64, count=len(active))
+    selected.setflags(write=False)
     writers = {}
     next_z = {cent:0 for _,cent in active}
     reads = {"rank_crop_reads":0, "empty_crop_reads":0, "rank_dense_reads":0,
@@ -407,16 +397,20 @@ def _project_chain(ranks, boxes, cutoffs, levels, present, view, shape, work, pr
             writers[cent] = IncrementalRawBBoxMaskStoreWriter(shape=shape, format_name=_SIBLING_STORE_FORMAT,
                 store_dir=products / f"conf_{cent:03d}.cvol", desc=f"Sweep {model_name}/{view.name} at {cent:02d}",
                 extra_meta={"nrrd_layer_key":key, "projection_output_shape_tyx":list(shape)})
-        level_count = max(levels)
-        # Compile once before lanes start rather than racing the first calls.
-        _pack_rank_level(np.zeros((1, 1), np.uint8), 0, 1, 0, 1, 1)
+        host_timing = None
         with sweep_rank_projection_reader(ranks, view, shape, work, level_count=level_count,
-                memory_bytes=memory_bytes, known_native_boxes=boxes, source_max_rank=active[-1][0],
-                workers=workers) as project:
+                memory_bytes=reader_budget, known_native_boxes=boxes, source_max_rank=active[-1][0],
+                workers=lane_limit) as project:
             z0,z1 = getattr(project,"known_z_bounds",(0,shape[0]))
             bounds = getattr(project,"known_output_bbox_tyx",(0,0,0,*shape))
             reader_lanes = max(1, int(getattr(project, "parallel_workers", 1)))
-            if getattr(project, "serialized_device_reader", False):
+            device_reader = getattr(project, "serialized_device_reader", False)
+            if device_reader and str(view.family) == "radial":
+                host_timing = dict(encode_planes=0, commit_planes=0, commit_records=0,
+                                   encode_seconds=0.0, ordered_result_wait_seconds=0.0,
+                                   ordered_commit_seconds=0.0)
+                poll_seconds_before_commit = disk.capacity_poll_seconds
+            if device_reader:
                 # A CUDA reader is one serialized device lane while scanning and
                 # packing run on the host: encode on a few threads so the GPU
                 # lease is not held for serial host work. A CPU reader that
@@ -424,12 +418,7 @@ def _project_chain(ranks, boxes, cutoffs, levels, present, view, shape, work, pr
                 encode_lanes = min(workers, 4)
             else:
                 encode_lanes = reader_lanes
-            lanes = min(workers, encode_lanes, max(1,z1-z0))
-            # Each in-flight plane holds its projected crop plus one packed
-            # payload per cutoff until the ordered commit; keep that within the
-            # projection credit for long cutoff grids.
-            held_per_plane = math.prod(shape[1:]) * (1 + (len(active) + 7) // 8)
-            lanes = max(1, min(lanes, int(memory_bytes) // max(1, 2 * held_per_plane)))
+            lanes = min(lane_limit, encode_lanes, max(1, z1-z0))
             read_crop = getattr(project, "read_crop", None)
             source = read_crop or project
             ordered_reads = None
@@ -466,23 +455,62 @@ def _project_chain(ranks, boxes, cutoffs, levels, present, view, shape, work, pr
                         ordered_reads.notify_all()
 
             def encode(z):
-                return _encode_rank_plane(z, read(z), read_crop, bounds, shape, level_count, active)
+                output = read(z)
+                started = time.perf_counter() if host_timing is not None else 0.0
+                counts, batch = _encode_rank_plane(
+                    z, output, read_crop, bounds, shape, level_count, selected, payload_limit)
+                elapsed = time.perf_counter() - started if host_timing is not None else 0.0
+                return counts, batch, elapsed
+
+            def commit(z, batch):
+                if batch is None:
+                    return 0
+                fields, offsets, payload = batch
+                for i in range(len(fields)):
+                    cent = active[i][1]
+                    first, stop = int(offsets[i]), int(offsets[i+1])
+                    disk.add(stop - first)
+                    writer = writers[cent]
+                    if next_z[cent] < z:
+                        writer.consume_empty_range(next_z[cent], z-next_z[cent])
+                    writer.consume_encoded_fields(z, fields[i:i+1], payload[first:stop], packed=True)
+                    next_z[cent] = z+1
+                return len(fields)
 
             with closing(_ordered_planes(encode,z0,z1,lanes)) as planes:
-                for z, (delta, pieces) in planes:
+                waiting_since = time.perf_counter() if host_timing is not None else 0.0
+                for z, (delta, batch, encode_seconds) in planes:
+                    if host_timing is not None:
+                        commit_started = time.perf_counter()
+                        host_timing["encode_planes"] += 1
+                        host_timing["encode_seconds"] += encode_seconds
+                        host_timing["ordered_result_wait_seconds"] += commit_started - waiting_since
                     for name, value in delta.items():
                         reads[name] += value
-                    for cent, record, payload in pieces:
-                        disk.add(int(record.size))
-                        writer = writers[cent]
-                        if next_z[cent] < z:
-                            writer.consume_empty_range(next_z[cent], z-next_z[cent])
-                        writer.consume_encoded_block(z, (record,), payload, packed=True)
-                        next_z[cent] = z+1
-                    del pieces
+                    record_count = commit(z, batch)
+                    # Drop the complete payload owner before the ordered producer
+                    # can refill, after all synchronous writer subviews retire.
+                    del batch
+                    if host_timing is not None:
+                        host_timing["commit_planes"] += bool(record_count)
+                        host_timing["commit_records"] += record_count
+                        waiting_since = time.perf_counter()
+                        host_timing["ordered_commit_seconds"] += waiting_since - commit_started
             info = getattr(project,"projection_diagnostics",None)
-            diagnostics.append({**(info() if info else {}), **reads, "execution_lanes":lanes,
-                                "nominal_output_voxels":math.prod(shape)})
+            lane_state = info() if info is not None and host_timing is None else {}
+        if host_timing is not None and info is not None:
+            lane_state = info()
+        receipt = {**lane_state, **reads, "execution_lanes":lanes,
+                   "rank_pack_credit_bytes":pack_credit,
+                   "rank_pack_payload_bytes_per_lane":payload_limit,
+                   "rank_pack_bytes_per_lane":lane_credit,
+                   "rank_pack_reserved_lanes":lane_limit,
+                   "rank_reader_budget_bytes":reader_budget,
+                   "nominal_output_voxels":math.prod(shape)}
+        if host_timing is not None:
+            host_timing["commit_capacity_poll_seconds"] = disk.capacity_poll_seconds - poll_seconds_before_commit
+            receipt["radial_host_timing"] = host_timing
+        diagnostics.append(receipt)
         for _, cent in active:
             writer = writers[cent]
             if next_z[cent] < shape[0]:

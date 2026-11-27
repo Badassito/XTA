@@ -91,9 +91,8 @@ def prepare_gpu_void_fill(
             ids = uf.new_ids(count)
             offset = int(ids[0]) - 1 if count else 0
             offsets.append(offset)
-            for local_id in boundary_ids:
-                if int(local_id) > 0:
-                    uf.mark_boundary(offset + int(local_id))
+            # Slab IDs are still roots until the seam union loop below.
+            uf.touches_boundary[offset + boundary_ids[boundary_ids > 0]] = True
         neighbors = _adjacent_xy_offsets_for_3d_connectivity(connectivity)
         for index in range(1, len(records)):
             z0 = records[index][0]

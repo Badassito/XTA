@@ -43,8 +43,8 @@ def test_canonical_tile_only_source_skips_full_and_preserves_pixels(tmp_path, ch
                           side_effect=AssertionError('rejected full mask rendered')),
         mock.patch.object(pta_rendering, 'render_shared_tile_images',
                           wraps=pta_rendering.render_shared_tile_images) as images,
-        mock.patch.object(pta_rendering.shared_geometry, 'render_categorical_dense_tile_for_job',
-                          wraps=pta_rendering.shared_geometry.render_categorical_dense_tile_for_job) as masks,
+        mock.patch.object(pta_rendering.shared_geometry, 'render_categorical_tile_for_job',
+                          wraps=pta_rendering.shared_geometry.render_categorical_tile_for_job) as masks,
     ):
         source = pta_rendering.render_plan_frame_source(
             volume=volume, mask=mask, plan=selected, idx=2, need_full=False,
