@@ -615,14 +615,10 @@ def test_native_scheduler_preserves_immutable_policy_range(tmp_path):
         assert run.scheduler.result().gpu_frames_completed_total==32
 
 
-def test_native_tile_policy_configuration_refuses_before_loader(monkeypatch):
+def test_native_tile_policy_configuration_uses_tile_capability():
     from XTA.scheduler_preflight import preflight_tta_scheduler
-    entered=[]
-    monkeypatch.setattr('XTA.native_scheduler._load_native',lambda:entered.append(True))
-    with pytest.raises(ValueError,match='tile ownership'):
-        preflight_tta_scheduler(gpu_device_count=1,cpu_enabled=False,
-                                tile_configs=({'augmentation_passes':3},),d1_owner_groups=False)
-    assert not entered
+    preflight_tta_scheduler(gpu_device_count=1,cpu_enabled=False,
+                            tile_configs=({'augmentation_passes':3},),d1_owner_groups=False)
 
 
 def test_unsupported_tile_inventory_cannot_partially_dispatch_fullframe_policy(tmp_path):
@@ -633,7 +629,7 @@ def test_unsupported_tile_inventory_cannot_partially_dispatch_fullframe_policy(t
         supported=policy_task(0,ratio=3,size=10,task_id=1)
         unsupported=policy_task(1,ratio=3,size=10,task_id=2)
         unsupported['kind']='tile'
-        with pytest.raises(ValueError,match='Unsupported'):
+        with pytest.raises(ValueError,match='Invalid independent tile descriptor'):
             run.declare(supported,unsupported)
         state=run.native.snapshot()
         assert state['dispatched']==state['tickets_used']==state['bytes_used']==0

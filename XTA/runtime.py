@@ -1766,27 +1766,29 @@ def _memfd_backing_path_from_array(arr: object) -> Optional[Path]:
         current = getattr(current, 'base', None)
     return None
 
+def _memfd_owner_entry_for_path_locked(path: str) -> Optional[Tuple[int, str]]:
+    entry = _MEMFD_OWNERS.get(path)
+    if entry is not None:
+        return entry
+    try:
+        return _MEMFD_OWNERS.get(str(Path(path).absolute()))
+    except Exception:
+        return None
+
+
 def _memfd_owner_fd_for_path(path: object) -> Optional[int]:
     """Return the parent-owned memfd represented by ``path``, if any."""
     if path is None:
         return None
     raw = str(path)
-    candidates = [raw]
-    try:
-        candidates.append(str(Path(raw).absolute()))
-    except Exception:
-        pass
     with _MEMFD_OWNER_LOCK:
-        for key in candidates:
-            entry = _MEMFD_OWNERS.get(str(key))
-            if entry is not None:
-                return int(entry[0])
-    return None
+        entry = _memfd_owner_entry_for_path_locked(raw)
+        return None if entry is None else int(entry[0])
 
 
 @contextlib.contextmanager
-def _pinned_memfd_owners(keys):
-    """Keep snapshot backings alive while slow work runs outside the registry."""
+def _pinned_memfd_owners(keys, *, strict_paths=False):
+    """Pin registry keys, or resolve detector paths and propagate duplication errors."""
     pins = {}
     keys = tuple(dict.fromkeys(keys))
     try:
@@ -1797,12 +1799,15 @@ def _pinned_memfd_owners(keys):
                 if owner_lock.acquire(blocking=False):
                     try:
                         for key in keys:
-                            entry = _MEMFD_OWNERS.get(key)
+                            entry = (_memfd_owner_entry_for_path_locked(key)
+                                     if strict_paths else _MEMFD_OWNERS.get(key))
                             if entry is None:
                                 continue
                             try:
                                 fd = os.dup(entry[0])
                             except OSError:
+                                if strict_paths:
+                                    raise
                                 continue
                             try:
                                 pin = _MemfdProbePin(entry, fd, os.getpid())

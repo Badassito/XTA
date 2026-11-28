@@ -516,3 +516,143 @@ def test_native_tee_rejects_invalid_target_before_committing():
         nk.or_tee_records(regions, results, records, target_ptr, target_index, volume)
 
     assert not volume.any()
+
+
+@pytest.mark.parametrize('layout', ['separate', 'overlap', 'reversed', 'broadcast'])
+def test_tee_row_or_preserves_ordered_bytes_and_aliases(layout):
+    source = np.array([2, 4, 128, 8, 32, 1, 16, 64, 0, 0, 0, 0, 3, 0, 0, 248], np.uint8)
+    def buffers(owner):
+        if layout == 'overlap':
+            return owner[:8], owner[1:9].reshape(1, 2, 4)
+        if layout == 'reversed':
+            return owner[::2][::-1], owner[1::2].reshape(1, 2, 4)[:, ::-1, ::-1]
+        if layout == 'broadcast':
+            return owner[:8], np.lib.stride_tricks.as_strided(
+                owner[9:], shape=(1, 2, 4), strides=(0, 0, 1), writeable=True)
+        return owner[:8], owner[8:].reshape(1, 2, 4)
+    expected = source.copy()
+    src, dst = buffers(expected)
+    for y in range(2):
+        for x in range(4):
+            dst[0,y,x] |= src[y*4+x]
+    src, dst = buffers(source)
+    nk.or_tee_records(np.array([[0, 0, 2, 4, 0]], np.int64), src,
+                      np.array([[0, 0, 0, 2, 4, 0]], np.int64), np.array([0, 1], np.int64),
+                      np.array([0], np.int64), dst)
+    np.testing.assert_array_equal(source, expected)
+
+
+@pytest.mark.parametrize('out', [(6, 20, 24), (4, 10, 12)])
+@pytest.mark.parametrize('fmt', FORMATS)
+def test_member_window_writes_identical_gzip_and_observations(tmp_path, out, fmt):
+    volume = np.zeros((6, 20, 24), np.uint8)
+    volume[2:4, 8:10, 10:12] = 1
+    path = _store(tmp_path, volume, fmt)
+    ref = NrrdLayerRef(name='test', key='k', path=path, shape=volume.shape, storage_format=fmt)
+    # Nonzero origins for the reference crop and the compact buffer; temporal
+    # contraction combines more than one source into an output plane.
+    th, h, w = out
+    offset = (0, h//4, w//4)
+    stored = (th, h//2, w//2)
+    def run(compact):
+        sink = _Sink()
+        inner = nc._MemberParallelGzipPayloadWriter(sink, codec_spec=_codec())
+        writer = outputs._CroppedNrrdPayloadWriter(inner, out, offset, stored)
+        # Route identity input through whole members too, as with a codec that
+        # cannot consume the canonical native crop-row span interface.
+        writer.minimum_input_bytes = 2
+        seen = []
+        def observe(z, y, x, crop):
+            seen.append((z, y, x, crop.shape, crop.tobytes()))
+        with mock.patch.object(writer, 'write_contained_member', wraps=writer.write_contained_member) as emit:
+            gate = (contextlib.nullcontext() if compact else
+                    mock.patch.object(nk, 'contained_member_groups', return_value=None))
+            with gate:
+                outputs._write_one_decomposed_nrrd_layer_payload(ref, out, writer, z_chunk=2,
+                                                                  sparse_consumer=observe)
+            assert emit.called == compact
+            if compact:
+                assert all(call.args[0].shape[1:] == stored[1:] for call in emit.call_args_list)
+        writer.finish()
+        inner.close()
+        return b''.join(sink.parts), seen
+    assert run(False) == run(True)
+
+
+def test_contained_member_detects_z_overhang_after_xy_proof():
+    inner = _Sink()
+    writer = outputs._CroppedNrrdPayloadWriter(inner, (3, 4, 6), (1, 1, 2), (1, 2, 2))
+    data = np.zeros((3, 2, 2), np.uint8)
+    data[0, 1, 1] = 3
+    with pytest.raises(outputs.NrrdCropExtentViolation):
+        writer.write_contained_member(data)
+    assert writer._position == writer._start
+
+    # The prior writer belongs to the discarded attempt; retry on a fresh stream.
+    inner = _Sink()
+    writer = outputs._CroppedNrrdPayloadWriter(inner, (3, 4, 6), (1, 1, 2), (1, 2, 2))
+    data[0] = 0
+    data[1] = 17
+    assert writer.write_contained_member(data) == 3*4*6
+    assert writer.finish() == 4
+    assert b''.join(inner.parts) == bytes([17]*4)
+
+
+def test_contained_member_tee_uses_reference_x_and_compact_buffer_x(tmp_path):
+    volume = np.zeros((4, 14, 22), np.uint8)
+    volume[1:3, 5:8, 12:15] = 1
+    path = _store(tmp_path, volume, INTERNAL_PACKED_CVOL_FORMAT)
+    with contextlib.closing(RawBBoxMaskStore.open(path, mmap_payload=True)) as store:
+        outputs_by_path = []
+        for compact in (False, True):
+            mirror = np.zeros((2, 7, 11), np.uint8)
+            job = dict(volume=mirror, shape=mirror.shape, src_to_m=((0,), (0,), (1,), (1,)),
+                       failed=False, locks=[threading.Lock(), threading.Lock()])
+            tee = nk.FusedSparseMirrorTee([job], (14, 22))
+            def observe(*args):
+                pytest.fail('unexpected generic observer')
+            observe.fused_sparse_mirror_tee = tee
+            if compact:
+                members = nk.contained_member_groups(store, volume.shape, 0, 4, 2048, observe,
+                                                     (4, 10, 9, 17))
+            else:
+                members = store.iter_native_sparse_members(0, 4, member_bytes=2048, sparse_consumer=observe)
+            list(members)
+            assert not job['failed'] and np.any(mirror)
+            outputs_by_path.append(mirror)
+    np.testing.assert_array_equal(*outputs_by_path)
+
+
+@pytest.mark.parametrize('clear_overhang', [True, False])
+def test_uncertain_xy_uses_original_zero_overhang_proof(tmp_path, clear_overhang):
+    volume = np.zeros((2, 6, 10), np.uint8)
+    volume[0, 2, 1] = volume[0, 2, 5] = 1
+    path = _store(tmp_path, volume, CVOL_FORMAT)
+    if clear_overhang:
+        # Preserve the declared (loose) box and remove its out-of-window foreground.
+        chunks = path/'chunks.bin'
+        raw = bytearray(chunks.read_bytes())
+        raw[0] = 0
+        chunks.write_bytes(raw)
+    ref = NrrdLayerRef(name='test', key='k', path=path, shape=volume.shape, storage_format=CVOL_FORMAT)
+    inner = _Sink()
+    writer = outputs._CroppedNrrdPayloadWriter(inner, volume.shape, (0, 1, 4), (2, 4, 4))
+    writer.minimum_input_bytes = 2
+    with mock.patch.object(writer, 'write_contained_member', side_effect=AssertionError('uncertified window')):
+        if clear_overhang:
+            outputs._write_one_decomposed_nrrd_layer_payload(ref, volume.shape, writer, z_chunk=2)
+            writer.finish()
+            assert b''.join(inner.parts) == volume[:, 1:5, 4:8].tobytes()
+        else:
+            with pytest.raises(outputs.NrrdCropExtentViolation):
+                outputs._write_one_decomposed_nrrd_layer_payload(ref, volume.shape, writer, z_chunk=2)
+
+
+def test_contained_member_keeps_inner_write_failure_precedence():
+    inner = _Sink()
+    writer = outputs._CroppedNrrdPayloadWriter(inner, (2, 4, 6), (1, 1, 2), (1, 2, 2))
+    writer._buffer_limit = 1
+    data = np.ones((2, 2, 2), np.uint8)
+    with mock.patch.object(inner, 'write', side_effect=OSError('failed inner write')):
+        with pytest.raises(OSError, match='failed inner write'):
+            writer.write_contained_member(data)

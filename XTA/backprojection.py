@@ -646,6 +646,8 @@ def _try_acquire_main_process_overlap_gpu_stage(
     purpose: str,
 ) -> Optional[_MainProcessGpuOverlapLease]:
     """A shared lease within the reserved overlap slice, or None (use the exclusive path)."""
+    if not _MAIN_PROCESS_GPU_STAGE_COORDINATOR.is_bound:
+        return None
     budget = gpu_projection_overlap_reserve_bytes()
     if budget <= 0:
         return None
@@ -698,6 +700,8 @@ def _try_acquire_main_process_gpu_stage(
     torch_mod: object,
     purpose: str,
 ) -> Optional[_MainProcessGpuStageLease]:
+    if not _MAIN_PROCESS_GPU_STAGE_COORDINATOR.is_bound:
+        return None
     return _MAIN_PROCESS_GPU_STAGE_COORDINATOR.try_acquire_stage(torch_mod, str(purpose))
 
 def _try_acquire_specific_main_process_gpu_stage(
@@ -1083,7 +1087,7 @@ class _ResidentTensorRTRingExecutor:
         self.proto_hole_treatment_active = bool(
             self.proto_hole_treatment == 'close' and self.proto_hole_radius > 0
         )
-        self.kernels = _resident_mask_kernels()
+        self.kernels = _resident_mask_kernels(self.device.index)
         if self.kernels is None:
             raise RuntimeError('CUDA confidence-compaction kernel is unavailable')
 
@@ -4098,18 +4102,24 @@ def _cancel_native_pull_cuda_request(view, *, failed=False):
         _native_pull_cuda_stage_purpose(view), failed=failed)
 
 
-def _native_pull_cuda_stage_enabled(view, plan):
-    """CPU-only capability/configuration check shared with workspace admission."""
+def _native_pull_cuda_configured():
     import os
     from .runtime import interpolation_process_worker_active
-    return bool(not interpolation_process_worker_active()
-        and plan is not None and gpu_backproject_enabled()
-        and _env_flag('YOLO_TTA_NATIVE_PULL_CUDA', True)
+
+    return (_MAIN_PROCESS_GPU_STAGE_COORDINATOR.is_bound
+            and not interpolation_process_worker_active()
+            and gpu_backproject_enabled()
+            and _env_flag('YOLO_TTA_NATIVE_PULL_CUDA', True)
+            and os.environ.get('CUDA_VISIBLE_DEVICES', '').strip() != '-1')
+
+
+def _native_pull_cuda_stage_enabled(view, plan):
+    """CPU-only capability/configuration check shared with workspace admission."""
+    return bool(plan is not None and _native_pull_cuda_configured()
         and plan.backend in ('compiled_native_tilted', 'compiled_azimuthal_cached',
                              'compiled_azimuthal_strip')
         and not (is_azimuthal_view(view) and is_tilted_azimuthal_view(view)
-                 and not _env_flag('YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True))
-        and os.environ.get('CUDA_VISIBLE_DEVICES', '').strip() != '-1')
+                 and not _env_flag('YOLO_TTA_GPU_TILTED_AZIMUTHAL_BACKPROJECT', True)))
 
 
 def _try_native_pull_overlap_stage(view, plan, make_session, purpose, admission):
@@ -4599,6 +4609,25 @@ def _backproject_tilted_azimuthal_volume_to_volume(
         known_row_occupancy=known_row_occupancy, workers=workers)
 
 
+def _upright_azimuthal_binary_pull_rows(source, view, shape, callback):
+    """Return proved binary occupancy only for a potentially GPU-bound call."""
+    import os
+
+    if (not _native_pull_cuda_configured()
+            or os.environ.get('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled').strip().lower() != 'compiled'
+            or (callback is not None and not callable(getattr(callback, 'consume_empty_range', None)))
+            or len(shape) != 3 or min(shape) <= 0
+            or math.prod(shape) < max(0, _env_int('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', 64 * 1024**2))
+            or not isinstance(source, np.ndarray) or source.ndim != 3 or source.dtype != np.uint8
+            or not source.size or source.shape[0] != int(view.num_slices)
+            or not view.azimuths_deg or len(view.azimuths_deg) != source.shape[0]):
+        return None
+    # One scan proves the numerical contract and supplies exact occupied rows.
+    # The legacy path can OR arbitrary uint8 values, so dtype alone is not proof.
+    rows = source.max(axis=(0, 2), initial=0)
+    return rows != 0 if rows.max(initial=0) <= 1 else None
+
+
 def backproject_azimuthal_volume_to_volume(
     azimuthal_mask_mm: np.ndarray,
     azimuthal_view: ViewInfo,
@@ -4639,10 +4668,24 @@ def backproject_azimuthal_volume_to_volume(
             projection_block_callback=projection_block_callback, sink_only=bool(sink_only),
         )
     if azimuthal_base_view_name(azimuthal_view) != 'transverse':
+        target_shape = (
+            (int(azimuthal_view.full_t), int(azimuthal_view.full_h), int(azimuthal_view.full_w))
+            if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
+        )
+        rows = _upright_azimuthal_binary_pull_rows(
+            azimuthal_mask_mm, azimuthal_view, target_shape, projection_block_callback,
+        )
+        if rows is not None:
+            return _backproject_native_destination_pull(
+                azimuthal_mask_mm, azimuthal_view, out_path, desc, output_shape=target_shape,
+                prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes),
+                callback=projection_block_callback, sink_only=bool(sink_only),
+                known_row_occupancy=rows, workers=int(workers),
+            )
         return _backproject_cartesian_azimuthal_generic(
             azimuthal_mask_mm, azimuthal_view, out_path, desc,
             prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes),
-            workers=int(workers), out_shape_tyx=out_shape_tyx,
+            workers=int(workers), out_shape_tyx=target_shape,
             projection_block_callback=projection_block_callback, sink_only=bool(sink_only),
         )
 

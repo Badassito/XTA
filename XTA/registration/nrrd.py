@@ -493,6 +493,55 @@ def _mask_samples(mask: np.ndarray, indices_xyz: np.ndarray) -> np.ndarray:
     return mask[tuple(np.clip(axis, 0, size - 1) for axis, size in zip(indexes, mask.shape))]
 
 
+def _write_dense_warp(labels, source_shape, target_shape, source_mask, target_mask,
+                      native_matrix, label_matrix, background_value, dtype,
+                      rows_per_block, label_stream, coverage_stream):
+    """Gather bounded scalar row blocks concurrently, writing in original Z/Y order."""
+    from concurrent.futures import ThreadPoolExecutor
+    from itertools import islice
+
+    from ..native_cpu import kernels
+
+    depth, height, width = target_shape
+    rows = min(rows_per_block, height)
+    blocks = depth * ((height + rows - 1) // rows)
+    # Both output buffers stay live until their ordered synchronous writes.
+    # Keep the combined result memory within the pre-existing 64 MiB budget,
+    # apart from the established one-row minimum for an exceptionally wide grid.
+    bytes_per_block = rows * width * (1 + dtype.itemsize)
+    workers = min(8, blocks, max(1, 64 * 1024**2 // bytes_per_block))
+    if workers > 1 and depth * height * width >= 262144:
+        from ..workspace import _cpu_count
+        workers = min(workers, _cpu_count())
+    else:
+        workers = 1
+    background = np.asarray(background_value, dtype=dtype).tobytes()
+    gather = kernels.registration_warp_rows
+
+    def compute(range_):
+        first, count = range_
+        return gather(labels, source_shape, target_shape, source_mask, target_mask,
+                      native_matrix, label_matrix, first, count, background)
+
+    ranges = ((z * height + y, min(rows, height-y))
+              for z in range(depth) for y in range(0, height, rows))
+    foreground = observed = 0
+    # Finish or join every reader before _label_array can unmap its backing.
+    with ExitStack() as work:
+        pool = (work.enter_context(ThreadPoolExecutor(max_workers=workers,
+                                                       thread_name_prefix="registration-gather"))
+                if workers > 1 else None)
+        while batch := tuple(islice(ranges, workers)):
+            results = pool.map(compute, batch) if pool is not None else map(compute, batch)
+            for raster, coverage, nonbackground, known in results:
+                label_stream.write(memoryview(raster).cast("B"))
+                coverage_stream.write(memoryview(coverage).cast("B"))
+                foreground += nonbackground
+                observed += known
+                del raster, coverage
+    return foreground, observed
+
+
 def _publish_complete_file(stage: Path, destination: Path) -> None:
     """Publish without replacing another writer's output."""
     if os.name == "nt":
@@ -719,53 +768,55 @@ def transfer_nrrd_labelmap(
                 coverage_stream = stack.enter_context(
                     gzip.GzipFile(fileobj=coverage_stream, mode="wb", compresslevel=3, mtime=0)
                 )
-            xx = np.arange(target_shape[2], dtype=np.float64)[None, :]
-            for z in range(target_shape[0]):
-                for start in range(0, target_shape[1], rows_per_block):
-                    end = min(target_shape[1], start + rows_per_block)
-                    yy = np.arange(start, end, dtype=np.float64)[:, None]
-                    native_index, valid = _mapped_block_indices(
-                        target_to_source, native_limits, xx, yy, z
-                    )
-                    if source_mask is not None:
-                        valid &= _mask_samples(source_mask, native_index)
-                    if target_mask is not None:
-                        target_plane = target_mask if target_mask.ndim == 2 else target_mask[z]
-                        valid &= target_plane[start:end]
-                    first_row, last_row = max(start, y0), min(end, y1)
-                    if z0 <= z < z1 and first_row < last_row:
-                        rows = slice(first_row - start, last_row - start)
-                        sampled = valid[rows, x0:x1]
-                        if shared_source_grid:
-                            label_index = native_index[:, rows, x0:x1]
-                        else:
-                            label_index, label_valid = _mapped_block_indices(
-                                target_to_label, label_limits, xx[:, x0:x1], yy[rows], z
-                            )
-                            # Cropped segmentations implicitly label unstored
-                            # native voxels as background. Plain cropped maps
-                            # give no label information outside their raster.
-                            if segmentation:
-                                sampled = sampled & label_valid
+            if not segmentation:
+                foreground, observed = _write_dense_warp(
+                    labels, source_shape, target_shape, source_mask, target_mask, target_to_source,
+                    None if shared_source_grid else target_to_label, background_value, dtype,
+                    rows_per_block, label_stream, coverage_stream,
+                )
+            else:
+                xx = np.arange(target_shape[2], dtype=np.float64)[None, :]
+                for z in range(target_shape[0]):
+                    for start in range(0, target_shape[1], rows_per_block):
+                        end = min(target_shape[1], start + rows_per_block)
+                        yy = np.arange(start, end, dtype=np.float64)[:, None]
+                        native_index, valid = _mapped_block_indices(
+                            target_to_source, native_limits, xx, yy, z
+                        )
+                        if source_mask is not None:
+                            valid &= _mask_samples(source_mask, native_index)
+                        if target_mask is not None:
+                            target_plane = target_mask if target_mask.ndim == 2 else target_mask[z]
+                            valid &= target_plane[start:end]
+                        first_row, last_row = max(start, y0), min(end, y1)
+                        if z0 <= z < z1 and first_row < last_row:
+                            rows = slice(first_row - start, last_row - start)
+                            sampled = valid[rows, x0:x1]
+                            if shared_source_grid:
+                                label_index = native_index[:, rows, x0:x1]
                             else:
-                                sampled &= label_valid
-                        shape = sampled.shape if layers is None else (*sampled.shape, layers)
-                        block = np.full(shape, background_value, dtype=dtype)
-                        block[sampled] = labels[tuple(axis[sampled] for axis in label_index[::-1])]
-                        label_stream.write(memoryview(block).cast("B"))
-                        if layers is None:
-                            foreground += int(np.count_nonzero(block != background_value))
-                        else:
-                            foreground += int(np.count_nonzero(np.any(block, axis=-1)))
-                        if segmentation and np.any(sampled):
-                            for segment in segments:
-                                segment.observe(
-                                    block if layers is None else block[..., segment.layer],
-                                    z, first_row, x0,
+                                label_index, label_valid = _mapped_block_indices(
+                                    target_to_label, label_limits, xx[:, x0:x1], yy[rows], z
                                 )
-                        del block
-                    coverage_stream.write(memoryview(valid.astype(np.uint8)).cast("B"))
-                    observed += int(np.count_nonzero(valid))
+                                # Native coverage includes implicit background outside a stored segmentation crop.
+                                sampled = sampled & label_valid
+                            shape = sampled.shape if layers is None else (*sampled.shape, layers)
+                            block = np.full(shape, background_value, dtype=dtype)
+                            block[sampled] = labels[tuple(axis[sampled] for axis in label_index[::-1])]
+                            label_stream.write(memoryview(block).cast("B"))
+                            if layers is None:
+                                foreground += int(np.count_nonzero(block != background_value))
+                            else:
+                                foreground += int(np.count_nonzero(np.any(block, axis=-1)))
+                            if np.any(sampled):
+                                for segment in segments:
+                                    segment.observe(
+                                        block if layers is None else block[..., segment.layer],
+                                        z, first_row, x0,
+                                    )
+                            del block
+                        coverage_stream.write(memoryview(valid.astype(np.uint8)).cast("B"))
+                        observed += int(np.count_nonzero(valid))
             if segmentation:
                 if encoding == "gzip":
                     label_stream.close()

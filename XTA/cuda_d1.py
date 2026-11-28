@@ -2272,7 +2272,9 @@ def _nrrd_layer_name(
         pieces.append(f'pass {int(pass_index)}')
     if tile_config_id:
         pieces.append(f'tile set {str(tile_config_id)}')
-    if tile_acceptance:
+    if tile_acceptance == 'independent':
+        pieces.append('independent observation')
+    elif tile_acceptance:
         pieces.append(f'accepted by {str(tile_acceptance).replace("_", " ")}')
     if stage:
         pieces.append(str(stage).replace('_', ' '))

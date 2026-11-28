@@ -169,16 +169,41 @@ def _build_radial_plane_plan_reference(view, radii, output_shape):
     return RadialPlanePlan(base, tuple(plane), shells, offsets, columns)
 
 
+def _radial_plan_strip_coordinates(view, work_plane, plane, flat):
+    height, width = plane
+    return (_centered_output_coordinates(flat % width, work_plane[1], width, float(view.center_x)),
+            _centered_output_coordinates(flat // width, work_plane[0], height, float(view.center_y)))
+
+
+def _radial_plan_strip(view, radii, work_plane, plane, first, stop):
+    """Keep vector angle and shell quantization identical to the reference."""
+    flat = np.arange(first, stop, dtype=np.int64)
+    dx, dy = _radial_plan_strip_coordinates(view, work_plane, plane, flat)
+    radius = np.hypot(dx, dy)
+    global_shell = _nearest_global_shell(radius, radii)
+    shell = global_shell - int(view.radial_shell_start)
+    valid = (_inside_closed_radial_limits(radius, float(view.radial_min_radius), float(view.radial_max_radius))
+             & (shell >= 0) & (shell < int(view.num_slices)))
+    positions = np.flatnonzero(valid).astype(np.int64, copy=False)
+    local_shell = shell[positions].astype(np.int32)
+    period, columns = _radial_plan_column_starts(view, radii[global_shell[positions]], dx[positions], dy[positions])
+    return positions, period, columns, local_shell
+
+
+def _radial_plan_column_starts(view, selected, dx, dy):
+    period = 2.0 * math.pi * selected
+    theta = np.mod(np.arctan2(dy, dx), 2.0 * math.pi)
+    ordinary = ~(period <= 1.0)
+    columns = np.zeros(period.shape, np.float64)
+    columns[ordinary] = np.mod(theta[ordinary] * selected[ordinary] - float(view.radial_arc_origin) + .5,
+                              period[ordinary]) - .5
+    return period.astype(np.float64, copy=False), columns
+
+
 def _build_radial_plane_plan(view, radii, output_shape, *, max_plan_bytes=None,
                              build_chunk_pixels=None):
-    """Evaluate exact NumPy geometry once, assembling CSR in bounded strips.
-
-    The reference evaluates every transcendental twice. Reusing one strip's
-    occurrences also reduces Python/NumPy handoffs during concurrent output
-    encoding. Strip payloads are bounded by the final plan budget; concatenation
-    temporarily retains at most two copies of the admitted column payload.
-    """
-    base, _, plane = _plane_geometry(view, output_shape)
+    """Count and fill CSR in bounded strips without retaining occurrence copies."""
+    base, work_plane, plane = _plane_geometry(view, output_shape)
     pixels = math.prod(plane)
     plan_limit = (_PLANE_PLAN_MAX_BYTES if max_plan_bytes is None
                   else min(_PLANE_PLAN_MAX_BYTES, int(max_plan_bytes)))
@@ -186,46 +211,45 @@ def _build_radial_plane_plan(view, radii, output_shape, *, max_plan_bytes=None,
                     else min(_PLANE_BUILD_CHUNK_PIXELS, int(build_chunk_pixels)))
     if plan_limit <= 0 or chunk_pixels <= 0:
         raise ValueError('Radial plan and build-strip budgets must be positive')
+    if min(plane) <= 0:
+        raise ValueError('Radial plane dimensions must be positive')
     if pixels > np.iinfo(np.uint32).max or pixels * 12 > plan_limit:
         raise _RadialPlanePlanTooLarge('Radial plane ownership exceeds the bounded plan budget')
-    shells = np.full(pixels, -1, np.int32)
+    native_width = int(view.src_w)
+    if not 0 < native_width <= int(np.iinfo(np.int32).max) + 1:
+        raise _RadialPlanePlanTooLarge('Radial periodic columns exceed the int32 column format')
+    column_limit = min(int(np.iinfo(np.uint32).max), (plan_limit - pixels * 8 - 4) // 4)
+    shells = np.empty(pixels, np.int32)
     offsets = np.empty(pixels + 1, np.uint32)
     offsets[0] = 0
-    parts = []
-    total = 0
+    count_strip = kernels.count_radial_plan_strip
+    fill_strip = kernels.fill_radial_plan_strip
     for first in range(0, pixels, chunk_pixels):
         stop = min(pixels, first + chunk_pixels)
-        counts = np.zeros(stop - first, np.uint32)
-        occurrences = []
-        strip_total = 0
-        for positions, local_shell, columns in _plane_occurrence_strips(
-                view, radii, output_shape, first_pixel=first, stop_pixel=stop,
-                chunk_pixels=chunk_pixels):
-            strip_total += int(columns.size)
-            if (total + strip_total > np.iinfo(np.uint32).max or
-                    pixels * 8 + 4 + (total + strip_total) * 4 > plan_limit):
-                raise _RadialPlanePlanTooLarge('Radial periodic occurrences exceed the bounded plan budget')
-            shells[positions] = local_shell
-            local = (positions - first).astype(np.int32)
-            counts[local] += 1
-            occurrences.append((local, columns))
-        np.cumsum(counts, dtype=np.uint32, out=offsets[first + 1:stop + 1])
-        # Local write cursors preserve the reference's per-pixel wrap order.
-        counts[0] = 0
-        counts[1:] = offsets[first + 1:stop]
-        part = np.empty(strip_total, np.int32)
-        for local, columns in occurrences:
-            part[counts[local]] = columns
-            counts[local] += 1
-        offsets[first + 1:stop + 1] += np.uint32(total)
-        total += strip_total
-        parts.append(part)
-        del occurrences, counts
-    columns = np.concatenate(parts)
+        positions, period, starts, local_shell = _radial_plan_strip(view, radii, work_plane, plane, first, stop)
+        total = count_strip(positions, period, starts, local_shell, shells[first:stop], offsets[first:stop + 1],
+                            native_width, column_limit)
+        if total is None:
+            raise _RadialPlanePlanTooLarge('Radial periodic occurrences exceed the bounded plan budget')
+        del positions, period, starts, local_shell
+    columns = np.empty(total, np.int32)
+    for first in range(0, pixels, chunk_pixels):
+        stop = min(pixels, first + chunk_pixels)
+        shell_strip = shells[first:stop]
+        if offsets[first] == offsets[stop]:
+            shell_strip.fill(-1)
+            continue
+        # Reuse the certified shells but keep the same vector membership as
+        # count. NumPy's scalar and vector atan2 paths can round differently.
+        positions = np.flatnonzero(shell_strip >= 0).astype(np.int64, copy=False)
+        dx, dy = _radial_plan_strip_coordinates(view, work_plane, plane, positions + first)
+        global_shells = shell_strip[positions].astype(np.int64) + int(view.radial_shell_start)
+        period, starts = _radial_plan_column_starts(view, radii[global_shells], dx, dy)
+        fill_strip(positions, period, starts, shell_strip, offsets[first:stop + 1], columns, native_width)
+        del positions, dx, dy, global_shells, period, starts
     for array in (shells, offsets, columns):
         array.flags.writeable = False
     return RadialPlanePlan(base, tuple(plane), shells, offsets, columns)
-
 
 def _radial_plane_plan(view, radii, output_shape, *, max_plan_bytes=None, build_chunk_pixels=None):
     global _PLANE_PLAN_CACHE_SIZE

@@ -1,7 +1,9 @@
 """Public native detector boundary; no retained Python selection implementation."""
 from concurrent.futures import Future
 from unittest import mock
+import numpy as np
 import pytest
+from XTA.geometry import TileJob, azimuthal_batch_padding_tile_result_ids
 from XTA.scheduler_preflight import preflight_tta_scheduler
 from XTA.tta_scheduler import TtaSchedulerCallbacks
 from tests.native_detector_test_support import (
@@ -51,7 +53,7 @@ def test_cpu_actor_ranges_and_statistics_stay_separate(tmp_path):
         assert result.cpu_completed_by_worker == {0: 1} and result.gpu_completed_by_worker == {}
 
 @pytest.mark.parametrize('changes,reason', [
-    ({'tile_configs': (object(),)}, 'tile'), ({'cpu_enabled': True}, 'hybrid'),
+    ({'cpu_enabled': True}, 'hybrid'),
     ({'gpu_device_count': 2, 'd1_owner_groups': True}, 'multi-worker D1')])
 def test_unsupported_request_fails_before_native_load(changes, reason):
     values = dict(gpu_device_count=1, cpu_enabled=False, tile_configs=(), d1_owner_groups=False)
@@ -76,11 +78,122 @@ def test_bad_inventory_cannot_fund_earlier_valid_parent(tmp_path):
         run.worker(0)
         bad = detector_task(2)
         bad['kind'] = 'tile'
-        with pytest.raises(ValueError, match='Unsupported'):
+        with pytest.raises(ValueError, match='Invalid independent tile descriptor'):
             run.declare(detector_task(1), bad)
         snapshot = run.native.snapshot()
         assert snapshot['dispatched'] == snapshot['bytes_used'] == snapshot['tickets_used'] == 0
         requested.assert_not_called()
+
+def _tile(root, task_id, view, *, tile_id=None, batch=1, cpu=False, confidence=False):
+    tile_id = tile_id or f'tile-{task_id}'
+    affine = np.eye(2, 3, dtype=np.float64)
+    job = TileJob(view.name, view.tta_aug_id, 'tile-config', tile_id, 0, 0, 2, 1, 8,
+                  affine, affine, parent_crop=(1, 3, 0, 2), M_out_to_crop=affine)
+    name = root / 'gpu_worker_results' / f'{view.name}-{tile_id}'
+    result = detector_task(task_id, view=view, count=view.num_slices, cpu=cpu,
+                           job=job, job_id=tile_id, processing_shape=(view.num_slices, 2, 2),
+                           prediction_batch=batch, result_mask_path=str(name.with_suffix('.mask')),
+                           result_conf_path=str(name.with_suffix('.conf')) if confidence else None)
+    result['kind'] = 'tile'
+    return result
+
+
+@pytest.mark.parametrize('backend', ('cpu', 'gpu'))
+def test_tile_lane_refills_while_matching_fullframe_publication_is_held(tmp_path, backend):
+    pending = Future()
+    cpu = backend == 'cpu'
+    inputs = _inputs(tmp_path, tiling_active=True, gpu_worker_tile_result_task_limit=1)
+    with DetectorRun(tmp_path, inputs=inputs) as run:
+        actor = run.worker(0, kind=backend)
+
+        def fullframe(task, stats):
+            run.results.append(('fullframe', task['task_id']))
+            run.scheduler.track_publication(('model', task['view'].name), pending)
+
+        def tile(task, stats):
+            run.results.append(('tile', task['task_id']))
+
+        run.scheduler.bind_result_callbacks(TtaSchedulerCallbacks(fullframe, tile, lambda: None, lambda: None))
+        run.start_transport()
+        view = _view(name='matching-view', num_slices=4)
+        run.declare(detector_task(0, view=view, cpu=cpu),
+                    _tile(tmp_path, 1, view, cpu=cpu), _tile(tmp_path, 2, view, cpu=cpu), ticket_limit=1)
+        assert run.take(0, kind=backend)['task_id'] == 0
+        finish_actor(actor, run.state.gpu_worker_tasks_by_id[0], cpu=cpu)
+        run.drain_until(lambda: len(run.results) == 1)
+        first = run.take(0, kind=backend)
+        assert first['task_id'] == 1
+        with pytest.raises(RuntimeError, match='premature tile retirement'):
+            run.scheduler.release_tile_result_for_key('model', view.name, first['job_id'], reason='test')
+        finish_actor(actor, first, cpu=cpu)
+        run.drain_until(lambda: len(run.results) == 2)
+        status = run.native.snapshot()
+        assert status['tickets_used'] == status['tile_result_tickets'] == status['blocked_tile_results'] == 1
+        assert status['tile_result_bytes'] == 16 and not pending.done()
+        assert status['dispatched'] == 2
+        run.scheduler.release_tile_result_for_key('model', view.name, first['job_id'], reason='closed')
+        with pytest.raises(RuntimeError, match='stale or premature tile retirement'):
+            run.scheduler.release_tile_result_for_key('model', view.name, first['job_id'], reason='duplicate')
+        second = run.take(0, kind=backend)
+        assert second['task_id'] == 2
+        finish_actor(actor, second, cpu=cpu)
+        run.drain_until(lambda: len(run.results) == 3)
+        run.scheduler.release_tile_result_for_key('model', view.name, second['job_id'], reason='closed')
+        run.drain_until(lambda: run.native.snapshot()['tile_result_bytes'] == 0)
+        assert run.native.snapshot()['tickets_used'] == 1
+        assert run.results == [('fullframe', 0), ('tile', 1), ('tile', 2)]
+        pending.set_result(None)
+        run.drain_until(lambda: not run.scheduler.publication_outstanding())
+        assert not run.scheduler.process_quiescence_issues()
+
+
+def test_tile_seams_and_policy_siblings_share_one_oversize_ticket(tmp_path):
+    # The original and policy copy intentionally use equal tile IDs in distinct views.
+    view = _view(name='azimuthal-original', num_slices=3, family='azimuthal')
+    sibling_view = _view(name='azimuthal-policy-copy', num_slices=3, family='azimuthal')
+    original = _tile(tmp_path, 1, view, tile_id='same-tile', batch=4, confidence=True)
+    sibling = _tile(tmp_path, 1, sibling_view, tile_id='same-tile', batch=4)
+    original['augmentation_pass_tasks'] = [sibling]
+    second = _tile(tmp_path, 2, view)
+    inputs = _inputs(tmp_path, tiling_active=True, gpu_worker_tile_result_limit=16,
+                     gpu_worker_tile_result_memory_safe_limit=65)
+    with DetectorRun(tmp_path, inputs=inputs) as run:
+        actor = run.worker(0)
+        run.start_transport()
+        run.declare(original, second)
+        work = run.take(0)
+        assert work['task_id'] == 1
+        assert work['augmentation_pass_tasks'][0]['view'] == sibling_view
+        finish_actor(actor, work)
+        run.drain_until(lambda: len(run.results) == 1)
+        assert run.native.snapshot()['tile_result_bytes'] == 60
+        ids = azimuthal_batch_padding_tile_result_ids('same-tile', view, 3, 4)
+        assert len(ids) == 2
+        for concrete_view, result_id in ((view, ids[0]), (sibling_view, ids[0]), (view, ids[1])):
+            run.scheduler.release_tile_result_for_key('model', concrete_view.name, result_id, reason='closed')
+            status = run.native.snapshot()
+            assert status['dispatched'] == 1 and status['tile_result_bytes'] == 60
+        run.scheduler.release_tile_result_for_key('model', sibling_view.name, ids[1], reason='closed')
+        second_work = run.take(0)
+        assert second_work['task_id'] == 2
+        finish_actor(actor, second_work)
+        run.drain_until(lambda: len(run.results) == 2)
+        run.scheduler.release_tile_result_for_key('model', view.name, second['job_id'], reason='closed')
+        run.drain_until(lambda: not run.scheduler.publication_outstanding())
+        assert run.native.snapshot()['tile_result_bytes'] == 0
+
+
+def test_tile_budget_rejects_oversize_memory_backing_before_any_dispatch(tmp_path):
+    inputs = _inputs(tmp_path, tiling_active=True, gpu_worker_tile_result_limit=32,
+                     gpu_worker_tile_result_memory_safe_limit=15)
+    with DetectorRun(tmp_path, inputs=inputs) as run:
+        run.worker(0)
+        view = _view(num_slices=4)
+        with pytest.raises(ValueError, match='available after shared workspace reservations'):
+            run.declare(detector_task(0, view=view), _tile(tmp_path, 1, view))
+        snapshot = run.native.snapshot()
+        assert snapshot['dispatched'] == snapshot['tickets_used'] == snapshot['tile_result_tickets'] == 0
+
 
 def test_delayed_publication_holds_ticket_not_unrelated_dispatch(tmp_path):
     pending = Future()

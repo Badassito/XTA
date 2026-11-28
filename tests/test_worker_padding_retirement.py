@@ -22,6 +22,8 @@ from XTA.runtime import wait_for_retired_memmap_unlinks
 def test_later_seam_parity_failure_retires_both_unpublished_groups(tmp_path, monkeypatch):
     from XTA import assembly, confidence_tiles, pipeline
     from XTA.confidence_evidence import configure_confidence_evidence
+    from XTA.geometry import azimuthal_batch_padding_frame_specs
+    from XTA.tile_pipeline import consume_tile_files
 
     predicate = '_submit_azimuthal_padding_tile_cleanups'
     tree = ast.parse(Path(pipeline.__file__).read_text(encoding='utf-8'))
@@ -29,6 +31,7 @@ def test_later_seam_parity_failure_retires_both_unpublished_groups(tmp_path, mon
         if isinstance(node, ast.FunctionDef) and node.name == predicate)
     actual_write = assembly._write_raw_bbox_payload_store
     paths = []
+    injected = OSError('second seam encode failed')
 
     def write(**kwargs):
         path = kwargs['store_dir']
@@ -37,20 +40,23 @@ def test_later_seam_parity_failure_retires_both_unpublished_groups(tmp_path, mon
             assert paths[0].is_dir()
             path.mkdir()
             (path / 'chunks.bin').write_bytes(b'partial')
-            raise OSError('second seam encode failed')
+            raise injected
         return actual_write(**kwargs)
 
     monkeypatch.setattr(assembly, '_write_raw_bbox_payload_store', write)
     mask_path, conf_path = tmp_path / 'mask.dat', tmp_path / 'conf.dat'
-    mask_path.touch()
-    conf_path.touch()
-    mask = np.ones((2, 3, 4), np.uint8)
-    view = ViewInfo('azimuthal', 7, 3, 10, 'clamp')
+    view = ViewInfo('azimuthal', 7, 3, 10, 'clamp', family='azimuthal')
+    specs = azimuthal_batch_padding_frame_specs(view, view.num_slices, 16)
+    assert {spec.mirror_azimuthal_u for spec in specs} == {False, True}
+    mask = np.ones((len(specs), 3, 4), np.uint8)
+    mask_path.write_bytes(mask.tobytes())
+    conf_path.write_bytes((mask * np.uint8(154)).tobytes())
     job = SimpleNamespace(tile_id='seam', config_id='c', parent_crop=(0, 3, 1, 5))
     configure_confidence_evidence(tmp_path / 'out', enabled=True)
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            namespace = {**vars(pipeline), 'temp_dir': tmp_path,
+            namespace = {**vars(pipeline), 'tile_staging': SimpleNamespace(path=tmp_path),
+                'consume_tile_files': consume_tile_files,
                 'args': SimpleNamespace(min_conf=0, min_radius=0),
                 'angle_variant_streaming_cleanup_active': False,
                 'tile_result_retirement_executor': executor, 'tile_result_retirement_slice_workers': 1,
@@ -58,14 +64,16 @@ def test_later_seam_parity_failure_retires_both_unpublished_groups(tmp_path, mon
             exec(compile(ast.Module(body=[function], type_ignores=[]), str(pipeline.__file__), 'exec'),
                 namespace)
             namespace[predicate](model_name='m', view=view, tile_job=job,
-                padding_mask_mm=mask, padding_conf_mm=mask * np.uint8(154),
+                padding_shape=mask.shape, expected_frames=specs,
                 padding_mask_path=mask_path, padding_conf_path=conf_path,
-                padding_frames=[dict(ordinal=0, destination=3, mirror_azimuthal_u=False),
-                                dict(ordinal=1, destination=4, mirror_azimuthal_u=True)],
+                padding_frames=[dict(ordinal=spec.azimuthal_padding_ordinal,
+                                     destination=spec.global_destination_index,
+                                     mirror_azimuthal_u=spec.mirror_azimuthal_u) for spec in specs],
                 threshold_plane_shape=(3, 10))
             future, = namespace['tile_cleanup_futures']
-            with pytest.raises(OSError, match='second seam encode failed'):
+            with pytest.raises(OSError, match='second seam encode failed') as caught:
                 future.result(timeout=5)
+            assert caught.value is injected
         assert len(paths) == 2 and not any(path.exists() for path in paths)
         assert not mask_path.exists() and not conf_path.exists()
         assert not confidence_tiles._RAW and not any((tmp_path / 'tile_confidence').iterdir())

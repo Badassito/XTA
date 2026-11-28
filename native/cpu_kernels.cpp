@@ -21,7 +21,14 @@ namespace xta::cpu {
 namespace {
 
 Object allocate(const char* operation, std::initializer_list<Py_ssize_t> shape, const char* dtype) {
-    Object numpy(PyImport_ImportModule("numpy"));
+    // Use an already initialized NumPy module without entering Python's
+    // import machinery for every output allocation. Resolve the allocator
+    // per call so temporary test hooks and embedded runtimes keep working.
+    Object name(PyUnicode_FromString("numpy"));
+    PyObject* existing = PyImport_GetModule(name.get());
+    if (existing == Py_None) { Py_DECREF(existing); existing = nullptr; }
+    if (existing == nullptr && !PyErr_Occurred()) existing = PyImport_Import(name.get());
+    Object numpy(existing);
     Object function(PyObject_GetAttrString(numpy.get(), operation));
     Object dimensions(PyTuple_New(static_cast<Py_ssize_t>(shape.size())));
     Py_ssize_t axis = 0;

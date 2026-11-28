@@ -32,6 +32,10 @@ class NativeDeviceStageCoordinator:
         self._residency_factory = residency_factory
         self._trace = trace
 
+    @property
+    def is_bound(self) -> bool:
+        return self._owner is not None
+
     def bind(self, owner):
         if not callable(getattr(owner, 'stage', None)):
             raise RuntimeError('Native scheduler device-stage API is unavailable')
@@ -116,16 +120,18 @@ class NativeDeviceStageCoordinator:
             identity = self._identities.get(key)
             if identity is None:
                 identity = self._next_identity
-                self._next_identity += 1
-                self._identities[key] = identity
-                self._names[identity] = text
                 if category == 'purpose':
                     kind = int(self._is_source_projection_retirement(text))
                     if text.strip().lower().startswith(('tta persistent sam ', 'sam ')):
                         kind |= 2
                     if text.endswith(' sibling ranks'):
                         kind |= 4
+                    # Publish only successfully registered purposes. A failed
+                    # admission must not invent a request for cleanup to cancel.
                     self._call('purpose', identity, kind)
+                self._next_identity += 1
+                self._identities[key] = identity
+                self._names[identity] = text
             return identity
 
     def _purpose(self, purpose):

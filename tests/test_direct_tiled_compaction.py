@@ -1,5 +1,5 @@
 """Packed FP16/FP32 direct unions preserve scalar logits, masks and confidence."""
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stdout
 import io
 import os
 from types import SimpleNamespace
@@ -75,8 +75,8 @@ class DirectTiledDispatchTests(unittest.TestCase):
                 tiled_compact = mock.Mock(side_effect=lambda grid, block, args, **kw: args[4].fill_(5))
                 union = mock.Mock(side_effect=lambda grid, block, args, **kw: args[10].fill_(2))
                 tiled_union = mock.Mock(side_effect=lambda grid, block, args, **kw: args[8].fill_(2))
-                kernels = SimpleNamespace(cp=SimpleNamespace(asarray=lambda value: value),
-                    compact_f16=compact, compact_f32=compact, compact_f16_tiled=tiled_compact,
+                cp = SimpleNamespace(asarray=lambda value: value, cuda=SimpleNamespace(Device=lambda _: nullcontext()))
+                kernels = SimpleNamespace(cp=cp, compact_f16=compact, compact_f32=compact, compact_f16_tiled=tiled_compact,
                     compact_f32_tiled=tiled_compact, union_f16_f16=union, union_f32_f32=union,
                     union_f16_f16_tiled=tiled_union, union_f32_f32_tiled=tiled_union)
                 original_empty = torch.empty

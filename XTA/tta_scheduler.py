@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 import numpy as np
 
 from .backprojection import GpuInferenceAssetsRetired
-from .geometry import ViewInfo
+from .geometry import TileJob, ViewInfo
 from .native_detector_handles import detector_handle_submission, planned_detector_source_pins
 from .native_scheduler import _MAX_PAYLOAD
 from .runtime import runtime_telemetry, runtime_trace_event
@@ -56,6 +56,7 @@ class TtaSchedulerInputs:
     drain_baseline_workspaces: Optional[Callable[[], None]] = None
     d1_owner_groups_requested: bool = False
     d1_owner_group_size_limit: int = 8
+    gpu_worker_tile_result_memory_safe_limit: Optional[int] = None
 
 @dataclass(frozen=True)
 class TtaSchedulerCallbacks:
@@ -118,7 +119,7 @@ class TtaSchedulerState:
     gpu_worker_tile_task_id_by_key: Dict[Tuple[str, str, str], int] = field(
         default_factory=dict
     )
-    gpu_worker_tile_pending_result_ids_by_task: Dict[int, set[str]] = field(
+    gpu_worker_tile_pending_result_ids_by_task: Dict[int, set[Tuple[str, str, str]]] = field(
         default_factory=dict
     )
     gpu_inference_drained_at: Optional[float] = None
@@ -213,6 +214,8 @@ class _ParentInputs:
     declared_generation: int = 0
     admission_reserve: int = 0
     result_bytes: int = 0
+    tile_task_id: Optional[int] = None
+    tile_final_received: bool = False
 
 
 class _WorkerCommands:
@@ -238,6 +241,7 @@ class TtaScheduler:
         self._parents = {}
         self._published = set()
         self._parent_by_key = {}
+        self._tile_parent_by_task = {}
         self._host_requests = {}
         self._worker_by_id = {}
         self._worker_pids = {}
@@ -389,6 +393,47 @@ class TtaScheduler:
                 packets.append((task_id, payload, allowed, sources))
         return packets
 
+    def _tile_result_keys(self, task, written_paths):
+        """Validate the crop and enumerate the exact raw-result retirement receipts."""
+        from .geometry import azimuthal_batch_padding_tile_result_ids
+
+        keys = set()
+        root = self.inputs.gpu_worker_result_dir.resolve()
+        for member in (task, *task.get('augmentation_pass_tasks', ())):
+            view, job = member.get('view'), member.get('job')
+            if (member.get('kind') != 'tile' or member.get('result_mode') != 'file'
+                    or member.get('bounded_parent_admission') or member.get('task_id') != task['task_id']
+                    or not isinstance(job, TileJob) or not isinstance(view, ViewInfo)
+                    or member.get('job_id') != job.tile_id):
+                raise ValueError(f'Invalid independent tile descriptor for task {task["task_id"]}')
+            shape = member.get('processing_shape')
+            y0, y1, x0, x1 = job.parent_crop
+            if (not isinstance(shape, (tuple, list)) or len(shape) != 3
+                    or any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
+                           or value <= 0 for value in shape)
+                    or tuple(shape) != (view.num_slices, y1 - y0, x1 - x0)
+                    or y0 < 0 or x0 < 0 or type(member.get('slice_start')) is not int
+                    or member['slice_start'] != 0 or type(member.get('slice_count')) is not int
+                    or member['slice_count'] != view.num_slices):
+                raise ValueError(f'Tile {job.tile_id} requires one complete crop-local result')
+            if not member.get('result_mask_path'):
+                raise ValueError(f'Tile {job.tile_id} has no named mask result')
+            for field in ('result_mask_path', 'result_conf_path'):
+                if not member.get(field):
+                    continue
+                path = Path(member[field]).resolve()
+                if not path.is_relative_to(root) or path == root or path in written_paths:
+                    raise ValueError(f'Tile {job.tile_id} has a shared or out-of-scratch result path {path}')
+                written_paths.add(path)
+            for result_id in azimuthal_batch_padding_tile_result_ids(
+                    job.tile_id, view, member['slice_count'],
+                    int(member.get('prediction_batch', self.inputs.gpu_batch))):
+                key = str(member['model_name']), str(view.name), result_id
+                if key in keys:
+                    raise ValueError(f'Duplicate tile result identity {key}')
+                keys.add(key)
+        return keys
+
     def declare_inventory(self, *, ticket_limit):
         """Validate the entire known route before native can fund its first parent."""
         if self._started:
@@ -396,22 +441,34 @@ class TtaScheduler:
         if self._streams:
             raise ValueError('Detector inventory contains an unregistered worker endpoint')
         groups = defaultdict(list)
+        tiles = {}
+        tile_result_owners = {}
+        tile_paths = set()
         for task_id, task in self.state.gpu_worker_tasks_by_id.items():
             if (type(task_id) is not int or not 0 <= task_id < 2**63
                     or type(task.get('task_id')) is not int or task_id != task['task_id']):
                 raise ValueError('Detector task inventory key and descriptor identity disagree')
-            if task['kind'] != 'fullframe' or task['result_mode'] not in ('direct_union', 'd1_owner', 'file'):
-                raise ValueError(f'Unsupported native detector task route {task["kind"]}/{task["result_mode"]}')
+            kind, mode = task['kind'], task['result_mode']
+            if not ((kind == 'fullframe' and mode in ('direct_union', 'd1_owner', 'file'))
+                    or (kind == 'tile' and mode == 'file')):
+                raise ValueError(f'Unsupported native detector task route {kind}/{mode}')
             if task['result_mode'] == 'd1_owner' and not (self.state.gpu_task_queues and task.get('gpu_eligible')):
                 raise ValueError('D1 parent ownership requires a CUDA model actor')
             if not ((task.get('gpu_eligible') and self.state.gpu_task_queues)
                     or (task.get('cpu_eligible') and self.state.cpu_task_queues)):
                 raise ValueError(f'No selected actor can execute detector task {task_id}')
-            groups[self.gpu_worker_fullframe_parent_key(task)].append(task_id)
+            if kind == 'tile':
+                keys = self._tile_result_keys(task, tile_paths)
+                if keys.intersection(tile_result_owners):
+                    raise ValueError(f'Duplicate native tile-result identity in task {task_id}')
+                tiles[task_id] = keys, self.tile_result_task_bytes(task)
+                tile_result_owners.update((key, task_id) for key in keys)
+            else:
+                groups[self.gpu_worker_fullframe_parent_key(task)].append(task_id)
         from .scheduler_preflight import preflight_tta_scheduler
         preflight_tta_scheduler(gpu_device_count=len(self.state.gpu_task_queues),
                                 cpu_enabled=bool(self.state.cpu_task_queues),
-                                tile_configs=self.inputs.tiling_active,
+                                tile_configs=bool(tiles),
                                 d1_owner_groups=self.inputs.d1_owner_groups_requested)
         cpu_reserve = self.cpu_input_prefetch.max_bytes if self.cpu_input_prefetch is not None else 0
         if self.cpu_input_prefetch is not None:
@@ -427,6 +484,16 @@ class TtaScheduler:
         inference = min(total, self.inputs.direct_union_inference_byte_limit)
         self.native.configure_capacity(total, ticket_limit, inference, self.inputs.direct_union_inference_view_limit,
                                        pressure_byte_capacity=self.inputs.direct_union_total_dense_byte_limit)
+        if tiles:
+            largest = max(size for _, size in tiles.values())
+            tile_limit = self.inputs.gpu_worker_tile_result_limit
+            safe_limit = self.inputs.gpu_worker_tile_result_memory_safe_limit
+            if safe_limit is not None:
+                if largest > safe_limit:
+                    raise ValueError(f'Native tile result needs {largest} bytes, but only {safe_limit} bytes '
+                                     'are available after shared workspace reservations')
+                tile_limit = min(tile_limit, safe_limit)
+            self.native.configure_tile_results(tile_limit, self.inputs.gpu_worker_tile_result_task_limit, largest)
         for parent_id, (key, ids) in enumerate(groups.items(), 1):
             self._validate_parent_ranges(key, ids)
             first = self.state.gpu_worker_tasks_by_id[ids[0]]
@@ -444,16 +511,28 @@ class TtaScheduler:
             self._parents[parent_id] = parent
             self._next_parent_id = parent_id + 1
             self._parent_by_key.update((member, parent_id) for member in keys)
+        for task_id, (keys, size) in tiles.items():
+            parent_id = self._next_parent_id
+            self._next_parent_id += 1
+            self._tile_parent_by_task[task_id] = parent_id
+            self._parents[parent_id] = _ParentInputs(('tile', task_id), (task_id,), (), 0, 0,
+                                                    result_bytes=size, tile_task_id=task_id)
+            self.state.gpu_worker_tile_pending_result_ids_by_task[task_id] = keys
+        self.state.gpu_worker_tile_task_id_by_key.update(tile_result_owners)
         self._started = True
         with planned_detector_source_pins() as capture_sources:
             packets_by_parent = {parent_id: self._immutable_descriptors(parent, capture_sources)
                                  for parent_id, parent in self._parents.items()}
             for parent_id, parent in self._parents.items():
                 packets = packets_by_parent.pop(parent_id)
-                generation = self.native.declare_parent(
-                    parent_id, len(parent.task_ids), parent.dense_bytes + parent.result_bytes,
-                    exclusive_worker_kind=parent.exclusive_kind, retirement_pressure_bytes=parent.dense_bytes,
-                    descriptor_only=packets is not None)
+                if parent.tile_task_id is not None:
+                    generation = self.native.declare_tile_result(parent_id, parent.result_bytes,
+                                                                 descriptor_only=packets is not None)
+                else:
+                    generation = self.native.declare_parent(
+                        parent_id, len(parent.task_ids), parent.dense_bytes + parent.result_bytes,
+                        exclusive_worker_kind=parent.exclusive_kind, retirement_pressure_bytes=parent.dense_bytes,
+                        descriptor_only=packets is not None)
                 if packets is not None:
                     parent.generation = generation
                     for task_id, payload, allowed, handles in packets:
@@ -597,6 +676,16 @@ class TtaScheduler:
             parent = self._parents[parent_id]
             if not parent.publication_received or parent.assembled != len(parent.task_ids):
                 continue
+            if parent.tile_task_id is not None:
+                task_id = parent.tile_task_id
+                if self.state.gpu_worker_tile_pending_result_ids_by_task[task_id]:
+                    continue
+                self.native.retire_parent(parent_id, parent.generation)
+                del self.state.gpu_worker_tile_pending_result_ids_by_task[task_id]
+                del self._tile_parent_by_task[task_id]
+                del self._parents[parent_id]
+                self._published.remove(parent_id)
+                continue
             for future in parent.publications:
                 if future.done():
                     future.result()
@@ -701,12 +790,18 @@ class TtaScheduler:
             self.state.cpu_frames_completed_total += task['slice_count']
         else:
             self.state.gpu_frames_completed_total += task['slice_count']
-        self._callbacks.handle_fullframe_worker_result(task, message['stats'])
+        parent = self._parents[lease.parent_id]
+        if parent.tile_task_id is not None:
+            if parent.tile_task_id != lease.task_id or parent.tile_final_received:
+                raise RuntimeError('Unexpected native tile final receipt')
+            parent.tile_final_received = True
+            self._callbacks.handle_tile_worker_result(task, message['stats'])
+        else:
+            self._callbacks.handle_fullframe_worker_result(task, message['stats'])
         runtime_trace_event('scheduler_result_handled', task=task, device=trace_device,
                             task_id=lease.task_id, generation=lease.generation)
-        parent = self._parents[lease.parent_id]
         parent.assembled += 1
-        if parent.assembled == len(parent.task_ids):
+        if parent.tile_task_id is None and parent.assembled == len(parent.task_ids):
             self.native.adopt_postprocess(lease.parent_id, parent.generation)
         self._callbacks.announce_process_inference_drain_if_complete()
 
@@ -810,14 +905,25 @@ class TtaScheduler:
         issues = {}
         if self.state.gpu_worker_results_collected != self.state.gpu_worker_total_tasks:
             issues['outstanding_tasks'] = self.state.gpu_worker_total_tasks-self.state.gpu_worker_results_collected
-        if self._parents:
-            issues['outstanding_parent_tickets'] = sorted(self._parents)
+        parents = [parent_id for parent_id, parent in self._parents.items()
+                   if parent.tile_task_id is None]
+        if parents:
+            issues['outstanding_parent_tickets'] = sorted(parents)
+        if self._tile_parent_by_task:
+            issues['outstanding_tile_tasks'] = sorted(self._tile_parent_by_task)
         return issues
 
-    def release_tile_result_task_id(self, *_args, **_kwargs):
-        raise RuntimeError('Tile ownership is unavailable with this native scheduler')
-
-    release_tile_result_for_key = release_tile_result_task_id
+    def release_tile_result_for_key(self, model_name, view_name, tile_id, *, reason):
+        """Record last use of one original or seam result after closing its raw backing."""
+        key = str(model_name), str(view_name), str(tile_id)
+        task_id = self.state.gpu_worker_tile_task_id_by_key.get(key)
+        parent_id = self._tile_parent_by_task.get(task_id)
+        if parent_id is None or not self._parents[parent_id].tile_final_received:
+            raise RuntimeError(f'Unknown, stale or premature tile retirement {key}: {reason}')
+        self.state.gpu_worker_tile_pending_result_ids_by_task[task_id].remove(key)
+        del self.state.gpu_worker_tile_task_id_by_key[key]
+        self._retire_consumed()
+        self.wake_scheduler()
 
     def describe_hybrid_cpu_idle_reason(self):
         return self.state.hybrid_cpu_idle_reason_last
@@ -875,19 +981,16 @@ class TtaScheduler:
     def tile_result_task_bytes(self, task: Dict[str, object]) -> int:
         if str(task.get('kind', '')) != 'tile':
             return 0
-        shape = tuple(int(v) for v in task.get('processing_shape', ()))
-        if len(shape) != 3:
-            return 0
-        planes = 2 if task.get('result_conf_path') else 1
-        main_bytes = int(math.prod(shape)) * int(planes)
-        policy_factor = 1 + len(task.get('augmentation_pass_tasks', ()))
-        padding_count = int(self.tile_task_azimuthal_padding_count(task))
-        if padding_count <= 0:
-            return int(main_bytes) * int(policy_factor)
-        plane_bytes = int(shape[1]) * int(shape[2]) * int(np.dtype(np.uint8).itemsize)
-        compact_padding_bytes = int(padding_count) * int(plane_bytes) * int(planes)
-        # Keep credit for both the worker's seam slots and one compact parity group.
-        return (main_bytes + 2 * compact_padding_bytes) * policy_factor
+        size = 0
+        for member in (task, *task.get('augmentation_pass_tasks', ())):
+            shape = tuple(int(v) for v in member.get('processing_shape', ()))
+            if len(shape) != 3:
+                raise ValueError('Tile result requires a three-dimensional shape')
+            planes = 2 if member.get('result_conf_path') else 1
+            frames = shape[0] + 2 * self.tile_task_azimuthal_padding_count(member)
+            # Retain the worker's seam slots plus the peak compact parity group.
+            size += frames * shape[1] * shape[2] * planes
+        return size
 
     def gpu_worker_fullframe_parent_key(self, task: Dict[str, object]) -> Optional[Tuple[str, str]]:
         if str(task.get('kind', '')) != 'fullframe':

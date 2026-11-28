@@ -1,5 +1,6 @@
 """Bounded confidence batches preserve exact stream bytes and numeric limits."""
 from pathlib import Path
+import weakref
 import zlib
 
 import numpy as np
@@ -121,3 +122,55 @@ def test_writer_reports_executed_mixed_codecs_and_native_batch_counts(tmp_path, 
     assert metrics['native_batch_seconds'] == .003
     assert metrics['capture_copy_kernel_calls'] == 2
     assert metrics['capture_copy_batch_peak_bytes'] == 64
+
+
+class _TrackingCallerEncoder:
+    def __init__(self, values):
+        self.values = values
+        self.frame_refs = []
+        self.previous_live = []
+
+    def encode_caller_frame(self, z, block_size):
+        if self.frame_refs:
+            self.previous_live.append(tuple(ref() is not None for ref in self.frame_refs[-1]))
+        value = self.values[z]
+        if value:
+            payload = np.frombuffer(zlib.compress(bytes((value,)), 3), np.uint8).copy()
+            records = np.array([(z, 0, 0, 1, 1, 0, len(payload))], storage.BLOCK_DTYPE)
+        else:
+            payload = np.empty(0, np.uint8)
+            records = np.empty(0, storage.BLOCK_DTYPE)
+        self.frame_refs.append((weakref.ref(records), weakref.ref(payload)))
+        return records, payload, int(value != 0), dict(
+            read_seconds=0., scan_seconds=0., compression_seconds=0.)
+
+
+def test_caller_encoder_releases_frame_before_encoding_next(tmp_path):
+    values = (1, 0, 3)
+    shape = (len(values), 1, 1)
+    options = dict(layer_key='k', model_name='m', provenance={})
+    caller = _TrackingCallerEncoder(values)
+    reference = storage.write_blocks(tmp_path/'reference', shape,
+        lambda z: np.full((1, 1), values[z], dtype=np.uint8), **options)
+    metrics = {}
+    actual = storage.write_blocks(tmp_path/'caller', shape, caller, metrics=metrics, **options)
+    assert caller.previous_live == [(False, False), (False, False)]
+    assert all(ref() is None for frame in caller.frame_refs for ref in frame)
+    assert actual == reference
+    for name in ('index.bin', 'scores.u8.zlib', 'metadata.json'):
+        assert (tmp_path/'caller'/name).read_bytes() == (tmp_path/'reference'/name).read_bytes()
+    assert metrics['storage_batch_reserved_bytes'] == 0
+    assert metrics['storage_index_write_calls'] == metrics['storage_payload_write_calls'] == 2
+
+
+def test_caller_encoder_limit_does_not_keep_buffers_in_failure_traceback(tmp_path):
+    caller = _TrackingCallerEncoder((1, 2, 3))
+    directory = tmp_path/'limited'
+    one_record = storage.BLOCK_DTYPE.itemsize + len(zlib.compress(b'\x01', 3))
+    with pytest.raises(storage.ConfidenceStageLimit, match='local staging reservation') as caught:
+        storage.write_blocks(directory, (3, 1, 1), caller, layer_key='k', model_name='m',
+            provenance={}, max_numeric_bytes=one_record)
+    assert caught.value.__traceback__ is not None
+    assert len(caller.frame_refs) == 2
+    assert all(ref() is None for frame in caller.frame_refs for ref in frame)
+    assert not list(directory.iterdir())

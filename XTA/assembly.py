@@ -1,4 +1,4 @@
-"""Completed-view assembly, tile gates, smoothing, and output handoff."""
+"""Completed-view assembly, independent tile configurations, smoothing, and output handoff."""
 
 from __future__ import annotations
 
@@ -101,8 +101,6 @@ from .cuda_d1 import (
     _read_binary_volume_slice_crop_bool,
     _volume_has_foreground,
     _volume_shape_tuple,
-    close_raw_store_or_memmap_volume,
-    subtract_volume_to_raw_bbox_store,
 )
 from .backprojection import (
     SinkOnlyProjectionResult,
@@ -1814,7 +1812,6 @@ def prepare_view_volume_after_fullframe(
     hole_fill_done_on_device: bool = False,
     slice_meta: Optional[Dict[str, object]] = None,
     fuse_azimuthal_component_layers: bool = False,
-    parent_mask_ready_callback: Optional[Callable[[str, str, object], None]] = None,
     internal_final_layer_enabled: bool = False,
     preinterpolation_layer_already_published: bool = False,
     submit_component_projection: Optional[Callable[..., Future[NrrdLayerRef]]] = None,
@@ -1857,10 +1854,6 @@ def prepare_view_volume_after_fullframe(
     d1_additions_path: Optional[Path] = None
     nrrd_layers: List[NrrdLayerRef] = []
     pending_component_layers: List[Future[NrrdLayerRef]] = []
-    parent_mask_support_mm: Optional[object] = None
-    parent_bridge_support_mm: Optional[object] = None
-    parent_mask_support_path: Optional[Path] = None
-    parent_bridge_support_path: Optional[Path] = None
     from .confidence_evidence import confidence_evidence_enabled
     fused_azimuthal_components = bool(
         fuse_azimuthal_component_layers
@@ -2060,29 +2053,6 @@ def prepare_view_volume_after_fullframe(
             if layer_ref is not None:
                 nrrd_layers.append(layer_ref)
 
-    # Per-tile gating always needs the immutable same-angle parent YOLO support, even
-    # when NRRD output is disabled. Keep it as a sparse slice-chunked cvol so the new
-    # two-stage gate can classify each original tile component before any cross-tile OR.
-    if bool(tiling_active):
-        parent_mask_support_path = temp_dir / 'tile_support' / model_name / view.name / 'fullframe_yolo_support.cvol'
-        write_raw_bbox_mask_store(
-            baseline_native_volume,
-            parent_mask_support_path,
-            format_name=CVOL_FORMAT,
-            desc=f'Tile support fullframe YOLO {model_name}/{view.name}',
-            workers=int(slice_workers),
-            extra_meta={
-                'support_kind': 'fullframe_yolo_pre_interpolation',
-                'physical_view': physical_view_name(view),
-                'tta_aug_id': str(view.tta_aug_id),
-                'tta_angle_deg': float(view.tta_angle_deg),
-            },
-        )
-        parent_mask_support_mm = RawBBoxMaskStore.open(parent_mask_support_path, mmap_payload=True)
-        # Publish immutable P immediately after cleanup, before any parent interpolation.
-        # Tile components may now perform their first gate while the parent bridge planner runs.
-        if parent_mask_ready_callback is not None:
-            parent_mask_ready_callback(str(model_name), str(view.name), parent_mask_support_mm)
 
 
     if (observation_inventory is None and backend == 'sam'
@@ -2295,7 +2265,7 @@ def prepare_view_volume_after_fullframe(
                         candidate_index = int(component_entry['candidate_index'])
                         # Immutable component stores no longer depend on the mutable
                         # parent canvas. Only refs-only parents can detach publication;
-                        # tile support and dense continuations keep the synchronous path.
+                        # Dense parent destinations keep the synchronous path.
                         materialize_component = (
                             submit_component_projection
                             if d1_component_refs_only and submit_component_projection is not None
@@ -2422,56 +2392,6 @@ def prepare_view_volume_after_fullframe(
                     f'projection pass ({int(fused_added_voxels)} bridge voxel(s)).'
                 )
 
-        if bool(tiling_active) and parent_mask_support_mm is not None:
-            parent_bridge_support_path = temp_dir / 'tile_support' / model_name / view.name / 'fullframe_bridge_support.cvol'
-            bridge_desc = f'NRRD support fullframe bridges {model_name}/{view.name}'
-            if interpolation_stats:
-                bridge_stats = subtract_volume_to_raw_bbox_store(
-                    baseline_native_volume,
-                    parent_mask_support_mm,
-                    parent_bridge_support_path,
-                    desc=bridge_desc,
-                    workers=int(slice_workers),
-                    format_name=CVOL_FORMAT,
-                )
-            else:
-                # No interpolation invocation occurred after the immutable parent
-                # snapshot. Retention copies preserve its pixels, and extrapolation
-                # starts below, so this delta is empty without rereading the volume.
-                # An actual pass always takes subtraction, even with zero-added stats.
-                bridge_shape = _volume_shape_tuple(baseline_native_volume)
-                parent_shape = _volume_shape_tuple(parent_mask_support_mm)
-                if bridge_shape != parent_shape:
-                    raise ValueError(f'{bridge_desc}: shape mismatch {bridge_shape} vs {parent_shape}')
-                bridge_stats = _write_raw_bbox_payload_store(
-                    shape=bridge_shape,
-                    store_dir=parent_bridge_support_path,
-                    encode_slice=lambda idx: RawBBoxSlicePayload(idx=int(idx), is_empty=True),
-                    desc=bridge_desc,
-                    workers=int(slice_workers),
-                    format_name=CVOL_FORMAT,
-                    extra_meta={'operation': 'after_and_not_before'},
-                )
-            if backend == 'sam':
-                from .sam_integration import publish_sam_gate_identity
-                last_stats = interpolation_stats[-1] if interpolation_stats else {}
-                identity_store = RawBBoxMaskStore.open(parent_bridge_support_path, mmap_payload=True)
-                try:
-                    gate_identity = publish_sam_gate_identity(
-                        identity_store, policy_identity=str(last_stats.get('sam_policy_hash', '')),
-                        evidence_path=str(last_stats.get('sam_evidence_path', '')))
-                finally:
-                    identity_store.close()
-                last_stats['parent_gate_support_identity'] = gate_identity
-            if int(bridge_stats.get('foreground_voxels', 0)) <= 0:
-                parent_bridge_support_mm = None
-                if parent_bridge_support_path is not None:
-                    try:
-                        shutil.rmtree(parent_bridge_support_path, ignore_errors=True)
-                    except Exception:
-                        pass
-            else:
-                parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path, mmap_payload=True)
 
         extrapolation_stats_local, tail_refs = _run_sam_extrapolation(
             baseline_native_volume, view=view, model_name=model_name, source='fullframe',
@@ -2576,12 +2496,6 @@ def prepare_view_volume_after_fullframe(
         # Every other configuration retains the established dense continuation.
         final_view_volume: Optional[np.ndarray] = baseline_native_volume
 
-        returned_parent_mask_support = parent_mask_support_mm if bool(tiling_active) else None
-        returned_parent_bridge_support = parent_bridge_support_mm if bool(tiling_active) else None
-        if parent_mask_support_mm is not None and returned_parent_mask_support is None:
-            close_raw_store_or_memmap_volume(parent_mask_support_mm)
-        if parent_bridge_support_mm is not None and returned_parent_bridge_support is None:
-            close_raw_store_or_memmap_volume(parent_bridge_support_mm)
 
         return PreparedViewResult(
             model_name=str(model_name),
@@ -2593,8 +2507,6 @@ def prepare_view_volume_after_fullframe(
             interpolation_stats=interpolation_stats,
             nrrd_layers=nrrd_layers,
             pending_component_layers=pending_component_layers,
-            parent_mask_support_mm=returned_parent_mask_support,
-            parent_bridge_support_mm=returned_parent_bridge_support,
         )
     except BaseException:
         if d1_component_refs_only:
@@ -3458,13 +3370,11 @@ def gate_tile_residual_against_parent_bridge(
             except Exception:
                 pass
 
-def finalize_consolidated_tile_volume_for_parent(
+def finalize_independent_tile_config(
     *,
     model_name: str,
     view: ViewInfo,
-    tile_accumulator_mm: np.ndarray,
-    destination_mm: np.ndarray,
-    destination_lock: threading.Lock,
+    tile_accumulator_mm: Optional[np.ndarray],
     temp_dir: Path,
     interpolate: int,
     interpolation_walk_back: int,
@@ -3475,27 +3385,19 @@ def finalize_consolidated_tile_volume_for_parent(
     slice_workers: int,
     interpolation_task_workers: int,
     nrrd_layers_enabled: bool = False,
-    tile_parent_mask_accumulator_mm: Optional[np.ndarray] = None,
-    tile_parent_bridge_accumulator_mm: Optional[np.ndarray] = None,
-    internal_final_layer_enabled: bool = False,
     config_id: str = '',
     interpolation_backend: str = 'sdf',
     sam_context: Optional[object] = None,
-    sam_upstream_lineage: Optional[Dict[str, object]] = None,
     extrapolation_distance: int = 0,
     extrapolation_walk_back: int = 1,
     extrapolation_min_radius: float = 3.,
 ) -> TileConsolidationResult:
-    """Interpolate one configuration's consolidated gated tiles, then union them.
+    """Publish one configuration's observed mask, then analyze its canonical union.
 
- The input accumulator contains the OR of every accepted tile mask for one tile configuration
- of this parent view. Interpolation is performed once per configuration instead of once per tile
- or once across unrelated configurations. When NRRD decomposition is enabled, the accepted YOLO
- tile support is written separately for tiles accepted by parent YOLO masks and by parent
- interpolation bridges; tile interpolation bridges are then exported per configuration/pass."""
-    # Local import keeps the package dependency graph acyclic.
-    from .confidence_tiles import retire_tile_confidence
-    from .finalization import union_volume_into_volume
+    The caller owns the observation canvas and joins the returned final canvas
+    with other completed branches. Interpolation can return a replacement mmap.
+    """
+    from .confidence_tiles import capture_consolidated_tile_confidence, retire_tile_confidence
 
     backend = str(interpolation_backend)
     if backend not in ('sdf', 'sam'):
@@ -3513,115 +3415,52 @@ def finalize_consolidated_tile_volume_for_parent(
         f'{config_id_norm}_tile_interpolation'
         if config_id_norm else 'tile_interpolation'
     )
-    tile_plane_shape = tuple(int(v) for v in np.asarray(tile_accumulator_mm).shape[-2:])
+    # Layer keys carry view/config identity. Model-specific roots keep simultaneous
+    # layers with the same key from writing each other's CVOL backing.
+    publication_dir = temp_dir / 'tile_models' / str(model_name)
+    has_foreground = tile_accumulator_mm is not None and _volume_has_foreground(tile_accumulator_mm)
+    observation = dict(model_name=str(model_name), view=view, source='tile', mask_kind='yolo',
+                       pass_index=0, tile_config_id=config_id_norm, tile_acceptance='independent',
+                       stage=pre_interpolation_stage, temp_dir=publication_dir,
+                       description=f'Cleaned {config_label} tile detections before interpolation.')
+    try:
+        if nrrd_layers_enabled and (has_foreground or view.augmentation_base_view):
+            if tile_accumulator_mm is None:
+                ref = materialize_empty_policy_layer(**observation)
+            else:
+                ref = materialize_nrrd_view_layer(tile_accumulator_mm, **observation, workers=int(slice_workers),
+                    known_has_foreground=has_foreground, emit_empty=bool(view.augmentation_base_view))
+            if ref is not None:
+                nrrd_layers.append(ref)
+        elif tile_accumulator_mm is not None:
+            capture_consolidated_tile_confidence(tile_accumulator_mm, view=view, model_name=model_name,
+                config_id=config_id_norm, category='independent', stage=pre_interpolation_stage, temp_dir=publication_dir)
+    finally:
+        retire_tile_confidence(model_name, view.name, config_id)
+    if not has_foreground:
+        return TileConsolidationResult(
+            model_name=str(model_name), view_name=str(view.name), aug_id=str(view.tta_aug_id),
+            angle_deg=float(view.tta_angle_deg), interpolation_stats=interpolation_stats,
+            nrrd_layers=nrrd_layers, final_accumulator_mm=None,
+        )
+
+    tile_plane_shape = tuple(int(v) for v in tile_accumulator_mm.shape[-2:])
     effective_interpolate_min_radius = view_processing_min_radius(
         view, float(interpolate_min_radius), tile_plane_shape,
     )
     effective_interpolation_search_angle = view_processing_search_angle(
         view, float(interpolation_search_angle), tile_plane_shape,
     )
-
-    if not _volume_has_foreground(tile_accumulator_mm):
-        if bool(nrrd_layers_enabled) and bool(view.augmentation_base_view):
-            empty_ref = materialize_nrrd_view_layer(
-                tile_accumulator_mm, model_name=str(model_name), view=view,
-                source='tile', mask_kind='yolo', pass_index=0,
-                tile_config_id=config_id_norm, tile_acceptance='parent_mask',
-                stage=pre_interpolation_stage,
-                description=f'Empty {config_label} tile YOLO policy-pass mask.',
-                temp_dir=temp_dir, workers=int(slice_workers),
-                known_has_foreground=False, emit_empty=True,
-            )
-            if empty_ref is not None:
-                nrrd_layers.append(empty_ref)
-        retire_tile_confidence(model_name, view.name, config_id)
-        if bool(internal_final_layer_enabled):
-            internal_ref = materialize_internal_final_view_layer(
-                destination_mm,
-                model_name=str(model_name),
-                view=view,
-                temp_dir=temp_dir,
-                workers=int(slice_workers),
-            )
-            if internal_ref is not None:
-                nrrd_layers.append(internal_ref)
-        return TileConsolidationResult(
-            model_name=str(model_name),
-            view_name=str(view.name),
-            aug_id=str(view.tta_aug_id),
-            angle_deg=float(view.tta_angle_deg),
-            interpolation_stats=interpolation_stats,
-            nrrd_layers=nrrd_layers,
-            final_accumulator_mm=tile_accumulator_mm,
-        )
-
-    if bool(nrrd_layers_enabled):
-        emitted_category = False
-        if tile_parent_mask_accumulator_mm is not None:
-            layer_ref = materialize_nrrd_view_layer(
-                tile_parent_mask_accumulator_mm,
-                model_name=str(model_name),
-                view=view,
-                source='tile',
-                mask_kind='yolo',
-                pass_index=0,
-                tile_config_id=config_id_norm,
-                tile_acceptance='parent_mask',
-                stage=pre_interpolation_stage,
-                emit_empty=bool(view.augmentation_base_view),
-                description=f'Accepted {config_label} tile YOLO masks whose components intersected parent full-frame YOLO support. Parent-mask support has priority when a component intersects both parent mask and parent bridge.',
-                temp_dir=temp_dir,
-                workers=int(slice_workers),
-            )
-            if layer_ref is not None:
-                nrrd_layers.append(layer_ref)
-                emitted_category = True
-        if tile_parent_bridge_accumulator_mm is not None:
-            layer_ref = materialize_nrrd_view_layer(
-                tile_parent_bridge_accumulator_mm,
-                model_name=str(model_name),
-                view=view,
-                source='tile',
-                mask_kind='yolo',
-                pass_index=0,
-                tile_config_id=config_id_norm,
-                tile_acceptance='parent_bridge',
-                stage=pre_interpolation_stage,
-                description=f'Accepted {config_label} tile YOLO masks whose components did not intersect parent YOLO support but did intersect a parent interpolation bridge.',
-                temp_dir=temp_dir,
-                workers=int(slice_workers),
-            )
-            if layer_ref is not None:
-                nrrd_layers.append(layer_ref)
-                emitted_category = True
-        if not emitted_category:
-            layer_ref = materialize_nrrd_view_layer(
-                tile_accumulator_mm,
-                model_name=str(model_name),
-                view=view,
-                source='tile',
-                mask_kind='yolo',
-                pass_index=0,
-                tile_config_id=config_id_norm,
-                tile_acceptance='parent_support',
-                stage=pre_interpolation_stage,
-                description=f'Accepted {config_label} tile YOLO masks before tile interpolation. Parent mask/bridge category supports were unavailable, so the category is the total parent support.',
-                temp_dir=temp_dir,
-                workers=int(slice_workers),
-            )
-            if layer_ref is not None:
-                nrrd_layers.append(layer_ref)
-
-
-    retire_tile_confidence(model_name, view.name, config_id)
-
+    sam_upstream_lineage = dict(seed_detector_identity=str(getattr(sam_context, 'detector_identity', None) or model_name),
+                                tile_config_id=config_id_norm,
+                                tile_acceptance='independent')
     observation_inventory = None
     if (backend == 'sam' and int(extrapolation_distance) > 0 and int(interpolate_passes) > 0
             and _view_uses_interpolation(view, int(interpolate))):
         from .sam_bridge_planning import SamObservationInventory
         observation_inventory = SamObservationInventory()
+    sam_observations = tile_accumulator_mm
     try:
-        sam_observations = tile_accumulator_mm
         if _view_uses_interpolation(view, int(interpolate)):
             total_passes = int(interpolate_passes)
             for pass_idx in range(1, total_passes + 1):
@@ -3732,11 +3571,9 @@ def finalize_consolidated_tile_volume_for_parent(
                                 f'Voxels added by this {config_label} tile interpolation pass '
                                 f'for walk-back origin {int(walk_back_index)} and candidate '
                                 f'{int(candidate_index)} only. Bridges are generated after '
-                                'accepted tile masks within this configuration are consolidated, '
-                                'so they are not attributed back to parent-mask vs parent-bridge '
-                                'acceptance categories.'
+                                'the cleaned observations from this tile configuration are consolidated.'
                             ),
-                            temp_dir=temp_dir,
+                            temp_dir=publication_dir,
                             workers=int(slice_workers),
                         )
                         nrrd_layers.append(layer_ref)
@@ -3756,28 +3593,18 @@ def finalize_consolidated_tile_volume_for_parent(
         nrrd_layers.extend(tail_refs)
         if extrapolation_stats_local is not None:
             interpolation_stats.append(extrapolation_stats_local)
+    except BaseException as error:
+        if tile_accumulator_mm is not sam_observations and not np.shares_memory(tile_accumulator_mm, sam_observations):
+            from .cuda_d1 import retire_temporary_binary_volume_storage
+            try:
+                retire_temporary_binary_volume_storage(tile_accumulator_mm)
+            except Exception as cleanup_error:
+                if hasattr(error, 'add_note'):
+                    error.add_note(f'Could not retire replacement tile interpolation canvas: {cleanup_error}')
+        raise
     finally:
         if observation_inventory is not None:
             observation_inventory.clear()
-
-    with destination_lock:
-        union_volume_into_volume(
-            destination_mm,
-            tile_accumulator_mm,
-            workers=int(slice_workers),
-            desc=f'Union consolidated gated tiles {model_name}/{view.name}/{config_label}',
-        )
-
-    if bool(internal_final_layer_enabled):
-        internal_ref = materialize_internal_final_view_layer(
-            destination_mm,
-            model_name=str(model_name),
-            view=view,
-            temp_dir=temp_dir,
-            workers=int(slice_workers),
-        )
-        if internal_ref is not None:
-            nrrd_layers.append(internal_ref)
 
     return TileConsolidationResult(
         model_name=str(model_name),

@@ -230,9 +230,60 @@ def test_bundled_reconciler_imports_without_inference(tmp_path):
     with ZipFile(path) as bundle:
         assert {"XTA/slicer_reconciliation.py", "XTA/reconciliation.py",
                 "XTA/reconciliation_policy.py", "XTA/slicer_preview_review.py"} <= set(bundle.namelist())
-    subprocess.run([
-        sys.executable, "-I", "-B", "-c",
-        "import sys; sys.path.insert(0, sys.argv[1]); import XTA.slicer_reconciliation;"
-        "assert 'torch' not in sys.modules and 'ultralytics' not in sys.modules",
-        str(path),
-    ], check=True)
+        assert "XTA/native_cpu.py" not in bundle.namelist()
+    script = """
+import sys
+from types import SimpleNamespace
+
+import numpy as np
+
+sys.path.insert(0, sys.argv[1])
+from XTA.reconciliation import EvidenceLayer, reconcile
+from XTA.slicer_reconciliation import prepare_reconciliation
+
+shape = (1, 131, 133)
+left = np.zeros(shape, np.uint8)
+right = np.zeros(shape, np.uint8)
+left[0, 4:7, 4:8] = 1
+right[0, 5:8, 5:9] = 1
+prior = np.zeros(shape, np.uint8)
+prior[0, 9, 9] = 1
+expected = left & right
+policy = dict(mode="weighted", grouping="views", threshold=2, min_sources=2)
+
+def layer(name, data):
+    return SimpleNamespace(lid=name, data=data, origin=(0, 0, 0), storage="level",
+                           words=1, additive=name != "global", role="direct")
+global_layer = layer("global", prior)
+store = SimpleNamespace(shape=shape, n_cutoffs=1, _txn=None, diverged=None,
+                        edit_revision=0, global_layer=lambda: global_layer,
+                        bits_dtype=np.dtype(np.uint64), bits_words=1,
+                        layers={"left": layer("left", left), "right": layer("right", right),
+                                "global": global_layer})
+def metadata(name):
+    return dict(mask_kind="yolo", physical_view_name=name)
+plan = SimpleNamespace(shape=shape, cutoffs=(90,),
+                       layers={name: {"rows": {0: metadata(name)}} for name in ("left", "right")})
+selected, = prepare_reconciliation(store, plan, policy, memory_mib=16).cutoffs
+np.testing.assert_array_equal(np.unpackbits(selected.packed_mask, axis=-1, count=shape[2],
+                                            bitorder="little"), expected)
+assert selected.added == 6 and selected.removed == 1
+
+# Crop readers exercise the sparse fallback available within the same ZIP.
+def forbidden_slab(*args):
+    raise AssertionError("Standalone crop evidence switched to a slab reader")
+layers = [
+    EvidenceLayer("left", shape, metadata("left"), forbidden_slab,
+                  read_mask_crop=lambda z: (4, 4, 7, 8, left[z, 4:7, 4:8])),
+    EvidenceLayer("right", shape, metadata("right"), forbidden_slab,
+                  read_mask_crop=lambda z: (5, 5, 8, 9, right[z, 5:8, 5:9])),
+]
+result = np.zeros(shape, np.uint8)
+reconcile(layers, shape_tyx=shape, policy=policy,
+          write_slab=lambda z0, z1, values: result.__setitem__(slice(z0, z1), values), memory_mib=16)
+np.testing.assert_array_equal(result, expected)
+assert not {"torch", "ultralytics", "XTA.native_cpu"} & sys.modules.keys()
+"""
+    completed = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(path)],
+                               capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr

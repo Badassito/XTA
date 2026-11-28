@@ -64,3 +64,65 @@ def test_sparse_area_kernel_matches_dense_cv2_restore(in_h, in_w, out_h, out_w, 
         source[y0:y1, x0:x1] = plane[y0:y1, x0:x1]
         expected = _resize_binary_mask_frame_to_output_shape(source, out_h, out_w)
         np.testing.assert_array_equal(_sparse_restore(source, bbox, out_h, out_w), expected)
+
+
+@pytest.mark.parametrize("value", [1, 2, 255])
+def test_binary_area_counts_each_positive_source_pixel_once(value):
+    from XTA import nrrd_sparse_kernels as nk
+
+    crop = np.zeros((30, 30), np.uint8)
+    crop[15, 15] = value
+    expected = _resize_binary_mask_frame_to_output_shape(crop, 1, 1)
+    assert not expected.any()
+    np.testing.assert_array_equal(_sparse_restore(crop, (0, 0, 30, 30), 1, 1), expected)
+    mode, ys, ye, xs, xe = nk.resize_mode_and_maps(30, 30, 1, 1)
+    zero = np.zeros(1, np.int64)
+    one = np.ones(1, np.int64)
+    restored, _ = nk.fill_restored_member_group(
+        crop.ravel(), False, zero, zero, zero, one*30, one*30, one.astype(np.uint8),
+        zero, one, 1, np.array([0, 1], np.int64), zero, 30, 30, 1, 1, ys, ye, xs, xe, mode,
+    )
+    np.testing.assert_array_equal(restored, expected)
+
+
+def test_binary_area_dense_255_does_not_wrap_at_signed_int32():
+    from XTA import nrrd_sparse_kernels as nk
+
+    crop = np.full((3000, 3000), 255, np.uint8)
+    expected = _resize_binary_mask_frame_to_output_shape(crop, 1500, 1500)
+    assert np.all(expected == 1)
+    np.testing.assert_array_equal(_sparse_restore(crop, (0, 0, 3000, 3000), 1500, 1500), expected)
+    mode, ys, ye, xs, xe = nk.resize_mode_and_maps(3000, 3000, 1500, 1500)
+    one = np.ones(1, np.int64)
+    zero = np.zeros(1, np.int64)
+    restored, _ = nk.fill_restored_member_group(
+        crop.ravel(), False, zero, zero, zero, one*3000, one*3000, one.astype(np.uint8),
+        zero, one, 1, np.array([0, 1], np.int64), zero, 3000, 3000, 1500, 1500,
+        ys, ye, xs, xe, mode,
+    )
+    np.testing.assert_array_equal(restored, expected)
+
+
+def test_binary_area_oversized_virtual_crop_keeps_workspace_bounded():
+    from XTA.native_cpu import kernels
+
+    crop = np.broadcast_to(np.uint8(255), (65536, 65536))
+    out = np.zeros((1, 1), np.uint8)
+    kernels.nrrd_area_crop_resize(crop, *crop.shape, 32768, 32768, 0, 0, *crop.shape,
+                                  32767, 32767, out)
+    np.testing.assert_array_equal(out, [[1]])
+
+
+def test_legacy_explicit_signed_prefix_abi_still_uses_binary_weights():
+    import cv2
+    from XTA.native_cpu import kernels
+
+    crop = np.zeros((30, 30), np.uint8)
+    crop[5, 5] = 255
+    prefix = cv2.integral(crop, sdepth=cv2.CV_32S)
+    output = np.ones((1, 1), np.uint8)
+    args = (crop, *crop.shape, 1, 1, 0, 0, *crop.shape, 0, 0, output)
+    kernels.nrrd_area_crop_resize(prefix, *args)
+    assert not output.any()
+    with pytest.raises(TypeError):
+        kernels.nrrd_area_crop_resize(prefix.view(np.uint32), *args)

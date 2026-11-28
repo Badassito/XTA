@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+import zlib
 
 import numpy as np
 import pytest
@@ -91,6 +92,40 @@ def test_background_encoding_journal_is_byte_identical(family, monkeypatch, veri
     assert background[0] == synchronous[0] and background[0]
     assert background[1] == synchronous[1]
     assert background[2] == synchronous[2]
+
+
+@pytest.mark.parametrize('with_scores', [False, True])
+@pytest.mark.parametrize('column_step', [1, -1])
+def test_native_crop_bytes_match_original_strip_encoder(family, monkeypatch, with_scores, column_step):
+    monkeypatch.setenv('XTA_YOLO_SWEEP_NATIVE_VERIFY', '1')
+    monkeypatch.setattr(views, '_CHUNK_BYTES', 79)
+    shape = (1, 4, 43)
+    # Odd rows cross the packed-byte boundary. The same fragmented pixels
+    # exercise the vector path and the non-unit-stride writer fallback.
+    rows, columns = np.indices((3, 37))
+    mask = ((rows + columns) % 3 == 0).astype(np.uint8)[::-1, ::column_step]
+    scores = (29 * rows + 3 * columns).astype(np.uint8)[:, ::column_step] if with_scores else None
+    writer = views.NativeTaskFanoutWriter(family, 'detector', 'view', shape, (60,),
+                                         frame_start=0, expected_frames=1)
+    writer.put(60, 0, mask, scores, bbox=(1, 4, 3, 40))
+    receipt = writer.finish()
+    expected = bytearray()
+    for first, stop in ((0, 2), (2, 3)):
+        piece = mask[first:stop]
+        packed = np.packbits(piece, axis=None, bitorder='little').tobytes()
+        raw = np.where(piece != 0, scores[first:stop], np.uint8(0)).tobytes() if with_scores else b''
+        packed_bytes = zlib.compress(packed, 1)
+        score_bytes = zlib.compress(raw, 1) if with_scores else b''
+        coords = (1 + first, 1 + stop, 3, 40)
+        sizes = (len(packed_bytes), len(score_bytes))
+        decoded = (len(packed), len(raw))
+        prefix = views.struct.pack('<8I', *coords, *sizes, *decoded)
+        crc = zlib.crc32(prefix)
+        expected += views._CHUNK.pack(*coords, *sizes, zlib.crc32(packed_bytes, crc),
+                                      zlib.crc32(score_bytes, crc), *decoded)
+        expected += packed_bytes + score_bytes
+    assert (Path(receipt['path']) / 'payload.bin').read_bytes() == expected
+    assert int(writer.index[0, 0]['chunks']) == 2
 
 
 def test_background_encode_failure_surfaces_on_next_call_and_abort_discards(family):

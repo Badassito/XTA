@@ -13,6 +13,7 @@ import pytest
 from XTA import pipeline, sam_parent_staging as staging
 from XTA.interpolation import _DirectUnionBackingLease
 from XTA.interpolation import _ByteAdmissionPool
+from XTA.tile_pipeline import IndependentTileSets
 from XTA.tta_background import BackgroundDrainBudget
 from XTA.view_prepare import AdmittedViewPrepare
 from tests.test_per_device_gpu_asset_retirement import case
@@ -39,10 +40,10 @@ def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
         parent_dense_retired_events=queues.SimpleQueue(),
         parent_confidence_retired_events=queues.SimpleQueue(),
         parent_mask_retired_events=queues.SimpleQueue(),
-        _drain_parent_mask_ready_events=lambda: None,
-        _flush_ready_postprocessed_tiles=lambda: None, _flush_ready_residual_tiles=lambda: None,
-        view_processing_futures={}, tile_cleanup_futures={}, tile_parent_gate_futures={},
-        tile_bridge_gate_futures={}, tile_consolidation_futures={}, tile_parent_finalization_futures={},
+        _submit_ready_tile_joins=lambda: None,
+        tile_configs_waiting_for_sam={}, tile_configs_waiting_to_join={},
+        view_processing_futures={}, tile_cleanup_futures={}, tile_config_join_futures={},
+        tile_consolidation_futures={}, tile_parent_finalization_futures={},
         physical_view_finalization_futures={}, physical_view_union_futures={},
         output_manager=SimpleNamespace(reap_completed=lambda **_kwargs: None),
         gpu_worker_pending_task_ids=[])
@@ -50,15 +51,11 @@ def pipeline_drain(stage, budget, scheduler, *, sam_context=None):
     unreachable = frozenset('''
         _dispatch_inference_windows _mark_tile_complete _publish_parent_dense_retired
         _mark_view_variant_terminal _maybe_finalize_tile_parent
-        _maybe_submit_tile_consolidations_for_parent _release_tile_result_for_key
-        _retire_parent_dense_view _submit_physical_view_union_reduction _submit_tile_bridge_gate
-        _submit_tile_parent_gate azimuthal_native_output_by_model
+        _release_tile_result_for_key _retire_parent_dense_view _submit_physical_view_union_reduction
+        _sam_parents_ready _submit_tile_config azimuthal_native_output_by_model
         interpolation_stats native_view_support_by_model nrrd_layer_refs
-        parent_bridge_ready parent_bridge_support_by_model parent_mask_support_by_model
-        physical_view_dense_handoff_credit sam_gate_lineage_by_parent
-        physical_view_finalization_refs tile_accumulator_by_set
-        tile_consolidation_completed tile_expected_by_parent tile_parent_bridge_accumulator_by_set
-        tile_parent_mask_accumulator_by_set tilted_native_output_by_model
+        physical_view_dense_handoff_credit physical_view_finalization_refs
+        tile_consolidation_completed tile_expected_by_parent tilted_native_output_by_model
         view_infos_by_name view_prepare_leases view_volumes_by_model physical_view_union_completed
     '''.split())
     return _function(Path(pipeline.__file__).read_text(),
@@ -298,7 +295,7 @@ def test_locked_parent_drain_reaches_wakeable_wait_and_independent_completion(tm
             raise WaitsObserved
     expected_timeout = .1 if wait_mode == 'nonpush_detector' else .002
     namespace = drain.__globals__
-    namespace.update(fanout_consumers=deque(),
+    namespace.update(fanout_consumers=deque(), tile_sets=IndependentTileSets({}),
         _test_drain=drain, _check_loop_limit=check_loop_limit,
         # The drain skips this not-done cleanup, so it stays the sole outer waitable.
         tile_cleanup_futures={} if wait_mode == 'future_free' else {
@@ -362,20 +359,18 @@ def test_denied_probe_keeps_ready_prepared_parent_ahead_of_unrelated_wait(tmp_pa
     ready, unrelated = Future(), Future()
     ready.set_result(SimpleNamespace(model_name='model', view_name='ready',
         pending_component_layers=[], nrrd_layers=[], interpolation_stats=[],
-        native_support_mm=None, parent_mask_support_mm=None, parent_bridge_support_mm=None,
-        final_view_volume_mm=None))
+        native_support_mm=None, final_view_volume_mm=None))
     parents = {ready: ('model', 'ready'), unrelated: ('model', 'unrelated')}
     assert prepared_view_waitables(parents) == [unrelated]
     settled = []
     drain.__globals__.update(
         view_processing_futures=parents,
-        tile_expected_by_parent={}, sam_gate_lineage_by_parent={}, parent_bridge_ready=set(),
+        tile_expected_by_parent={},
         interpolation_stats=[], nrrd_layer_refs=[],
         view_prepare_leases=SimpleNamespace(complete=lambda key, **_kw: settled.append(key) or True),
         view_infos_by_name={'ready': SimpleNamespace(family='cartesian')},
         _mark_view_variant_terminal=lambda *_args: None,
-        _retire_parent_dense_view=lambda *_args, **_kwargs: None,
-        _maybe_submit_tile_consolidations_for_parent=lambda *_args: None)
+        _retire_parent_dense_view=lambda *_args, **_kwargs: None)
     try:
         drain()
         assert settled == [('model', 'ready')]

@@ -143,3 +143,46 @@ def test_completed_view_radius_filter_precedes_hole_fill(backend):
     with mock.patch.object(cleanup, 'yolo_hole_fill_enabled', return_value=True):
         cleanup.cleanup_view_volume_after_prediction_inplace(mask, None, view, 0, 2, backend=backend)
     assert not np.any(mask)  # Filling first would keep the solid component.
+
+
+def test_opencv_radius_keeps_full_raster_distance_rounding_at_cutoff(monkeypatch):
+    # At this origin OpenCV 5 can round sqrt(37) differently after a halo crop.
+    yy, xx = np.ogrid[:20, :32]
+    plane = (((yy - 6) ** 2 + (xx - 1) ** 2) < 37).astype(np.uint8)
+    full_distance = cleanup.cv2.distanceTransform(
+        plane, cleanup.cv2.DIST_L2, cleanup.cv2.DIST_MASK_PRECISE,
+    )
+
+    def distance_for_full_plane(mask, distance_type, mask_size):
+        assert distance_type == cleanup.cv2.DIST_L2
+        assert mask_size == cleanup.cv2.DIST_MASK_PRECISE
+        np.testing.assert_array_equal(mask, plane, strict=True)
+        return full_distance
+
+    # IPP can round by one float32 step differently on repeated calls of equal
+    # shape. Feed the same observed field to the cutoff and the code under test.
+    monkeypatch.setattr(cleanup.cv2, 'distanceTransform', distance_for_full_plane)
+    radius = float(full_distance.max())
+    # Passing a Python float used to compare against float32 NumPy maxima.
+    just_above = np.nextafter(radius, np.inf).item()
+    np.testing.assert_array_equal(
+        cleanup._filter_connected_components_by_min_radius_opencv(plane, radius), plane != 0,
+    )
+    np.testing.assert_array_equal(
+        cleanup._filter_connected_components_by_min_radius_opencv(plane, just_above), plane != 0,
+    )
+
+
+def test_opencv_confidence_crop_uses_original_row_strides_and_unsigned_order():
+    plane = np.zeros((25, 33), np.uint8)
+    plane[2:5, 4:7] = 1
+    plane[8:10, 11:14] = 255
+    confidence = np.zeros_like(plane)[::-1, ::-1]
+    confidence[2, 4] = 128
+    confidence[9, 13] = 127
+    confidence[7, 7] = 255  # Background does not participate in either maximum.
+    expected = np.zeros_like(plane, dtype=bool)
+    expected[2:5, 4:7] = True
+    np.testing.assert_array_equal(
+        cleanup._filter_connected_components_by_min_conf_opencv(plane, confidence, 128), expected,
+    )

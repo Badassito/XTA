@@ -1,5 +1,7 @@
 """CPU broad-phase scheduling agrees with the independent categorical oracle."""
 from dataclasses import replace
+from concurrent.futures import CancelledError
+import threading
 import unittest
 from unittest import mock
 
@@ -20,6 +22,42 @@ def project(data, view, shape, boxes=None, *, bounded=True):
 
 
 class SphericalCpuBoundsTests(unittest.TestCase):
+    def test_dense_rectangles_keep_global_x_coordinates_and_chunk_cancellation(self):
+        shape = (15, 17, 19)
+        view = build_spherical_view_infos(*shape, targets=('transverse',),
+            min_radius=.5, patch_size=25, tilted_views=())[0]
+        radii = np.asarray(view.spherical_radii)
+        source = np.ones((len(radii), 11, 13), np.uint8)
+        first_z = shape[0] // 2
+        bounds = mock.Mock()
+        bounds.block.return_value = (first_z, first_z + 1, 4, 11, 10, 17)
+        base_args = source, view, radii, np.eye(3), shape
+        expected = np.zeros((1, *shape[1:]), np.uint8)
+        full = oracle.project_spherical_block(*base_args, first_z, 1)
+        expected[:, 4:11, 10:17] = full[:, 4:11, 10:17]
+        self.assertTrue(np.any(expected))
+        original = sp._select_spherical_cpu_pull(*base_args, None)
+        cancel = threading.Event()
+        pull = mock.Mock(side_effect=AssertionError('rectangular crop used flat pull'))
+        pull.rectangle = mock.Mock(wraps=original.rectangle)
+        project_args = (*base_args, first_z, 1)
+        with mock.patch.object(sp, '_PULL_CHUNK_VOXELS', 17):
+            np.testing.assert_array_equal(sp._project_spherical_block(*project_args,
+                output_bounds=bounds, cpu_pull=pull), expected)
+            self.assertEqual([call.kwargs['bounds_yx'] for call in pull.rectangle.call_args_list],
+                [(4, 6, 10, 17), (6, 8, 10, 17), (8, 10, 10, 17), (10, 11, 10, 17)])
+
+            def stop_after_chunk(*args, **kwargs):
+                result = original.rectangle(*args, **kwargs)
+                cancel.set()
+                return result
+
+            pull.rectangle = mock.Mock(side_effect=stop_after_chunk)
+            with self.assertRaises(CancelledError):
+                sp._project_spherical_block(*project_args, output_bounds=bounds,
+                    cancel_event=cancel, cpu_pull=pull)
+            pull.rectangle.assert_called_once()
+
     def test_exact_full_oracle_parity_on_faces_patches_rotations_and_restoration(self):
         built = build_spherical_view_infos(33, 35, 37, targets=('transverse',),
             min_radius=.5, patch_size=29, tilted_views=())

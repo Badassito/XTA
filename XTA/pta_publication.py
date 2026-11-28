@@ -16,7 +16,6 @@ import uuid
 import zlib
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -35,6 +34,7 @@ from .pta_augmentation import (
 )
 from .pta_dataset import AUGMENTATION_TAG_LENGTH, OutputCandidate, WarningSink
 from .pta_binary import candidate_binary_output_path, write_binary_mask
+from .native_cpu import kernels
 from .polygon_keyholes import holes_by_parent, splice_holes
 from .runtime import runtime_telemetry_phase
 
@@ -102,16 +102,6 @@ def output_image_suffix(image_format: str) -> str:
     normalized = parse_output_image_format(image_format)
     return f".{normalized}"
 
-@lru_cache(maxsize=32)
-def _yolo_coordinate_text(size: int) -> np.ndarray:
-    """Normalized label text for every pixel coordinate of one frame axis."""
-    scale = float(max(1, size))
-    text = np.array([f"{min(1.0, max(0.0, float(value) / scale)):.6f}" for value in range(size)],
-                    dtype=object)
-    text.flags.writeable = False  # Shared across polygon threads.
-    return text
-
-
 def yolo_label_window(bounds: Sequence[int], shape: Tuple[int, int]) -> Optional[Tuple[int, int, int, int]]:
     """Return the (y0, y1, x0, x1) crop for inclusive mask bounds, or None if empty.
 
@@ -167,10 +157,7 @@ def mask_to_yolo_lines(mask01: np.ndarray, *, warnings: WarningSink, context: st
             else:
                 holes.append(ring)
         pts = splice_holes(pts, holes)
-        # Contour points lie inside the frame, so cached per-axis text is exact.
-        xs = _yolo_coordinate_text(w)
-        text = xs[pts] if w == h else np.stack((xs[pts[:, 0]], _yolo_coordinate_text(h)[pts[:, 1]]), axis=1)
-        lines.append("0 " + " ".join(text.ravel().tolist()))
+        lines.append(kernels.format_yolo_polygon_line(pts, w, h))
     if holes_discarded:
         warnings.add("holes_discarded_during_polygon_export", context)
     return lines

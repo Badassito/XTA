@@ -1,8 +1,7 @@
 """SAM component filtering never re-reads its own source file.
 
-The module identity is hashed once at import. Historical receipts stay bound to
-the numerical helpers through ``_QUALIFIED_NUMERICAL_SOURCE``, whose digest is
-also read once, at import. Effective masks equal the v25.0.2 filter.
+The module identity is hashed once at import. Current masks are
+compared with the v25.0.2 numerical implementation as an independent oracle.
 """
 from __future__ import annotations
 
@@ -21,6 +20,7 @@ from tests.test_sam_cyclic_evidence_replay import bundle_at
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_COMMIT = "5320fbef0655293a85719593f36fffc8a213cea6"  # v25.0.2
+REFERENCE_FILTER_SHA256 = "82daefcb1b6739044fbae4e4c23686b7dbf78496531ef498e70655e5337c1ea2"
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def old_filtering(tmp_path, monkeypatch):
                                 capture_output=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         pytest.skip(f"reference commit {REFERENCE_COMMIT[:7]} is unavailable")
-    assert hashlib.sha256(source).hexdigest() == sam_filtering._QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION
+    assert hashlib.sha256(source).hexdigest() == REFERENCE_FILTER_SHA256
     assert source != Path(sam_filtering.__file__).read_bytes()
     package = tmp_path / "oldpkg"
     package.mkdir()
@@ -84,27 +84,14 @@ def test_effective_masks_match_v25_filter_on_bundle_and_reader(tmp_path, old_fil
         old_value = None if disabled else old_spec
         old = [old_filtering.measure_effective_raw_mask(bundle, r, f, old_value) for r, f in frames]
         plain = [sam_filtering.measure_effective_raw_mask(bundle, r, f, new_value) for r, f in frames]
-        # Historical (v25.0.2) specs remain accepted by the edited module.
-        historical = [sam_filtering.measure_effective_raw_mask(bundle, r, f, old_value) for r, f in frames]
         with bundle.reader() as reader:
             guarded = [sam_filtering.measure_effective_raw_mask(reader, r, f, new_value) for r, f in frames]
             via_reader = [reader.measure_effective_raw_mask(r, f, new_value) for r, f in frames]
-        for (om, od), *others in zip(old, plain, historical, guarded, via_reader):
+        for (om, od), *others in zip(old, plain, guarded, via_reader):
             for nm, nd in others:
                 assert nm.dtype == om.dtype and nm.shape == om.shape and nm.strides == om.strides
                 assert nm.flags.writeable == om.flags.writeable
                 assert nm.tobytes() == om.tobytes() and nd == od
-
-
-def test_filter_numerics_stay_pinned_and_previous_release_is_qualified():
-    assert sam_filtering.IMPLEMENTATION_SHA256 != sam_filtering._QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION
-    assert sam_filtering.IMPLEMENTATION_SHA256 != sam_filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION
-    assert sam_filtering._compatible_filter_implementation(sam_filtering._QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION)
-    assert sam_filtering._compatible_filter_implementation(sam_filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION)
-    assert (sam_filtering._numerical_source_sha256(sam_filtering._numerical_helpers())
-            == sam_filtering._QUALIFIED_NUMERICAL_SOURCE)
-    assert sam_filtering._compatible_filter_implementation(sam_filtering.IMPLEMENTATION_SHA256)
-    assert not sam_filtering._compatible_filter_implementation("0" * 64)
 
 
 def test_unqualified_receipt_implementation_is_still_rejected(tmp_path):
@@ -123,14 +110,10 @@ def test_no_filter_path_reads_the_filter_source(tmp_path, monkeypatch):
     bundle = bundle_at(tmp_path)
     receipt = select_sam_proposals(bundle, policy={"sam_bridge_policy": "permissive"})
     spec = sam_filtering.build_mask_filter(bundle, min_radius=1.0)
-    historical = dict(spec, implementation_sha256=sam_filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION)
-    historical.pop("sha256")
-    historical["sha256"] = sam_filtering._fingerprint(historical)
     frames = _frames(bundle)
     reads = _forbid_filter_source_reads(monkeypatch)
     for run_id, frame in frames:
         sam_filtering.measure_effective_raw_mask(bundle, run_id, frame, spec)
-        sam_filtering.measure_effective_raw_mask(bundle, run_id, frame, historical)
     sam_filtering.build_mask_filter(bundle, min_radius=1.0)
     sam_filtering.filter_sam_components(np.ones((3, 3), bool), 1.0)
     with bundle.reader() as reader:

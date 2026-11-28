@@ -1,6 +1,7 @@
 """Native worker/owner transactions using the production actor wire encoder."""
 import os
 import socket
+import sys
 import threading
 import unittest
 
@@ -122,6 +123,38 @@ class PreparedSchedulerTests(unittest.TestCase):
         with self.assertRaises(EOFError):
             recv_dispatch(actor)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires proc fd table")
+    def test_concurrent_close_calls_wait_for_native_socket_retirement(self):
+        registered = set()
+        for worker in range(12):
+            local, remote = socket.socketpair()
+            self.addCleanup(remote.close)
+            with local:
+                registered.add(os.readlink(f"/proc/self/fd/{local.fileno()}"))
+                self.owner.register_worker(worker, 5, os.getpid(), CPU, 1, local)
+        barrier = threading.Barrier(5, timeout=3)
+        survivors = []
+
+        def close_and_inspect():
+            barrier.wait()
+            self.owner.close()
+            for fd in os.listdir("/proc/self/fd"):
+                try:
+                    target = os.readlink(f"/proc/self/fd/{fd}")
+                except FileNotFoundError:
+                    continue  # The descriptor used to list the directory.
+                if target in registered:
+                    survivors.append(target)
+
+        workers = [threading.Thread(target=close_and_inspect, daemon=True) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(3)
+            self.assertFalse(worker.is_alive(), "native close failed to join worker threads")
+        self.assertFalse(survivors, "native close returned before retiring all sockets")
+
     def test_device_fence_retirement_remains_possible_after_fault(self):
         gate = self.owner.try_acquire_stage(0)
         self.assertIsNotNone(gate)
@@ -238,6 +271,39 @@ class PreparedSchedulerTests(unittest.TestCase):
         self.assertTrue(self.owner.snapshot()["retirement_pressure"])
         self.owner.set_parent_remaining_bytes(*parent, 160)
         self.assertFalse(self.owner.snapshot()["retirement_pressure"])
+
+    def test_tile_and_oversize_host_restore_do_not_share_escape_capacity(self):
+        actor = self.actor()
+        self.owner.configure_tile_results(64, 1, 16)
+
+        def complete_tile(parent, generation):
+            self.owner.submit_prepared(10 + parent, parent, b"tile", CPU)
+            lease, payload = recv_dispatch(actor)
+            self.assertEqual(payload, b"tile")
+            send_receipt(actor, lease, "installed")
+            send_receipt(actor, lease, "final")
+            self.assertEqual(self.owner.wait_publication(2), (parent, generation))
+            self.owner.retire_parent(parent, generation)
+
+        first = self.owner.declare_tile_result(1, 16)
+        self.assertEqual(self.owner.wait_preparation(2), (1, first))
+        host = self.owner.declare_parent(2, 0, 150, allow_oversize_host=True)
+        second = self.owner.declare_tile_result(3, 16)
+        self.assertIsNone(self.owner.wait_preparation(0.05))
+        complete_tile(1, first)
+        # The queued tile can refill even though the oversized restore was
+        # declared earlier. A host join may later need the tile's sparse output.
+        self.assertEqual(self.owner.wait_preparation(2), (3, second))
+        complete_tile(3, second)
+        self.assertEqual(self.owner.wait_preparation(2), (2, host))
+        third = self.owner.declare_tile_result(4, 16)
+        self.assertIsNone(self.owner.wait_preparation(0.05))
+        self.assertEqual(self.owner.snapshot()["oversize_host_bytes"], 50)
+        self.assertEqual(self.owner.snapshot()["tile_result_bytes"], 0)
+        self.owner.host_prepared(2, host)
+        self.assertEqual(self.owner.wait_publication(2), (2, host))
+        self.owner.retire_parent(2, host)
+        self.assertEqual(self.owner.wait_preparation(2), (4, third))
 
     def test_immutable_parent_refills_after_final_without_python_preparation(self):
         actor = self.actor(1, GPU, window=1, device=0)

@@ -8,9 +8,7 @@ and final-survival checks must all use these accessors with the same receipt.
 from __future__ import annotations
 
 from collections.abc import Mapping
-import functools
 import hashlib
-import inspect
 import json
 
 import numpy as np
@@ -22,25 +20,6 @@ from .file_hashing import source_sha256
 SCHEMA = "xta.sam_component_filter/1"
 IMPLEMENTATION_SHA256 = source_sha256(__file__)
 _MAX_COMPONENT_RECORDS = 128
-_QUALIFIED_LEGACY_IMPLEMENTATION = "bac0f301626e20500c3b8beab261b1f9ea64289de2af2add26b883507495a780"
-_QUALIFIED_PREVIOUS_IMPLEMENTATION = "96278bbc549acb81c54f1e6f8124faa1d091ffbca378e98cd73d09040f44368c"
-_QUALIFIED_RADIUS_ONLY_IMPLEMENTATION = "c67e0fed11962aba7b106cb7dce3f60b5eb6ce44b042159cb73cc99767c78cf7"
-_QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION = "dc97330222b3ca987787cff5451525d8917a43ece38058221d091c99a789c10b"
-# Module source from v24.1.3 through v25.0.2; only the source guard changed after it.
-_QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION = "82daefcb1b6739044fbae4e4c23686b7dbf78496531ef498e70655e5337c1ea2"
-# Module source from v25.0.3 through v26.0.1; only the mid-run source guards were
-# removed and source hashing became line-ending stable after it.
-_QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION = "6dd89b0929e8d3407750654cdf9606d2dfd3fe1689c3549e0debd04a95152bdc"
-# The line-ending-stable Python reduction used from v26.0.2 through v26.2.0.
-_QUALIFIED_V26_PYTHON_IMPLEMENTATION = "3c89c5c507172c981ebdeddacc9a91fe4a2168fae4a10d2b02d3509da6cab53c"
-_QUALIFIED_IMPLEMENTATIONS = frozenset({_QUALIFIED_LEGACY_IMPLEMENTATION, _QUALIFIED_PREVIOUS_IMPLEMENTATION,
-    _QUALIFIED_RADIUS_ONLY_IMPLEMENTATION, _QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION,
-    _QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION, _QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION,
-    _QUALIFIED_V26_PYTHON_IMPLEMENTATION})
-# Qualified AOT port of the historical numerical helpers. Both source pins
-# must match when interpreting a receipt issued for an older implementation.
-_QUALIFIED_NUMERICAL_SOURCE = "de84aa2e93bb04bb63a575dfaf539e84ac903fbcda5d0a9010aba7933040060a"
-_QUALIFIED_NATIVE_SOURCE = "23c8ccdcb70eb666a65c32476c15119a6c7853a1d0d7df13157ef387d8dd6109"
 
 
 def _fingerprint(value):
@@ -70,32 +49,6 @@ def build_mask_filter(bundle, *, enabled=True, min_radius=None):
         spec["native_implementation"] = native_cpu_provenance("retina")
     spec["sha256"] = _fingerprint(spec)
     return spec
-
-
-def _numerical_helpers():
-    return (_readonly, _component_maxima, _component_inscribed_radii, filter_sam_components)
-
-
-@functools.lru_cache(maxsize=8)
-def _numerical_source_sha256(functions):
-    """Digest of the numerical helpers' text; None when their source is unavailable."""
-    try:
-        parts = [function.__name__ + "\n" +
-                 inspect.getsource(getattr(function, "py_func", function)).replace("\r\n", "\n").rstrip("\n") + "\n"
-                 for function in functions]
-    except (OSError, TypeError):
-        return None
-    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()
-
-
-def _compatible_filter_implementation(identifier):
-    """Accept the qualified v25 receipts only while their exact numerics remain."""
-    if identifier == IMPLEMENTATION_SHA256:
-        return True
-    if not isinstance(identifier, str) or identifier not in _QUALIFIED_IMPLEMENTATIONS:
-        return False
-    return (_numerical_source_sha256(_numerical_helpers()) == _QUALIFIED_NUMERICAL_SOURCE
-            and native_cpu_provenance("retina")["source_sha256"] == _QUALIFIED_NATIVE_SOURCE)
 
 
 def _compatible_native_implementation(record):
@@ -151,12 +104,12 @@ def _spec(value):
     thresholds = result.get("thresholds_by_group")
     if (not isinstance(thresholds, Mapping) or any(isinstance(v, bool) or not np.isfinite(float(v)) or float(v) < 0 for v in thresholds.values())):
         raise ValueError("SAM component filter thresholds must be finite and nonnegative")
-    if result.get("enabled"):
-        implementation = result.get("implementation_sha256")
-        if not _compatible_filter_implementation(implementation):
-            raise ValueError("SAM component filter implementation differs from its selection receipt")
-        if implementation == IMPLEMENTATION_SHA256 and not _compatible_native_implementation(result.get("native_implementation")):
-            raise ValueError("SAM component filter native implementation differs from its selection receipt")
+    if result.get("implementation_sha256") != IMPLEMENTATION_SHA256:
+        raise ValueError("SAM component filter implementation differs from its selection receipt; "
+                         "regenerate the selection with this version")
+    if result["enabled"] and not _compatible_native_implementation(result.get("native_implementation")):
+        raise ValueError("SAM component filter native implementation differs from its selection receipt; "
+                         "regenerate the selection with this version")
     return result
 
 
@@ -265,6 +218,3 @@ def effective_candidate_mask(bundle, run_id, frame, receipt_or_filter=None):
     _spec(receipt_or_filter)
     from .sam_mask_reader import effective_candidate_mask as central_candidate_mask
     return central_candidate_mask(bundle, run_id, frame, receipt_or_filter)
-
-
-_numerical_source_sha256(_numerical_helpers())  # read the helper text once, at import, from the source just loaded

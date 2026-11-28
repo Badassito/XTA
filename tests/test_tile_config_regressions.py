@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import tempfile
-import threading
 import types
 import unittest
 from pathlib import Path
@@ -10,7 +9,7 @@ from unittest import mock
 import numpy as np
 
 
-from XTA import assembly, finalization, geometry
+from XTA import assembly, geometry
 
 
 class MultipleTileConfigurationTests(unittest.TestCase):
@@ -25,7 +24,6 @@ class MultipleTileConfigurationTests(unittest.TestCase):
         first[0, 0, 0] = np.uint8(255)
         second = np.zeros((1, 2, 2), dtype=np.uint8)
         second[0, 1, 1] = np.uint8(255)
-        destination = np.zeros_like(first)
         view = geometry.ViewInfo(
             name='transverse__tta_r000p000',
             num_slices=1, src_h=2, src_w=2, pad_mode='clamp',
@@ -61,9 +59,6 @@ class MultipleTileConfigurationTests(unittest.TestCase):
             nrrd_config_ids.append(str(kwargs['tile_config_id']))
             return types.SimpleNamespace(stage=str(kwargs['stage']))
 
-        def union_into(destination_mm: np.ndarray, source_mm: np.ndarray, **_kwargs: object) -> None:
-            np.bitwise_or(destination_mm, source_mm, out=destination_mm)
-
         with (
             tempfile.TemporaryDirectory() as tmp,
             mock.patch.object(
@@ -77,18 +72,15 @@ class MultipleTileConfigurationTests(unittest.TestCase):
                 'materialize_interpolation_component_nrrd_view_layer',
                 side_effect=record_layer,
             ),
-            mock.patch.object(finalization, 'union_volume_into_volume', side_effect=union_into),
             mock.patch.object(assembly, 'view_processing_min_radius', return_value=0.0),
             mock.patch.object(assembly, 'view_processing_search_angle', return_value=15.0),
         ):
             results = []
             for config, accumulator in zip(configs, (first, second)):
-                results.append(assembly.finalize_consolidated_tile_volume_for_parent(
+                results.append(assembly.finalize_independent_tile_config(
                     model_name='model',
                     view=view,
                     tile_accumulator_mm=accumulator,
-                    destination_mm=destination,
-                    destination_lock=threading.Lock(),
                     temp_dir=Path(tmp),
                     interpolate=1,
                     interpolation_walk_back=1,
@@ -99,7 +91,6 @@ class MultipleTileConfigurationTests(unittest.TestCase):
                     slice_workers=1,
                     interpolation_task_workers=1,
                     nrrd_layers_enabled=True,
-                    tile_parent_mask_accumulator_mm=accumulator,
                     config_id=config.config_id,
                 ))
 
@@ -132,13 +123,13 @@ class MultipleTileConfigurationTests(unittest.TestCase):
                     source='tile',
                     mask_kind='yolo',
                     tile_config_id=config.config_id,
-                    tile_acceptance='parent_mask',
+                    tile_acceptance='independent',
                 )
                 for config in configs
             },
             {
-                'Transverse_R000p000_tile_s2048_st1024_yolo_parent_mask',
-                'Transverse_R000p000_tile_s1536_st768_yolo_parent_mask',
+                'Transverse_R000p000_tile_s2048_st1024_yolo_independent',
+                'Transverse_R000p000_tile_s1536_st768_yolo_independent',
             },
         )
         self.assertEqual(
@@ -146,7 +137,7 @@ class MultipleTileConfigurationTests(unittest.TestCase):
             ['s2048_st1024', 's1536_st768'],
         )
         np.testing.assert_array_equal(
-            destination,
+            results[0].final_accumulator_mm | results[1].final_accumulator_mm,
             np.array([[[255, 0], [0, 255]]], dtype=np.uint8),
         )
 

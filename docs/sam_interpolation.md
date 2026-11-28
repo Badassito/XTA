@@ -609,14 +609,14 @@ coverage, containment violations, and tracker scores are retained before
 publication cleanup. Structural failures and incomplete evidence cannot be
 converted into a successful empty bridge by relaxing a quality policy.
 
-The main pipeline's component-gated OR is used for both backends. Direct parent
-detector support admits whole original tile components first. Residual tile
-components are then evaluated against the completed selected parent bridge
-union. Accepted detections are consolidated into parent-view coordinates per
-tile configuration before running that same backend's tiled interpolation.
-Rejected SAM runs never provide tile rescue. A tile observation rescued by a
-selected parent SAM bridge remains a detector observation, with its admission
-dependency recorded; consolidated tile bridges cannot rescue their own seeds.
+The native scheduler admits tile inference and cleanup independently. Cleaned
+tile detections, including any azimuthal seam contributions, are placed in
+view coordinates and unioned per detector, concrete angle and policy pass, and
+tile configuration. Each completed configuration supplies one observation
+domain for SDF or SAM interpolation. This preserves components and tracker
+contexts that cross tile boundaries. Only the final output join needs the
+completed full-frame result. Tile confidence comes from the original detector
+measurements, with the maximum used where tiles overlap.
 
 ## Selected output and retained evidence
 
@@ -1020,7 +1020,6 @@ or write-domain invariants.
 relaxes stock quality checks and disables component-radius filtering while
 retaining structural validity. Label such
 results as permissive candidates; they do not become stock-selected repairs.
-The unchanged parent bridge tile gate still applies to their resulting support.
 This legacy preset retains the narrow write domain, so it is not a pixel
 superset of the new fixed-context v6/v7 output. Research comparisons distinguish
 unqualified full raw support from these clipped candidate masks.
@@ -1046,8 +1045,8 @@ raw-candidate ablation.
 The [historical policy reference](sam_history.md#historical-guarded-rescue-explicit-whole-v4--tiled-v5)
 retains the explicit v4/v5 selection contracts, thresholds, resource bounds
 and receipt fields. Current connected-branch defaults disable guarded rescue.
-Reselecting old raw evidence creates a new receipt and must still validate
-dependent tile-admission fingerprints.
+Reselecting old raw evidence creates a new receipt. Replaying a historical
+gated run also requires its recorded admission inputs.
 
 ## Replay and validation boundaries
 
@@ -1111,8 +1110,8 @@ replay additionally needs the captured view recipe and native component.
 ### Evidence selection and scope replay
 
 Fixed-evidence replay changes proposal selection without loading the detector
-or SAM model. It requires the same complete, structurally valid proposals,
-planning inputs, and gate snapshot. Changes to crop geometry, model,
+or SAM model. It requires the same complete, structurally valid proposals
+and planning inputs. Changes to crop geometry, model,
 preprocessing, group inventory, missing frame coverage, or admitted detector
 observations require generation again.
 Replay resolves crop mode from saved evidence, rather than the current
@@ -1121,11 +1120,10 @@ geometry. Historical v2/v3 selection receipts keep their recorded decisions;
 an explicit new selection uses its resolved v6/v7 or requested legacy policy
 identity. Changing crop mode requires generation.
 
-Changing parent bridge selection can change tile admission and therefore the
-downstream proposal inventory. A changed upstream gate-support fingerprint
-invalidates affected downstream evidence or requires regeneration. A comparison
-on the original frozen proposal set must identify that snapshot; it is not a
-fresh end-to-end run under a different admission result.
+Historical gated runs also bind their downstream proposal inventory to the
+recorded gate snapshot. Replaying that inventory requires the same upstream
+support fingerprint. A comparison on a frozen proposal set identifies that
+snapshot. Regenerate proposals to evaluate a different observation inventory.
 
 Proposal comparison accepts a retained bundle directory or a live archive
 reference directly, without loading detector or SAM runtimes. Portable export

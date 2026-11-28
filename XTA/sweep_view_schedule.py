@@ -85,7 +85,7 @@ class SweepViewSchedule:
         if gpu and cpu:
             self.reason = 'hybrid backend selection can change scalar detector precision and ownership'
         elif tiles:
-            self.reason = 'tile masks require cutoff-specific parent and bridge gates'
+            self.reason = 'shared native confidence fanout is not yet implemented for tile configurations'
         elif args.augmentation_ratio > 1:
             self.reason = 'external augmentation requires per-task inverse mapping'
         elif args.min_conf or args.min_radius or 'yolo' in (args.enable_2D_hole_fill or ()):

@@ -6,7 +6,9 @@ FOV oracle for dense masks. These tests do not import the benchmark candidate.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -71,6 +73,91 @@ def cpu_environment(monkeypatch):
     monkeypatch.setenv('YOLO_TTA_GPU_BACKPROJECT', '0')
     monkeypatch.setenv('YOLO_TTA_DELAY_NATIVE_EXPANSION', '1')
     monkeypatch.setenv('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', '7')
+
+
+@pytest.mark.parametrize('base', ['sagittal', 'coronal'])
+@pytest.mark.parametrize('reason', ['eligible', 'numeric', 'unbound', 'small', 'legacy_callback', 'disabled'])
+def test_upright_native_pull_requires_a_qualified_binary_gpu_request(monkeypatch, tmp_path, base, reason):
+    view = make_view(base)
+    source = np.zeros((view.num_slices, view.src_h, view.src_w), np.uint8)[:, :, ::-1]
+    source[:, 2:4, 1] = 2 if reason == 'numeric' else 1
+    shape = (17, 9, 11)
+
+    def legacy_callback(*args):
+        pytest.fail('This test only examines dispatch')
+
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '' if reason != 'disabled' else '-1')
+    monkeypatch.setenv('YOLO_TTA_GPU_BACKPROJECT', '1')
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_CUDA', '1')
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled')
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', str(np.prod(shape) + 1 if reason == 'small' else 0))
+    monkeypatch.setattr(bp, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR', SimpleNamespace(is_bound=reason != 'unbound'))
+
+    def native(actual, *_args, **kwargs):
+        assert actual is source
+        assert kwargs['output_shape'] == shape
+        np.testing.assert_array_equal(kwargs['known_row_occupancy'], np.any(source, axis=(0, 2)))
+        return 'native'
+
+    monkeypatch.setattr(bp, '_backproject_native_destination_pull', native)
+    monkeypatch.setattr(bp, '_backproject_cartesian_azimuthal_generic', lambda *a, **kw: 'generic')
+    actual = bp.backproject_azimuthal_volume_to_volume(
+        source, view, tmp_path / 'unused.u8', 'upright routing',
+        out_shape_tyx=shape, reserve_bytes=0,
+        projection_block_callback=legacy_callback if reason == 'legacy_callback' else None,
+    )
+    assert actual == ('native' if reason == 'eligible' else 'generic')
+
+
+@pytest.mark.skipif(os.environ.get('XTA_TEST_NATIVE_PULL_CUDA') != '1', reason='explicit CUDA qualification')
+@pytest.mark.parametrize('base', ['sagittal', 'coronal'])
+def test_actual_upright_cuda_sink_matches_whole_cross_oracle(tmp_path, monkeypatch, request, base):
+    import torch
+    from tests.native_stage_test_support import native_coordinator
+
+    assert torch.cuda.is_available()
+    coordinator = native_coordinator(request, monkeypatch)
+    coordinator.configure_workers((0,))
+    coordinator.set_inference_priority_active(False)
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')
+    monkeypatch.setenv('YOLO_TTA_GPU_BACKPROJECT', '1')
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_CUDA', '1')
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_BACKEND', 'compiled')
+    monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_GPU_MIN_VOXELS', '0')
+    monkeypatch.setenv('YOLO_TTA_GPU_PROJECTION_OVERLAP_GIB', '0')
+
+    view = make_view(base)
+    source = np.random.default_rng(653).integers(0, 2, (view.num_slices, 5, 5), dtype=np.uint8)[:, :, ::-1]
+    source.flags.writeable = False
+    shape = (17, 4, 21)
+    expected = whole_cross_expected(source, view, shape)
+    assert expected.any()
+    before = source.tobytes()
+    stages = []
+    acquire = bp._try_native_pull_cuda_stage
+
+    def track_cuda(*args, **kwargs):
+        stage = acquire(*args, **kwargs)
+        assert stage is not None, 'Upright projection did not acquire the real CUDA stage'
+        stages.append(stage)
+        return stage
+
+    monkeypatch.setattr(bp, '_try_native_pull_cuda_stage', track_cuda)
+    monkeypatch.setattr(bp, '_backproject_cartesian_azimuthal_generic',
+                        lambda *args, **kwargs: pytest.fail('Unexpected legacy dispatch'))
+
+    class EmptyAwareCapture(Capture):
+        def consume_empty_range(self, first, count):
+            self(first, np.zeros((count, *shape[1:]), np.uint8))
+
+    consumer = EmptyAwareCapture()
+    result = project(source, view, shape, consumer, tmp_path)
+    assert result.shape == shape and stages
+    assert consumer.firsts == list(range(shape[0]))
+    np.testing.assert_array_equal(np.concatenate(consumer.blocks), expected)
+    assert source.tobytes() == before and not consumer.aborted
+    assert all(stage.session is None and stage.lease._released for stage in stages)
+    assert not coordinator.snapshot()['stage_leases']
 
 
 @pytest.mark.parametrize('base', ['sagittal', 'coronal'])

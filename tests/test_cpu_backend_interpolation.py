@@ -59,6 +59,27 @@ def test_compiled_workspace_growth_preserves_all_fragmented_candidates() -> None
         cache.clear()
 
 
+@pytest.mark.parametrize('capacity, expected_size, overflow', [(64, 0, 1), (79, 79, 0), (1024, 79, 0)])
+def test_compiled_candidates_allocate_exact_arrays_after_a_wide_step(capacity, expected_size, overflow):
+    labels = np.zeros((2, 1, 79), np.uint16)
+    labels[0] = 1
+    labels[1] = np.arange(2, 81, dtype=np.uint16)
+    sdf = np.ones((1, 79), np.float32)
+    result = interpolation.kernels.interpolation_find_projection_candidates(
+        labels, np.empty(0, np.uint16), np.empty(0, np.int64), np.empty((0, 4), np.int64),
+        False, 2, 79, np.zeros(1, np.uint32), np.empty(0, np.int64), sdf,
+        0, 0, 0, 0, 39, 1, 1, 1, 0., 100, False, False, capacity,
+    )
+    assert result[-2:] == (expected_size, overflow)
+    for column in result[:-2]:
+        assert column.shape == (expected_size,) and column.dtype == np.int64
+    if expected_size:
+        np.testing.assert_array_equal(result[0], np.arange(2, 81))
+        np.testing.assert_array_equal(result[1], np.ones(79))
+        np.testing.assert_array_equal(result[3], np.arange(79))
+        np.testing.assert_array_equal(result[5], (np.arange(79) - 39) ** 2)
+
+
 def test_compiled_candidate_kernel_error_propagates() -> None:
     labels = np.zeros((3, 32, 32), dtype=np.uint16)
     labels[0, 10:20, 10:20] = 1

@@ -20,11 +20,7 @@ class CvolSource {
     // CVOL is a persisted little-endian format. The rows can be unaligned and
     // strided (including backwards); they are 48 bytes by the format contract.
     template <class T> T field(I frame, int offset) const {
-        const auto *p = reinterpret_cast<const unsigned char *>(records.ptr(frame, offset));
-        T result = 0;
-        for (std::size_t i = 0; i < sizeof(T); ++i)
-            result |= static_cast<T>(p[i]) << (8 * i);
-        return result;
+        return load_little_endian<T>(records.ptr(frame, offset));
     }
 
     std::uint8_t read(I frame, I row, I column, Stats &stats) const {

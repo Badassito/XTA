@@ -291,6 +291,154 @@ double positive_remainder(double value, double period) noexcept {
     return remainder < 0.0 ? remainder + period : remainder;
 }
 
+// NumPy supplies the strip's original float64 angles, periods and starting
+// columns. Its vector atan2 can round differently from scalar libm at a
+// half-column boundary. Keep all subsequent wrap additions in the same order.
+std::uint64_t radial_columns(double column, double period, Index width, std::uint64_t limit,
+                             const Buffer* output = nullptr, Index first = 0) noexcept {
+    if (period <= 1.0) {
+        const auto count = static_cast<std::uint64_t>(width);
+        if (count <= limit && output) {
+            for (Index i = 0; i < width; ++i) {
+                output->store(static_cast<std::int32_t>(i), first + i);
+            }
+        }
+        return count;
+    }
+    std::uint64_t count = 0;
+    while (true) {
+        const double rounded = std::nearbyint(column);
+        if (!(rounded >= 0.0 && rounded < static_cast<double>(width))) {
+            return count;
+        }
+        if (count == limit) {
+            return limit + 1;
+        }
+        if (output) {
+            output->store(static_cast<std::int32_t>(rounded), first + static_cast<Index>(count));
+        }
+        ++count;
+        column += period;
+    }
+}
+
+class RadialPlanStrip {
+public:
+    explicit RadialPlanStrip(const Arguments& a) : positions(a[0], "Radial strip positions", 1),
+            periods(a[1], "Radial strip periods", 1), first_columns(a[2], "Radial starting columns", 1) {
+        positions.require<std::int64_t>();
+        periods.require<double>();
+        first_columns.require<double>();
+        if (periods.shape(0) != positions.shape(0) || first_columns.shape(0) != positions.shape(0)) {
+            value_error("Radial strip candidate arrays must have matching lengths");
+        }
+    }
+
+    std::uint64_t collect(Index candidate, Index width, std::uint64_t limit,
+                          const Buffer* output = nullptr, Index first = 0) const noexcept {
+        return radial_columns(first_columns.load<double>(candidate), periods.load<double>(candidate),
+                              width, limit, output, first);
+    }
+
+    const Buffer positions, periods, first_columns;
+};
+
+PyObject* count_radial_plan_strip(PyObject*, PyObject* args) {
+    return protect([&] {
+        const Arguments a(args, 8);
+        const RadialPlanStrip strip(a);
+        const Buffer candidates(a[3], "Radial candidate shells", 1);
+        const Buffer shells(a[4], "Radial plane shells", 1, true);
+        const Buffer offsets(a[5], "Radial column offsets", 1, true);
+        candidates.require<std::int32_t>();
+        shells.require<std::int32_t>();
+        offsets.require<std::uint32_t>();
+        const Index width = a.index(6), ceiling = a.index(7);
+        if (width <= 0 || static_cast<std::uint64_t>(width - 1) > std::numeric_limits<std::int32_t>::max()
+            || ceiling < 0 || static_cast<std::uint64_t>(ceiling) > std::numeric_limits<std::uint32_t>::max()
+            || candidates.shape(0) != strip.positions.shape(0)
+            || offsets.shape(0) != checked_add(shells.shape(0), 1)) {
+            value_error("Invalid Radial column counting dimensions or ceiling");
+        }
+        std::uint64_t total = offsets.load<std::uint32_t>(0);
+        const auto limit = static_cast<std::uint64_t>(ceiling);
+        bool admitted = total <= limit;
+        {
+            GilRelease release;
+            Index candidate = 0;
+            for (Index pixel = 0; admitted && pixel < shells.shape(0); ++pixel) {
+                auto shell = std::int32_t{-1};
+                if (candidate < strip.positions.shape(0) && strip.positions.load<std::int64_t>(candidate) == pixel) {
+                    const auto count = strip.collect(candidate, width, limit - total);
+                    if (count > limit - total) {
+                        admitted = false;
+                        break;
+                    }
+                    // Retain all geometrically valid shells through counting.
+                    // Fill needs the same angle-vector membership even when
+                    // some pixels have no active column in a partial arc.
+                    shell = candidates.load<std::int32_t>(candidate);
+                    if (shell < 0) {
+                        throw std::invalid_argument("Invalid Radial candidate shell");
+                    }
+                    total += count;
+                    ++candidate;
+                }
+                shells.store(shell, pixel);
+                offsets.store(static_cast<std::uint32_t>(total), pixel + 1);
+            }
+            if (admitted && candidate != strip.positions.shape(0)) {
+                throw std::invalid_argument("Radial strip candidate positions must be ordered and within the strip");
+            }
+        }
+        if (!admitted) {
+            Py_RETURN_NONE;
+        }
+        return PyLong_FromUnsignedLongLong(total);
+    });
+}
+
+PyObject* fill_radial_plan_strip(PyObject*, PyObject* args) {
+    return protect([&] {
+        const Arguments a(args, 7);
+        const RadialPlanStrip strip(a);
+        const Buffer shells(a[3], "Radial plane shells", 1, true);
+        const Buffer offsets(a[4], "Radial column offsets", 1);
+        const Buffer columns(a[5], "Radial native columns", 1, true);
+        shells.require<std::int32_t>();
+        offsets.require<std::uint32_t>();
+        columns.require<std::int32_t>();
+        const Index width = a.index(6);
+        if (width <= 0 || static_cast<std::uint64_t>(width - 1) > std::numeric_limits<std::int32_t>::max()
+            || offsets.shape(0) != checked_add(shells.shape(0), 1)) {
+            value_error("Invalid Radial column fill dimensions");
+        }
+        {
+            GilRelease release;
+            Index previous = -1;
+            for (Index candidate = 0; candidate < strip.positions.shape(0); ++candidate) {
+                const auto pixel = strip.positions.load<std::int64_t>(candidate);
+                if (pixel <= previous || pixel >= offsets.shape(0) - 1) {
+                    throw std::invalid_argument("Radial strip candidate positions must be ordered and within the strip");
+                }
+                const auto first = offsets.load<std::uint32_t>(static_cast<Index>(pixel));
+                const auto stop = offsets.load<std::uint32_t>(static_cast<Index>(pixel + 1));
+                if (stop < first || stop > static_cast<std::uint64_t>(columns.shape(0))) {
+                    throw std::invalid_argument("Radial CSR column offsets exceed the admitted storage");
+                }
+                const auto count = std::uint64_t{stop} - first;
+                if (count == 0) {
+                    shells.store(std::int32_t{-1}, static_cast<Index>(pixel));
+                } else if (strip.collect(candidate, width, count, &columns, static_cast<Index>(first)) != count) {
+                    throw std::invalid_argument("Radial geometry changed between counting and filling columns");
+                }
+                previous = static_cast<Index>(pixel);
+            }
+        }
+        Py_RETURN_NONE;
+    });
+}
+
 class PlanFreeProjection {
 public:
     PlanFreeProjection(const Arguments& a)
@@ -601,6 +749,8 @@ PyObject* pack_radial_source_block(PyObject*, PyObject* args) {
 PyMethodDef methods[] = {
     {"project_radial_block", project_radial_block, METH_VARARGS, nullptr},
     {"pull_radial_range_into", pull_radial_range_into, METH_VARARGS, nullptr},
+    {"count_radial_plan_strip", count_radial_plan_strip, METH_VARARGS, nullptr},
+    {"fill_radial_plan_strip", fill_radial_plan_strip, METH_VARARGS, nullptr},
     {"bucket_shell_pixels", bucket_shell_pixels, METH_VARARGS, nullptr},
     {"pack_radial_source_block", pack_radial_source_block, METH_VARARGS, nullptr},
     {nullptr, nullptr, 0, nullptr},

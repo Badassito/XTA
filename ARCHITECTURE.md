@@ -827,8 +827,9 @@ concurrently and join one shared tracker without changing their configured
 device or worker-slot identities. With fleet startup credit owned, the first admitted cohort permits
 parent work; later cohort startup
 and failures remain tracked. A cohort resource refusal falls back only after
-its attempted workers settle. Valid empty detector metadata keeps startup lazy;
-nonempty tile callbacks warm before taking their own parent grant. Live SAM
+its attempted workers settle. Valid empty detector metadata keeps startup lazy.
+Nonempty tile configurations request SAM work after their own observation set
+has completed. Live SAM
 residency continues to forbid YOLO reuse on the same GPU.
 The H100 profile uses Meta's FA3 attention path: FP8 E4M3 Q/K/V with BF16
 attention outputs and BF16 runtime autocast. Stored weights remain FP32; this
@@ -1010,15 +1011,15 @@ cyclic addresses through O(selected owners) lookup descriptors within its existi
 mutable or rebound metadata falls back to the original traversal. This native
 baseline must settle before dependent extrapolation starts, independently of
 later source-grid projection.
-The main component gate uses a direct-parent and residual-parent-bridge
-whole-component OR.
-It receives completed selected parent support. Admitted tile observations are
-then consolidated in parent coordinates before SAM plans the tiled scope.
-Gate-support fingerprints preserve dependency lineage for later replay.
+The native scheduler funds whole tile results through a separate byte and
+ticket budget. Each tile is cleaned in its crop coordinates, then placed in
+the common view grid. One complete observation set per model, concrete view
+and tile configuration supplies interpolation and extrapolation. Full-frame
+detector and bridge masks contribute through the final union. That join waits
+for both branches and preserves the physical-view vote identity.
 
-Fixed-proposal replay requires no inference, but an upstream parent selection
-change may invalidate downstream tile admission and planning. Changed inputs
-require explicit regeneration or a labelled frozen-evidence comparison. The
+Fixed-proposal replay uses the original observation inventory. Changes to those
+inputs require explicit regeneration or a labelled frozen-evidence comparison. The
 current-source inventory detects file-set and byte drift; the enclosing Git
 commit or complete-source archive binds that record. Source identity is separate
 from workload qualification and measured quality.

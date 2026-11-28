@@ -536,6 +536,33 @@ def test_decoder_disabled_by_configuration_reports_python_route(monkeypatch):
     assert decoder is None and receipt['fallback_reason'] == 'disabled_by_configuration'
 
 
+def test_rank_merge_reads_unaligned_64_bit_windows_without_consuming_tail_padding():
+    decoder, receipt = decode.native_view_decoder()
+    if decoder is None:
+        pytest.skip(f'native journal decode unavailable: {receipt}')
+    height, width = 3, 69
+    selected = np.zeros((height, width), dtype=bool)
+    selected[:2, :64] = True
+    selected[2, 1:64:3] = True
+    selected[:, -1] = True
+    packed = np.packbits(selected.ravel(), bitorder='little')
+    # The 207 pixels occupy seven bits of the last byte.
+    packed[-1] |= 0b10000000
+    body = zlib.compress(packed)
+    header = views._CHUNK.pack(0, height, 1, width + 1, len(body), 0, 0, 0, len(packed), 0)
+    payload = np.frombuffer(header + body, np.uint8)
+    output = np.full((height, width + 2), 3, np.uint8)
+    output[1, 5] = 1
+    expected = output.copy()
+    expected[:, 1:-1][selected] = 4
+    metadata = np.array(((0, len(payload), 1, 0, height, 1, width + 1,
+                          height, width + 2, 0, height * width, 4, 1),), np.int64)
+    status, report, top, bottom, left, right = decoder.merge_rank_rows(payload, metadata, output)
+    assert (status, top, bottom, left, right) == (0, 0, height, 1, width + 1)
+    np.testing.assert_array_equal(report, [[1, 1, len(payload)]])
+    np.testing.assert_array_equal(output, expected)
+
+
 @pytest.mark.parametrize('case', CASES, ids=lambda case: f'seed{case[0]}')
 def test_sibling_family_matches_cutoff_readers_and_skips_consumed_iterators(
         family, monkeypatch, route, case, tmp_path):

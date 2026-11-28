@@ -8,6 +8,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
+from importlib.util import find_spec
 import math
 from typing import Any, Callable, Mapping, Sequence
 
@@ -16,6 +17,7 @@ import numpy as np
 from .reconciliation_policy import validate_policy
 
 _VOTE_TILE = 128
+_PORTABLE_REVIEW_BUNDLE = find_spec(f'{__package__}._slicer_review_bundle') is not None
 
 
 @dataclass
@@ -359,6 +361,14 @@ def _reduce_vote_groups(scores, direct, extrapolated, tiles):
                 direct.sum(axis=0, dtype=np.uint16),
                 scores.sum(axis=0, dtype=np.float32),
                 None if extrapolated is None else extrapolated.sum(axis=0, dtype=np.uint16))
+    contiguous = (scores.strides[3] == scores.itemsize and direct.strides[3] == 1
+                  and (extrapolated is None or extrapolated.strides[3] == 1))
+    if not _PORTABLE_REVIEW_BUNDLE and contiguous:
+        from .native_cpu import kernels
+
+        return kernels.reconciliation_reduce_vote_groups(scores, direct, extrapolated, tiles, _VOTE_TILE)
+    # NumPy handles non-unit-stride score rows and the portable Slicer bundle.
+    # Keep the same bounded tile runs and group order on those routes.
     shape = scores.shape[1:]
     support = np.zeros(shape, dtype=np.uint16)
     direct_support = np.zeros(shape, dtype=np.uint16)
@@ -382,6 +392,7 @@ def _reduce_vote_groups(scores, direct, extrapolated, tiles):
         if extrapolated is not None:
             np.add(extrapolation_support[region], extrapolated[selected], out=extrapolation_support[region])
     return support, direct_support, total, extrapolation_support
+
 
 
 def _voting_lanes(entries, parallel_layer_costs, shape, plan, memory_mib, workers):

@@ -30,6 +30,21 @@ def numpy_reference(dm, dc, sm, sc):
 
 
 class ConfidenceCompositionTests(unittest.TestCase):
+    def test_native_shifted_aliases_use_forward_pixel_order(self):
+        # A write to the next source pixel makes the source change during
+        # this call. The exposed native helper has always processed this in
+        # scalar index order. Load-before-store SIMD would change the bytes.
+        storage = np.zeros(70, np.uint8)
+        storage[0] = 219
+        dst_conf = np.full((2, 34), 255, np.uint8)
+        src_conf = np.full((2, 34), 33, np.uint8)
+        src_mask = storage[:68].reshape(2, 34)
+        dst_mask = storage[1:69].reshape(2, 34)
+        backend._native_cpu_kernels.union_conf_slice_inplace(dst_mask, dst_conf, src_mask, src_conf)
+        np.testing.assert_array_equal(storage[:-1], np.full(69, 219, np.uint8))
+        np.testing.assert_array_equal(storage[-1:], np.zeros(1, np.uint8))
+        np.testing.assert_array_equal(dst_conf, src_conf)
+
     def test_all_score_pairs_preserve_mask_bytes_strict_ties_and_empty_destinations(self):
         shape = (9, 256, 256)
         dm = np.empty(shape, np.uint8)

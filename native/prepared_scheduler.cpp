@@ -2,6 +2,8 @@
 #define PY_SSIZE_T_CLEAN
 #include "prepared_scheduler.hpp"
 #include <Python.h>
+#include <optional>
+#include <string_view>
 
 namespace {
 using namespace xta_scheduler;
@@ -10,8 +12,34 @@ constexpr auto capsule_name = "XTA.prepared_scheduler.v1";
 class Unlocked {
     PyThreadState *state_ = PyEval_SaveThread();
 public:
+    Unlocked() = default;
+    Unlocked(const Unlocked &) = delete;
+    Unlocked &operator=(const Unlocked &) = delete;
     ~Unlocked() { PyEval_RestoreThread(state_); }
 };
+
+// Call only after all Python argument conversion. The argument tuple keeps
+// immutable byte buffers and the scheduler capsule alive until we return.
+template <class Function> auto native_call(Function &&invoke) {
+    Unlocked unlock;
+    return invoke();
+}
+
+// Preserve the fast uncontended path. On contention, unlock the native mutex
+// before restoring the GIL (members are destroyed in reverse declaration order).
+class ContentionAwareLock {
+    std::optional<Unlocked> release_gil_;
+    Lock lock_;
+public:
+    explicit ContentionAwareLock(std::mutex &mutex) : lock_(mutex, std::defer_lock) {
+        if (!lock_.try_lock()) {
+            release_gil_.emplace();
+            lock_.lock();
+        }
+    }
+};
+
+constexpr size_t small_payload = 64 * 1024;
 
 struct PythonError {};
 class Args {
@@ -28,7 +56,7 @@ public:
         if (PyErr_Occurred()) throw PythonError{};
         return value;
     }
-    Bytes bytes(int i) const {
+    std::string_view bytes(int i) const {
         char *data;
         Py_ssize_t size;
         if (PyBytes_AsStringAndSize(at(i), &data, &size) < 0) throw PythonError{};
@@ -77,11 +105,22 @@ PyObject *create(Args a) {
     return result;
 }
 PyObject *configure(Args a) {
-    a.owner().configure(a.number(1), a.number(2), a.number(3), a.number(4), a.number(5));
+    auto &owner = a.owner();
+    Id bytes = a.number(1), tickets = a.number(2), inference = a.number(3);
+    Id window = a.number(4), pressure = a.number(5);
+    owner.configure<ContentionAwareLock>(bytes, tickets, inference, window, pressure);
+    return none();
+}
+PyObject *configure_tile_results(Args a) {
+    auto &owner = a.owner();
+    Id bytes = a.number(1), tickets = a.number(2), largest = a.number(3);
+    owner.configure_tile_results<ContentionAwareLock>(bytes, tickets, largest);
     return none();
 }
 PyObject *try_resize_capacity(Args a) {
-    return boolean(a.owner().try_resize_capacity(a.number(1), a.number(2), a.number(3)));
+    auto &owner = a.owner();
+    Id bytes = a.number(1), inference = a.number(2), pressure = a.number(3);
+    return boolean(owner.try_resize_capacity<ContentionAwareLock>(bytes, inference, pressure));
 }
 PyObject *register_worker(Args a) {
     auto &owner = a.owner();
@@ -97,15 +136,30 @@ PyObject *register_worker(Args a) {
     auto socket = dup(static_cast<Socket>(handle));
 #endif
     require(socket != invalid_socket, "failed to acquire scheduler socket");
-    owner.add_worker(id, epoch, pid, kinds, window, socket, device);
+    native_call([&] { owner.add_worker(id, epoch, pid, kinds, window, socket, device); });
     return none();
 }
 PyObject *declare_parent(Args a) {
-    return number(a.owner().declare_parent(a.number(1), a.number(2), a.number(3), a.number(4), a.number(5),
-                                           a.number(6), bool(a.number(7)), a.number(8), bool(a.number(9)), a.number(10)));
+    auto &owner = a.owner();
+    Id id = a.number(1), count = a.number(2), bytes = a.number(3), priority = a.number(4);
+    Id exclusive = a.number(5), headroom = a.number(6);
+    bool oversize = a.number(7) != 0;
+    Id pressure = a.number(8);
+    bool descriptor_only = a.number(9) != 0;
+    Id reserve = a.number(10);
+    return number(owner.declare_parent<ContentionAwareLock>(
+        id, count, bytes, priority, exclusive, headroom, oversize, pressure, descriptor_only, reserve));
+}
+PyObject *declare_tile_result(Args a) {
+    auto &owner = a.owner();
+    Id id = a.number(1), bytes = a.number(2);
+    bool descriptor_only = a.number(3) != 0;
+    return number(owner.declare_tile_result<ContentionAwareLock>(id, bytes, descriptor_only));
 }
 PyObject *update_host_reserve(Args a) {
-    return boolean(a.owner().update_host_reserve(a.number(1), a.number(2), a.number(3)));
+    auto &owner = a.owner();
+    Id id = a.number(1), generation = a.number(2), reserve = a.number(3);
+    return boolean(owner.update_host_reserve<ContentionAwareLock>(id, generation, reserve));
 }
 PyObject *next_parent(Args a) {
     auto &owner = a.owner();
@@ -121,7 +175,8 @@ PyObject *submit_packet(Args a, bool planned) {
     auto *specs = a.at(8);
     require(PyTuple_Check(specs) && PyTuple_GET_SIZE(specs) <= max_payload,
             "invalid prepared detector handle table");
-    DetectorHandles handles;
+    struct RawHandle { int fd; std::string identity; int role; };
+    std::vector<RawHandle> raw_handles;
     for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(specs); ++i) {
         auto *item = PyTuple_GET_ITEM(specs, i);
         int fd, role;
@@ -129,10 +184,22 @@ PyObject *submit_packet(Args a, bool planned) {
         if (!PyArg_ParseTuple(item, "isi", &fd, &identity, &role)) throw PythonError{};
         require(fd >= 0 && role >= 0 && role <= 2, "invalid prepared detector handle");
         require(!planned || role == 0, "planned detector work only accepts immutable source handles");
-        handles.push_back(owner.pin_detector_file(fd, identity, role));
+        raw_handles.push_back({fd, identity, role});
     }
-    owner.submit(a.number(1), a.number(2), a.bytes(3), a.number(4), a.number(5), a.number(6), a.number(7),
-                 std::move(handles), planned);
+    Id id = a.number(1), parent = a.number(2);
+    auto payload = a.bytes(3);
+    Id kinds = a.number(4), priority = a.number(5), required = a.number(6), bytes = a.number(7);
+    if (raw_handles.empty() && payload.size() <= small_payload) {
+        owner.submit<ContentionAwareLock>(id, parent, Bytes(payload), kinds, priority, required, bytes, {}, planned);
+        return none();
+    }
+    native_call([&] {
+        DetectorHandles handles;
+        handles.reserve(raw_handles.size());
+        for (const auto &handle : raw_handles)
+            handles.push_back(owner.pin_detector_file(handle.fd, handle.identity, handle.role));
+        owner.submit(id, parent, Bytes(payload), kinds, priority, required, bytes, std::move(handles), planned);
+    });
     return none();
 }
 PyObject *submit(Args a) { return submit_packet(a, false); }
@@ -159,19 +226,48 @@ PyObject *wait_final(Args a) {
     { Unlocked unlock; result = owner.wait_final(id, generation, timeout); }
     return boolean(result);
 }
-PyObject *retire_task(Args a) { a.owner().retire_task(a.number(1), a.number(2)); return none(); }
-PyObject *retire_parent(Args a) { a.owner().retire_parent(a.number(1), a.number(2)); return none(); }
-PyObject *host_prepared(Args a) { a.owner().host_prepared(a.number(1), a.number(2)); return none(); }
-PyObject *adopt_postprocess(Args a) { a.owner().adopt_postprocess(a.number(1), a.number(2)); return none(); }
+PyObject *retire_task(Args a) {
+    auto &owner = a.owner();
+    Id id = a.number(1), generation = a.number(2);
+    owner.retire_task<ContentionAwareLock>(id, generation);
+    return none();
+}
+PyObject *retire_parent(Args a) {
+    auto &owner = a.owner();
+    Id id = a.number(1), generation = a.number(2);
+    owner.retire_parent<ContentionAwareLock>(id, generation);
+    return none();
+}
+PyObject *host_prepared(Args a) {
+    auto &owner = a.owner();
+    Id id = a.number(1), generation = a.number(2);
+    owner.host_prepared<ContentionAwareLock>(id, generation);
+    return none();
+}
+PyObject *adopt_postprocess(Args a) {
+    auto &owner = a.owner();
+    Id id = a.number(1), generation = a.number(2);
+    owner.adopt_postprocess<ContentionAwareLock>(id, generation);
+    return none();
+}
 PyObject *set_parent_remaining(Args a) {
-    a.owner().set_parent_remaining(a.number(1), a.number(2), a.number(3));
+    auto &owner = a.owner();
+    Id id = a.number(1), generation = a.number(2), remaining = a.number(3);
+    owner.set_parent_remaining<ContentionAwareLock>(id, generation, remaining);
     return none();
 }
 PyObject *send_control(Args a) {
-    return number(a.owner().send_control(a.number(1), a.bytes(2), bool(a.number(3)), bool(a.number(4))));
+    auto &owner = a.owner();
+    Id id = a.number(1);
+    auto payload = a.bytes(2);
+    bool stop = a.number(3) != 0, reply = a.number(4) != 0;
+    if (payload.size() <= small_payload)
+        return number(owner.send_control<ContentionAwareLock>(id, Bytes(payload), stop, reply));
+    return number(native_call([&] { return owner.send_control(id, Bytes(payload), stop, reply); }));
 }
 PyObject *snapshot(Args a) {
-    auto fields = a.owner().snapshot();
+    auto &owner = a.owner();
+    auto fields = owner.snapshot<ContentionAwareLock>();
     auto *out = PyDict_New();
     if (!out) return nullptr;
     for (const auto &field : fields) {
@@ -196,7 +292,7 @@ PyObject *stage(Args a) {
         if (PyErr_Occurred()) throw PythonError{};
         data.push_back(value);
     }
-    auto result = owner.stage(op, data);
+    auto result = owner.stage<ContentionAwareLock>(op, data);
     PyObject *out = PyTuple_New(static_cast<Py_ssize_t>(result.size()));
     if (!out) return nullptr;
     for (size_t i = 0; i < result.size(); ++i) {
@@ -212,7 +308,12 @@ PyObject *wait_stage_change(Args a) {
     { Unlocked unlock; result = owner.wait_stage_change(epoch, ms); }
     return number(result);
 }
-PyObject *cancel(Args a) { a.owner().cancel(a.string(1)); return none(); }
+PyObject *cancel(Args a) {
+    auto &owner = a.owner();
+    auto reason = a.string(1);
+    native_call([&] { owner.cancel(reason); });
+    return none();
+}
 PyObject *close_run(Args a) {
     auto &owner = a.owner();
     { Unlocked unlock; owner.close_run(); }
@@ -221,6 +322,7 @@ PyObject *close_run(Args a) {
 #define BIND(name) {#name, call<name>, METH_VARARGS, nullptr}
 PyMethodDef methods[] = {
     BIND(create), BIND(configure), BIND(try_resize_capacity), BIND(register_worker), BIND(declare_parent), BIND(next_parent),
+    BIND(configure_tile_results), BIND(declare_tile_result),
     BIND(submit), BIND(submit_planned), BIND(wait_final), BIND(next_event), BIND(retire_task), BIND(retire_parent),
     BIND(send_control), BIND(snapshot), BIND(stage), BIND(wait_stage_change), BIND(set_parent_remaining),
     BIND(host_prepared), BIND(adopt_postprocess), BIND(update_host_reserve), BIND(cancel), BIND(close_run),

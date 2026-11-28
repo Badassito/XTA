@@ -48,30 +48,30 @@ def fill_crop_row_batch(chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
 
 
 def fill_native_member_group(chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
-                             member_first, member_count, total_slices, height, width):
+                             member_first, member_count, total_slices, height, width, *window):
     """Decode whole source slices and return their placed crop records."""
     return _native_cpu.nrrd_fill_native_member_group(
         chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
-        member_first, member_count, total_slices, height, width,
+        member_first, member_count, total_slices, height, width, *window,
     )
 
 
 def fill_restored_member_group(chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
                                member_first, member_count, total_slices, source_ptr, source_index,
-                               in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode):
+                               in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode, *window):
     """Restore whole slices and return the records of their temporal union crops."""
     return _native_cpu.nrrd_fill_restored_member_group(
         chunks, packed, offsets, y0s, x0s, y1s, x1s, kinds,
         member_first, member_count, total_slices, source_ptr, source_index,
-        in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode,
+        in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode, *window,
     )
 
 
 def resize_records_for_tee(buf2d, records, target_ptr, in_h, in_w, out_h, out_w,
-                           y_starts, y_stops, x_starts, x_stops, mode):
+                           y_starts, y_stops, x_starts, x_stops, mode, column_origin=0):
     """Stage resized crop records before acquiring mirror stripe locks."""
     return _native_cpu.nrrd_resize_records_for_tee(
-        buf2d, records, target_ptr, in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode,
+        buf2d, records, target_ptr, in_h, in_w, out_h, out_w, y_starts, y_stops, x_starts, x_stops, mode, column_origin,
     )
 
 
@@ -244,7 +244,7 @@ class FusedSparseMirrorTee:
                 self._plans[key] = plan
         return plan
 
-    def tee_records(self, buf2d: np.ndarray, records: np.ndarray) -> None:
+    def tee_records(self, buf2d: np.ndarray, records: np.ndarray, column_origin=0) -> None:
         if int(records.shape[0]) <= 0:
             return
         for job in self.jobs:
@@ -257,7 +257,7 @@ class FusedSparseMirrorTee:
                 # before) only for one small nogil OR call. One lock round per batch keeps
                 # the GIL hand-offs per batch constant (per-stripe calls convoy).
                 regions, results = resize_records_for_tee(
-                    buf2d, records, ptr, self.in_h, self.in_w, m_h, m_w, ys, ye, xs, xe, mode,
+                    buf2d, records, ptr, self.in_h, self.in_w, m_h, m_w, ys, ye, xs, xe, mode, column_origin,
                 )
                 live = regions[:, 2] > regions[:, 0]
                 if not bool(live.any()):
@@ -287,22 +287,23 @@ def fused_mirror_tee_of(consumer: Optional[Callable[..., object]]) -> Optional[F
     return tee if isinstance(tee, FusedSparseMirrorTee) else None
 
 
-def observe_records(consumer: Callable[..., object], buf2d: np.ndarray, records: np.ndarray) -> None:
+def observe_records(consumer: Callable[..., object], buf2d: np.ndarray, records: np.ndarray, column_origin=0) -> None:
     """Generic sparse consumers see each recorded crop once, in record (z) order."""
     for row0, y0, x0, y1, x1, z in records.tolist():
-        crop = buf2d[int(row0):int(row0) + int(y1 - y0), int(x0):int(x1)]
+        crop = buf2d[int(row0):int(row0) + int(y1 - y0), int(x0) - column_origin:int(x1) - column_origin]
         crop.flags.writeable = False  # the band/member bytes are already queued or owned
         consumer(int(z), int(y0), int(x0), crop)
 
 
-def tee_or_observe(consumer: Optional[Callable[..., object]], buf2d: np.ndarray, records: np.ndarray) -> None:
+def tee_or_observe(consumer: Optional[Callable[..., object]], buf2d: np.ndarray, records: np.ndarray,
+                   column_origin=0) -> None:
     if consumer is None or int(records.shape[0]) <= 0:
         return
     tee = fused_mirror_tee_of(consumer)
     if tee is not None:
-        tee.tee_records(buf2d, records)
+        tee.tee_records(buf2d, records, column_origin)
     else:
-        observe_records(consumer, buf2d, records)
+        observe_records(consumer, buf2d, records, column_origin)
 
 
 # --------------------------------------------------------------------------------------
@@ -322,9 +323,10 @@ def _member_groups(first: int, stop: int, slices_per_member: int, member_bytes: 
 
 
 def iter_native_member_groups(view: FusedStoreView, z0: int, z1: int, slices_per_member: int,
-                              slice_bytes: int, sparse_consumer: Optional[Callable[..., object]],
+                              slice_bytes: int, sparse_consumer: Optional[Callable[..., object]], window=(),
                               ) -> Iterator[Tuple[int, Optional[np.ndarray]]]:
     _t, h, w = view.shape
+    y0, x0, y1, x1 = window or (0, 0, h, w)
     kinds = view.kinds
     for group in _member_groups(z0, z1, slices_per_member, slices_per_member * slice_bytes):
         flags = [bool(np.any(kinds[a:b] == 1)) for a, b in group]
@@ -336,10 +338,10 @@ def iter_native_member_groups(view: FusedStoreView, z0: int, z1: int, slices_per
             total = int(count.sum())
             buf, records = fill_native_member_group(
                 view.chunks, view.packed, view.offsets, view.y0, view.x0, view.y1, view.x1,
-                kinds, first, count, total, int(h), int(w),
+                kinds, first, count, total, int(h), int(w), *window,
             )
-            tee_or_observe(sparse_consumer, buf, records)
-            members = buf.reshape((total, int(h), int(w)))
+            tee_or_observe(sparse_consumer, buf, records, x0)
+            members = buf.reshape((total, y1 - y0, x1 - x0))
         slot = 0
         for (a, b), flag in zip(group, flags):
             ln = int(b - a) * int(slice_bytes)
@@ -354,11 +356,12 @@ def iter_native_member_groups(view: FusedStoreView, z0: int, z1: int, slices_per
 def iter_restored_member_groups(view: FusedStoreView, output_shape: Tuple[int, int, int],
                                 z0: int, z1: int, slices_per_member: int, slice_bytes: int,
                                 source_ptr: np.ndarray, source_index: np.ndarray,
-                                sparse_consumer: Optional[Callable[..., object]],
+                                sparse_consumer: Optional[Callable[..., object]], window=(),
                                 ) -> Iterator[Tuple[int, Optional[np.ndarray]]]:
     in_t, in_h, in_w = view.shape
     out_t, out_h, out_w = (int(v) for v in output_shape)
     mode, ys, ye, xs, xe = resize_mode_and_maps(in_h, in_w, out_h, out_w)
+    y0, x0, y1, x1 = window or (0, 0, out_h, out_w)
     kinds = view.kinds
     source_active = (kinds[source_index] == 1).astype(np.int64)
     active_prefix = np.concatenate((np.zeros(1, np.int64), np.cumsum(source_active)))
@@ -374,10 +377,10 @@ def iter_restored_member_groups(view: FusedStoreView, output_shape: Tuple[int, i
             buf, records = fill_restored_member_group(
                 view.chunks, view.packed, view.offsets, view.y0, view.x0, view.y1, view.x1,
                 kinds, first, count, total, source_ptr, source_index,
-                int(in_h), int(in_w), int(out_h), int(out_w), ys, ye, xs, xe, int(mode),
+                int(in_h), int(in_w), int(out_h), int(out_w), ys, ye, xs, xe, int(mode), *window,
             )
-            tee_or_observe(sparse_consumer, buf, records)
-            members = buf.reshape((total, int(out_h), int(out_w)))
+            tee_or_observe(sparse_consumer, buf, records, x0)
+            members = buf.reshape((total, y1 - y0, x1 - x0))
         slot = 0
         for (a, b), flag in zip(group, flags):
             ln = int(b - a) * int(slice_bytes)
@@ -387,3 +390,46 @@ def iter_restored_member_groups(view: FusedStoreView, output_shape: Tuple[int, i
             yield ln, members[slot:slot + (b - a)]
             slot += b - a
         del buf
+
+
+def contained_member_groups(store, output_shape, first, stop, member_bytes, consumer, window):
+    """Use compact member buffers only when the stored XY window contains all output crops.
+
+    Uncertain extents keep the ordinary full-width producer and its pixel-level
+    overhang check. Grouping, logical byte lengths and Z numbering remain based
+    on the reference grid, including members that contain only background.
+    """
+    method = ('iter_native_sparse_members' if tuple(store.shape) == tuple(output_shape)
+              else 'iter_restored_sparse_members')
+    if method in vars(store):
+        return None
+    view = fused_store_view(store)
+    if view is None:
+        return None
+    depth, height, width = output_shape
+    if window == (0, 0, height, width):
+        return None
+    direct = view.shape == tuple(output_shape)
+    if direct:
+        used = np.arange(first, stop, dtype=np.int64)
+    else:
+        ptr, indices = restore_source_csr(view.shape[0], depth)
+        used = indices[ptr[first]:ptr[stop]]
+    if not view.valid(used):
+        return None
+    active = used[view.kinds[used] != 0]
+    if active.size:
+        top, left = int(view.y0[active].min()), int(view.x0[active].min())
+        bottom, right = int(view.y1[active].max()), int(view.x1[active].max())
+        if view.shape[1:] != (height, width):
+            _, ys, ye, xs, xe = resize_mode_and_maps(*view.shape[1:], height, width)
+            top, bottom = int(np.searchsorted(ye, top, side='right')), int(np.searchsorted(ys, bottom))
+            left, right = int(np.searchsorted(xe, left, side='right')), int(np.searchsorted(xs, right))
+        if top < window[0] or left < window[1] or bottom > window[2] or right > window[3]:
+            return None
+    plane = height * width
+    slices = max(1, member_bytes // plane)
+    if direct:
+        return iter_native_member_groups(view, first, stop, slices, plane, consumer, window)
+    return iter_restored_member_groups(view, output_shape, first, stop, slices, plane, ptr, indices,
+                                       consumer, window)

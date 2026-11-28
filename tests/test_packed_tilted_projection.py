@@ -146,7 +146,7 @@ def _task(root, *, external_alias=False, fail_once=False):
         slice_workers=2, interpolation_task_workers=1, component_layers_needed=True,
         precleaned_slice_cleanup=True, hole_fill_done_on_device=True, slice_meta=None,
         fuse_azimuthal_component_layers=lambda: False,
-        preinterpolation_layer_already_published=False, parent_mask_ready_callback=None,
+        preinterpolation_layer_already_published=False,
         submit_component_projection=lambda *_a, **_k: None,
         materialize_workspace=materialize_raw_bbox_mask_store_workspace,
         prepare=assembly.prepare_view_volume_after_fullframe,

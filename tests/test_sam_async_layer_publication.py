@@ -334,7 +334,7 @@ def owned_task(root, view, context, submitter, admission):
         component_layers_needed=True, precleaned_slice_cleanup=True,
         hole_fill_done_on_device=True, slice_meta=None, fuse_azimuthal_component_layers=lambda:False,
         preinterpolation_layer_already_published=False,
-        parent_mask_ready_callback=None, submit_component_projection=lambda *_a, **_kw:None,
+        submit_component_projection=lambda *_a, **_kw:None,
         materialize_workspace=lambda *_a, **_kw:None, prepare=assembly.prepare_view_volume_after_fullframe,
         interpolation_backend='sam', sam_context=context, extrapolation_distance=2,
         extrapolation_walk_back=1, extrapolation_min_radius=0,

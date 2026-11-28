@@ -55,6 +55,44 @@ class PolicyRetirementCudaTests(unittest.TestCase):
         for name, value in expected_meta.items():
             np.testing.assert_array_equal(actual_meta[name], value, err_msg=name)
 
+    def test_nonoverwrite_uses_task_local_device_occupancy(self):
+        masks = np.zeros((7, 17, 33), np.uint8)
+        masks[0, 4:6, 1:8] = 1
+        masks[2, 3:10, 11:20] = 1  # Unwritten, even if its source has data.
+        masks[4, 16, 32] = 1
+        conf = masks * np.uint8(91)
+        written = np.array([True, False, False, True, True, False, True])
+        parent = np.zeros_like(masks)
+        parent[:, 0, 0] = 1
+        parent_conf = parent * np.uint8(128)
+        expected_masks = parent.copy()
+        expected_masks[written] |= masks[written]
+        expected_conf = parent_conf.copy()
+        expected_conf[written] = np.maximum(expected_conf[written], conf[written])
+
+        occupancy = masks.copy()
+        occupancy[~written] = 0
+        expected_any = occupancy.any(axis=(1, 2))
+        expected_rows = np.packbits(occupancy.any(axis=2), axis=1)
+        expected_bboxes = np.zeros((7, 4), np.int64)
+        expected_bboxes[0] = [4, 6, 1, 8]
+        expected_bboxes[4] = [16, 17, 32, 33]
+        with mock.patch.object(inference, 'gpu_union_retirement_chunk_slices', return_value=2):
+            lane = inference._GpuUnionRetirementLane(torch, torch.device('cuda:0'), 0, 17 * 33)
+        original_any = np.any
+
+        def require_device_occupancy(array, *args, **kwargs):
+            self.assertLess(array.ndim, 3, 'retirement rescanned a dense host mask')
+            return original_any(array, *args, **kwargs)
+
+        with mock.patch.object(inference.np, 'any', side_effect=require_device_occupancy):
+            result = self.retire(masks, conf, written, parent, parent_conf, owned=False, lane=lane)
+        np.testing.assert_array_equal(parent, expected_masks)
+        np.testing.assert_array_equal(parent_conf, expected_conf)
+        np.testing.assert_array_equal(result['slice_any'], expected_any)
+        np.testing.assert_array_equal(result['slice_bboxes'], expected_bboxes)
+        np.testing.assert_array_equal(result['slice_row_any'], expected_rows)
+
     def test_host_fallback_keeps_union_semantics_and_invalidates_device_metadata(self):
         masks = np.zeros((2, 7, 9), dtype=np.uint8)
         masks[:, 1, 2] = 1

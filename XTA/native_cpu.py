@@ -91,11 +91,17 @@ def native_cpu_provenance(domain: str) -> dict[str, str]:
     }
 
 
+_default_load_native_cpu = load_native_cpu
+
+
 class _KernelBindings:
     def __getattr__(self, name):
         if name.startswith("__"):
             raise AttributeError(name)
-        return getattr(load_native_cpu(), name)
+        module = _native_cpu_module
+        if module is None or load_native_cpu is not _default_load_native_cpu:
+            module = load_native_cpu()
+        return getattr(module, name)
 
 
 kernels = _KernelBindings()

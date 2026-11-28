@@ -4,12 +4,15 @@ import ast
 import hashlib
 import json
 import re
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import XTA
 from XTA import cli, config
@@ -90,6 +93,27 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py', data_files)
         self.assertNotIn(PREVIOUS_LAUNCHER, data_files)
         self.assertNotIn(RENAMED_LAUNCHER, data_files)
+
+    def test_native_cpu_optimization_uses_strict_fp_and_portable_flags(self) -> None:
+        # Inspect Extension recipes without running a compiler or hardware probe.
+        with (patch.dict("os.environ", {"XTA_BUILD_EXTENSION": "cpu"}),
+              patch.object(sys, "argv", ["setup.py", "build_ext"]),
+              patch("setuptools.setup")):
+            recipe = runpy.run_path(str(ROOT / "setup.py"))
+
+        namespace = recipe["_cpu_kernels"].__globals__
+        isa_prefixes = ("-march=", "-mavx", "-mfma", "-mbmi", "-mpopcnt", "/arch:")
+        for platform in ("linux", "win32"):
+            with self.subTest(platform=platform), patch.dict(namespace, sys=SimpleNamespace(platform=platform)):
+                cpu_flags = recipe["_cpu_kernels"]().extra_compile_args
+                scheduler_flags = recipe["_prepared_scheduler"]().extra_compile_args
+                self.assertFalse(any(flag.startswith(isa_prefixes) for flag in (*cpu_flags, *scheduler_flags)))
+                self.assertNotIn("-O3", scheduler_flags)
+                if platform == "linux":
+                    self.assertTrue({"-O3", "-fno-fast-math", "-ffp-contract=off"} <= set(cpu_flags))
+                else:
+                    self.assertIn("/fp:strict", cpu_flags)
+                    self.assertNotIn("-O3", cpu_flags)
 
     def test_source_distribution_has_one_versioned_launcher(self) -> None:
         manifest_lines = {

@@ -7,7 +7,7 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize('mode', ['disabled', 'isolated'])
+@pytest.mark.parametrize('mode', ['disabled', 'isolated', 'standalone'])
 @pytest.mark.parametrize('route', ['dense', 'materialize'])
 def test_fresh_cpu_projection_needs_no_native_scheduler(tmp_path, mode, route):
     repo = Path(__file__).resolve().parents[1]
@@ -32,6 +32,33 @@ def test_real_gpu_admission_still_requires_native_owner():
     coordinator = _MainProcessGpuStageCoordinator()
     with pytest.raises(RuntimeError, match='Native scheduler must be bound'):
         coordinator.can_attempt_source_projection('Native source projection unbound request')
+
+
+def test_failed_purpose_registration_leaves_nothing_to_cancel():
+    from XTA.backprojection import _MainProcessGpuStageCoordinator
+
+    coordinator = _MainProcessGpuStageCoordinator()
+    purpose = 'Native source projection unbound request'
+    with pytest.raises(RuntimeError, match='Native scheduler must be bound'):
+        coordinator._purpose(purpose)
+    coordinator.cancel_spherical_retirement_request(purpose)
+    assert coordinator._next_identity == 1
+    assert not coordinator._identities and not coordinator._names
+
+
+def test_standalone_stage_facades_decline_without_cuda(monkeypatch):
+    from XTA import backprojection
+
+    monkeypatch.setattr(backprojection, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR',
+                       backprojection._MainProcessGpuStageCoordinator())
+
+    class NoCudaProbe:
+        def __getattr__(self, name):
+            raise AssertionError(f'Standalone stage attempted CUDA probe: {name}')
+
+    purpose = 'Native source projection standalone'
+    assert backprojection._try_acquire_main_process_gpu_stage(NoCudaProbe(), purpose) is None
+    assert backprojection._try_acquire_main_process_overlap_gpu_stage(NoCudaProbe(), purpose) is None
 
 
 def test_registered_request_cannot_silently_cancel_after_losing_owner(request, monkeypatch):

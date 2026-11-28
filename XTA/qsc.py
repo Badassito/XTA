@@ -6,9 +6,8 @@ coordinates nor the approximate COBE projection. References:
 https://proj.org/en/stable/operations/projections/qsc.html
 https://github.com/OSGeo/PROJ/blob/master/src/projections/qsc.cpp
 
-Directions are XYZ, independently of a volume's array-axis order. A future
-ellipsoid adapter can transform coordinates around this unit-sphere interface;
-the coverage guarantee below currently applies to spherical voxel coordinates.
+Directions use XYZ regardless of a volume's array axis order. The coverage
+guarantee below applies to spherical voxel coordinates.
 
 Sampling bound
 --------------

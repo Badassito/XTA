@@ -5,7 +5,16 @@
 #include <array>
 #include <climits>
 #include <cstdint>
+#include <optional>
 #include <vector>
+
+#if defined(_M_X64) || defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace xta::cpu {
 namespace {
@@ -103,6 +112,98 @@ constexpr auto unpacked_bytes() {
 }
 constexpr auto bits = unpacked_bytes();
 
+template<bool Scored>
+bool pack_crop(const Buffer& mask, const Buffer* scores, Byte* packed, Byte* score_bytes) {
+    const Index height = mask.shape(0), width = mask.shape(1);
+    const Index mask_step = mask.stride(1);
+    const Index score_step = Scored ? scores->stride(1) : 0;
+    bool foreground = false;
+    unsigned shift = 0;
+    Byte byte = 0;
+    for (Index y = 0; y < height; ++y) {
+        const auto* mask_row = reinterpret_cast<const Byte*>(mask.ptr(y, 0));
+        const Byte* score_row = nullptr;
+        if constexpr (Scored) score_row = reinterpret_cast<const Byte*>(scores->ptr(y, 0));
+        const auto append_pixel = [&](Index x) {
+            const Byte member = mask_row[x * mask_step];
+            if (member > 1) throw std::invalid_argument("Native detector masks must contain only 0/1");
+            if constexpr (Scored) {
+                *score_bytes++ = member ? score_row[x * score_step] : Byte{0};
+            }
+            foreground |= member != 0;
+            byte |= static_cast<Byte>(member << shift);
+            if (++shift == 8) {
+                *packed++ = byte;
+                shift = 0;
+                byte = 0;
+            }
+        };
+        Index x = 0;
+#if defined(_M_X64) || defined(__SSE2__)
+        if (mask_step == 1 && (!Scored || score_step == 1)) {
+            // A journal strip is packed as one stream, without padding at rows.
+            for (; x < width && shift != 0; ++x) append_pixel(x);
+            const auto zero = _mm_setzero_si128(), ones = _mm_set1_epi8(1);
+            for (; x <= width - 16; x += 16, packed += 2) {
+                __m128i members;
+                std::memcpy(&members, mask_row + x, sizeof(members));
+                const auto binary = _mm_cmpeq_epi8(members, _mm_min_epu8(members, ones));
+                if (_mm_movemask_epi8(binary) != 0xffff) {
+                    throw std::invalid_argument("Native detector masks must contain only 0/1");
+                }
+                const auto background = _mm_cmpeq_epi8(members, zero);
+                const auto word = static_cast<unsigned>(_mm_movemask_epi8(background)) ^ 0xffffu;
+                packed[0] = static_cast<Byte>(word);
+                packed[1] = static_cast<Byte>(word >> 8);
+                foreground |= word != 0;
+                if constexpr (Scored) {
+                    __m128i values;
+                    std::memcpy(&values, score_row + x, sizeof(values));
+                    const auto masked = _mm_andnot_si128(background, values);
+                    std::memcpy(score_bytes, &masked, sizeof(masked));
+                    score_bytes += sizeof(masked);
+                }
+            }
+        }
+#endif
+        for (; x < width; ++x) append_pixel(x);
+    }
+    if (shift) *packed = byte;
+    return foreground;
+}
+
+PyObject* encode_crop(PyObject*, PyObject* args) {
+    return protect([&]() -> PyObject* {
+        PyObject *mask_object, *score_object;
+        if (!PyArg_ParseTuple(args, "OO:journal_encode_crop", &mask_object, &score_object))
+            return nullptr;
+        const Buffer mask(mask_object, "journal crop mask", 2);
+        mask.require<Byte>();
+        std::optional<Buffer> scores;
+        if (score_object != Py_None) {
+            scores.emplace(score_object, "journal crop scores", 2);
+            scores->require<Byte>();
+            if (scores->shape(0) != mask.shape(0) || scores->shape(1) != mask.shape(1))
+                value_error("Native mask/scores must be matching 2-D uint8 arrays");
+        }
+        const Index area = mask.nbytes();
+        if (!area) Py_RETURN_NONE;
+        // Both bytes objects are private until the ordered strip is validated.
+        Object packed(PyBytes_FromStringAndSize(nullptr, area / 8 + (area % 8 != 0)));
+        Object raw(PyBytes_FromStringAndSize(nullptr, scores ? area : 0));
+        auto* output = reinterpret_cast<Byte*>(PyBytes_AS_STRING(packed.get()));
+        auto* score_bytes = reinterpret_cast<Byte*>(PyBytes_AS_STRING(raw.get()));
+        bool occupied;
+        {
+            GilRelease release;
+            occupied = scores ? pack_crop<true>(mask, &*scores, output, score_bytes)
+                              : pack_crop<false>(mask, nullptr, output, nullptr);
+        }
+        if (!occupied) Py_RETURN_NONE;
+        return PyTuple_Pack(2, packed.get(), raw.get());
+    });
+}
+
 PyObject* decode_row(PyObject*, PyObject* args) {
     PyObject *address, *payload_object, *params_object;
     int include_scores;
@@ -178,6 +279,32 @@ struct Box {
     Index top, bottom, left, right;
 };
 
+unsigned first_set_bit(std::uint64_t word) noexcept {
+#if defined(_MSC_VER) && defined(_M_X64)
+    unsigned long index;
+    _BitScanForward64(&index, word);
+    return static_cast<unsigned>(index);
+#elif defined(__GNUC__) || defined(__clang__)
+    return static_cast<unsigned>(__builtin_ctzll(word));
+#else
+    unsigned index = 0;
+    while (!(word & 1)) {
+        ++index;
+        word >>= 1;
+    }
+    return index;
+#endif
+}
+
+// A complete 64-bit window can span a ninth byte. The caller checked that
+// all 64 bits are inside the current row, hence inside the decompressed mask.
+std::uint64_t packed_window(const Byte* packed, Index bit) noexcept {
+    const auto* bytes = packed + bit / 8;
+    const unsigned shift = bit & 7;
+    const auto first = load_little_endian<std::uint64_t>(bytes);
+    return shift ? (first >> shift) | (std::uint64_t(bytes[8]) << (64 - shift)) : first;
+}
+
 // Merge only after every stream of every row has passed validation; otherwise
 // the Python reader can resume without any partial mutation of the caller's plane.
 void merge_chunk(const Chunk& h, const Byte* packed, const Buffer& plane, Word level,
@@ -185,8 +312,34 @@ void merge_chunk(const Chunk& h, const Byte* packed, const Buffer& plane, Word l
     Index bit = 0;
     const Word previous = level == std::numeric_limits<Word>::min()
         ? std::numeric_limits<Word>::max() : level-1;
+    const Byte value_to_write = static_cast<Byte>(level);
+    const bool contiguous = plane.stride(1) == 1;
     for (Index y = h.y0; y < h.y1; ++y) {
-        for (Index x = h.x0; x < h.x1;) {
+        Index x = h.x0;
+        if (contiguous) {
+            auto* values = reinterpret_cast<Byte*>(plane.ptr(y, h.x0));
+            for (; h.x1 - x >= 64; x += 64, bit += 64, values += 64) {
+                auto selected = packed_window(packed, bit);
+                if (!selected) continue;
+                populated = true;
+                if (selected == ~std::uint64_t{0}) {
+                    if (check && !gap) {
+                        gap = std::any_of(values, values + 64, [previous](Byte value) {
+                            return value < previous;
+                        });
+                    }
+                    std::memset(values, value_to_write, 64);
+                } else {
+                    while (selected) {
+                        const auto index = first_set_bit(selected);
+                        if (check && !gap && values[index] < previous) gap = true;
+                        values[index] = value_to_write;
+                        selected &= selected - 1;
+                    }
+                }
+            }
+        }
+        for (; x < h.x1;) {
             const Index shift = bit & 7;
             const Index take = std::min<Index>(8-shift, h.x1-x);
             const unsigned ones = (1u << take)-1;
@@ -196,7 +349,7 @@ void merge_chunk(const Chunk& h, const Byte* packed, const Buffer& plane, Word l
                 for (Index k = 0; k < take; ++k) {
                     if (value != ones && !((value >> k) & 1)) continue;
                     if (check && plane.load<Byte>(y, x+k) < previous) gap = true;
-                    plane.store<Byte>(static_cast<Byte>(level), y, x+k);
+                    plane.store<Byte>(value_to_write, y, x+k);
                 }
             }
             bit += take;
@@ -389,6 +542,7 @@ PyObject* store_rank_region(PyObject*, PyObject* args) {
 }
 
 PyMethodDef methods[] = {
+    {"journal_encode_crop", encode_crop, METH_VARARGS, "Pack a binary crop and mask its score lane."},
     {"journal_decode_row", decode_row, METH_VARARGS, "Decode one bounded native sweep journal row."},
     {"journal_merge_family_rank_rows", merge_family_rank_rows, METH_VARARGS, "Merge selected lanes directly from a sealed journal frame index."},
     {"journal_merge_rank_rows", merge_rank_rows, METH_VARARGS, "Validate and merge journal rows into a rank plane."},

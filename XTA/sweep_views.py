@@ -27,6 +27,7 @@ import zlib
 import numpy as np
 
 from .json_publication import write_json_atomic
+from .native_cpu import kernels
 from .sweep_quota import (
     SweepViewCapacityError, native_fanout_root as _root, native_journal_usage, update_leases as _quota_many,
 )
@@ -328,13 +329,23 @@ class NativeTaskFanoutWriter:
         for first in range(0, y1-y0, step):
             stop = min(y1-y0, first+step)
             piece = values[first:stop]
-            if np.any(piece > 1):
-                raise ValueError('Native detector masks must contain only 0/1')
-            if not np.any(piece):
-                continue
-            packed = np.packbits(piece, axis=None, bitorder='little').tobytes()
+            score_piece = None if scores is None else scores[first:stop]
+            if piece.strides[1] == 1 and (score_piece is None or score_piece.strides[1] == 1):
+                encoded = kernels.journal_encode_crop(piece, score_piece)
+                if encoded is None:
+                    continue
+                packed, score_raw = encoded
+            else:
+                # NumPy retains its efficient non-unit-stride path for crops
+                # that cannot use the native row vectors.
+                if np.any(piece > 1):
+                    raise ValueError('Native detector masks must contain only 0/1')
+                if not np.any(piece):
+                    continue
+                packed = np.packbits(piece, axis=None, bitorder='little').tobytes()
+                score_raw = (b'' if score_piece is None else
+                             np.where(piece != 0, score_piece, np.uint8(0)).tobytes())
             mask_bytes = zlib.compress(packed, 1)
-            score_raw = b'' if scores is None else np.where(piece != 0, scores[first:stop], np.uint8(0)).tobytes()
             score_bytes = b'' if scores is None else zlib.compress(score_raw, 1)
             mc=sc=0
             if self.verify_integrity:

@@ -220,25 +220,38 @@ extern "C" __global__ void semantic_component_filter(
 '''
 
 
-@lru_cache(maxsize=16)
+_KERNELS_BY_DEVICE: dict[int, tuple] = {}
+_KERNELS_LOCK = threading.Lock()
+
+
 def _kernels_for_device(device_index: int):
+    cached = _KERNELS_BY_DEVICE.get(device_index)
+    if cached is not None:
+        return cached
+
     import cupy as cp  # type: ignore
 
     if int(cp.cuda.runtime.getDevice()) != int(device_index):
         raise RuntimeError('semantic CUDA kernel cache requested for the wrong device')
-    module = cp.RawModule(
-        code=_KERNEL_SOURCE, options=('-std=c++11',),
-        name_expressions=(
+    with _KERNELS_LOCK:
+        cached = _KERNELS_BY_DEVICE.get(device_index)
+        if cached is not None:
+            return cached
+        module = cp.RawModule(
+            code=_KERNEL_SOURCE, options=('-std=c++11',),
+            name_expressions=(
+                'semantic_decode_native', 'semantic_reset_flags', 'semantic_scan_weak',
+                'semantic_parent_init', 'semantic_union8',
+                'semantic_component_max', 'semantic_component_filter',
+            ),
+        )
+        cached = cp, {name: module.get_function(name) for name in (
             'semantic_decode_native', 'semantic_reset_flags', 'semantic_scan_weak',
             'semantic_parent_init', 'semantic_union8',
             'semantic_component_max', 'semantic_component_filter',
-        ),
-    )
-    return cp, {name: module.get_function(name) for name in (
-        'semantic_decode_native', 'semantic_reset_flags', 'semantic_scan_weak',
-        'semantic_parent_init', 'semantic_union8',
-        'semantic_component_max', 'semantic_component_filter',
-    )}
+        )}
+        _KERNELS_BY_DEVICE[device_index] = cached
+        return cached
 
 
 def _kernels():

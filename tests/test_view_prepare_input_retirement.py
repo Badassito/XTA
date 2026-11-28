@@ -50,7 +50,7 @@ def _task(root, *, restored=False):
         slice_workers=1, interpolation_task_workers=1, component_layers_needed=True,
         precleaned_slice_cleanup=True, hole_fill_done_on_device=True, slice_meta=None,
         fuse_azimuthal_component_layers=lambda:False,
-        preinterpolation_layer_already_published=False, parent_mask_ready_callback=None,
+        preinterpolation_layer_already_published=False,
         submit_component_projection=lambda *_a,**_kw:None,
         materialize_workspace=materialize_raw_bbox_mask_store_workspace, prepare=prepare,
     )

@@ -69,7 +69,7 @@ def main():
             row = {'view': view.name, 'runs': []}
             expected = None
             # Alternating order avoids comparing one cold build to one warm build.
-            for name in ('reference', 'single_pass', 'single_pass', 'reference'):
+            for name in ('reference', 'production', 'production', 'reference'):
                 build = (projection._build_radial_plane_plan_reference if name == 'reference'
                          else projection._build_radial_plane_plan)
                 started = time.perf_counter()

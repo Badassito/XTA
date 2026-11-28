@@ -37,73 +37,45 @@ def test_modern_receipt_missing_filter_cannot_use_legacy_unfiltered_path(version
         filtering.effective_candidate_mask(_Bundle(), "r", 0, receipt)
 
 
-def _legacy_spec(bundle):
-    result = filtering.build_mask_filter(bundle)
-    result["implementation_sha256"] = filtering._QUALIFIED_LEGACY_IMPLEMENTATION
-    result["sha256"] = filtering._fingerprint({key: value for key, value in result.items() if key != "sha256"})
-    return result
-
-
-@pytest.mark.parametrize('implementation', [filtering._QUALIFIED_LEGACY_IMPLEMENTATION,
-                                           filtering._QUALIFIED_PREVIOUS_IMPLEMENTATION,
-                                           filtering._QUALIFIED_RADIUS_ONLY_IMPLEMENTATION,
-                                           filtering._QUALIFIED_PRE_BOOLEAN_IMPLEMENTATION,
-                                           filtering._QUALIFIED_V25_SOURCE_GUARD_IMPLEMENTATION,
-                                           filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION,
-                                           filtering._QUALIFIED_V26_PYTHON_IMPLEMENTATION])
-def test_qualified_legacy_filter_has_exact_current_pixels(implementation):
+@pytest.mark.parametrize("implementation,issued_native_source", [
+    # The pre-AOT source guard, plus the retained pre-checkpoint and tagged AOT sources.
+    ("6dd89b0929e8d3407750654cdf9606d2dfd3fe1689c3549e0debd04a95152bdc", None),
+    ("434ec05db044c2c1383e4e58b5f099e76945018b2e60b87cf2fe8b6d03ad5cf3",
+     "23c8ccdcb70eb666a65c32476c15119a6c7853a1d0d7df13157ef387d8dd6109"),
+    ("434ec05db044c2c1383e4e58b5f099e76945018b2e60b87cf2fe8b6d03ad5cf3",
+     "31c3e5ead5e932db22c4704875dc10935ff768a195a986cc70eaa591294d0fa7"),
+    ("0" * 64, None),
+])
+@pytest.mark.parametrize("enabled", (False, True))
+def test_noncurrent_filter_spec_requires_regeneration(monkeypatch, implementation,
+                                                       issued_native_source, enabled):
     bundle = _Bundle()
-    current = filtering.effective_candidate_mask(bundle, "r", 0, filtering.build_mask_filter(bundle))
-    spec = _legacy_spec(bundle)
-    spec['implementation_sha256'] = implementation
-    spec['sha256'] = filtering._fingerprint({key: value for key, value in spec.items() if key != 'sha256'})
-    old = filtering.effective_candidate_mask(bundle, "r", 0, {"mask_filter": spec})
-    np.testing.assert_array_equal(old, current)
-    assert current[3:14, 3:14].all()
-    assert not current[4:7, 23:26].any()
+    spec = filtering.build_mask_filter(bundle, enabled=enabled)
+    assert implementation != filtering.IMPLEMENTATION_SHA256
+    spec["implementation_sha256"] = implementation
+    if enabled:
+        if issued_native_source is None:
+            spec.pop("native_implementation")
+        else:
+            spec["native_implementation"]["source_sha256"] = issued_native_source
+    _refingerprint(spec)
+    monkeypatch.setattr(filtering, "native_cpu_provenance",
+                        lambda _: pytest.fail("An incompatible module must fail before native verification"))
+    with pytest.raises(ValueError, match="implementation differs.*regenerate"):
+        filtering.effective_candidate_mask(bundle, "r", 0, {"mask_filter": spec})
 
 
-def test_old_compatibility_rejects_changed_numerical_function(monkeypatch):
+def test_current_disabled_filter_preserves_raw_masks_without_native_receipt(monkeypatch):
     bundle = _Bundle()
-    spec = _legacy_spec(bundle)
-
-    def changed_filter(*args, **kwargs):
-        return bundle.raw.copy(), {}
-
-    monkeypatch.setattr(filtering, "filter_sam_components", changed_filter)
-    with pytest.raises(ValueError, match="implementation differs"):
-        filtering.effective_candidate_mask(bundle, "r", 0, spec)
+    monkeypatch.setattr(filtering, "native_cpu_provenance",
+                        lambda _: pytest.fail("A disabled filter must not load the native extension"))
+    spec = filtering.build_mask_filter(bundle, enabled=False)
+    assert "native_implementation" not in spec
+    np.testing.assert_array_equal(filtering.effective_candidate_mask(bundle, "r", 0, spec), bundle.raw)
 
 
-def test_numerical_pin_is_read_once_per_process(monkeypatch):
-    assert filtering._compatible_filter_implementation(filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION)
-
-    def unavailable(*args, **kwargs):
-        raise AssertionError("numerical helper source was re-read")
-    monkeypatch.setattr(filtering.inspect, "getsource", unavailable)
-    assert filtering._compatible_filter_implementation(filtering._QUALIFIED_V26_SOURCE_GUARD_IMPLEMENTATION)
-    assert filtering._compatible_filter_implementation(filtering._QUALIFIED_LEGACY_IMPLEMENTATION)
-
-
-def test_unknown_implementation_is_not_accepted_as_compatible():
-    bundle = _Bundle()
-    spec = _legacy_spec(bundle)
-    spec["implementation_sha256"] = "0" * 64
+def _refingerprint(spec):
     spec["sha256"] = filtering._fingerprint({key: value for key, value in spec.items() if key != "sha256"})
-    with pytest.raises(ValueError, match="implementation differs"):
-        filtering.effective_candidate_mask(bundle, "r", 0, spec)
-
-
-def test_compatibility_rejects_changed_component_radius_helper(monkeypatch):
-    bundle = _Bundle()
-    spec = _legacy_spec(bundle)
-
-    def changed_radii(raw, labels, count):
-        return np.full(count, 1.e9)
-
-    monkeypatch.setattr(filtering, '_component_inscribed_radii', changed_radii)
-    with pytest.raises(ValueError, match='implementation differs'):
-        filtering.effective_candidate_mask(bundle, 'r', 0, spec)
 
 
 def test_real_legacy_unfiltered_receipt_keeps_its_meaning():
@@ -121,16 +93,20 @@ def test_current_filter_receipt_records_native_source_and_issuing_binary():
     assert all(len(native[key]) == 64 for key in ("source_sha256", "binary_sha256"))
     assert filtering._spec(spec) is spec
 
-    for field, replacement in (("source_sha256", "0" * 64), ("fp_contract", "changed"), ("binary_sha256", None)):
+    # Source and FP contract identify replay semantics. The issuing binary and
+    # compiler stay in the receipt even when another platform performs replay.
+    portable = dict(spec, native_implementation={**native, "binary_sha256": "a" * 64, "compiler": "other-build"})
+    _refingerprint(portable)
+    assert filtering._spec(portable) is portable
+
+    for field, replacement in (("source_sha256", "0" * 64), ("fp_contract", "changed"),
+                               ("binary_sha256", None), ("binary_sha256", "g" * 64), ("compiler", "")):
         changed = dict(spec, native_implementation={**native, field: replacement})
-        changed["sha256"] = filtering._fingerprint({key: value for key, value in changed.items() if key != "sha256"})
-        with pytest.raises(ValueError, match="native implementation differs"):
+        _refingerprint(changed)
+        with pytest.raises(ValueError, match="native implementation differs.*regenerate"):
             filtering._spec(changed)
-
-
-def test_historical_filter_rejects_unqualified_native_source(monkeypatch):
-    spec = _legacy_spec(_Bundle())
-    native = filtering.native_cpu_provenance("retina")
-    monkeypatch.setattr(filtering, "native_cpu_provenance", lambda _: {**native, "source_sha256": "0" * 64})
-    with pytest.raises(ValueError, match="implementation differs"):
-        filtering._spec(spec)
+    missing = dict(spec)
+    del missing["native_implementation"]
+    _refingerprint(missing)
+    with pytest.raises(ValueError, match="native implementation differs.*regenerate"):
+        filtering._spec(missing)

@@ -119,6 +119,22 @@ def test_adversarial_midpoint_neighbors_match_original_argmin():
     np.testing.assert_array_equal(reverses, [item[1] for item in expected])
 
 
+def test_sorted_lookup_preserves_wrap_ties_and_large_finite_subtraction():
+    # At 1e20 all these raw differences round to the same binary64 value.
+    # A modulo-first lookup on this target would incorrectly pick 100°.
+    sources = np.arange(0., 180., 5.)
+    targets = np.array([1.e20, -1.e20, -180., 177.5, 2.5,
+                        np.nextafter(2.5, 0.), np.nextafter(2.5, np.inf),
+                        45., 90., 180., np.nan, -np.inf])
+    with np.errstate(invalid='ignore'):
+        expected = [bp._nearest_azimuthal_source_for_backprojection(float(target), sources)
+                    for target in targets]
+    assert expected[:2] == [(0, True), (0, True)]
+    indices, reverses = nearest_azimuthal_sources(targets, sources)
+    np.testing.assert_array_equal(indices, [item[0] for item in expected])
+    np.testing.assert_array_equal(reverses, [item[1] for item in expected])
+
+
 @pytest.mark.parametrize('cached', [False, True])
 def test_plan_retains_exact_raw_angles_and_charges_their_bytes(cached):
     from XTA import projection_coverage_cpu as cpu

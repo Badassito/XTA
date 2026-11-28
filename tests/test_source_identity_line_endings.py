@@ -75,9 +75,8 @@ def test_no_package_module_hashes_its_own_raw_bytes():
 
 
 def test_previous_release_identities_stay_readable():
-    from XTA import sam_branch_selection, sam_cyclic, sam_filtering
-    assert sam_filtering._compatible_filter_implementation(
-        "6dd89b0929e8d3407750654cdf9606d2dfd3fe1689c3549e0debd04a95152bdc")
+    from XTA import sam_branch_selection, sam_cyclic
+
     assert sam_branch_selection._QUALIFIED_PACKED_OWNER_IMPLEMENTATIONS[
         "b7131c1e76e3a557354a8f7c3181233d669ad203751936d0a518174e94b27ce1"] == "tracked_known"
     assert "f65c83b547ec3b434eb0d25555685a022089984f9d7b76e5a79531d9c446f9bd" in sam_cyclic.QUALIFIED_IMPLEMENTATIONS

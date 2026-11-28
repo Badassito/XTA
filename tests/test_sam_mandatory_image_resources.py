@@ -269,7 +269,7 @@ def make_task(tmp_path, pool, context, *, base=4*GIB, allowance=4*GIB, view=None
         slice_workers=1, interpolation_task_workers=1, component_layers_needed=False,
         precleaned_slice_cleanup=True, hole_fill_done_on_device=True, slice_meta=None,
         fuse_azimuthal_component_layers=lambda:False,
-        preinterpolation_layer_already_published=False, parent_mask_ready_callback=None,
+        preinterpolation_layer_already_published=False,
         submit_component_projection=lambda *args, **kwargs:None,
         materialize_workspace=lambda *args, **kwargs:None, prepare=lambda **kwargs:None,
         interpolation_backend='sam', sam_context=context, sam_base_allowance_bytes=allowance,

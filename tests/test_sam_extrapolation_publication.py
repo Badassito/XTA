@@ -189,7 +189,7 @@ def test_extrapolation_context_image_failure_is_infrastructure_not_tail_stop(tmp
 
 
 @pytest.mark.parametrize('backend,distance', [('sdf', 3), ('sam', 3), ('sdf', 0)])
-def test_fullframe_extrapolation_uses_completed_local_baseline_and_excludes_tails_from_gate(
+def test_fullframe_extrapolation_uses_completed_local_baseline_without_a_tile_gate(
         tmp_path, backend, distance):
     shape = (5, 12, 13)
     view = geometry.get_view_infos(*shape, cartesian_views=('transverse',))[0]
@@ -210,15 +210,7 @@ def test_fullframe_extrapolation_uses_completed_local_baseline_and_excludes_tail
     called = []
     def extrapolate(observed, **kwargs):
         np.testing.assert_array_equal(observed, original | bridge)
-        gate = tmp_path/'tile_support'/'detector'/view.name/'fullframe_bridge_support.cvol'
-        if distance:
-            store = interpolation.RawBBoxMaskStore.open(gate)
-            try:
-                np.testing.assert_array_equal(np.stack([store.decode_slice(i) for i in range(shape[0])]), bridge)
-            finally:
-                store.close()
-        else:
-            assert not gate.exists()
+        assert not (tmp_path/'tile_support').exists()
         called.append(observed.copy())
         path = tmp_path/'tail.cvol'
         interpolation.write_raw_bbox_mask_store(tail, path,
@@ -237,18 +229,10 @@ def test_fullframe_extrapolation_uses_completed_local_baseline_and_excludes_tail
             slice_workers=1, interpolation_task_workers=1,
             interpolation_backend=backend, sam_context=context,
             extrapolation_distance=2, extrapolation_min_radius=0.)
-    try:
-        assert len(called) == 1
-        np.testing.assert_array_equal(result.final_view_volume_mm, original | bridge | tail)
-        assert result.interpolation_stats[-1]['processing_role'] == 'extrapolation'
-        if result.parent_bridge_support_mm is not None:
-            np.testing.assert_array_equal(np.stack([result.parent_bridge_support_mm.decode_slice(i)
-                for i in range(shape[0])]), bridge)
-    finally:
-        if result.parent_mask_support_mm is not None:
-            result.parent_mask_support_mm.close()
-        if result.parent_bridge_support_mm is not None:
-            result.parent_bridge_support_mm.close()
+    assert len(called) == 1
+    np.testing.assert_array_equal(result.final_view_volume_mm, original | bridge | tail)
+    assert result.interpolation_stats[-1]['processing_role'] == 'extrapolation'
+    assert not (tmp_path/'tile_support').exists()
 
 
 def test_shared_context_real_render_planner_evidence_and_publication_without_gpu(tmp_path):

@@ -135,7 +135,13 @@ def try_assemble_preprojected_packed_union(
     depth, height, width = shape
     packed_shape = (depth, height, (width + 7) // 8)
     worker_count = choose_slice_parallel_workers(workers, depth)
-    required = destination.nbytes + int(np.prod(packed_shape, dtype=np.int64)) + worker_count * height * width
+    direct_expand = (destination.dtype == np.uint8 and destination.flags.c_contiguous
+                     and destination.flags.writeable)
+    index_bytes = np.dtype(np.intp).itemsize
+    metadata_bytes = depth * max(2 * index_bytes + 2, index_bytes + np.dtype(np.int64).itemsize + 1)
+    required = destination.nbytes + math.prod(packed_shape) + metadata_bytes
+    if not direct_expand:
+        required += worker_count * height * width
     if not should_use_in_memory_workspace(required):
         return None
     try:
@@ -172,9 +178,12 @@ def try_assemble_preprojected_packed_union(
 
     def expand_slice(index: int) -> None:
         z = int(indices[index])
-        plane = np.unpackbits(packed[z], axis=1, count=width, bitorder='little')
-        destination[z] = plane
-        counts[index] = np.count_nonzero(plane)
+        if direct_expand:
+            counts[index] = _native_cpu.unpack_packed_plane_and_count(packed[z], destination[z])
+        else:
+            plane = np.unpackbits(packed[z], axis=1, count=width, bitorder='little')
+            destination[z] = plane
+            counts[index] = np.count_nonzero(plane)
 
     parallel_for_indices_chunked(
         len(indices), expand_slice, max_workers=worker_count, desc='Expanding packed projected union',

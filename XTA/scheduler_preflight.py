@@ -12,8 +12,6 @@ def preflight_tta_scheduler(*, gpu_device_count, cpu_enabled, tile_configs, view
     from .experimental_features import d1_owner_groups_requested
     from .native_scheduler import require_native_scheduler
 
-    if tile_configs:
-        raise ValueError('Native detector scheduler does not yet support tile ownership')
     if gpu_device_count and cpu_enabled:
         raise ValueError('Native detector scheduler does not yet support hybrid OpenVINO/CUDA dispatch')
     if d1_owner_groups is None:
@@ -28,16 +26,17 @@ def preflight_tta_scheduler(*, gpu_device_count, cpu_enabled, tile_configs, view
     from .native_cpu import load_native_cpu
 
     load_native_cpu()
+    scheduler_options = {'tiles': True} if tile_configs else {}
     global _native_preflight_reported
     if _native_preflight_reported:
-        require_native_scheduler()
+        require_native_scheduler(**scheduler_options)
         return
     started = time.perf_counter()
     print(f'[startup] Checking native scheduler in pid {os.getpid()} at {time.time_ns()} Unix ns.',
           flush=True)
     failed = True
     try:
-        require_native_scheduler()
+        require_native_scheduler(**scheduler_options)
         failed = False
     finally:
         status = 'failed' if failed else 'finished'

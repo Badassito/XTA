@@ -12,6 +12,7 @@ import numpy as np
 
 from ._deps import cv2, ndi
 from .geometry import ViewInfo, view_processing_min_radius
+from .native_cpu import kernels
 from .runtime import (
     choose_parallel_chunk_size,
     choose_slice_parallel_workers,
@@ -140,26 +141,51 @@ def _filter_connected_components_by_min_radius_scipy(
         return np.zeros(mask_bool.shape, dtype=bool)
     return np.isin(labels2d, keep_ids)
 
+def _component_keep_lookup(labels2d, values, num_labels, threshold):
+    # Preserve the Float32/uint8 comparison dtype used by the old maximum.at path.
+    maxima = kernels.component_maxima(labels2d, values, int(num_labels) - 1)
+    lookup = np.empty(int(num_labels), dtype=bool)
+    lookup[0] = False
+    lookup[1:] = maxima >= threshold
+    return lookup
+
+
 def _filter_connected_components_by_min_radius_opencv(
     mask_bool: np.ndarray,
     min_radius: float,
 ) -> np.ndarray:
     mask_u8 = np.ascontiguousarray(np.asarray(mask_bool, dtype=np.uint8))
-    if mask_u8.size == 0 or not np.any(mask_u8):
+    if mask_u8.size == 0:
         return np.zeros(mask_u8.shape, dtype=bool)
-    if bool(mask_u8.all()):
+    x0, y0, width, height = cv2.boundingRect(mask_u8)
+    if width == 0 or height == 0:
+        return np.zeros(mask_u8.shape, dtype=bool)
+    area = width * height
+    if area == mask_u8.size and bool(mask_u8.all()):
         return np.full(mask_u8.shape, math.hypot(*mask_u8.shape) >= float(min_radius), dtype=bool)
+    region = np.s_[y0:y0 + height, x0:x0 + width] if 2 * area <= mask_u8.size else None
+    label_input = mask_u8 if region is None else mask_u8[region]
 
-    num_labels, labels2d = _cv2_connected_components(mask_u8, connectivity=8)
+    num_labels, labels2d = _cv2_connected_components(label_input, connectivity=8)
     if int(num_labels) <= 1:
         return np.zeros(mask_u8.shape, dtype=bool)
 
+    # Bbox cropping preserves the component labels. OpenCV can round its
+    # distance transform differently on a cropped raster near a radius cutoff.
     dist = cv2.distanceTransform(mask_u8, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-    radii = np.zeros((int(num_labels),), dtype=np.float32)
-    np.maximum.at(radii, labels2d.ravel(), np.asarray(dist, dtype=np.float32).ravel())
-    keep_lookup = radii >= float(min_radius)
-    keep_lookup[0] = False
-    return keep_lookup[labels2d]
+    dist = np.asarray(dist, dtype=np.float32)
+    lookup = _component_keep_lookup(
+        labels2d, dist if region is None else dist[region], num_labels, float(min_radius),
+    )
+    del dist
+    kept = lookup[labels2d]
+    if region is None:
+        return kept
+    del labels2d
+    result = np.zeros(mask_u8.shape, dtype=bool)
+    result[region] = kept
+    return result
+
 
 def _filter_connected_components_by_min_conf_opencv(
     mask_bool: np.ndarray,
@@ -194,10 +220,10 @@ def _filter_connected_components_by_min_conf_opencv(
     confidence = np.asarray(conf_slice, dtype=np.uint8)
     if region is not None:
         confidence = confidence[region]
-    maxima = np.zeros((int(num_labels),), dtype=np.uint8)
-    np.maximum.at(maxima, labels2d.ravel(), confidence.ravel())
-    keep_lookup = maxima >= int(min_conf_u8)
-    keep_lookup[0] = False
+    elif confidence.shape != labels2d.shape:
+        # The previous flattened scatter also accepted a one-element score.
+        confidence = np.broadcast_to(confidence.ravel(), (labels2d.size,)).reshape(labels2d.shape)
+    keep_lookup = _component_keep_lookup(labels2d, confidence, num_labels, int(min_conf_u8))
     kept = keep_lookup[labels2d]
     if region is None:
         return kept

@@ -29,6 +29,22 @@ def test_single_voxel_edge_tile_keeps_full_grid_float32_order():
     assert not result[0][1].any()
 
 
+def test_complete_package_does_not_fallback_on_native_build_errors(monkeypatch):
+    from XTA import native_cpu
+    from XTA.native_cpu_build import NativeCpuBuildError
+
+    def unavailable():
+        raise NativeCpuBuildError('test native artifact verification failure')
+
+    monkeypatch.setattr(native_cpu, 'load_native_cpu', unavailable)
+    scores = np.zeros((2, 1, 129, 129), np.float32)
+    direct = np.zeros_like(scores, dtype=bool)
+    tiles = np.zeros((2, 1, 2, 2), dtype=bool)
+    tiles[0, 0, 0, 0] = True
+    with pytest.raises(NativeCpuBuildError, match='test native artifact verification failure'):
+        reconciliation._reduce_vote_groups(scores, direct, None, tiles)
+
+
 class _Scores:
     def __init__(self, data):
         self.data = data

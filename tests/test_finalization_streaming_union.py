@@ -12,9 +12,23 @@ import numpy as np
 from XTA import finalization, interpolation
 
 
+def test_native_unpack_writes_only_visible_tail_pixels_and_counts_them():
+    from XTA.native_cpu import kernels
+
+    packed = np.array([[0xa1, 0xff], [0x80, 0xf8]], np.uint8)
+    storage = np.full(24, 213, np.uint8)
+    destination = storage[1:-1].reshape(2, 11)
+    expected = np.unpackbits(packed, axis=1, count=11, bitorder='little')
+    assert kernels.unpack_packed_plane_and_count(packed, destination) == np.count_nonzero(expected)
+    np.testing.assert_array_equal(destination, expected)
+    np.testing.assert_array_equal(storage[[0, -1]], [213, 213])
+
+
 def test_preprojected_packed_union_merges_unaligned_crops_and_counts(monkeypatch, tmp_path):
-    monkeypatch.setattr(finalization, 'should_use_in_memory_workspace', lambda _required: True)
     shape = (4, 9, 19)
+    # Fits the destination, packed slab, and slice metadata, while even one
+    # temporary expanded plane would exceed the admitted budget.
+    monkeypatch.setattr(finalization, 'should_use_in_memory_workspace', lambda required: required <= 880)
     refs = []
     expected = np.zeros(shape, np.uint8)
     for offset in range(8):

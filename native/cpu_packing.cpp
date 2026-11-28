@@ -6,6 +6,10 @@
 #if defined(_M_X64) || defined(__SSE2__)
 #include <emmintrin.h>
 #endif
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+#include <immintrin.h>
+#define XTA_PACKING_TARGETS 1
+#endif
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -72,10 +76,6 @@ struct DenseRow {
 struct BitsetRow {
     const char* data;
     Size start_bit;
-
-    Size group(Size x, Size remaining) const noexcept {
-        return std::min<Size>(32 - (start_bit + x) % 32, remaining);
-    }
 
     Word bits(Size x, unsigned count) const noexcept {
         const Size at = start_bit + x;
@@ -151,6 +151,35 @@ RowBounds scan_groups(const Row& row, Size width) noexcept {
     return bounds;
 }
 
+RowBounds scan_row(const BitsetRow& row, Size width) noexcept {
+    RowBounds bounds{width, 0, 0};
+    for (Size x = 0; x < width;) {
+        const Size at = row.start_bit + x;
+        const unsigned shift = static_cast<unsigned>(at % 32);
+        const unsigned take = static_cast<unsigned>(std::min<Size>(64 - shift, width - x));
+        const char* address = row.data + (at / 32) * sizeof(Word);
+        Word low;
+        std::memcpy(&low, address, sizeof(low));
+        std::uint64_t pair = low;
+        if (shift + take > 32) {
+            Word high;
+            std::memcpy(&high, address + sizeof(Word), sizeof(high));
+            pair |= std::uint64_t(high) << 32;
+        }
+        pair >>= shift;
+        if (take < 64) pair &= (std::uint64_t{1} << take) - 1;
+        if (pair) {
+            const auto a = static_cast<Word>(pair);
+            const auto b = static_cast<Word>(pair >> 32);
+            bounds.count += popcount(a) + popcount(b);
+            if (bounds.first == width) bounds.first = x + (a ? trailing(a) : 32 + trailing(b));
+            bounds.stop = x + (b ? 64 - leading(b) : 32 - leading(a));
+        }
+        x += take;
+    }
+    return bounds;
+}
+
 template<class Row>
 RowBounds scan_row(const Row& row, Size width) noexcept {
     return scan_groups(row, width);
@@ -168,8 +197,41 @@ Word nonzero_bits_16(const char* data) noexcept {
     return static_cast<Word>(_mm_movemask_epi8(zeros)) ^ 0xffffu;
 }
 
+#if defined(XTA_PACKING_TARGETS)
+__attribute__((target("avx2,popcnt")))
+RowBounds scan_dense_avx2(const char* row, Size width) noexcept {
+    RowBounds bounds{width, 0, 0};
+    Size x = 0;
+    for (; x <= width - 32; x += 32) {
+        __m256i pixels;
+        std::memcpy(&pixels, row + x, sizeof(pixels));
+        const auto zero = _mm256_cmpeq_epi8(pixels, _mm256_setzero_si256());
+        const Word mask = ~static_cast<Word>(_mm256_movemask_epi8(zero));
+        if (mask) {
+            bounds.count += __builtin_popcount(mask);
+            if (bounds.first == width) bounds.first = x + trailing(mask);
+            bounds.stop = x + (32 - leading(mask));
+        }
+    }
+    for (; x < width; ++x) {
+        if (row[x]) {
+            ++bounds.count;
+            if (bounds.first == width) bounds.first = x;
+            bounds.stop = x + 1;
+        }
+    }
+    return bounds;
+}
+#endif
+
 RowBounds scan_row(const DenseRow& row, Size width) noexcept {
     if (row.stride != 1 || width < 16) return scan_groups(row, width);
+#if defined(XTA_PACKING_TARGETS)
+    // GCC and Clang's feature check includes OS support for YMM state.
+    if (width >= 64 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("popcnt")) {
+        return scan_dense_avx2(row.data, width);
+    }
+#endif
     // Sum 0/1 bytes in two independent 64-bit lanes. Bound searches then
     // inspect only the empty margins and one occupied group at each edge.
     __m128i counts = _mm_setzero_si128();
@@ -375,7 +437,144 @@ PyObject* words_encode(PyObject*, PyObject* args) {
     });
 }
 
+struct UnpackedByte {
+    std::array<std::uint8_t, 8> pixels{};
+    unsigned foreground = 0;
+};
+
+constexpr auto unpacked_bytes() {
+    std::array<UnpackedByte, 256> values{};
+    for (unsigned value = 0; value < values.size(); ++value) {
+        auto& entry = values[value];
+        for (unsigned bit = 0; bit < entry.pixels.size(); ++bit) {
+            entry.pixels[bit] = static_cast<std::uint8_t>((value >> bit) & 1);
+            entry.foreground += entry.pixels[bit];
+        }
+    }
+    return values;
+}
+
+PyObject* unpack_plane_and_count(PyObject*, PyObject* args) {
+    return protect([&]() -> PyObject* {
+        PyObject *packed_object, *destination_object;
+        if (!PyArg_ParseTuple(args, "OO:unpack_packed_plane_and_count", &packed_object, &destination_object))
+            return nullptr;
+        const Buffer packed(packed_object, "packed union plane", 2);
+        const Buffer destination(destination_object, "expanded union plane", 2, true);
+        packed.require<std::uint8_t>().require_contiguous();
+        destination.require<std::uint8_t>().require_contiguous();
+        const Size height = destination.shape(0), width = destination.shape(1);
+        const Size full = width / 8;
+        const auto tail = static_cast<unsigned>(width % 8);
+        if (packed.shape(0) != height || packed.shape(1) != full + (tail != 0))
+            value_error("Packed union plane differs from its destination shape");
+        if (!height || !width) return PyLong_FromLong(0);
+        const auto from = reinterpret_cast<std::uintptr_t>(packed.data());
+        const auto to = reinterpret_cast<std::uintptr_t>(destination.data());
+        if ((from <= to && to - from < std::uintmax_t(packed.nbytes()))
+            || (to < from && from - to < std::uintmax_t(destination.nbytes())))
+            value_error("Packed union input and output must be disjoint");
+        static constexpr auto lut = unpacked_bytes();
+        Size foreground = 0;
+        {
+            GilRelease release;
+            for (Size y = 0; y < height; ++y) {
+                const auto* input = reinterpret_cast<const std::uint8_t*>(packed.ptr(y, 0));
+                auto* output = destination.ptr(y, 0);
+                for (Size x = 0; x < full; ++x, output += 8) {
+                    const auto& entry = lut[input[x]];
+                    std::memcpy(output, entry.pixels.data(), entry.pixels.size());
+                    foreground += entry.foreground;
+                }
+                if (tail) {
+                    const auto& entry = lut[input[full] & low_bits(tail)];
+                    std::memcpy(output, entry.pixels.data(), tail);
+                    foreground += entry.foreground;
+                }
+            }
+        }
+        return PyLong_FromSsize_t(foreground);
+    });
+}
+
+bool has_foreground_word(const char* data) noexcept {
+    std::uint64_t word;
+    std::memcpy(&word, data, sizeof(word));
+    return word != 0;
+}
+
+Size first_foreground(const DenseRow& row, Size width) noexcept {
+    Size x = 0;
+    if (row.stride == 1) {
+        while (width - x >= 8 && !has_foreground_word(row.data + x)) x += 8;
+    }
+    while (x < width && row.data[x * row.stride] == 0) ++x;
+    return x;
+}
+
+Size foreground_stop(const DenseRow& row, Size lower, Size width) noexcept {
+    Size x = width;
+    if (row.stride == 1) {
+        while (x - lower >= 8 && !has_foreground_word(row.data + x - 8)) x -= 8;
+    }
+    while (x > lower && row.data[(x - 1) * row.stride] == 0) --x;
+    return x;
+}
+
+PyObject* binary_slice_metadata(PyObject*, PyObject* input) {
+    return protect([&]() -> PyObject* {
+        const Buffer source(input, "worker mask volume", 3);
+        if (!source.is<std::uint8_t>() && !source.is<bool>()) {
+            type_error("Worker binary metadata requires a uint8 or bool mask volume");
+        }
+        const Size depth = source.shape(0);
+        const Size height = source.shape(1);
+        const Size width = source.shape(2);
+        const Size packed_width = height / 8 + (height % 8 != 0);
+        auto any_array = zeros({depth}, "bool");
+        auto bbox_array = zeros({depth, 4}, "int64");
+        auto rows_array = zeros({depth, packed_width}, "uint8");
+        if (height && width && depth) {
+            const Buffer any(any_array.get(), "worker occupied slices", 1, true);
+            const Buffer bounds(bbox_array.get(), "worker slice bounds", 2, true);
+            const Buffer rows(rows_array.get(), "worker occupied rows", 2, true);
+            const DenseSource volume{source, 0};
+            GilRelease release;
+            for (Size z = 0; z < depth; ++z) {
+                Size top = height, bottom = 0, left = width, right = 0;
+                for (Size y = 0; y < height; ++y) {
+                    const auto row = volume.row(z, y);
+                    const Size first = first_foreground(row, width);
+                    if (first == width) continue;
+
+                    top = std::min(top, y);
+                    bottom = y + 1;
+                    left = std::min(left, first);
+                    // An earlier row already covers every column below right.
+                    const Size stop = foreground_stop(row, std::max(first, right), width);
+                    right = std::max(right, stop);
+
+                    // Worker receipts use NumPy's MSB-first row occupancy.
+                    const auto bit = static_cast<std::uint8_t>(0x80u >> (y % 8));
+                    rows.store<std::uint8_t>(rows.load<std::uint8_t>(z, y / 8) | bit, z, y / 8);
+                }
+                if (bottom != 0) {
+                    any.store<bool>(true, z);
+                    bounds.store<std::int64_t>(top, z, 0);
+                    bounds.store<std::int64_t>(bottom, z, 1);
+                    bounds.store<std::int64_t>(left, z, 2);
+                    bounds.store<std::int64_t>(right, z, 3);
+                }
+            }
+        }
+        return PyTuple_Pack(3, any_array.get(), bbox_array.get(), rows_array.get());
+    });
+}
+
 PyMethodDef methods[] = {
+    {"unpack_packed_plane_and_count", unpack_plane_and_count, METH_VARARGS,
+     "Expand one packed union plane into a disjoint byte destination and count foreground."},
+    {"binary_slice_metadata_from_volume", binary_slice_metadata, METH_O, "Scan worker slice bounds and row occupancy."},
     {"dense_mask_fields", dense_metadata<true>, METH_VARARGS, "Build CVOL records and their packed byte count."},
     {"dense_mask_metadata", dense_metadata<false>, METH_VARARGS, "Return exact per-plane bounds and foreground counts."},
     {"dense_mask_encode", dense_encode, METH_VARARGS, "Pack nonzero uint8 members into a bounded crop payload."},

@@ -70,24 +70,15 @@ public:
     }
 
 private:
-    // Read the fixed-width little-endian CTILE_INDEX_DTYPE wire fields.
-    static std::uint64_t little_endian(const unsigned char* bytes, int count) noexcept {
-        std::uint64_t value = 0;
-        for (int index = 0; index < count; ++index) {
-            value |= std::uint64_t(bytes[index]) << (8 * index);
-        }
-        return value;
-    }
-
     bool encoded_bit(Py_ssize_t shell, Py_ssize_t row, Py_ssize_t column) const {
         const auto* record = reinterpret_cast<const unsigned char*>(index_->ptr(shell, 0));
         if (record[0] == 0) {
             return false;
         }
-        const auto top = little_endian(record + 24, 4);
-        const auto left = little_endian(record + 28, 4);
-        const auto bottom = little_endian(record + 32, 4);
-        const auto right = little_endian(record + 36, 4);
+        const std::uint64_t top = load_little_endian<std::uint32_t>(record + 24);
+        const std::uint64_t left = load_little_endian<std::uint32_t>(record + 28);
+        const std::uint64_t bottom = load_little_endian<std::uint32_t>(record + 32);
+        const std::uint64_t right = load_little_endian<std::uint32_t>(record + 36);
         if (record[0] != 1 || top >= bottom || left >= right || bottom > std::uint64_t(shape_[1])
             || right > std::uint64_t(shape_[2])) {
             throw std::invalid_argument("Invalid encoded shell bounds");
@@ -101,8 +92,8 @@ private:
         const auto stride = packed_ ? (width + 7) / 8 : width;
         const auto relative = (std::uint64_t(row) - top) * stride
             + (packed_ ? local_column / 8 : local_column);
-        const auto offset = little_endian(record + 8, 8);
-        const auto payload_size = little_endian(record + 16, 8);
+        const auto offset = load_little_endian<std::uint64_t>(record + 8);
+        const auto payload_size = load_little_endian<std::uint64_t>(record + 16);
         const auto length = std::uint64_t(encoded_->shape(0));
         if (offset >= length || payload_size > length - offset || relative >= payload_size) {
             throw std::invalid_argument("Invalid encoded shell payload extent");

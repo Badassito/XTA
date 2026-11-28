@@ -11,7 +11,8 @@ cannot be loaded. CLI help and version discovery do not need it.
 Use the same Python interpreter that will run XTA. Install setuptools, the
 CPython development headers, and a C++17 compiler. On Windows, use MSVC Build
 Tools and the Windows SDK. The CPU extension uses the Python buffer protocol and
-does not need NumPy headers.
+does not need NumPy headers. The Unix CPU extension requests `-O3` and keeps the
+strict floating-point flags. The build recipe adds no target ISA flags.
 
 ```text
 python -B tools/build_native_cpu.py
@@ -29,6 +30,8 @@ The tool prints the extension path. You can also select that path with
 `native_cpu_build.json` receipt together with the extension. The source loader
 checks the native build source fingerprint, CPython ABI, and binary digest.
 Rebuild with the selected interpreter if any native build input changes.
+Both artifact identities include `setup.py`, so a change to that shared recipe
+requires new CPU and scheduler artifacts for source launches.
 Launches load an existing matching artifact and never start a CPU compiler.
 
 ## Building a wheel

@@ -302,11 +302,12 @@ def _fill_owners(keys, positions, cursors, owners):
 
 def _scatter_upright_crop(crop, azimuth, first_row, first_u, key_offsets, owners,
                           row_offsets, frames, plane_w, processing_width, base_id,
-                          out_h, out_w, packed, bounds, slice_counts):
-    return kernels.sparse_inverse_scatter_upright_crop(
-        crop, azimuth, first_row, first_u, key_offsets, owners, row_offsets, frames,
-        plane_w, processing_width, base_id, out_h, out_w, packed, bounds, slice_counts,
-    )
+                          out_h, out_w, packed, bounds, slice_counts, *, packed_width=None):
+    args = (azimuth, first_row, first_u, key_offsets, owners, row_offsets, frames,
+            plane_w, processing_width, base_id, out_h, out_w, packed, bounds, slice_counts)
+    if packed_width is not None:
+        return kernels.sparse_inverse_scatter_upright_packed_crop(crop, packed_width, *args)
+    return kernels.sparse_inverse_scatter_upright_crop(crop, *args)
 
 
 def _map_key_strips(view, plan, grid, plane_shape):
@@ -532,8 +533,8 @@ def _destination_bbox_for_sparse_input(store, view, output_shape, *, trajectory=
     return (*first, *stop)
 
 
-def _input_slabs(store: RawBBoxMaskStore):
-    """Yield bounded row slabs, without calling full-slice/full-volume decode."""
+def _input_slabs(store: RawBBoxMaskStore, *, decode_packed=True):
+    """Yield bounded row slabs. The native scatter can borrow stored packed rows."""
     depth, height, width = map(int, store.shape)
     backing = store._chunks_bytes if store._chunks_bytes is not None else store._chunks_mmap
     for z in range(depth):
@@ -567,7 +568,8 @@ def _input_slabs(store: RawBBoxMaskStore):
                 if len(payload) != count:
                     raise IOError(f'{store.root}: short input payload')
                 data = np.frombuffer(payload, dtype=np.uint8).reshape(count_rows, stride)
-            crop = np.unpackbits(data, axis=1, count=cols, bitorder='little') if store._packbits_payload else data
+            crop = (np.unpackbits(data, axis=1, count=cols, bitorder='little')
+                    if store._packbits_payload and decode_packed else data)
             yield z, y0+row0, x0, crop, count
 
 
@@ -767,7 +769,8 @@ def project_azimuthal_sparse_store(
                         retirement['mapping'] = weakref.ref(packed._mmap)
                         flat = packed.reshape(-1)
                         scatter_started = time.perf_counter()
-                        slabs = _input_slabs(store)
+                        encoded = store._packbits_payload
+                        slabs = _input_slabs(store, decode_packed=not encoded)
                         try:
                             for azimuth, row0, u0, crop, stored_bytes in slabs:
                                 try:
@@ -776,12 +779,14 @@ def project_azimuthal_sparse_store(
                                         mapping.row_offsets, mapping.frames, mapping.plane_width,
                                         mapping.processing_width, mapping.base_id, out_h, out_w,
                                         flat, bounds, slice_counts,
+                                        packed_width=int(store.index[azimuth]['x1']) - u0 if encoded else None,
                                     )
                                     foreground += int(positive)
                                     contributions += int(mapped)
                                     unique += int(newly_set)
                                     input_bytes += int(stored_bytes)
-                                    max_slab = max(max_slab, int(crop.nbytes))
+                                    if not encoded:
+                                        max_slab = max(max_slab, int(crop.nbytes))
                                 finally:
                                     del crop
                         finally:

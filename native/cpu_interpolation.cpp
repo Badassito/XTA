@@ -313,6 +313,44 @@ PyObject* keep_center_fill(PyObject*, PyObject* args) {
     });
 }
 
+PyObject* blend_bridge_section(PyObject*, PyObject* args) {
+    return protect([&]() -> PyObject* {
+        arguments(args, 4);
+        const Buffer source(arg(args, 0), "source bridge SDF", 2);
+        const Buffer target(arg(args, 1), "target bridge SDF", 2);
+        source.require<float>();
+        target.require<float>();
+        const Index height = source.shape(0), width = source.shape(1);
+        if (target.shape(0) != height || target.shape(1) != width)
+            value_error("Interpolation bridge fields must have the same shape");
+        const double alpha = real(args, 2);
+        const float first_weight = static_cast<float>(1.0 - alpha);
+        const float last_weight = static_cast<float>(alpha);
+        const bool fill_holes = flag(args, 3);
+        auto result = empty({height, width}, "bool");
+        const Buffer section(result.get(), "blended bridge component", 2, true);
+        bool occupied = false;
+        {
+            GilRelease release;
+            for (Index y = 0; y < height; ++y) {
+                for (Index x = 0; x < width; ++x) {
+                    // Each product is rounded in float32 before addition, as
+                    // in the two NumPy multiplies and separate add operation.
+                    const float first = source.load<float>(y, x) * first_weight;
+                    const float last = target.load<float>(y, x) * last_weight;
+                    const bool member = (first + last) >= 0.f;
+                    section.store<bool>(member, y, x);
+                    occupied |= member;
+                }
+            }
+            // The flood reads all original membership before writing its final
+            // state, so the output can double as the input without a raw slab.
+            if (occupied) flood_center(section, section, fill_holes);
+        }
+        return PyTuple_Pack(2, result.get(), occupied ? Py_True : Py_False);
+    });
+}
+
 
 template<bool Packed, class Word>
 Index paste_mask(const Buffer& destination, const Buffer& local, Index dy0, Index dx0,
@@ -413,13 +451,40 @@ struct ProjectionCount {
     int overflow = 0;
 };
 
+// Common walks use only a few entries. Larger walks grow to the original
+// bound once, without the transient half-full vector reallocations.
+constexpr Index projection_inline_capacity = 64;
+
+template<class T>
+class ProjectionScratch {
+public:
+    const T* data() const noexcept { return heap_ ? heap_.get() : inline_.data(); }
+    T& operator[](Index index) noexcept { return heap_ ? heap_[index] : inline_[index]; }
+
+    void store(Index index, Index capacity, const T& value) {
+        if (index == projection_inline_capacity && !heap_) {
+            heap_.reset(new T[capacity]);
+            std::copy_n(inline_.data(), projection_inline_capacity, heap_.get());
+        }
+        (*this)[index] = value;
+    }
+
+    void release_heap() noexcept { heap_.reset(); }
+
+private:
+    std::array<T, projection_inline_capacity> inline_;
+    std::unique_ptr<T[]> heap_;
+};
+
+using ProjectionColumns = std::array<ProjectionScratch<Signed>, 6>;
+
 template<class Label, bool Sparse>
 ProjectionCount project_candidates(
     const Buffer& labels, const Buffer& offsets, const Buffer& boxes,
     const Buffer& lut, const Buffer& lut_offsets, const Buffer& sdf,
-    const ProjectionWalk& walk, const std::array<Buffer, 6>& output) {
+    const ProjectionWalk& walk, ProjectionColumns& output) {
     const bool use_lut = lut_offsets.shape(0) == walk.slices;
-    std::unique_ptr<Candidate[]> step_candidates(new Candidate[walk.capacity]);
+    ProjectionScratch<Candidate> step_candidates;
     ProjectionCount count;
     for (Index step = 1; step <= walk.max_steps; ++step) {
         Index slice = walk.source_slice + walk.direction * step;
@@ -486,7 +551,7 @@ ProjectionCount project_candidates(
                 }
 
                 Index prior = 0;
-                while (prior < count.found && output[0].load<Signed>(prior) != target) {
+                while (prior < count.found && output[0][prior] != target) {
                     ++prior;
                 }
                 if (prior < count.found) {
@@ -505,7 +570,7 @@ ProjectionCount project_candidates(
                         count.overflow = 1;
                         return count;
                     }
-                    step_candidates[step_count++] = {target, gy, sample_x, distance};
+                    step_candidates.store(step_count++, walk.capacity, {target, gy, sample_x, distance});
                 } else if (distance < step_candidates[local].distance) {
                     step_candidates[local] = {target, gy, sample_x, distance};
                 }
@@ -523,12 +588,11 @@ ProjectionCount project_candidates(
                 return count;
             }
             const auto& candidate = step_candidates[local];
-            output[0].store<Signed>(candidate.label, count.found);
-            output[1].store<Signed>(slice, count.found);
-            output[2].store<Signed>(candidate.y, count.found);
-            output[3].store<Signed>(candidate.x, count.found);
-            output[4].store<Signed>(step, count.found);
-            output[5].store<Signed>(candidate.distance, count.found);
+            const std::array<Signed, 6> record{candidate.label, slice, candidate.y, candidate.x,
+                                               step, candidate.distance};
+            for (std::size_t column = 0; column < output.size(); ++column) {
+                output[column].store(count.found, walk.capacity, record[column]);
+            }
             ++count.found;
         }
         if (count.found >= walk.max_candidates) {
@@ -582,19 +646,7 @@ PyObject* find_projection_candidates(PyObject*, PyObject* args) {
             || walk.crop_y > dense.shape(1) || sdf.shape(0) > dense.shape(1) - walk.crop_y) {
             value_error("Interpolation projection crop is outside the dense label volume");
         }
-        std::array<Object, 6> result{
-            zeros({walk.capacity}, "int64"), zeros({walk.capacity}, "int64"),
-            zeros({walk.capacity}, "int64"), zeros({walk.capacity}, "int64"),
-            zeros({walk.capacity}, "int64"), zeros({walk.capacity}, "int64"),
-        };
-        const std::array<Buffer, 6> output{{
-            {result[0].get(), "candidate labels", 1, true},
-            {result[1].get(), "candidate slices", 1, true},
-            {result[2].get(), "candidate rows", 1, true},
-            {result[3].get(), "candidate columns", 1, true},
-            {result[4].get(), "candidate steps", 1, true},
-            {result[5].get(), "candidate distances", 1, true},
-        }};
+        ProjectionColumns output;
         const Buffer& labels = sparse_mode ? sparse : dense;
         const auto count = integer_dtype(labels, [&](auto dtype) {
             using Label = typename decltype(dtype)::type;
@@ -604,6 +656,30 @@ PyObject* find_projection_candidates(PyObject*, PyObject* args) {
             }
             return project_candidates<Label, false>(labels, offsets, boxes, lut, lut_offsets, sdf, walk, output);
         });
+        std::array<Object, 6> result;
+        const std::size_t bytes = checked_extent(count.found, sizeof(Signed));
+        for (std::size_t column = 0; column < result.size(); ++column) {
+            result[column] = empty({count.found}, "int64");
+            if (!bytes) continue;
+            const Buffer destination(result[column].get(), "candidate results", 1, true);
+            destination.require<Signed>().require_contiguous();
+            if (destination.shape(0) != count.found)
+                value_error("Interpolation candidate allocator returned an inconsistent shape");
+            // Transfer one column at a time. The current step's workspace is
+            // already gone, and releasing each native column avoids retaining
+            // two complete arrays when exceptionally many labels are present.
+            constexpr std::size_t column_copy_threshold = 8 * 1024;
+            const bool releases_large_allocation = count.found > projection_inline_capacity
+                && walk.capacity > static_cast<Index>(column_copy_threshold / sizeof(Signed));
+            if (bytes > column_copy_threshold || releases_large_allocation) {
+                GilRelease release;
+                std::memcpy(destination.data(), output[column].data(), bytes);
+                output[column].release_heap();
+            } else {
+                std::memcpy(destination.data(), output[column].data(), bytes);
+                output[column].release_heap();
+            }
+        }
         return Py_BuildValue("OOOOOOni", result[0].get(), result[1].get(), result[2].get(),
                              result[3].get(), result[4].get(), result[5].get(), count.found, count.overflow);
     });
@@ -769,6 +845,7 @@ PyMethodDef methods[] = {
     {"interpolation_nearest_true_pixel", nearest_true_pixel, METH_VARARGS, nullptr},
     {"interpolation_dilated_overlap_count", dilated_overlap_count, METH_VARARGS, nullptr},
     {"interpolation_keep_center_fill", keep_center_fill, METH_VARARGS, nullptr},
+    {"interpolation_blend_bridge_section", blend_bridge_section, METH_VARARGS, nullptr},
     {"interpolation_paste_masked_or", paste_or<false>, METH_VARARGS, nullptr},
     {"interpolation_paste_packed_or", paste_or<true>, METH_VARARGS, nullptr},
     {"interpolation_find_projection_candidates", find_projection_candidates, METH_VARARGS, nullptr},

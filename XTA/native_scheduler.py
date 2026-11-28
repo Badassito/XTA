@@ -62,9 +62,11 @@ def _load_native():
         return module
 
 
-def require_native_scheduler() -> None:
+def require_native_scheduler(*, tiles=False) -> None:
     """Validate the mandatory compiled backend before preparing a study or opening products."""
-    _load_native()
+    module = _load_native()
+    if tiles and not (hasattr(module, 'configure_tile_results') and hasattr(module, 'declare_tile_result')):
+        raise RuntimeError('The native detector scheduler lacks tile leases. Rebuild it for this checkout.')
 
 
 @dataclass(frozen=True)
@@ -133,8 +135,10 @@ def send_receipt(channel: socket.socket, lease: Lease, kind: str, *, payload: by
             lock = threading.Lock()
             _send_locks[channel] = lock
     with lock:
-        channel.sendall(header)
-        if payload:
+        if len(payload) <= 64 * 1024:
+            channel.sendall(header + payload)
+        else:
+            channel.sendall(header)
             channel.sendall(payload)
 
 
@@ -162,6 +166,14 @@ class PreparedWorkScheduler:
                            *, pressure_byte_capacity=None):
         self._native.configure(self._owner, byte_capacity, ticket_capacity, inference_byte_capacity, preparation_window,
                                byte_capacity if pressure_byte_capacity is None else pressure_byte_capacity)
+
+    def configure_tile_results(self, byte_capacity, ticket_capacity, largest_result):
+        """Bound independent array-backed tile results through scientific cleanup."""
+        self._native.configure_tile_results(self._owner, byte_capacity, ticket_capacity, largest_result)
+
+    def declare_tile_result(self, parent_id, byte_cost, *, descriptor_only=False):
+        """Declare one tile work packet and its complete retained result charge."""
+        return self._native.declare_tile_result(self._owner, parent_id, byte_cost, descriptor_only)
 
     def try_resize_capacity(self, byte_capacity, inference_byte_capacity, *, pressure_byte_capacity=None):
         """Transfer settled dense capacity after detector drain. An unsafe transfer returns False."""

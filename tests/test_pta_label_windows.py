@@ -14,7 +14,7 @@ from XTA import polygon_keyholes, pta_workers as workers
 from XTA.polygon_keyholes import holes_by_parent, splice_holes
 from XTA.pta_dataset import OutputCandidate
 from XTA.pta_publication import (
-    _yolo_coordinate_text, candidate_output_paths, mask_to_yolo_lines, yolo_label_window,
+    candidate_output_paths, mask_to_yolo_lines, yolo_label_window,
 )
 from tests.test_pta_gpu_publication import FakeTensor, FakeTorch
 
@@ -187,12 +187,16 @@ def test_large_frames_match_reference(shape):
         assert windowed(mask) == expected
 
 
-def test_coordinate_text_matches_per_vertex_format_for_every_pixel():
-    for size in (1, 2, 3, 7, 640, 3072, 3064):
-        text = _yolo_coordinate_text(size)
-        assert not text.flags.writeable
-        assert text.tolist() == [f"{min(1.0, max(0.0, float(v) / float(max(1, size)))):.6f}"
-                                 for v in range(size)]
+def test_polygon_text_matches_per_vertex_format_for_every_pixel():
+    from XTA.native_cpu import kernels
+
+    for size in (1, 2, 3, 7, 640, 3072, 3064, 2000000):
+        values = np.arange(size, dtype=np.int64) if size < 10000 else np.array(
+            [0, 1, 2, 3, 7, 11, size // 2, size - 1], np.int64)
+        points = np.column_stack((values, values % 17))[::-1]
+        expected = "0 " + " ".join(
+            f"{float(x) / float(size):.6f} {float(y) / 17.:.6f}" for x, y in points)
+        assert kernels.format_yolo_polygon_line(points, size, 17) == expected
 
 
 def device_masks():

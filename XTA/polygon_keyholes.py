@@ -88,6 +88,19 @@ def _bridge_in_foreground(start: np.ndarray, end: np.ndarray, foreground: np.nda
     return bool(np.all(foreground[y0:y1 + 1, x0:x1 + 1][scratch != 0]))
 
 
+def _foreground_bridge_rank(hole, points, starts, targets, foreground) -> int:
+    if (isinstance(foreground, np.ndarray) and foreground.ndim == 2
+            and foreground.dtype in (np.dtype(np.uint8), np.dtype(bool))):
+        from .native_cpu import kernels
+
+        rank = kernels.polygon_first_foreground_bridge(
+            foreground, hole, points, np.asarray(starts, dtype=np.intp), np.asarray(targets, dtype=np.intp))
+        if rank != -2:
+            return max(0, rank)
+    return next((rank for rank, (j, c) in enumerate(zip(starts, targets))
+                 if _bridge_in_foreground(hole[j], points[c], foreground)), 0)
+
+
 def splice_holes(outer: np.ndarray, holes: Sequence[np.ndarray], foreground: Optional[np.ndarray] = None,
                  max_validated_holes: int = 64) -> np.ndarray:
     """Return ``outer`` (N, 2) int64 with each hole ring spliced in at one vertex.
@@ -120,8 +133,7 @@ def splice_holes(outer: np.ndarray, holes: Sequence[np.ndarray], foreground: Opt
         for k in order:
             points = np.concatenate([rings[r] for r in attached])
             starts, targets = _ranked_bridges(rings[k], points, _BRIDGE_CANDIDATES)
-            pick = next((rank for rank, (j, c) in enumerate(zip(starts, targets))
-                         if _bridge_in_foreground(rings[k][j], points[c], foreground)), 0)
+            pick = _foreground_bridge_rank(rings[k], points, starts, targets, foreground)
             ends = np.cumsum([len(rings[r]) for r in attached])
             slot = int(np.searchsorted(ends, targets[pick], side="right"))
             vertex = int(targets[pick]) - (int(ends[slot - 1]) if slot else 0)

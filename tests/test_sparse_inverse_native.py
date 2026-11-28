@@ -114,3 +114,39 @@ def test_sparse_inverse_scatter_matches_bytes_and_counts_for_each_base(base):
     with pytest.raises(ValueError, match="offsets exceed"):
         sparse._scatter_upright_crop(*arguments[:4], bad_offsets, *arguments[5:])
     np.testing.assert_array_equal(packed, original)
+
+
+@pytest.mark.parametrize("base", [0, 1, 2])
+def test_packed_upright_scatter_ignores_padding_and_counts_unmapped_rows(base):
+    out_t, out_h, out_w = 3, 2, 5
+    plane_width = out_h if base == 2 else out_w
+    plane_area = (out_h if base == 0 else out_t) * plane_width
+    crop = np.zeros((3, 9), np.uint8)
+    crop[0, [0, 3, 8]] = 1
+    crop[1, [4, 7, 8]] = 1  # Foreground with no mapped destination frames.
+    crop[2, [0, 8]] = 1
+    encoded = np.packbits(crop, axis=1, bitorder="little")
+    encoded[:, -1] |= 0xfe  # Only bit zero is a live column.
+    encoded = encoded[::-1, ::-1].copy()[::-1, ::-1]
+    encoded.setflags(write=False)
+    key_offsets = np.arange(crop.shape[1] + 1, dtype=np.uint32)
+    owners = np.arange(crop.shape[1], dtype=np.uint32) % plane_area
+    row_offsets = np.array([0, 1, 1, 2], np.uint32)
+    frames = np.array([0, 1], np.uint32)
+
+    def scatter(data, packed_width):
+        packed = np.zeros(out_t * out_h * ((out_w + 7) // 8), np.uint8)
+        bounds = np.tile(np.array([out_h, 0, out_w, 0], np.int32), (out_t, 1))
+        counts = np.zeros(out_t, np.uint64)
+        report = sparse._scatter_upright_crop(
+            data, 0, 0, 0, key_offsets, owners, row_offsets, frames,
+            plane_width, crop.shape[1], base, out_h, out_w, packed, bounds, counts,
+            packed_width=packed_width)
+        return report, packed, bounds, counts
+
+    wanted = scatter(crop, None)
+    actual = scatter(encoded, crop.shape[1])
+    assert actual[0] == wanted[0]
+    assert actual[0][:2] == (8, 5)
+    for observed, expected in zip(actual[1:], wanted[1:]):
+        np.testing.assert_array_equal(observed, expected)

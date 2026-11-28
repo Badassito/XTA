@@ -1344,7 +1344,7 @@ class _CroppedNrrdPayloadWriter:
         self._flush_data()
         self._zero_pending += count
 
-    def _queue_data(self, values: np.ndarray) -> None:
+    def _queue_data(self, values: np.ndarray, *, check_foreground: bool = True) -> None:
         count = int(values.size)
         if count <= 0:
             return
@@ -1358,7 +1358,8 @@ class _CroppedNrrdPayloadWriter:
             # Exactly one copy: an ordinary writer may reuse its block, and the box is
             # usually a strided view, so the compressor retains an owned contiguous copy.
             owned = np.array(values, dtype=np.uint8, order='C', copy=True).reshape(-1)
-        self._queued_nonzero += int(np.count_nonzero(owned))
+        if check_foreground:
+            self._queued_nonzero += int(np.count_nonzero(owned))
         if count >= self._buffer_limit:
             self._flush_data()
             self._write_owned(owned)
@@ -1447,6 +1448,38 @@ class _CroppedNrrdPayloadWriter:
 
     def write_owned_known_nonzero(self, data: object) -> int:
         return self._write_reference_bytes(data, owned=True)
+
+    @property
+    def member_window(self):
+        return self._y0, self._x0, self._y1, self._x1
+
+    def write_contained_member(self, data):
+        """Route an owned XY-window member using its original reference-plane positions."""
+        if self._finished:
+            raise RuntimeError('Cannot write to a finished cropped NRRD payload stream')
+        first, remainder = divmod(self._position, self._plane)
+        if (remainder or data.ndim != 3 or data.shape[1:] != (self._y1-self._y0, self._x1-self._x0)
+                or data.dtype != np.uint8):
+            raise ValueError('Cropped NRRD member does not match its reference window')
+        count = len(data)
+        stop = first + count
+        if self._position + count * self._plane > self._stop:
+            raise ValueError('Cropped NRRD member exceeds the reference stream range')
+        begin = min(count, max(0, self._t0 - first))
+        end = max(begin, min(count, self._t1 - first))
+        if end > begin:
+            accepted = data[begin:end]
+            # A slice can borrow a whole producer group. Detach a strict subset
+            # before an asynchronous compressor or pending queue retains it.
+            owner = data.base if isinstance(data.base, np.ndarray) else data
+            self._source_owned = accepted.nbytes == owner.nbytes
+            self._queue_data(accepted, check_foreground=False)
+        # As with reference-stream writes, inner I/O failures take precedence
+        # over an excluded-foreground error for the same member.
+        if np.any(data[:begin]) or np.any(data[end:]):
+            self._raise_outside_foreground()
+        self._position = stop * self._plane
+        return count * self._plane
 
     def try_write_crop_span_batch(
         self,
@@ -4105,11 +4138,11 @@ def _nrrd_sparse_resize_axis_map(
     return starts, stops
 
 def _nrrd_area_crop_resize_kernel(
-    integral, crop, in_h, in_w, out_h, out_w,
+    crop, in_h, in_w, out_h, out_w,
     source_y0, source_x0, source_y1, source_x1, out_y0, out_x0, restored,
 ):
     _native_cpu.nrrd_area_crop_resize(
-        integral, crop, in_h, in_w, out_h, out_w,
+        crop, in_h, in_w, out_h, out_w,
         source_y0, source_x0, source_y1, source_x1, out_y0, out_x0, restored,
     )
 
@@ -4126,7 +4159,7 @@ def _resize_sparse_binary_crop_to_output_region(
  Returns ``(out_y0, out_x0, out_y1, out_x1, crop)``. The output region includes every
  output pixel whose global sampling footprint can see the source bbox, including the
  one-pixel influence halo that an area downscale can create. Work is proportional to
- the affected region: OpenCV's integral-image kernel and the compiled area sampler
+ the affected region: the binary integral and area sampler
  avoid a full zero-plane resize."""
     in_h, in_w = (max(1, int(v)) for v in source_shape)
     out_h, out_w = (max(1, int(v)) for v in output_shape)
@@ -4175,16 +4208,13 @@ def _resize_sparse_binary_crop_to_output_region(
         restored = crop_u8[src_y[:, None], src_x[None, :]]
     else:
         # Reproduce INTER_AREA's global phase and uint8 rounding threshold without padding
-        # a full source plane. cv2.integral is a compiled, GIL-releasing prefix pass over
-        # the bbox; evaluating its continuous piecewise-constant integral accounts for
-        # fractional first/last source pixels, and like cv::computeResizeAreaTab the
-        # kernel drops edge slivers of at most 1e-3 source px.
-        integral = cv2.integral(crop_u8, sdepth=cv2.CV_32S)
+        # a full source plane. Both fused and standalone calls build their binary
+        # prefix from nonzero membership, retaining fractional support at the crop edges.
         restored = np.empty(
             (int(out_y1 - out_y0), int(out_x1 - out_x0)), dtype=np.uint8,
         )
         _nrrd_area_crop_resize_kernel(
-            integral, crop_u8,
+            crop_u8,
             int(in_h), int(in_w), int(out_h), int(out_w),
             int(y0), int(x0), int(y1), int(x1),
             int(out_y0), int(out_x0), restored,
@@ -4351,7 +4381,15 @@ def _write_one_decomposed_nrrd_layer_payload(
             if not callable(write_nonzero):
                 write_nonzero = payload_writer.write
             write_aligned_zeros = getattr(payload_writer, 'write_aligned_zeros', None)
-            if bool(raw_store_native_stream):
+            members = None
+            if (type(payload_writer) is _CroppedNrrdPayloadWriter and type(src) is RawBBoxMaskStore
+                    and block_consumer is None):
+                from .nrrd_sparse_kernels import contained_member_groups
+                members = contained_member_groups(src, (out_t, out_h, out_w), z_begin, z_end,
+                                                  member_bytes, sparse_consumer, payload_writer.member_window)
+            if members is not None:
+                write_nonzero = payload_writer.write_contained_member
+            elif raw_store_native_stream:
                 members = src.iter_native_sparse_members(
                     int(z_begin), int(z_end), member_bytes=int(member_bytes),
                     sparse_consumer=sparse_consumer,

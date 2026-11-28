@@ -3,7 +3,16 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <vector>
+
+#if defined(_M_X64) || defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#endif
 
 namespace xta::cpu {
 namespace {
@@ -48,6 +57,185 @@ float bilinear(float a, float b, float c, float d, float wx, float wy) noexcept 
     const float top = a * (1.0f - wx) + b * wx;
     const float bottom = c * (1.0f - wx) + d * wx;
     return top * (1.0f - wy) + bottom * wy;
+}
+
+Index clipped_box_edge(float edge, Index extent) noexcept {
+    if (edge <= 0.0f) return 0;
+    if (static_cast<double>(edge) >= static_cast<double>(extent)) return extent;
+    return static_cast<Index>(std::ceil(static_cast<double>(edge)));
+}
+
+Byte retina_confidence_score(float confidence) noexcept {
+    // The public Python quantizer clamps NaN to zero and scales in binary64.
+    if (!(confidence > 0.0f)) return 0;
+    if (confidence >= 1.0f) return 255;
+    const double value = static_cast<double>(confidence) * 255.0;
+    const auto whole = static_cast<unsigned>(value);
+    const double fraction = value - whole;
+    return static_cast<Byte>(whole + (fraction > 0.5 || (fraction == 0.5 && (whole & 1u))));
+}
+
+void accumulate_logit_row(float coefficient, const char* proto_row, Index proto_step,
+                          float* logits, Index width) noexcept {
+    for (Index x = 0; x < width; ++x) {
+        float value;
+        std::memcpy(&value, proto_row + x * proto_step, sizeof(value));
+        logits[x] = std::fma(coefficient, value, logits[x]);
+    }
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx,fma")))
+void accumulate_logit_row_fma(float coefficient, const char* proto_row,
+                              float* logits, Index width) noexcept {
+    const auto weight = _mm256_set1_ps(coefficient);
+    Index x = 0;
+    for (; x <= width - 8; x += 8) {
+        __m256 source;
+        std::memcpy(&source, proto_row + x * sizeof(float), sizeof(source));
+        const auto values = _mm256_loadu_ps(logits + x);
+        _mm256_storeu_ps(logits + x, _mm256_fmadd_ps(weight, source, values));
+    }
+    accumulate_logit_row(coefficient, proto_row + x * sizeof(float), sizeof(float),
+                         logits + x, width - x);
+}
+#endif
+
+PyObject* accumulate_retina_rois(PyObject*, PyObject* args) {
+    return protect([&]() -> PyObject* {
+        PyObject *proto_input, *coeff_input, *boxes_input, *confs_input;
+        Index crop_y, crop_x, crop_h, crop_w, out_h, out_w;
+        int track_confidence;
+        if (!PyArg_ParseTuple(args, "OOOOnnnnnnp:accumulate_retina_rois",
+                              &proto_input, &coeff_input, &boxes_input, &confs_input,
+                              &crop_y, &crop_x, &crop_h, &crop_w, &out_h, &out_w,
+                              &track_confidence)) {
+            throw PythonError{};
+        }
+        const Buffer proto(proto_input, "Retina prototypes", 3);
+        const Buffer coefficients(coeff_input, "Retina coefficients", 2);
+        const Buffer boxes(boxes_input, "Retina bounding boxes", 2);
+        const Buffer confidences(confs_input, "Retina confidences", 1);
+        proto.require<float>();
+        coefficients.require<float>();
+        boxes.require<float>();
+        confidences.require<float>();
+        if (proto.shape(0) <= 0 || coefficients.shape(1) != proto.shape(0)
+            || (boxes.shape(0) && boxes.shape(1) < 4) || out_h <= 0 || out_w <= 0
+            || crop_y < 0 || crop_x < 0 || crop_h <= 0 || crop_w <= 0
+            || crop_y > proto.shape(1) || crop_h > proto.shape(1) - crop_y
+            || crop_x > proto.shape(2) || crop_w > proto.shape(2) - crop_x) {
+            value_error("Retina crop, detection and prototype shapes are inconsistent");
+        }
+
+        auto union_array = zeros({out_h, out_w}, "uint8");
+        Object score_array;
+        const Buffer frame_union(union_array.get(), "Retina union", 2, true);
+        std::optional<Buffer> frame_scores;
+        if (track_confidence) {
+            score_array = zeros({out_h, out_w}, "uint8");
+            frame_scores.emplace(score_array.get(), "Retina scores", 2, true);
+        }
+        Index kept = 0;
+        {
+            GilRelease release;
+            const bool identity = crop_h == out_h && crop_w == out_w;
+            const float scale_y = static_cast<float>(static_cast<double>(crop_h) / out_h);
+            const float scale_x = static_cast<float>(static_cast<double>(crop_w) / out_w);
+            std::vector<float> logits;
+            std::vector<Coordinate> x_coordinates;
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+            const bool vector_rows = proto.stride(2) == static_cast<Index>(sizeof(float))
+                && __builtin_cpu_supports("avx") && __builtin_cpu_supports("fma");
+#endif
+            const Index detections = std::min(coefficients.shape(0), boxes.shape(0));
+            for (Index detection = 0; detection < detections; ++detection) {
+                const float left = boxes.load<float>(detection, 0);
+                const float top = boxes.load<float>(detection, 1);
+                const float right = boxes.load<float>(detection, 2);
+                const float bottom = boxes.load<float>(detection, 3);
+                bool finite = std::isfinite(left) && std::isfinite(top)
+                    && std::isfinite(right) && std::isfinite(bottom);
+                for (Index field = 4; finite && field < boxes.shape(1); ++field) {
+                    finite = std::isfinite(boxes.load<float>(detection, field));
+                }
+                if (!finite) continue;
+
+                const Index first_x = clipped_box_edge(left, out_w);
+                const Index first_y = clipped_box_edge(top, out_h);
+                const Index stop_x = clipped_box_edge(right, out_w);
+                const Index stop_y = clipped_box_edge(bottom, out_h);
+                if (stop_x <= first_x || stop_y <= first_y) continue;
+
+                // Even identity resizing uses the canonical binary32 pixel-center
+                // calculation, which can round onto an adjacent cell at wide extents.
+                const Index proto_first_y = source_coordinate(first_y, crop_h, scale_y).first;
+                const Index proto_first_x = source_coordinate(first_x, crop_w, scale_x).first;
+                const auto last_y = source_coordinate(stop_y - 1, crop_h, scale_y);
+                const auto last_x = source_coordinate(stop_x - 1, crop_w, scale_x);
+                const Index proto_last_y = identity ? last_y.first : last_y.second;
+                const Index proto_last_x = identity ? last_x.first : last_x.second;
+                const Index width = proto_last_x - proto_first_x + 1;
+                const Index height = proto_last_y - proto_first_y + 1;
+                logits.assign(static_cast<std::size_t>(checked_extent(height, width)), 0.0f);
+
+                // Vectorize across spatial cells only. Every cell still sees
+                // the canonical sequence of float32 fused channel updates.
+                for (Index channel = 0; channel < proto.shape(0); ++channel) {
+                    const float coefficient = coefficients.load<float>(detection, channel);
+                    for (Index y = 0; y < height; ++y) {
+                        const auto* src = proto.ptr(channel, crop_y + proto_first_y + y,
+                                                    crop_x + proto_first_x);
+                        auto* dst = logits.data() + y * width;
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+                        if (vector_rows && width >= 8) {
+                            accumulate_logit_row_fma(coefficient, src, dst, width);
+                            continue;
+                        }
+#endif
+                        accumulate_logit_row(coefficient, src, proto.stride(2), dst, width);
+                    }
+                }
+
+                x_coordinates.clear();
+                x_coordinates.reserve(stop_x - first_x);
+                for (Index x = first_x; x < stop_x; ++x) {
+                    auto coordinate = source_coordinate(x, crop_w, scale_x);
+                    coordinate.first -= proto_first_x;
+                    coordinate.second -= proto_first_x;
+                    x_coordinates.push_back(coordinate);
+                }
+                const Byte score = frame_scores && detection < confidences.shape(0)
+                    ? retina_confidence_score(confidences.load<float>(detection)) : 0;
+                bool foreground = false;
+                for (Index y = first_y; y < stop_y; ++y) {
+                    const auto coordinate = source_coordinate(y, crop_h, scale_y);
+                    const auto* row0 = logits.data() + (coordinate.first - proto_first_y) * width;
+                    const auto* row1 = identity ? row0
+                        : logits.data() + (coordinate.second - proto_first_y) * width;
+                    for (Index x = first_x; x < stop_x; ++x) {
+                        const auto sample = x_coordinates[x - first_x];
+                        float value = row0[sample.first];
+                        if (!identity) {
+                            value = bilinear(value, row0[sample.second],
+                                             row1[sample.first], row1[sample.second],
+                                             sample.weight, coordinate.weight);
+                        }
+                        if (!(value > 0.0f)) continue;
+                        foreground = true;
+                        frame_union.store<Byte>(1, y, x);
+                        if (frame_scores && score > frame_scores->load<Byte>(y, x)) {
+                            frame_scores->store<Byte>(score, y, x);
+                        }
+                    }
+                }
+                kept += foreground;
+            }
+        }
+        Object count(PyLong_FromSsize_t(kept));
+        return PyTuple_Pack(3, union_array.get(),
+                            track_confidence ? score_array.get() : Py_None, count.get());
+    });
 }
 
 struct CanonicalLogits {
@@ -161,6 +349,56 @@ PyObject* threshold_roi(PyObject*, PyObject* args) {
     });
 }
 
+#if defined(_M_X64) || defined(__SSE2__)
+bool union_rows_do_not_overlap(const std::array<const Buffer*, 4>& planes,
+                               Index height, Index width) noexcept {
+    if (height == 0 || width < 16) return false;
+    std::array<std::uintptr_t, 4> begin, end;
+    for (std::size_t i = 0; i < planes.size(); ++i) {
+        const Buffer& plane = *planes[i];
+        if (plane.stride(1) != 1 || plane.stride(0) < width) return false;
+        begin[i] = reinterpret_cast<std::uintptr_t>(plane.data());
+        // Buffer has checked that the last element's offset is representable.
+        const auto last = static_cast<std::uintptr_t>((height - 1) * plane.stride(0) + (width - 1));
+        if (last > std::numeric_limits<std::uintptr_t>::max() - begin[i]) return false;
+        end[i] = begin[i] + last;
+        for (std::size_t j = 0; j < i; ++j) {
+            if (begin[i] <= end[j] && begin[j] <= end[i]) return false;
+        }
+    }
+    return true;
+}
+
+Index union_conf_vector_row(char* dst_mask, char* dst_conf, const char* src_mask,
+                            const char* src_conf, Index width) noexcept {
+    const auto zero = _mm_setzero_si128();
+    const auto sign = _mm_set1_epi8(-128);
+    Index x = 0;
+    for (; x <= width - 16; x += 16) {
+        __m128i mask;
+        std::memcpy(&mask, src_mask + x, sizeof(mask));
+        const auto background = _mm_cmpeq_epi8(mask, zero);
+        if (_mm_movemask_epi8(background) == 0xffff) continue;
+
+        __m128i previous_mask, previous_conf, confidence;
+        std::memcpy(&previous_mask, dst_mask + x, sizeof(previous_mask));
+        std::memcpy(&previous_conf, dst_conf + x, sizeof(previous_conf));
+        std::memcpy(&confidence, src_conf + x, sizeof(confidence));
+        const auto higher = _mm_cmpgt_epi8(_mm_xor_si128(confidence, sign),
+                                          _mm_xor_si128(previous_conf, sign));
+        const auto replace = _mm_andnot_si128(background,
+            _mm_or_si128(_mm_cmpeq_epi8(previous_mask, zero), higher));
+        const auto next_mask = _mm_or_si128(_mm_and_si128(replace, mask),
+                                          _mm_andnot_si128(replace, previous_mask));
+        const auto next_conf = _mm_or_si128(_mm_and_si128(replace, confidence),
+                                          _mm_andnot_si128(replace, previous_conf));
+        std::memcpy(dst_mask + x, &next_mask, sizeof(next_mask));
+        std::memcpy(dst_conf + x, &next_conf, sizeof(next_conf));
+    }
+    return x;
+}
+#endif
+
 PyObject* union_conf_slice(PyObject*, PyObject* args) {
     return protect([&]() -> PyObject* {
         PyObject *dst_mask_input, *dst_conf_input, *src_mask_input, *src_conf_input;
@@ -180,10 +418,21 @@ PyObject* union_conf_slice(PyObject*, PyObject* args) {
                 value_error("Union mask and confidence planes must have the same shape");
             }
         }
+#if defined(_M_X64) || defined(__SSE2__)
+        const bool vector_rows = union_rows_do_not_overlap(
+            {&dst_mask, &dst_conf, &src_mask, &src_conf}, height, width);
+#endif
         {
             GilRelease release;
             for (Index y = 0; y < height; ++y) {
-                for (Index x = 0; x < width; ++x) {
+                Index first = 0;
+#if defined(_M_X64) || defined(__SSE2__)
+                if (vector_rows) {
+                    first = union_conf_vector_row(dst_mask.ptr(y, 0), dst_conf.ptr(y, 0),
+                                                  src_mask.ptr(y, 0), src_conf.ptr(y, 0), width);
+                }
+#endif
+                for (Index x = first; x < width; ++x) {
                     const auto mask = src_mask.load<Byte>(y, x);
                     const auto confidence = src_conf.load<Byte>(y, x);
                     if (mask != 0 && (dst_mask.load<Byte>(y, x) == 0 || confidence > dst_conf.load<Byte>(y, x))) {
@@ -197,73 +446,108 @@ PyObject* union_conf_slice(PyObject*, PyObject* args) {
     });
 }
 
-template<class Label, class Distance>
-void reduce_component_maxima(const Buffer& labels, const Buffer& distances,
-                             const Buffer& maxima, Index count) noexcept {
-    for (Index y = 0; y < labels.shape(0); ++y) {
-        for (Index x = 0; x < labels.shape(1); ++x) {
-            const auto label = labels.load<Label>(y, x);
-            if (label <= 0 || static_cast<std::uint64_t>(label) > static_cast<std::uint64_t>(count)) {
-                continue;
-            }
-            const Index slot = static_cast<Index>(label) - 1;
-            const double distance = static_cast<double>(distances.load<Distance>(y, x));
-            if (distance > maxima.load<double>(slot)) {
-                maxima.store(distance, slot);
-            }
+template<class Label, class Value, class Maximum, bool UnitStride>
+void reduce_component_row(const char* labels, Index label_step, const char* values, Index value_step,
+                          const Buffer& maxima, Index count, Index width) noexcept {
+    const Index label_stride = UnitStride ? static_cast<Index>(sizeof(Label)) : label_step;
+    const Index value_stride = UnitStride ? static_cast<Index>(sizeof(Value)) : value_step;
+    for (Index x = 0; x < width; ++x) {
+        Label label;
+        std::memcpy(&label, labels + x * label_stride, sizeof(label));
+        if (label <= 0 || static_cast<std::uint64_t>(label) > static_cast<std::uint64_t>(count)) {
+            continue;
         }
+        const Index slot = static_cast<Index>(label) - 1;
+        Value sample;
+        std::memcpy(&sample, values + x * value_stride, sizeof(sample));
+        const auto value = static_cast<Maximum>(sample);
+        if (value > maxima.load<Maximum>(slot)) {
+            maxima.store(value, slot);
+        }
+    }
+}
+
+template<class Label, class Value, class Maximum>
+void reduce_component_maxima(const Buffer& labels, const Buffer& values,
+                             const Buffer& maxima, Index count) noexcept {
+    const Index width = labels.shape(1);
+    if (width == 0 || count == 0) return;
+    const Index label_step = labels.stride(1), value_step = values.stride(1);
+    // The inner row may be contiguous even when a crop retains the larger pitch.
+    // memcpy handles unaligned buffers in both paths.
+    const auto reduce = label_step == static_cast<Index>(sizeof(Label))
+                         && value_step == static_cast<Index>(sizeof(Value))
+        ? reduce_component_row<Label, Value, Maximum, true>
+        : reduce_component_row<Label, Value, Maximum, false>;
+    for (Index y = 0; y < labels.shape(0); ++y) {
+        reduce(labels.ptr(y, 0), label_step, values.ptr(y, 0), value_step, maxima, count, width);
     }
 }
 
 using MaximaReducer = void (*)(const Buffer&, const Buffer&, const Buffer&, Index);
 
-template<class Distance>
+template<class Value, class Maximum>
 MaximaReducer component_maxima_reducer(const Buffer& labels) {
-    if (labels.is<std::int32_t>()) return reduce_component_maxima<std::int32_t, Distance>;
-    if (labels.is<std::int64_t>()) return reduce_component_maxima<std::int64_t, Distance>;
-    if (labels.is<std::uint32_t>()) return reduce_component_maxima<std::uint32_t, Distance>;
-    if (labels.is<std::uint64_t>()) return reduce_component_maxima<std::uint64_t, Distance>;
-    if (labels.is<std::int16_t>()) return reduce_component_maxima<std::int16_t, Distance>;
-    if (labels.is<std::uint16_t>()) return reduce_component_maxima<std::uint16_t, Distance>;
-    if (labels.is<std::int8_t>()) return reduce_component_maxima<std::int8_t, Distance>;
-    if (labels.is<std::uint8_t>()) return reduce_component_maxima<std::uint8_t, Distance>;
-    type_error("SAM component labels must be native integers");
+    if (labels.is<std::int32_t>()) return reduce_component_maxima<std::int32_t, Value, Maximum>;
+    if (labels.is<std::int64_t>()) return reduce_component_maxima<std::int64_t, Value, Maximum>;
+    if (labels.is<std::uint32_t>()) return reduce_component_maxima<std::uint32_t, Value, Maximum>;
+    if (labels.is<std::uint64_t>()) return reduce_component_maxima<std::uint64_t, Value, Maximum>;
+    if (labels.is<std::int16_t>()) return reduce_component_maxima<std::int16_t, Value, Maximum>;
+    if (labels.is<std::uint16_t>()) return reduce_component_maxima<std::uint16_t, Value, Maximum>;
+    if (labels.is<std::int8_t>()) return reduce_component_maxima<std::int8_t, Value, Maximum>;
+    if (labels.is<std::uint8_t>()) return reduce_component_maxima<std::uint8_t, Value, Maximum>;
+    type_error("Component labels must be native integers");
 }
 
+template<class Value, class Maximum>
+PyObject* component_maxima_result(const Buffer& labels, const Buffer& values, Index count) {
+    const auto reduce = component_maxima_reducer<Value, Maximum>(labels);
+    constexpr auto dtype = std::is_same_v<Maximum, Byte> ? "uint8"
+        : std::is_same_v<Maximum, float> ? "float32" : "float64";
+    auto result = zeros({count}, dtype);
+    {
+        const Buffer maxima(result.get(), "component maxima", 1, true);
+        maxima.require<Maximum>();
+        if (maxima.shape(0) != count) value_error("Component maxima allocator returned the wrong shape");
+        GilRelease release;
+        reduce(labels, values, maxima, count);
+    }
+    return result.release();
+}
+
+template<bool PreserveValueDtype>
 PyObject* component_maxima(PyObject*, PyObject* args) {
     return protect([&]() -> PyObject* {
-        PyObject *label_input, *distance_input;
+        PyObject *label_input, *value_input;
         Index count;
-        if (!PyArg_ParseTuple(args, "OOn:sam_component_maxima", &label_input, &distance_input, &count)) {
+        if (!PyArg_ParseTuple(args, "OOn:component_maxima", &label_input, &value_input, &count)) {
             throw PythonError{};
         }
-        const Buffer labels(label_input, "SAM component labels", 2);
-        const Buffer distances(distance_input, "SAM component distances", 2);
-        if (count < 0 || labels.shape(0) != distances.shape(0) || labels.shape(1) != distances.shape(1)) {
-            value_error("SAM component count and array shapes are inconsistent");
+        const Buffer labels(label_input, "component labels", 2);
+        const Buffer values(value_input, "component values", 2);
+        if (count < 0 || labels.shape(0) != values.shape(0) || labels.shape(1) != values.shape(1)) {
+            value_error("Component count and array shapes are inconsistent");
         }
-        MaximaReducer reduce;
-        if (distances.is<double>()) {
-            reduce = component_maxima_reducer<double>(labels);
-        } else {
-            distances.require<float>();
-            reduce = component_maxima_reducer<float>(labels);
+        if (values.is<double>()) {
+            return component_maxima_result<double, double>(labels, values, count);
         }
-        Object result = zeros({count}, "float64");
-        {
-            const Buffer maxima(result.get(), "SAM component maxima", 1, true);
-            GilRelease release;
-            reduce(labels, distances, maxima, count);
+        if (values.is<Byte>()) {
+            return component_maxima_result<Byte, std::conditional_t<PreserveValueDtype, Byte, double>>(
+                labels, values, count);
         }
-        return result.release();
+        values.require<float>();
+        return component_maxima_result<float, std::conditional_t<PreserveValueDtype, float, double>>(
+            labels, values, count);
     });
 }
 
 PyMethodDef methods[] = {
+    {"accumulate_retina_rois", accumulate_retina_rois, METH_VARARGS, "Accumulate canonical Retina ROIs."},
     {"max_float32_magnitude_bits", magnitude_bits, METH_O, "Find the maximum unsigned float32 magnitude word."},
     {"threshold_retina_roi", threshold_roi, METH_VARARGS, "Threshold a retina ROI with canonical replay."},
     {"union_conf_slice_inplace", union_conf_slice, METH_VARARGS, "Merge foreground and confidence into a slice."},
-    {"sam_component_maxima", component_maxima, METH_VARARGS, "Reduce the maximum distance of each SAM component."},
+    {"component_maxima", component_maxima<true>, METH_VARARGS, "Reduce nonnegative values by one-based component label."},
+    {"sam_component_maxima", component_maxima<false>, METH_VARARGS, "Reduce component maxima to float64."},
     {nullptr, nullptr, 0, nullptr},
 };
 

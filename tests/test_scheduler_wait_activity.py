@@ -97,8 +97,7 @@ def test_wait_logger_skips_busy_admission_without_waiting_or_inventing_usage():
     namespace.update(runtime_telemetry=lambda: telemetry,
         _MAIN_PROCESS_GPU_STAGE_COORDINATOR=SimpleNamespace(snapshot=lambda: {}),
         _env_float=lambda _name, default: default,
-        parent_transient_admission=pool,
-        postprocessed_tiles_waiting_by_parent={}, residual_tiles_waiting_by_parent={})
+        parent_transient_admission=pool, tiling_active=False)
     logger = _wait_logger(namespace)
     finished = threading.Event()
     errors = []
@@ -153,18 +152,18 @@ def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
         _env_float=lambda _name, default: default,
         parent_transient_admission=SimpleNamespace(condition=threading.Condition(),
                                                  in_use=88, capacity=192),
-        postprocessed_tiles_waiting_by_parent={}, residual_tiles_waiting_by_parent={},
+        tiling_active=True, tile_configs_waiting_to_join={},
         view_processing_futures=future_map,
-        native_detector=SimpleNamespace(snapshot=lambda: {'dispatched': 2243}),
+        native_detector=SimpleNamespace(snapshot=lambda: {
+            'dispatched': 2243, 'tile_result_tickets': 2, 'tile_result_bytes': 50}),
         scheduler_state=state, direct_union_inference_bytes={},
         direct_union_postprocess_bytes={str(n): 10 for n in range(17)},
         direct_union_total_dense_byte_limit=256,
         direct_union_inference_views=set(), direct_union_postprocess_views=set(range(17)),
-        gpu_worker_tile_result_task_limit=4, gpu_worker_tile_result_limit=100,
-        gpu_worker_tile_result_reservations={})
+        gpu_worker_tile_result_task_limit=4, gpu_worker_tile_result_limit=100)
     for name in ('physical_view_finalization_futures',
-                 'physical_view_union_futures', 'tile_cleanup_futures', 'tile_parent_gate_futures',
-                 'tile_bridge_gate_futures', 'tile_consolidation_futures',
+                 'physical_view_union_futures', 'tile_cleanup_futures',
+                 'tile_config_join_futures', 'tile_consolidation_futures',
                  'tile_parent_finalization_futures'):
         namespace[name] = {}
     logger = _wait_logger(namespace)
@@ -174,6 +173,7 @@ def test_actual_wait_logger_reports_credit_convoy_and_live_planes(capsys):
     assert 'inference_received=2243/6111' in output
     assert 'native_projection_active=1' in output
     assert "'completed_planes': 321" in output
+    assert 'tile_results=2/4 task(s)' in output
     native_key, native_receipt = telemetry.gauge.call_args_list[0].args
     assert native_key == 'scheduler.native'
     assert native_receipt['dispatched'] == 2243 and native_receipt['sample_monotonic_ns'] > 0

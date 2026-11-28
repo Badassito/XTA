@@ -43,29 +43,36 @@ def _holders(task, *, copy):
 
 @contextlib.contextmanager
 def detector_handle_submission(task):
-    """Borrow stable registered FDs through native submit, which acquires its own pins."""
+    """Pin registered FDs while leaving the registry free during native submit."""
     from . import runtime
 
     packet = dict(task)
-    slots, handles = {}, []
-    with runtime._MEMFD_OWNER_LOCK:
-        for holder, fields in _holders(packet, copy=True):
-            if _SLOTS in holder or _TABLE in holder:
-                raise ValueError('Detector task already carries a handle manifest')
-            for field, role in fields.items():
-                path = holder.get(field)
-                if path is None:
-                    continue
-                fd = runtime._memfd_owner_fd_for_path(path)
-                if fd is None:
-                    if str(path).startswith('/proc/') and '/fd/' in str(path):
-                        raise RuntimeError(f'Detector {field} refers to an unregistered proc descriptor')
-                    continue
-                key = _identity(fd), role
-                if key not in slots:
-                    slots[key] = len(handles)
-                    handles.append((fd, *key))
-                holder.setdefault(_SLOTS, {})[field] = slots[key]
+    references = []
+    for holder, fields in _holders(packet, copy=True):
+        if _SLOTS in holder or _TABLE in holder:
+            raise ValueError('Detector task already carries a handle manifest')
+        for field, role in fields.items():
+            path = holder.get(field)
+            if path is not None:
+                references.append((holder, field, role, str(path)))
+
+    slots, handles, identities = {}, [], {}
+    paths = (path for _, _, _, path in references)
+    with runtime._pinned_memfd_owners(paths, strict_paths=True) as pins:
+        for holder, field, role, path in references:
+            pin = pins.get(path)
+            if pin is None:
+                if path.startswith('/proc/') and '/fd/' in path:
+                    raise RuntimeError(f'Detector {field} refers to an unregistered proc descriptor')
+                continue
+            fd = pin.fd
+            if fd not in identities:
+                identities[fd] = _identity(fd)
+            key = identities[fd], role
+            if key not in slots:
+                slots[key] = len(handles)
+                handles.append((fd, *key))
+            holder.setdefault(_SLOTS, {})[field] = slots[key]
         if handles:
             packet[_TABLE] = tuple(slots)
         yield packet, tuple(handles)

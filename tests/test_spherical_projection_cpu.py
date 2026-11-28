@@ -6,6 +6,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import struct
 import threading
 from types import SimpleNamespace
 import unittest
@@ -134,6 +135,18 @@ class SphericalCompiledPullTests(unittest.TestCase):
         self.assertFalse(source.flags.writeable)
         self.assertEqual(candidate.pull_spherical_chunk_native(*args[:-2], 0, 0).size, 0)
 
+    def test_encoded_shell_stride_does_not_wrap_at_uint32_crop_width(self):
+        width = (1 << 32) - 1
+        record = struct.pack('<B7xQQIIII8x', 1, 0, 1, 0, 0, 2, width)
+        source = ((1, 2, width), np.frombuffer(b'\xff', np.uint8),
+                  np.frombuffer(record, np.uint8).reshape(1, 48), True)
+        # Face 0 at physical (z=0, y=0, x=2) samples shell row 1, column 0.
+        # The second row needs a positive offset beyond this one-byte payload.
+        with self.assertRaisesRegex(ValueError, 'encoded shell payload extent'):
+            candidate.kernels.spherical_pull(source, np.array([1.]), np.eye(3),
+                np.empty((0, 4), np.int64), False, 1, 1, 3, 1, 1, 3,
+                0, 2, 1, 0, 2, width, 1., 1., 0, 2, 3, 0, 0, 0, False)
+
 
 class SphericalCompiledAdmissionTests(unittest.TestCase):
     def setUp(self):
@@ -238,7 +251,9 @@ class SphericalCompiledAdmissionTests(unittest.TestCase):
 
     def test_runtime_numerical_failure_propagates_without_fallback_or_publication(self):
         publish = mock.Mock()
-        pull = mock.Mock(side_effect=ValueError('numerical failure'))
+        failure = ValueError('numerical failure')
+        pull = mock.Mock(side_effect=failure)
+        pull.rectangle = mock.Mock(side_effect=failure)
         with mock.patch.object(reference, '_select_spherical_cpu_pull', return_value=pull), \
                 mock.patch.object(reference, '_try_spherical_cuda_stage', return_value=None), \
                 mock.patch.object(reference, 'spherical_cuda_backproject_enabled', return_value=False), \

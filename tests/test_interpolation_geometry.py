@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+from types import SimpleNamespace
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,28 @@ CPU_ENV = {
 def _ellipse(dest, z, cy, cx, ry, rx, value=1):
     yy, xx = np.ogrid[:dest.shape[1], :dest.shape[2]]
     dest[z, ((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2 <= 1.0] = value
+
+
+def test_blended_bridge_keeps_the_nearest_component_when_center_is_background():
+    field = np.full((5, 7), -.5, dtype=np.float32)
+    field[1, 2:4] = .5
+    field[4, 5] = .5
+    source = field[:, ::-1]
+    plan = SimpleNamespace(sdf0=source, sdf1=source)
+    section, occupied = interpolation._blend_linear_bridge_section(plan, 1 / 3, False)
+    expected = np.zeros(field.shape, dtype=bool)
+    expected[1, 2:4] = True
+    np.testing.assert_array_equal(section, expected[:, ::-1])
+    assert occupied
+
+
+def test_solid_bridge_section_has_no_assumed_exterior_zero_halo():
+    field = np.full((3, 7), 19.5, dtype=np.float32)
+    plan = SimpleNamespace(sdf0=field, sdf1=field, steps=2, fill_section_holes=False,
+                           endpoint_radius=None, cached_sections=[])
+    radius = interpolation._estimate_linear_slice_bridge_min_radius_from_plan(plan, cache_sections=True)
+    assert radius == 7.0
+    np.testing.assert_array_equal(plan.cached_sections[1], np.ones(field.shape, dtype=bool))
 
 
 def _paint_cases():

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import os
 import pickle
 import socket
 import tempfile
+import threading
 import unittest
 
 from XTA import runtime
@@ -56,7 +58,10 @@ class DetectorSourcePreparationTests(unittest.TestCase):
                         augmentation_pass_tasks=[child])
             with detector_handle_submission(base) as (packet, handles):
                 self.assertEqual(len(handles), 3)
-                self.assertEqual({entry[0] for entry in handles}, {fd})
+                borrowed, = {entry[0] for entry in handles}
+                self.assertNotEqual(borrowed, fd)
+                self.assertEqual(os.fstat(borrowed), os.fstat(fd))
+                self.assertFalse(os.get_inheritable(borrowed))
                 self.assertEqual(len({entry[1] for entry in handles}), 1)
                 self.assertEqual({entry[2] for entry in handles}, {0, 1, 2})
                 copied = packet['augmentation_pass_tasks'][0]
@@ -64,7 +69,42 @@ class DetectorSourcePreparationTests(unittest.TestCase):
                                  copied['native_resize']['_detector_handle_slots']['path'])
                 self.assertEqual(copied['_detector_handle_slots']['result_conf_path'],
                                  packet['_detector_handle_slots']['result_mask_path'])
+            with self.assertRaises(OSError):
+                os.fstat(borrowed)
             self.assertFalse(any('_detector_handle_slots' in owner for owner in (base, child, child['native_resize'])))
+
+    def test_owner_can_retire_during_submission_and_pin_closes_on_failure(self):
+        with _owner('registered') as original:
+            with self.assertRaisesRegex(RuntimeError, 'submit failed'):
+                with detector_handle_submission(dict(source_volume_path='registered')) as (_, handles):
+                    pin = handles[0][0]
+                    release = threading.Thread(target=runtime._release_memfd_owner_key,
+                                               args=('registered',))
+                    release.start()
+                    release.join(3)
+                    self.assertFalse(release.is_alive(), 'descriptor preparation kept the registry locked')
+                    with self.assertRaises(OSError):
+                        os.fstat(original)
+                    self.assertEqual(os.fstat(pin).st_size, len(b'source'))
+                    raise RuntimeError('submit failed')
+            with self.assertRaises(OSError):
+                os.fstat(pin)
+
+    @unittest.skipUnless(hasattr(os, 'fork'), 'requires inherited descriptor table')
+    def test_forked_child_drops_submission_pin(self):
+        with _owner('registered'):
+            with detector_handle_submission(dict(source_volume_path='registered')) as (_, handles):
+                pin = handles[0][0]
+                child = os.fork()
+                if not child:
+                    try:
+                        os.fstat(pin)
+                    except OSError as exc:
+                        os._exit(0 if exc.errno == errno.EBADF else 1)
+                    os._exit(2)
+                _, result = os.waitpid(child, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(result), 0)
+                self.assertEqual(os.fstat(pin).st_size, len(b'source'))
 
     def test_unregistered_proc_alias_and_pickle_failure_preserve_parent_ownership(self):
         with _owner('registered') as fd:

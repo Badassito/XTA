@@ -116,6 +116,22 @@ inline Py_ssize_t checked_extent(Py_ssize_t count, Py_ssize_t stride) {
     return count * stride;
 }
 
+// Read a fixed-width little-endian field from a possibly unaligned wire record.
+template<class T>
+T load_little_endian(const void* address) noexcept {
+    static_assert(std::is_unsigned_v<T>);
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    T result;
+    std::memcpy(&result, address, sizeof(result));
+    return result;
+#else
+    const auto* bytes = static_cast<const unsigned char*>(address);
+    T result = 0;
+    for (std::size_t i = 0; i < sizeof(T); ++i) result |= static_cast<T>(bytes[i]) << (8 * i);
+    return result;
+#endif
+}
+
 class Buffer {
 public:
     // ndim=-1 accepts any rank. The exporter stays pinned until destruction.

@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import sys
-import threading
 import time
 import numpy as np
 
@@ -120,14 +119,12 @@ def native_view(shape):
         src_h=shape[1], src_w=shape[2], full_t=shape[0], full_h=shape[1], full_w=shape[2],
         pad_mode="clamp", family="orthogonal", tta_angle_deg=0.)
 
-def store_volume(store):
-    return np.stack([store.decode_slice(index) for index in range(store.shape[0])])
-
 def seam(args):
     from XTA import assembly, backprojection, outputs, pipeline
-    from XTA.sam_integration import SamInterpolationContext, _store_fingerprint, sam_workers_unsettled
+    from XTA.sam_integration import SamInterpolationContext, sam_workers_unsettled
     from XTA.sam_crop_tiling import resolve_sam_crop_mode, tile_grid
-    from XTA.interpolation import TilePostprocessTask
+    from XTA.interpolation import RawBBoxMaskStore, TilePostprocessTask
+    from XTA.tile_observations import accumulate_independent_tile_observation
     from tools.compare_sam_crop_strategies import helper
     fixture = json.loads((args.output / "fixture.json").read_text())
     shape = tuple(fixture["shape_tyx"])
@@ -173,7 +170,8 @@ def seam(args):
         original_interpolate = context.interpolate
         def traced_interpolate(volume, **kwargs):
             lineage = dict(kwargs.get("upstream_lineage") or {})
-            lineage["observation_source"] = fixture["observation_source"]
+            lineage["observation_source"] = ("Independent prescribed native crops of actual detector59/64 masks"
+                if lineage.get("tile_acceptance") == "independent" else fixture["observation_source"])
             lineage.update(native_source_frames=fixture["native_source_frames"],
                 original_source_frame_start=fixture["original_source_frame_start"],
                 source_image_sha256=fixture["image_sha256"])
@@ -181,7 +179,6 @@ def seam(args):
             return original_interpolate(volume, **kwargs)
         context.interpolate = traced_interpolate
         try:
-            ready = []
             prepared = assembly.prepare_view_volume_after_fullframe(
                 model_name="actual_detector", view=view, union_mm=observations, confmap_mm=None,
                 union_path=runroot / "original.uint8.dat", confmap_path=None, temp_dir=runroot / "temporary",
@@ -189,24 +186,19 @@ def seam(args):
                 interpolation_walk_back=0, interpolation_candidates=1, interpolate_passes=1,
                 interpolate_min_radius=3., interpolation_search_angle=30.,
                 slice_workers=1, interpolation_task_workers=1, nrrd_layers_enabled=True,
-                interpolation_backend="sam", sam_context=context,
-                parent_mask_ready_callback=lambda *_: ready.append("immutable_parent_ready"))
-            if ready != ["immutable_parent_ready"]:
-                raise AssertionError("Ordinary immutable parent support was not published")
+                interpolation_backend="sam", sam_context=context)
             stats = prepared.interpolation_stats[0]
             if not stats.get("sam_generated_runs"):
                 raise AssertionError("Native qualification must actually generate independently seeded SAM runs")
             if mode == "tiled" and stats.get("sam_tiled_multi_tile_runs",0) < 1:
                 raise AssertionError("Requested tiled mode did not actually exercise multiple footprints")
-            np.save(runroot / "online_selected_additions.npy", np.asarray(prepared.final_view_volume_mm != 0) & ~(observations != 0))
-            report.update(parent_stats=stats, parent_support_immutable=bool(np.array_equal(store_volume(prepared.parent_mask_support_mm), observations)),
+            np.save(runroot / "online_selected_additions.npy", np.asarray(prepared.final_view_volume_mm != 0) & ~(original != 0))
+            report.update(parent_stats=stats,
                 immutable_postcleanup_detector_snapshot_sha256=stats["sam_scope_metadata"]["observation_snapshot_sha256"],
                 postcleanup_detector_file_sha256=file_sha(runroot / "original.uint8.dat"),
-                parent_bridge_support_path=(str(prepared.parent_bridge_support_mm.root) if prepared.parent_bridge_support_mm is not None else None),
-                parent_bridge_identity=(_store_fingerprint(Path(prepared.parent_bridge_support_mm.root)) if prepared.parent_bridge_support_mm is not None else str(stats.get("parent_gate_support_identity", ""))),
                 parent_nrrd_layers=[dict(key=layer.key, path=str(layer.path), direction=layer.interpolation_direction,
                     shape=list(layer.shape), native_transform=layer.native_transform) for layer in prepared.nrrd_layers])
-            # Gate a prescribed crop of actual detector output. It is explicitly
+            # Accumulate prescribed crops of actual detector output. This step is explicitly
             # not claimed to be independently inferred YOLO tile output.
             probe = np.load(args.output / "actual_detector_0059_component.npy")
             target = np.load(args.output / "actual_detector_0064_component.npy")
@@ -215,9 +207,8 @@ def seam(args):
             group = next(iter(bundle.groups.values()))
             grid = tile_grid(group["context_bbox_yx"])
             total = np.zeros(shape, np.uint8)
-            parent_category = np.zeros(shape, np.uint8)
-            bridge_category = np.zeros(shape, np.uint8)
-            gate_records = []
+            expected = {frame: np.zeros(shape[1:], np.uint8) for frame in (5, 10)}
+            tile_records = []
             for tile in grid:
                 y0,x0,y1,x1 = tile.crop_bbox_yx
                 path = runroot / (tile.tile_id + ".uint8.dat")
@@ -229,44 +220,30 @@ def seam(args):
                     tile.tile_id, (y0,y1,x0,x1), tile_mm, None, path, None,
                     processing_shape=tuple(tile_mm.shape), threshold_plane_shape=shape[1:])
                 result = assembly.postprocess_tile_volume_after_inference(task, view=view,
-                    min_conf=0., min_radius=0., slice_workers=1)
-                first_gate = assembly.gate_tile_result_against_parent_mask(result,
-                    parent_mask_support_mm=prepared.parent_mask_support_mm,
-                    tile_accumulator_mm=total, tile_accumulator_locks=None,
-                    work_dir=runroot / "tile_gate", slice_workers=1,
-                    tile_parent_mask_accumulator_mm=parent_category)
-                second = None
-                if first_gate.residual_result is not None and prepared.parent_bridge_support_mm is not None:
-                    second = assembly.gate_tile_residual_against_parent_bridge(first_gate.residual_result,
-                        parent_bridge_support_mm=prepared.parent_bridge_support_mm,
-                        tile_accumulator_mm=total, tile_accumulator_locks=None,
-                        work_dir=runroot / "tile_gate", slice_workers=1,
-                        tile_parent_bridge_accumulator_mm=bridge_category)
-                gate_records.append(dict(tile_id=tile.tile_id, crop_bbox_yx=tile.crop_bbox_yx,
-                    source="Prescribed native crop of actual fullframe detector59/64 masks; no SAM seed handoff",
-                    parent=first_gate.gate_stats, bridge=getattr(second,"gate_stats",None)))
-                if first_gate.residual_result is not None and prepared.parent_bridge_support_mm is None:
-                    assembly._delete_tile_result_storage(first_gate.residual_result)
-                del task, tile_mm, result, first_gate, second
-            report.update(gates=gate_records, bridge_rescued_native59_voxels=int(bridge_category[5].sum()),
-                direct_parent_native64_voxels=int(parent_category[10].sum()))
-            if args.policy == "raw" and not bridge_category[5].any():
-                raise AssertionError("Explicit permissive path must exercise nonempty actual-detector bridge rescue")
-            identity = report["parent_bridge_identity"]
-            lineage = dict(parent_scope="parent_bridge", gate_support_identity=identity,
-                interpolation_policy_identity=stats["sam_policy_hash"],
-                gate_support_fingerprints={"parent_bridge":identity},
-                observation_source="Only ordinary-gated prescribed crops of actual detector59/64 components")
-            consolidated = assembly.finalize_consolidated_tile_volume_for_parent(
+                    min_conf=0., min_radius=0., slice_workers=1, sparse_retire_dir=runroot / "tiles")
+                tile_records.append(dict(tile_id=tile.tile_id, crop_bbox_yx=tile.crop_bbox_yx,
+                    source="Prescribed native crop of actual fullframe detector59/64 masks", empty=result is None))
+                if result is not None:
+                    store = RawBBoxMaskStore.open(result.tile_mask_path, mmap_payload=True)
+                    try:
+                        for frame, plane in expected.items():
+                            plane[y0:y1, x0:x1] |= store.decode_slice(frame)
+                    finally:
+                        store.close()
+                    accumulate_independent_tile_observation(result, tile_accumulator_mm=total)
+                del task, tile_mm, result
+            if any(not plane.any() or not np.array_equal(plane != 0, total[frame] != 0)
+                   for frame, plane in expected.items()):
+                raise AssertionError("Independent tile configuration lost a cleaned detector observation")
+            report.update(tiles=tile_records, independent_native59_voxels=int(np.count_nonzero(total[5])),
+                          independent_native64_voxels=int(np.count_nonzero(total[10])))
+            consolidated = assembly.finalize_independent_tile_config(
                 model_name="actual_detector", view=view, tile_accumulator_mm=total,
-                destination_mm=prepared.final_view_volume_mm, destination_lock=threading.Lock(),
                 temp_dir=runroot / "temporary", interpolate=15, interpolation_walk_back=0,
                 interpolation_candidates=1, interpolate_passes=1, interpolate_min_radius=3.,
                 interpolation_search_angle=30., slice_workers=1,
                 interpolation_task_workers=1, nrrd_layers_enabled=True,
-                tile_parent_mask_accumulator_mm=parent_category, tile_parent_bridge_accumulator_mm=bridge_category,
-                config_id="diagnostic_actual_fullframe_crops", interpolation_backend="sam",
-                sam_context=context, sam_upstream_lineage=lineage)
+                config_id="diagnostic_actual_fullframe_crops", interpolation_backend="sam", sam_context=context)
             report["consolidated_stats"] = consolidated.interpolation_stats
             report["context_runtime"] = dict(start_seconds=context.start_seconds, render_seconds=context.render_seconds,
                 wait_seconds=context.wait_seconds, rendered_frames=context.rendered_frames,
@@ -276,10 +253,6 @@ def seam(args):
             report.update(status="failed", error_type=type(error).__name__, error=str(error))
             raise
         finally:
-            if prepared is not None:
-                for store in (prepared.parent_mask_support_mm, prepared.parent_bridge_support_mm):
-                    if store is not None:
-                        store.close()
             if context is not None:
                 context.close()
                 report["context_closed"] = context._closed
@@ -295,7 +268,7 @@ def seam(args):
             write(runroot / "qualification.json", report)
     print(json.dumps({"status":report["status"], "crop_mode":mode, "policy":args.policy,
         "parent_generated":stats["sam_generated_runs"], "parent_added":stats["added_voxels"],
-        "gate_rescued":report["bridge_rescued_native59_voxels"], "output":str(runroot)}, indent=2))
+        "independent_native59_voxels":report["independent_native59_voxels"], "output":str(runroot)}, indent=2))
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)

@@ -1,7 +1,8 @@
-"""Retain original tile scores through immutable parent/component support gates."""
+"""Retain measured tile scores until their configuration is published."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
 import shutil
@@ -21,6 +22,7 @@ class _TileScores:
     reference: ConfidenceEvidenceRef
     parent_crop: tuple[int, int, int, int]
     work_dir: Path
+    independent: bool = False
 
 
 _LOCK = threading.RLock()
@@ -115,8 +117,31 @@ def record_tile_confidence_gate(result, category, gate_slice, *, workers):
             _ACCEPTED.setdefault(token, []).append(_TileScores(reference, retained.parent_crop, retained.work_dir))
 
 
+@contextmanager
+def retain_independent_tile_confidence(result):
+    """Make the original measurements publishable when independent mask placement succeeds."""
+    if not confidence_evidence_enabled():
+        yield
+        return
+    key = _tile_key(result)
+    with _LOCK:
+        retained = _RAW.get(key)
+    if retained is None:
+        raise RuntimeError(f'Independent tile lost original confidence: {key}')
+    if retained.independent:
+        raise RuntimeError(f'Independent tile already consumed: {key}')
+    if (retained.parent_crop != tuple(result.parent_crop)
+            or retained.reference.storage_shape != tuple(result.tile_shape)):
+        raise ValueError(f'Independent tile confidence differs from its processing crop: {key}')
+    yield
+    with _LOCK:
+        if _RAW.get(key) is not retained:
+            raise RuntimeError(f'Independent tile confidence ownership changed: {key}')
+        _RAW[key] = replace(retained, independent=True)
+
+
 def retire_tile_confidence(model_name, view_name, config_id):
-    """Drop tile-local scores after all gate and publication consumers settle."""
+    """Drop tile-local measurements after their publication consumers settle."""
     if not confidence_evidence_enabled():
         return
     prefix = (str(model_name), str(view_name), str(config_id))
@@ -129,23 +154,33 @@ def retire_tile_confidence(model_name, view_name, config_id):
 
 
 def discard_unpublished_tile_confidence(result):
-    """Retire an original tile before it reaches either component gate."""
+    """Retire original tile scores when their mask cannot be consumed."""
+    key = _tile_key(result)
     with _LOCK:
-        tile = _RAW.pop(_tile_key(result), None)
-    if tile is not None:
-        shutil.rmtree(tile.work_dir, ignore_errors=True)
+        tile = _RAW.get(key)
+        if tile is None or tile.independent:
+            return
+        del _RAW[key]
+    shutil.rmtree(tile.work_dir, ignore_errors=True)
 
 
 def capture_consolidated_tile_confidence(mask, *, view, model_name, config_id,
                                          category, stage, temp_dir):
-    """Max original accepted tile scores, then project the matching category layer."""
+    """Max measured tile scores, then project the matching observation layer."""
     if not confidence_evidence_enabled():
         return None
     from .runtime import close_memmap_array_without_flush
     prefix = (str(model_name), str(view.name), str(config_id))
-    categories = ('parent_mask', 'parent_bridge') if category == 'parent_support' else (str(category),)
     with _LOCK:
-        tiles = [entry for kind in categories for entry in _ACCEPTED.get((*prefix, kind), ())]
+        if category == 'independent':
+            observations = sorted(
+                (key, tile) for key, tile in _RAW.items()
+                if key[:3] == prefix and tile.independent and tile.reference.metadata['known_voxels']
+            )
+            tiles = [tile for _, tile in observations]
+        else:
+            categories = ('parent_mask', 'parent_bridge') if category == 'parent_support' else (str(category),)
+            tiles = [entry for kind in categories for entry in _ACCEPTED.get((*prefix, kind), ())]
     shape = tuple(map(int, mask.shape))
     pieces = []
     for tile in tiles:
@@ -185,4 +220,5 @@ def capture_consolidated_tile_confidence(mask, *, view, model_name, config_id,
 
 
 __all__ = ['capture_tile_confidence', 'record_tile_confidence_gate',
-           'capture_consolidated_tile_confidence', 'retire_tile_confidence', 'reset_tile_confidence']
+           'capture_consolidated_tile_confidence', 'retain_independent_tile_confidence',
+           'retire_tile_confidence', 'reset_tile_confidence']

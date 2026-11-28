@@ -93,9 +93,8 @@ class MultiModelBridgeStorageTests(unittest.TestCase):
                               slice_workers=1, interpolation_task_workers=1,
                               nrrd_layers_enabled=not delta_only)
                 if tile:
-                    result = assembly.finalize_consolidated_tile_volume_for_parent(
-                        tile_accumulator_mm=volume, destination_mm=np.zeros_like(volume),
-                        destination_lock=threading.Lock(), config_id='tiles', **shared)
+                    result = assembly.finalize_independent_tile_config(
+                        tile_accumulator_mm=volume, config_id='tiles', **shared)
                 else:
                     result = assembly.prepare_view_volume_after_fullframe(
                         union_mm=volume, confmap_mm=None, union_path=root / model / 'union.dat',

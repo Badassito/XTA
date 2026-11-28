@@ -40,6 +40,7 @@ def submission(tmp_path, *, ready=False, staged=True):
             interpolation_walk_back=0,interpolation_candidates=1,interpolation_passes=1,
             interpolation_min_radius=0,interpolation_search_angle=90),
         input_T=3,input_H=4,input_W=5,temp_dir=tmp_path,tiling_active=True,
+        tile_staging=SimpleNamespace(path=tmp_path),
         parent_transient_admission=mock.Mock(),interpolation_settings=SimpleNamespace(backend='sam',
             extrapolation_enabled=False, extrapolation_distance=0,
             extrapolation_walk_back=1, extrapolation_min_radius=3.),
@@ -73,7 +74,7 @@ def test_shared_sam_submission_defers_before_transient_prepare(tmp_path):
     function,ns,view,key,leases,captured,executor,_future=submission(tmp_path)
     function('model',view)
     task,required=captured[0]
-    assert required==480  # Exact float32 confidence plus future tile/category canvases.
+    assert required == 300  # 60 mask bytes and 240 score bytes; tiles own separate reservations.
     assert task.union_mm.shape==(3,4,5) and task.confmap_mm.dtype==np.float32
     assert leases.leases[key].phase=='postprocess' and leases.postprocess_bytes[key]==480
     assert key not in ns['baseline_union_by_model_view']

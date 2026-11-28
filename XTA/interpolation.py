@@ -1414,6 +1414,18 @@ def _build_linear_slice_bridge_plan(
         endpoint_radius=endpoint_radius,
     )
 
+def _blend_linear_bridge_section(plan, alpha, fill_holes):
+    """Return the selected component and whether the unfiltered blend was nonempty."""
+    source, target = plan.sdf0, plan.sdf1
+    if (type(source) is np.ndarray and type(target) is np.ndarray
+            and source.ndim == 2 and target.shape == source.shape
+            and source.dtype == target.dtype == np.float32):
+        return kernels.interpolation_blend_bridge_section(source, target, alpha, fill_holes)
+    section = ((1.0 - alpha) * source + alpha * target) >= 0.0
+    occupied = bool(np.any(section))
+    return (_keep_center_component_2d(section, fill_holes=fill_holes) if occupied else section), occupied
+
+
 def _estimate_linear_slice_bridge_min_radius_from_plan(
     plan: SliceBridgeRenderPlan,
     *,
@@ -1447,10 +1459,7 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
             plan.cached_sections[:] = [None] * (int(plan.steps) + 1)
             for idx in range(1, int(plan.steps)):
                 alpha = float(idx) / float(plan.steps)
-                section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
-                plan.cached_sections[idx] = _keep_center_component_2d(
-                    section, fill_holes=fill_holes,
-                )
+                plan.cached_sections[idx], _ = _blend_linear_bridge_section(plan, alpha, fill_holes)
         return witness
 
     source_local = np.asarray(plan.sdf0 >= 0.0, dtype=bool)
@@ -1468,10 +1477,9 @@ def _estimate_linear_slice_bridge_min_radius_from_plan(
         section_cache[:] = [None] * (int(plan.steps) + 1)
     for idx in range(1, int(plan.steps)):
         alpha = float(idx) / float(plan.steps)
-        section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
-        if not np.any(section):
+        section, occupied = _blend_linear_bridge_section(plan, alpha, fill_holes)
+        if not occupied:
             return 0.0
-        section = _keep_center_component_2d(section, fill_holes=fill_holes)
         if bool(cache_sections):
             # The painter only reads this array (wrap handling creates a reversed view),
             # so retaining the exact estimator result is bit-for-bit equivalent.
@@ -1498,10 +1506,9 @@ def _paint_linear_slice_bridge_plan_onto_slice(
     if int(step_idx) < len(plan.cached_sections):
         section = plan.cached_sections[int(step_idx)]
     if section is None:
-        section = ((1.0 - alpha) * plan.sdf0 + alpha * plan.sdf1) >= 0.0
-        if not np.any(section):
+        section, occupied = _blend_linear_bridge_section(plan, alpha, bool(plan.fill_section_holes))
+        if not occupied:
             return 0
-        section = _keep_center_component_2d(section, fill_holes=bool(plan.fill_section_holes))
     center_y = (1.0 - alpha) * float(plan.source_anchor[0]) + alpha * float(plan.target_anchor[0])
     center_x = (1.0 - alpha) * float(plan.source_anchor[1]) + alpha * float(plan.target_anchor[1])
     # the morph runs in source-side "unrolled" coordinates. Intermediate

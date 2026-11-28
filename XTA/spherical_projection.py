@@ -217,6 +217,19 @@ def _project_spherical_block(source, view, radii, rotation, shape, first_z, coun
         if z0 == z1 or y0 == y1 or x0 == x1:
             return block
         first_pixel, stop_pixel = y0 * shape[2], y1 * shape[2]
+        rectangle_pull = getattr(cpu_pull, 'rectangle', None)
+        width = x1 - x0
+        if callable(rectangle_pull) and width < shape[2] and width <= _PULL_CHUNK_VOXELS:
+            rows_per_chunk = _PULL_CHUNK_VOXELS // width
+            for z in range(z0, z1):
+                for row in range(y0, y1, rows_per_chunk):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise CancelledError('Spherical CPU block retired before publication')
+                    end = min(row + rows_per_chunk, y1)
+                    crop = rectangle_pull(source, view, radii, rotation, shape, z, 0, (end - row) * width,
+                                          bboxes, bounds_yx=(row, end, x0, x1))
+                    block[z - first_z, row:end, x0:x1] = crop.reshape(end - row, width)
+            return block
     for z in range(z0, z1):
         local_z = z - first_z
         plane = block[local_z].reshape(-1)

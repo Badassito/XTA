@@ -217,7 +217,7 @@ def _shared_coordinator(monkeypatch, released):
     lease = SimpleNamespace(device_index=1, budget_bytes=BUDGET, torch_device=lambda _: 'cuda:1',
                             release=lambda: released.append('overlap'))
     coordinator = SimpleNamespace(
-        try_acquire_overlap_stage=lambda torch, purpose, budget: lease,
+        is_bound=True, try_acquire_overlap_stage=lambda torch, purpose, budget: lease,
         decline_overlap=Mock(),
         can_attempt_source_projection=lambda purpose: False,
         cancel_spherical_retirement_request=lambda *args, **kwargs: None)

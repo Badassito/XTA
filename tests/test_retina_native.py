@@ -53,3 +53,62 @@ def test_component_maxima_preserves_order_and_missing_labels_on_strided_views():
     distances.setflags(write=False)
     actual = _component_maxima(labels, distances, 3)
     np.testing.assert_array_equal(actual, [7., 5., np.inf])
+
+
+@pytest.mark.parametrize("target", [(10, 18), (17, 19), (5, 6)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_roi_accumulator_matches_existing_canonical_roi_iterator(target, strided):
+    from XTA import inference
+
+    rng = np.random.default_rng(1403)
+    proto = rng.standard_normal((5, 10, 18), dtype=np.float32)
+    coefficients = rng.standard_normal((8, 5), dtype=np.float32)
+    limit = np.finfo(np.float32).max
+    h, w = target
+    boxes = np.asarray([
+        [0, 0, w, h], [2.1, 1.7, w - .3, h - .8], [-limit, -limit, limit, limit],
+        [np.nan, 0, w, h], [limit, 0, w, h], [0, 0, -limit, h], [0, 0, 3, 3],
+    ], dtype=np.float32)
+    confs = np.asarray([.5, np.inf, np.nan, -.5], dtype=np.float32)
+    if strided:
+        proto = proto[::-1, ::-1, ::-1]
+        coefficients = coefficients[:, ::-1]
+        # Keep the legacy full-record finite check on extra box fields.
+        boxes = np.column_stack((boxes, np.array([0, np.nan, 0, 0, 0, 0, 0], np.float32)))
+        boxes = np.broadcast_to(boxes[:, None, :], (7, 2, 5))[:, 0, :]
+        confs = confs[::-1]
+    payload = inference.CpuRetinaMaskPayload(proto[None], coefficients, boxes, confs, target, target)
+    expected_mask = np.zeros(target, np.uint8)
+    expected_scores = np.zeros_like(expected_mask)
+    kept = 0
+    for _, score, y0, y1, x0, x1, mask in inference._iter_cpu_retina_payload_rois(payload, target):
+        expected_mask[y0:y1, x0:x1] |= mask
+        patch = expected_scores[y0:y1, x0:x1]
+        patch[mask] = np.maximum(patch[mask], inference.quantize_conf_to_u8(score))
+        kept += 1
+
+    assert kept > 0
+    for scores_requested in (True, False):
+        mask, scores, count = inference._accumulate_cpu_retina_rois(payload, target, scores_requested)
+        np.testing.assert_array_equal(mask, expected_mask)
+        if scores_requested:
+            np.testing.assert_array_equal(scores, expected_scores)
+        else:
+            assert scores is None
+        assert count == kept
+
+
+def test_cpu_retina_identity_uses_canonical_pixel_center_on_wide_grids():
+    x = 1 << 23
+    width = x + 8
+    proto = np.zeros((1, 1, width), np.float32)
+    proto[0, 0, x - 1:x + 1] = [-1., 1.]
+    boxes = np.array([[x, 0, x + 1, 1]], np.float32)
+
+    mask, scores, kept = kernels.accumulate_retina_rois(
+        proto, np.ones((1, 1), np.float32), boxes, np.ones(1, np.float32),
+        0, 0, 1, width, 1, width, False,
+    )
+    # FP32 (x + .5) - .5 rounds onto the negative sample at x - 1.
+    assert mask[0, x] == 0 and kept == 0
+    assert scores is None

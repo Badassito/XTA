@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <vector>
 
 namespace xta::cpu {
@@ -145,30 +146,36 @@ float area_alpha(Index source_i, const AreaTab& tab) {
     return static_cast<float>(1.0 / tab.cell);
 }
 
-double continuous_integral(const Plane<std::int32_t>& integral, const Plane<Byte>& crop,
-                           Index height, Index width, double y, double x) {
-    y = std::clamp(y, 0.0, static_cast<double>(height));
-    x = std::clamp(x, 0.0, static_cast<double>(width));
-    const double y_round = std::round(y);
-    const double x_round = std::round(x);
-    if (std::abs(y - y_round) < 1e-12) {
-        y = y_round;
-    }
-    if (std::abs(x - x_round) < 1e-12) {
-        x = x_round;
-    }
-    const auto iy = static_cast<Index>(std::floor(y));
-    const auto ix = static_cast<Index>(std::floor(x));
-    const double fy = y - static_cast<double>(iy);
-    const double fx = x - static_cast<double>(ix);
-    const Index iy_cell = std::min(iy, height - 1);
-    const Index ix_cell = std::min(ix, width - 1);
-    double value = static_cast<double>(integral.load(iy, ix));
-    value += static_cast<double>(static_cast<std::int64_t>(integral.load(iy, ix_cell + 1))
-                                - integral.load(iy, ix_cell)) * fx;
-    value += static_cast<double>(static_cast<std::int64_t>(integral.load(iy_cell + 1, ix))
-                                - integral.load(iy_cell, ix)) * fy;
-    value += static_cast<double>(crop.load(iy_cell, ix_cell)) * fy * fx;
+struct SampleCoordinate {
+    Index at, cell;
+    double fraction;
+};
+
+SampleCoordinate sample_coordinate(double value, Index size) {
+    value = std::clamp(value, 0.0, static_cast<double>(size));
+    const double rounded = std::round(value);
+    if (std::abs(value - rounded) < 1e-12) value = rounded;
+    const auto at = static_cast<Index>(std::floor(value));
+    return {at, std::min(at, size - 1), value - static_cast<double>(at)};
+}
+
+struct SampleSpan {
+    SampleCoordinate low, high;
+    double cell;
+};
+
+SampleSpan sample_span(Index index, Index in_size, Index out_size, Index first, Index stop) {
+    const auto span = area_span(index, in_size, out_size, first, stop);
+    return {sample_coordinate(span.low, stop - first), sample_coordinate(span.high, stop - first), span.cell};
+}
+
+template<class Prefix>
+double continuous_integral(const Plane<Prefix>& integral, const Plane<Byte>& crop,
+                           const SampleCoordinate& y, const SampleCoordinate& x) {
+    double value = static_cast<double>(integral.load(y.at, x.at));
+    value += static_cast<double>(static_cast<std::int64_t>(integral.load(y.at, x.cell + 1)) - integral.load(y.at, x.cell)) * x.fraction;
+    value += static_cast<double>(static_cast<std::int64_t>(integral.load(y.cell + 1, x.at)) - integral.load(y.cell, x.at)) * y.fraction;
+    value += static_cast<double>(crop.load(y.cell, x.cell) != 0) * y.fraction * x.fraction;
     return value;
 }
 
@@ -197,34 +204,83 @@ float area_binary_value(const Plane<Byte>& crop, const Box& source, const Geomet
     return total;
 }
 
-bool area_resize(const Plane<std::int32_t>& integral, const Plane<Byte>& crop,
-                 const Box& source, const Geometry& geometry, const Box& target,
-                 const Plane<Byte>& restored) {
-    std::vector<AreaSpan> x_spans;
-    x_spans.reserve(static_cast<std::size_t>(target.width()));
-    for (Index x = target.x0; x < target.x1; ++x) {
-        x_spans.push_back(area_span(x, geometry.in_w, geometry.out_w, source.x0, source.x1));
-    }
+bool area_resize_direct(const Plane<Byte>& crop, const Box& source, const Geometry& geometry,
+                        const Box& target, const Plane<Byte>& restored) {
     bool any = false;
     for (Index y = target.y0; y < target.y1; ++y) {
-        const auto sy = area_span(y, geometry.in_h, geometry.out_h, source.y0, source.y1);
-        for (Index x = 0; x < target.width(); ++x) {
-            const auto sx = x_spans[static_cast<std::size_t>(x)];
-            double weighted = continuous_integral(integral, crop, source.height(), source.width(), sy.high, sx.high);
-            weighted -= continuous_integral(integral, crop, source.height(), source.width(), sy.low, sx.high);
-            weighted -= continuous_integral(integral, crop, source.height(), source.width(), sy.high, sx.low);
-            weighted += continuous_integral(integral, crop, source.height(), source.width(), sy.low, sx.low);
-            // A half-even uint8 tie stays zero. Reproduce the ordered OpenCV
-            // float32 taps near the threshold, where the integral is insufficient.
-            const double threshold = sy.cell * sx.cell / 510.0;
-            const bool inside = std::abs(weighted - threshold) > 1e-4 * threshold
-                ? weighted > threshold
-                : area_binary_value(crop, source, geometry, y, target.x0 + x) > 0.5f;
-            restored.store(y - target.y0, x, static_cast<Byte>(inside));
+        for (Index x = target.x0; x < target.x1; ++x) {
+            const bool inside = area_binary_value(crop, source, geometry, y, x) > 0.5f;
+            restored.store(y - target.y0, x - target.x0, static_cast<Byte>(inside));
             any |= inside;
         }
     }
     return any;
+}
+
+template<class Prefix>
+bool resize_from_prefix(const Plane<Prefix>& integral, const Plane<Byte>& crop,
+                        const Box& source, const Geometry& geometry, const Box& target,
+                        const Plane<Byte>& restored) {
+    // Bound precomputed coordinates even for a very wide, shallow output.
+    constexpr Index max_columns = 512;
+    // Use at most the old sizeof(AreaSpan) per output column. Limiting the
+    // count before multiplication keeps the byte calculation representable.
+    const auto budget = std::min<Index>(target.width(), max_columns * sizeof(SampleSpan)) * sizeof(AreaSpan);
+    const Index allocation = static_cast<Index>(std::min<std::size_t>(max_columns, budget / sizeof(SampleSpan)));
+    std::vector<SampleSpan> storage(static_cast<std::size_t>(allocation));
+    SampleSpan single;
+    SampleSpan* spans = allocation ? storage.data() : &single;
+    const Index tile_columns = std::max<Index>(1, allocation);
+    bool any = false;
+    for (Index first = target.x0; first < target.x1;) {
+        const Index stop = first + std::min(tile_columns, target.x1 - first);
+        for (Index x = first; x < stop; ++x) {
+            spans[x - first] = sample_span(x, geometry.in_w, geometry.out_w, source.x0, source.x1);
+        }
+        for (Index y = target.y0; y < target.y1; ++y) {
+            const auto sy = sample_span(y, geometry.in_h, geometry.out_h, source.y0, source.y1);
+            for (Index x = first; x < stop; ++x) {
+                const auto& sx = spans[x - first];
+                double weighted = continuous_integral(integral, crop, sy.high, sx.high);
+                weighted -= continuous_integral(integral, crop, sy.low, sx.high);
+                weighted -= continuous_integral(integral, crop, sy.high, sx.low);
+                weighted += continuous_integral(integral, crop, sy.low, sx.low);
+                const double threshold = sy.cell * sx.cell / 510.0;
+                const bool inside = std::abs(weighted - threshold) > 1e-4 * threshold
+                    ? weighted > threshold
+                    : area_binary_value(crop, source, geometry, y, x) > 0.5f;
+                restored.store(y - target.y0, x - target.x0, static_cast<Byte>(inside));
+                any |= inside;
+            }
+        }
+        first = stop;
+    }
+    return any;
+}
+
+bool area_resize(const Plane<Byte>& crop, const Box& source, const Geometry& geometry,
+                 const Box& target, const Plane<Byte>& restored) {
+    const auto pixels = checked_extent(source.height(), source.width());
+    if (static_cast<std::uint64_t>(pixels) > std::numeric_limits<std::uint32_t>::max()) {
+        // An oversized crop needs a wider prefix than its four-byte-per-cell budget.
+        // Evaluate the same OpenCV tap order without allocating a prefix.
+        return area_resize_direct(crop, source, geometry, target, restored);
+    }
+    const Index stride = checked_add(source.width(), 1);
+    const Index entries = checked_extent(checked_add(source.height(), 1), stride);
+    auto sums = std::unique_ptr<std::uint32_t[]>(new std::uint32_t[static_cast<std::size_t>(entries)]);
+    const auto integral = dense_plane(sums.get(), stride);
+    std::fill_n(sums.get(), stride, 0u);
+    for (Index y = 0; y < source.height(); ++y) {
+        integral.store(y + 1, 0, 0u);
+        std::uint32_t row = 0;
+        for (Index x = 0; x < source.width(); ++x) {
+            row += crop.load(y, x) != 0;
+            integral.store(y + 1, x + 1, integral.load(y, x + 1) + row);
+        }
+    }
+
+    return resize_from_prefix(integral, crop, source, geometry, target, restored);
 }
 
 Index search_sorted(const Buffer& map, Index value, bool right) {
@@ -280,21 +336,7 @@ public:
     bool resize(const Plane<Byte>& crop, const Box& source, const Box& region,
                 const Plane<Byte>& output) const {
         if (mode == area) {
-            const Index height = checked_add(source.height(), 1);
-            const Index width = checked_add(source.width(), 1);
-            std::vector<std::int32_t> sums(static_cast<std::size_t>(checked_extent(height, width)), 0);
-            const auto integral = dense_plane(sums.data(), width);
-            for (Index y = 0; y < source.height(); ++y) {
-                std::uint32_t row = 0;
-                for (Index x = 0; x < source.width(); ++x) {
-                    row += crop.load(y, x);
-                    const std::uint32_t value = static_cast<std::uint32_t>(integral.load(y, x + 1)) + row;
-                    std::int32_t encoded;
-                    std::memcpy(&encoded, &value, sizeof(encoded));
-                    integral.store(y + 1, x + 1, encoded);
-                }
-            }
-            return area_resize(integral, crop, source, grid, region, output);
+            return area_resize(crop, source, grid, region, output);
         }
         bool any = mode == identity;
         for (Index y = 0; y < region.height(); ++y) {
@@ -435,7 +477,36 @@ Box record_box(const Buffer& records, Index i) {
             records.load<std::int64_t>(i, 3), records.load<std::int64_t>(i, 4)};
 }
 
+#if defined(_MSC_VER)
+#define XTA_NRRD_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#define XTA_NRRD_RESTRICT __restrict__
+#else
+#define XTA_NRRD_RESTRICT
+#endif
+
+void or_disjoint_row(const Byte* XTA_NRRD_RESTRICT source, Byte* XTA_NRRD_RESTRICT destination, Index width) {
+    for (Index x = 0; x < width; ++x) destination[x] |= source[x];
+}
+
 void or_plane(const Plane<Byte>& input, const Plane<Byte>& output, Index height, Index width) {
+    if (!height || !width) return;
+    if (input.col_stride == 1 && output.col_stride == 1 &&
+        (height == 1 || (input.row_stride >= width && output.row_stride >= width))) {
+        // Count padding in the address spans. Only declare nonaliasing when the
+        // complete touched spans are disjoint, including for multirow subviews.
+        const auto end_address = [&](const Plane<Byte>& view) {
+            return reinterpret_cast<std::uintptr_t>(view.bytes + (height - 1) * view.row_stride + (width - 1));
+        };
+        if (end_address(input) < reinterpret_cast<std::uintptr_t>(output.bytes) ||
+            end_address(output) < reinterpret_cast<std::uintptr_t>(input.bytes)) {
+            for (Index y = 0; y < height; ++y) {
+                or_disjoint_row(reinterpret_cast<const Byte*>(input.bytes + y * input.row_stride),
+                                reinterpret_cast<Byte*>(output.bytes + y * output.row_stride), width);
+            }
+            return;
+        }
+    }
     for (Index y = 0; y < height; ++y) {
         for (Index x = 0; x < width; ++x) {
             output.store(y, x, static_cast<Byte>(output.load(y, x) | input.load(y, x)));
@@ -445,27 +516,47 @@ void or_plane(const Plane<Byte>& input, const Plane<Byte>& output, Index height,
 
 PyObject* area_crop_resize(PyObject*, PyObject* raw) {
     return protect([&]() -> PyObject* {
-        const Args args(raw, 13);
-        const Buffer integral(args.object(0), "NRRD integral image", 2);
-        const Buffer crop(args.object(1), "NRRD crop", 2);
-        const Geometry grid{args.index(2), args.index(3), args.index(4), args.index(5)};
+        // The prior private ABI accepts cv2.integral(CV_32S) before the crop.
+        // Current callers provide the crop alone and fund just one normalized prefix.
+        const int offset = PyTuple_GET_SIZE(raw) == 13 ? 1 : 0;
+        const Args args(raw, 12 + offset);
+        const Buffer crop(args.object(offset), "NRRD crop", 2);
+        const Geometry grid{args.index(offset + 1), args.index(offset + 2), args.index(offset + 3), args.index(offset + 4)};
         grid.validate();
-        const Box source{args.index(6), args.index(7), args.index(8), args.index(9)};
-        const Buffer out(args.object(12), "NRRD crop resize output", 2, true);
-        const Index y = args.index(10), x = args.index(11);
+        const Box source{args.index(offset + 5), args.index(offset + 6), args.index(offset + 7), args.index(offset + 8)};
+        const Buffer out(args.object(offset + 11), "NRRD crop resize output", 2, true);
+        const Index y = args.index(offset + 9), x = args.index(offset + 10);
         const Box target{y, x, checked_add(y, out.shape(0)), checked_add(x, out.shape(1))};
         crop.require<Byte>();
-        integral.require<std::int32_t>();
         out.require<Byte>();
-        if (!source.within(grid.in_h, grid.in_w) || source.height() != crop.shape(0) || source.width() != crop.shape(1)
-            || integral.shape(0) != checked_add(crop.shape(0), 1)
-            || integral.shape(1) != checked_add(crop.shape(1), 1)
-            || y < 0 || x < 0 || target.y1 > grid.out_h || target.x1 > grid.out_w) {
+        if (!source.within(grid.in_h, grid.in_w) || source.height() != crop.shape(0)
+            || source.width() != crop.shape(1) || y < 0 || x < 0
+            || target.y1 > grid.out_h || target.x1 > grid.out_w) {
             value_error("Invalid NRRD area crop resize bounds");
         }
-        if (target.nonempty()) {
+        if (offset) {
+            const Buffer prefix(args.object(0), "NRRD integral image", 2);
+            prefix.require<std::int32_t>();
+            if (prefix.shape(0) != checked_add(crop.shape(0), 1) || prefix.shape(1) != checked_add(crop.shape(1), 1)) {
+                value_error("Invalid NRRD area crop resize bounds");
+            }
+            if (target.nonempty()) {
+                GilRelease unlock;
+                bool canonical = checked_extent(source.height(), source.width()) <= std::numeric_limits<std::int32_t>::max();
+                for (Index row = 0; canonical && row < crop.shape(0); ++row) {
+                    for (Index col = 0; col < crop.shape(1); ++col) {
+                        if (crop.load<Byte>(row, col) > 1) { canonical = false; break; }
+                    }
+                }
+                if (canonical) {
+                    resize_from_prefix(plane<std::int32_t>(prefix), plane<Byte>(crop), source, grid, target, plane<Byte>(out));
+                } else {
+                    area_resize_direct(plane<Byte>(crop), source, grid, target, plane<Byte>(out));
+                }
+            }
+        } else if (target.nonempty()) {
             GilRelease unlock;
-            area_resize(plane<std::int32_t>(integral), plane<Byte>(crop), source, grid, target, plane<Byte>(out));
+            area_resize(plane<Byte>(crop), source, grid, target, plane<Byte>(out));
         }
         Py_RETURN_NONE;
     });
@@ -508,9 +599,21 @@ PyObject* fill_crop_row_batch(PyObject*, PyObject* raw) {
     });
 }
 
+Box member_window(const Args& args, Index offset, Index height, Index width, bool cropped) {
+    if (!cropped) return {0, 0, height, width};
+    const Box window{args.index(offset), args.index(offset + 1), args.index(offset + 2), args.index(offset + 3)};
+    if (!window.within(height, width)) value_error("Invalid NRRD member window");
+    return window;
+}
+
+bool contains(const Box& outer, const Box& inner) {
+    return outer.y0 <= inner.y0 && inner.y1 <= outer.y1 && outer.x0 <= inner.x0 && inner.x1 <= outer.x1;
+}
+
 PyObject* fill_native_member_group(PyObject*, PyObject* raw) {
     return protect([&]() -> PyObject* {
-        const Args args(raw, 13);
+        const bool cropped = PyTuple_GET_SIZE(raw) == 17;
+        const Args args(raw, cropped ? 17 : 13);
         const CropStore crops(args);
         const Buffer first(args.object(8), "NRRD member starts", 1), count(args.object(9), "NRRD member counts", 1);
         const Index total = args.index(10), height = args.index(11), width = args.index(12);
@@ -519,7 +622,8 @@ PyObject* fill_native_member_group(PyObject*, PyObject* raw) {
         if (first.shape(0) != count.shape(0) || total < 0 || height < 1 || width < 1) {
             value_error("Invalid native NRRD member dimensions");
         }
-        auto array = zeros({checked_extent(total, height), width}, "uint8");
+        const Box window = member_window(args, 13, height, width, cropped);
+        auto array = zeros({checked_extent(total, window.height()), window.width()}, "uint8");
         const Buffer output(array.get(), "NRRD native members", 2, true);
         std::vector<Record> records;
         {
@@ -529,11 +633,11 @@ PyObject* fill_native_member_group(PyObject*, PyObject* raw) {
                     return;
                 }
                 const auto box = crops.box(z);
-                if (!box.within(height, width)) {
+                if (!box.within(height, width) || !contains(window, box)) {
                     throw std::invalid_argument("NRRD crop is outside its member plane");
                 }
-                const Index row = slot * height + box.y0;
-                crops.decode(z, box, {output.ptr(row, box.x0), output.stride(0), output.stride(1)});
+                const Index row = slot * window.height() + (box.y0 - window.y0);
+                crops.decode(z, box, {output.ptr(row, box.x0 - window.x0), output.stride(0), output.stride(1)});
                 records.push_back({row, box.y0, box.x0, box.y1, box.x1, z});
             });
         }
@@ -543,7 +647,8 @@ PyObject* fill_native_member_group(PyObject*, PyObject* raw) {
 
 PyObject* fill_restored_member_group(PyObject*, PyObject* raw) {
     return protect([&]() -> PyObject* {
-        const Args args(raw, 22);
+        const bool cropped = PyTuple_GET_SIZE(raw) == 26;
+        const Args args(raw, cropped ? 26 : 22);
         const CropStore crops(args);
         const Buffer first(args.object(8), "NRRD member starts", 1), count(args.object(9), "NRRD member counts", 1);
         const Index total = args.index(10);
@@ -556,14 +661,15 @@ PyObject* fill_restored_member_group(PyObject*, PyObject* raw) {
         if (first.shape(0) != count.shape(0) || total < 0 || source_ptr.shape(0) < 1) {
             value_error("Invalid restored NRRD member dimensions");
         }
-        auto array = zeros({checked_extent(total, plan.grid.out_h), plan.grid.out_w}, "uint8");
+        const Box window = member_window(args, 22, plan.grid.out_h, plan.grid.out_w, cropped);
+        auto array = zeros({checked_extent(total, window.height()), window.width()}, "uint8");
         const Buffer output(array.get(), "NRRD restored members", 2, true);
         std::vector<Record> records;
         {
             GilRelease unlock;
             std::vector<Byte> crop_bytes, restored_bytes;
             member_slices(first, count, source_ptr.shape(0) - 1, total, [&](Index z, Index slot) {
-                const Index row = slot * plan.grid.out_h;
+                const Index row = slot * window.height();
                 Box combined{plan.grid.out_h, plan.grid.out_w, 0, 0};
                 auto range = destinations(source_ptr, z, source_index.shape(0));
                 for (Index t = range.first; t < range.stop; ++t) {
@@ -576,6 +682,9 @@ PyObject* fill_restored_member_group(PyObject*, PyObject* raw) {
                     if (!region.nonempty()) {
                         continue;
                     }
+                    if (!contains(window, region)) {
+                        throw std::invalid_argument("Restored NRRD crop exceeds its certified member window");
+                    }
                     crop_bytes.resize(static_cast<std::size_t>(checked_extent(box.height(), box.width())));
                     const auto crop = dense_plane(crop_bytes.data(), box.width());
                     crops.decode(source_z, box, crop);
@@ -584,7 +693,7 @@ PyObject* fill_restored_member_group(PyObject*, PyObject* raw) {
                     if (!plan.resize(crop, box, region, restored)) {
                         continue;
                     }
-                    or_plane(restored, {output.ptr(row + region.y0, region.x0), output.stride(0), output.stride(1)},
+                    or_plane(restored, {output.ptr(row + (region.y0 - window.y0), region.x0 - window.x0), output.stride(0), output.stride(1)},
                              region.height(), region.width());
                     combined.y0 = std::min(combined.y0, region.y0);
                     combined.x0 = std::min(combined.x0, region.x0);
@@ -592,7 +701,7 @@ PyObject* fill_restored_member_group(PyObject*, PyObject* raw) {
                     combined.x1 = std::max(combined.x1, region.x1);
                 }
                 if (combined.nonempty()) {
-                    records.push_back({row + combined.y0, combined.y0, combined.x0, combined.y1, combined.x1, z});
+                    records.push_back({row + (combined.y0 - window.y0), combined.y0, combined.x0, combined.y1, combined.x1, z});
                 }
             });
         }
@@ -602,7 +711,10 @@ PyObject* fill_restored_member_group(PyObject*, PyObject* raw) {
 
 PyObject* resize_records_for_tee(PyObject*, PyObject* raw) {
     return protect([&]() -> PyObject* {
-        const Args args(raw, 12);
+        const bool cropped = PyTuple_GET_SIZE(raw) == 13;
+        const Args args(raw, cropped ? 13 : 12);
+        const Index column_origin = cropped ? args.index(12) : 0;
+        if (column_origin < 0) value_error("Invalid NRRD tee column origin");
         const Buffer source(args.object(0), "NRRD tee source", 2), records(args.object(1), "NRRD crop records", 2);
         const Buffer ptr(args.object(2), "NRRD target pointers", 1);
         const ResizePlan plan(args, 3);
@@ -631,7 +743,8 @@ PyObject* resize_records_for_tee(PyObject*, PyObject* raw) {
                     continue;
                 }
                 const auto row = records.load<std::int64_t>(i, 0);
-                if (row < 0 || row > source.shape(0) || box.height() > source.shape(0) - row || box.x1 > source.shape(1)) {
+                if (row < 0 || row > source.shape(0) || box.height() > source.shape(0) - row || box.x0 < column_origin
+                    || box.x1 - column_origin > source.shape(1)) {
                     throw std::invalid_argument("NRRD tee crop is outside its member buffer");
                 }
                 regions.store<std::int64_t>(region.y0, i, 0);
@@ -652,7 +765,7 @@ PyObject* resize_records_for_tee(PyObject*, PyObject* raw) {
                 const Box region{regions.load<std::int64_t>(i, 0), regions.load<std::int64_t>(i, 1),
                                  regions.load<std::int64_t>(i, 2), regions.load<std::int64_t>(i, 3)};
                 const auto offset = regions.load<std::int64_t>(i, 4);
-                const Plane<Byte> crop{source.ptr(item.row, item.source.x0), source.stride(0), source.stride(1)};
+                const Plane<Byte> crop{source.ptr(item.row, item.source.x0 - column_origin), source.stride(0), source.stride(1)};
                 if (!plan.resize(crop, item.source, region,
                                  dense_plane(reinterpret_cast<Byte*>(results.ptr(offset)), region.width()))) {
                     regions.store<std::int64_t>(region.y0, i, 2);

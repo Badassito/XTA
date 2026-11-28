@@ -163,6 +163,7 @@ struct Parent {
     Id admission_reserve;
     Id generation = 0, worker = -1, submitted = 0, completed = 0, task_bytes = 0, unread_finals = 0;
     bool funded = false, preparing = false, published = false, retired = false, postprocess_adopted = false;
+    bool tile_result = false;
     std::set<Decision> planned_tasks;
 };
 struct Task {
@@ -179,6 +180,7 @@ struct Worker {
     Socket socket;
     Id active = 0, unsettled = 0, resident = -1, last_use = 0;
     bool closing = false;
+    std::condition_variable command_ready;
     std::deque<Packet> commands;
     std::set<Id> outstanding_controls;
     std::set<std::string> installed_sources, pending_sources;
@@ -193,11 +195,14 @@ using Summary = std::map<std::string, Id>;
 class Scheduler {
     SocketEvent stop_io_;
     DetectorFilePool detector_files_;
+    std::mutex close_mutex_;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     const Id run_;
     Id capacity_, tickets_, inference_capacity_, preparation_window_, pressure_capacity_;
     Id used_ = 0, funded_ = 0, inf_bytes_ = 0, inf_parents_ = 0, retained_parent_bytes_ = 0;
+    Id tile_capacity_ = 0, tile_ticket_capacity_ = 0, tile_maximum_ = 0;
+    Id tile_used_ = 0, tile_funded_ = 0, tile_inference_ = 0;
     Id sequence_ = 0, generations_ = 0, issued_ = 0, installed_ = 0, finals_ = 0;
     bool dirty_ = false, stopping_ = false;
     std::string fault_;
@@ -205,6 +210,7 @@ class Scheduler {
     std::map<Id, Parent> parents_;
     std::map<Id, Task> tasks_;
     std::set<Decision> pending_parents_, ready_;
+    std::deque<Id> pending_tiles_;
     std::deque<std::pair<Id, Id>> preparation_, publication_;
     std::deque<Packet> events_;
     DeviceStages stages_;
@@ -229,9 +235,16 @@ class Scheduler {
             fault_ = reason;
             stop_io_.signal();
             discard_detector_files();
-            for (auto &entry : workers_) interrupt_socket(entry.second->socket);
+            interrupt_workers();
         }
         changed_.notify_all();
+    }
+    void interrupt_workers() {
+        for (auto &entry : workers_) {
+            auto &worker = *entry.second;
+            interrupt_socket(worker.socket);
+            worker.command_ready.notify_one();
+        }
     }
     void discard_detector_files() {
         for (auto &entry : tasks_) entry.second.handles.clear();
@@ -257,6 +270,31 @@ class Scheduler {
         require(it != workers_.end(), "unknown scheduler worker");
         return *it->second;
     }
+    void grant(Parent &p) {
+        p.funded = true;
+        if (p.descriptor_only) {
+            const Id granted = now_ns();
+            for (const auto &item : p.planned_tasks) task(std::get<2>(item)).ready_since_ns = granted;
+            ready_.merge(p.planned_tasks);
+        } else {
+            preparation_.emplace_back(p.id, p.generation);
+        }
+    }
+    void fund_tile_results() {
+        // An oversized host restore spends its whole escape lane alone.
+        if (used_ > capacity_) return;
+        while (!pending_tiles_.empty() && tile_funded_ < tile_ticket_capacity_) {
+            auto &p = parent(pending_tiles_.front());
+            if (p.descriptor_only && p.submitted != p.expected) return;
+            const bool singleton = p.bytes > tile_capacity_ && !tile_funded_;
+            if (!singleton && p.bytes > tile_capacity_ - tile_used_) return;
+            ++tile_funded_;
+            ++tile_inference_;
+            tile_used_ += p.bytes;
+            grant(p);
+            pending_tiles_.pop_front();
+        }
+    }
     void fund_parents() {
         for (auto it = pending_parents_.begin(); it != pending_parents_.end();) {
             if (funded_ == tickets_ || inf_parents_ == preparation_window_) break;
@@ -267,7 +305,7 @@ class Scheduler {
             // Its full physical backing remains charged even above the usual
             // ceiling. While in debt, ordinary and zero-byte grants both wait.
             bool singleton_restore = p.allow_oversize_host && p.bytes > capacity_ && !funded_ && !used_ &&
-                                     !p.admission_reserve;
+                                     !tile_funded_ && pending_tiles_.empty() && !p.admission_reserve;
             const Id free = capacity_ - used_;
             if ((!singleton_restore && (p.admission_reserve > free ||
                  p.bytes + p.headroom > free - p.admission_reserve)) ||
@@ -284,18 +322,11 @@ class Scheduler {
                 p.worker = available->first;
                 available->second->resident = p.id;
             }
-            p.funded = true;
             ++funded_;
             ++inf_parents_;
             used_ += p.bytes + p.headroom;
             inf_bytes_ += p.bytes;
-            if (p.descriptor_only) {
-                const Id granted = now_ns();
-                for (const auto &item : p.planned_tasks) task(std::get<2>(item)).ready_since_ns = granted;
-                ready_.merge(p.planned_tasks);
-            } else {
-                preparation_.emplace_back(p.id, p.generation);
-            }
+            grant(p);
             it = pending_parents_.erase(it);
         }
     }
@@ -354,6 +385,7 @@ class Scheduler {
                 files.emplace_back(static_cast<std::uint32_t>(i), handle.file);
             }
             w->commands.push_back({dispatch, lease, std::move(t.data), std::move(files)});
+            w->command_ready.notify_one();
             it = ready_.erase(it);
         }
     }
@@ -398,6 +430,7 @@ class Scheduler {
                 dirty_ = false;
                 stages_.refresh_deadlines();
                 fund_parents();
+                fund_tile_results();
                 update_stage_policy();
                 dispatch_ready();
                 update_stage_policy();
@@ -412,7 +445,7 @@ class Scheduler {
                 Packet out{};
                 {
                     Lock lock(mutex_);
-                    changed_.wait(lock, [&] { return !w.commands.empty() || stopping_ || !fault_.empty(); });
+                    w.command_ready.wait(lock, [&] { return !w.commands.empty() || stopping_ || !fault_.empty(); });
                     if (stopping_ || !fault_.empty()) return;
                     out = std::move(w.commands.front());
                     w.commands.pop_front();
@@ -478,9 +511,13 @@ class Scheduler {
                 if (!p.data.empty()) ++parent_state.unread_finals;
                 if (++parent_state.completed == parent_state.expected) {
                     parent_state.published = true;
-                    --inf_parents_;
-                    inf_bytes_ -= parent_state.bytes;
-                    if (parent_state.worker >= 0) worker(parent_state.worker).resident = -1;
+                    if (parent_state.tile_result) {
+                        --tile_inference_;
+                    } else {
+                        --inf_parents_;
+                        inf_bytes_ -= parent_state.bytes;
+                        if (parent_state.worker >= 0) worker(parent_state.worker).resident = -1;
+                    }
                     publication_.emplace_back(t.parent, parent_state.generation);
                 }
             }
@@ -526,8 +563,9 @@ public:
         dispatcher_ = std::thread(&Scheduler::dispatch_loop, this);
     }
     ~Scheduler() { close_run(); }
+    template <class StateLock = Lock>
     void configure(Id bytes, Id tickets, Id inference_bytes, Id preparation_window, Id pressure_capacity) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         require(parents_.empty(), "cannot reconfigure capacity after declaring work");
         require(bytes >= 0 && tickets > 0 && inference_bytes >= 0 && inference_bytes <= bytes &&
@@ -538,8 +576,19 @@ public:
         preparation_window_ = preparation_window;
         pressure_capacity_ = pressure_capacity;
     }
+    template <class StateLock = Lock>
+    void configure_tile_results(Id bytes, Id tickets, Id largest) {
+        StateLock lock(mutex_);
+        healthy();
+        require(parents_.empty(), "cannot reconfigure tile capacity after declaring work");
+        require(bytes > 0 && tickets > 0 && largest > 0, "invalid tile result capacities");
+        tile_capacity_ = bytes;
+        tile_ticket_capacity_ = tickets;
+        tile_maximum_ = largest;
+    }
+    template <class StateLock = Lock>
     bool try_resize_capacity(Id bytes, Id inference_bytes, Id pressure_capacity) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         require(bytes >= 0 && inference_bytes >= 0 && inference_bytes <= bytes && pressure_capacity >= bytes,
                 "invalid dense repartition capacity");
@@ -548,7 +597,7 @@ public:
         if (used_ > bytes) return false;
         for (const auto &entry : parents_) {
             const auto &p = entry.second;
-            if (p.retired || p.published) continue;
+            if (p.tile_result || p.retired || p.published) continue;
             if (p.expected || p.bytes > bytes || (!p.funded && p.admission_reserve > bytes - p.bytes)) return false;
         }
         capacity_ = bytes;
@@ -559,7 +608,13 @@ public:
         return true;
     }
     void add_worker(Id id, Id epoch, Id pid, Id kinds, Id window, Socket socket, Id device) {
-        auto owned = std::make_unique<Worker>(id, epoch, pid, kinds, window, device, socket);
+        std::unique_ptr<Worker> owned;
+        try {
+            owned = std::make_unique<Worker>(id, epoch, pid, kinds, window, device, socket);
+        } catch (...) {
+            close_socket(socket);
+            throw;
+        }
         Lock lock(mutex_);
         healthy();
         require(id >= 0 && epoch > 0 && pid > 0 && kinds > 0 && kinds <= 3 &&
@@ -573,9 +628,10 @@ public:
         } catch (const std::exception &e) { fail(e.what()); throw; }
         wake();
     }
+    template <class StateLock = Lock>
     Id declare_parent(Id id, Id expected, Id bytes, Id priority, Id exclusive, Id headroom,
                       bool allow_oversize_host, Id pressure_bytes, bool descriptor_only, Id admission_reserve) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         require(id >= 0 && expected >= 0 && bytes >= 0 && headroom >= 0 && exclusive >= 0 && exclusive <= 3 &&
                 (expected > 0 || (!exclusive && !headroom)),
@@ -598,8 +654,24 @@ public:
         wake();
         return generation;
     }
+    template <class StateLock = Lock>
+    Id declare_tile_result(Id id, Id bytes, bool descriptor_only) {
+        StateLock lock(mutex_);
+        healthy();
+        require(id >= 0 && bytes > 0 && bytes <= tile_maximum_ && tile_ticket_capacity_ > 0,
+                "tile result exceeds the configured lane or has no capacity");
+        require(!parents_.count(id), "duplicate tile result identity");
+        Id generation = next_generation();
+        Parent tile{id, 1, bytes, 0, 0, 0, false, 0, descriptor_only, 0, generation};
+        tile.tile_result = true;
+        parents_.emplace(id, std::move(tile));
+        pending_tiles_.push_back(id);
+        wake();
+        return generation;
+    }
+    template <class StateLock = Lock>
     bool update_host_reserve(Id id, Id generation, Id reserve) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         auto &p = parent(id);
         require(!p.expected && p.generation == generation && reserve >= 0 && !p.retired,
@@ -623,9 +695,10 @@ public:
     DetectorHandle pin_detector_file(int fd, const std::string &identity, int role) {
         return detector_files_.pin(fd, identity, role);
     }
+    template <class StateLock = Lock>
     void submit(Id id, Id pid, Bytes data, Id kinds, Id priority, Id required, Id bytes, DetectorHandles handles,
                 bool planned = false) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         auto &p = parent(pid);
         require(p.descriptor_only == planned && (planned || p.preparing) && !p.retired && p.submitted < p.expected,
@@ -635,8 +708,9 @@ public:
                 "predeclared descriptors only accept immutable source handles");
         require(!planned || !p.exclusive_kind || (required < 0 && !(p.exclusive_kind & ~kinds)),
                 "predeclared task incompatible with parent worker reservation");
+        const bool allowed_bytes = p.tile_result ? bytes == 0 : bytes <= capacity_ - p.bytes;
         require(id >= 0 && kinds > 0 && kinds <= 3 && required >= -1 && bytes >= 0 &&
-                bytes <= capacity_ - p.bytes && data.size() <= max_payload, "invalid prepared task descriptor");
+                 allowed_bytes && data.size() <= max_payload, "invalid prepared task descriptor");
         require(!tasks_.count(id), "duplicate task identity");
         if (required >= 0) {
             auto &w = worker(required);
@@ -659,8 +733,9 @@ public:
         require(generation > 0 && t.generation == generation, "task wait lease generation mismatch");
         return wait(lock, ms, [&] { return t.final_seen; });
     }
+    template <class StateLock = Lock>
     void host_prepared(Id id, Id generation) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         auto &p = parent(id);
         require(!p.expected && p.preparing && !p.published && generation == p.generation,
@@ -674,11 +749,13 @@ public:
         publication_.emplace_back(id, generation);
         wake();
     }
+    template <class StateLock = Lock>
     void adopt_postprocess(Id id, Id generation) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         auto &p = parent(id);
-        require(p.expected && p.generation == generation && p.published && !p.retired && !p.postprocess_adopted,
+        require(!p.tile_result && p.expected && p.generation == generation && p.published &&
+                !p.retired && !p.postprocess_adopted,
                 "invalid postprocess adoption receipt");
         p.postprocess_adopted = true;
         retained_parent_bytes_ += p.pressure_bytes;
@@ -693,8 +770,9 @@ public:
         if (out.kind == final) --parent(out.lease.parent).unread_finals;
         return true;
     }
+    template <class StateLock = Lock>
     void retire_task(Id id, Id generation) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         auto &t = task(id);
         require(generation > 0 && t.generation == generation && t.final_seen && !t.retired, "invalid task retirement receipt");
@@ -705,11 +783,13 @@ public:
         t.retired = true;
         wake();
     }
+    template <class StateLock = Lock>
     void set_parent_remaining(Id id, Id generation, Id remaining) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         auto &p = parent(id);
-        require(p.published && !p.retired && p.generation == generation && remaining >= 0 && remaining < p.bytes,
+        require(!p.tile_result && p.published && !p.retired && p.generation == generation &&
+                remaining >= 0 && remaining < p.bytes,
                 "invalid parent component retirement receipt");
         used_ -= p.bytes - remaining;
         const Id dense_remaining = std::min(p.pressure_bytes, remaining);
@@ -719,44 +799,53 @@ public:
         update_retirement_pressure();
         wake();
     }
+    template <class StateLock = Lock>
     void retire_parent(Id id, Id generation) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         auto &p = parent(id);
         require(p.generation == generation && p.published && !p.retired && !p.task_bytes && !p.unread_finals,
                 "invalid parent retirement or retained task aliases");
-        used_ -= p.bytes + p.headroom;
-        if (p.postprocess_adopted) retained_parent_bytes_ -= p.pressure_bytes;
-        update_retirement_pressure();
-        --funded_;
+        if (p.tile_result) {
+            tile_used_ -= p.bytes;
+            --tile_funded_;
+        } else {
+            used_ -= p.bytes + p.headroom;
+            if (p.postprocess_adopted) retained_parent_bytes_ -= p.pressure_bytes;
+            update_retirement_pressure();
+            --funded_;
+        }
         p.retired = true;
         auto entry = std::find(publication_.begin(), publication_.end(), std::make_pair(id, generation));
         if (entry != publication_.end()) publication_.erase(entry);
         wake();
     }
+    template <class StateLock = Lock>
     Id send_control(Id id, Bytes data, bool last, bool expect_reply) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         healthy();
         auto &w = worker(id);
         require(!w.closing && data.size() <= max_payload && w.commands.size() < static_cast<size_t>(w.window) + 64 &&
                 w.outstanding_controls.size() < 64, "closed worker, full control lane or oversized control");
         if (last) {
-            require(!expect_reply && w.outstanding_controls.empty() && !w.unsettled && ready_.empty() && pending_parents_.empty() &&
-                    inf_parents_ == 0, "worker stop with outstanding inference work");
+            require(!expect_reply && w.outstanding_controls.empty() && !w.unsettled && ready_.empty() &&
+                    pending_parents_.empty() && pending_tiles_.empty() && inf_parents_ == 0 && tile_inference_ == 0,
+                    "worker stop with outstanding inference work");
             w.closing = true;
         }
         Id generation = expect_reply ? next_generation() : 0;
         if (expect_reply) w.outstanding_controls.insert(generation);
         w.commands.push_back({control, {run_, 0, 0, id, w.epoch, w.pid, generation}, std::move(data)});
-        changed_.notify_all();
+        w.command_ready.notify_one();
         return generation;
     }
     void cancel(const std::string &reason) {
         Lock lock(mutex_);
         fail("native scheduler cancelled: " + reason);
     }
+    template <class StateLock = Lock>
     std::vector<Id> stage(const std::string &op, const std::vector<Id> &fields) {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         // Actors can finish an already-owned device fence after an unrelated
         // failure. Only proof/teardown operations survive a fault.
         static const std::set<std::string> fault_cleanup{
@@ -774,8 +863,9 @@ public:
         wait(lock, ms, [&] { return stages_.epoch() != epoch; });
         return stages_.epoch();
     }
+    template <class StateLock = Lock>
     Summary snapshot() const {
-        Lock lock(mutex_);
+        StateLock lock(mutex_);
         Id active = 0;
         for (const auto &entry : workers_) active += entry.second->active;
         return {{"bytes_used", used_}, {"byte_capacity", capacity_}, {"inference_byte_capacity", inference_capacity_},
@@ -784,6 +874,9 @@ public:
                 {"pressure_byte_capacity", pressure_capacity_},
                 {"ticket_capacity", tickets_}, {"inference_bytes", inf_bytes_}, {"preparing_parents", inf_parents_},
                 {"blocked_parents", static_cast<Id>(pending_parents_.size())},
+                {"tile_result_bytes", tile_used_}, {"tile_result_byte_capacity", tile_capacity_},
+                {"tile_result_tickets", tile_funded_}, {"tile_result_ticket_capacity", tile_ticket_capacity_},
+                {"tile_inference", tile_inference_}, {"blocked_tile_results", static_cast<Id>(pending_tiles_.size())},
                 {"ready", static_cast<Id>(ready_.size())}, {"active", active}, {"dispatched", issued_},
                 {"installed", installed_}, {"final", finals_}, {"events", static_cast<Id>(events_.size())},
                 {"publication_tickets", static_cast<Id>(publication_.size())},
@@ -792,7 +885,9 @@ public:
                 {"stage_claims", stages_.claim_count()}, {"stage_epoch", stages_.epoch()}, {"failed", !fault_.empty()}};
     }
     void close_run() {
-        // The binding serializes close/destroy calls. All other methods may be waiting.
+        // A concurrent close returns only after this owner has joined its threads
+        // and closed its sockets. Workers acquire mutex_ but never close_mutex_.
+        Lock closing(close_mutex_);
         {
             Lock lock(mutex_);
             if (stopping_) return;
@@ -800,7 +895,7 @@ public:
             stop_io_.signal();
             discard_detector_files();
             changed_.notify_all();
-            for (auto &entry : workers_) interrupt_socket(entry.second->socket);
+            interrupt_workers();
         }
         if (dispatcher_.joinable()) dispatcher_.join();
         for (auto &entry : workers_) {

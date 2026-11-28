@@ -61,7 +61,7 @@ def _cpu_kernels() -> Extension:
         ],
         extra_compile_args=(
             ["/std:c++17", "/EHsc", "/fp:strict"] if sys.platform == "win32" else
-            ["-std=c++17", "-fno-fast-math", "-ffp-contract=off", "-pthread"]
+            ["-std=c++17", "-O3", "-fno-fast-math", "-ffp-contract=off", "-pthread"]
         ),
         extra_link_args=[] if sys.platform == "win32" else ["-pthread"],
     )

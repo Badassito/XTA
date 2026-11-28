@@ -15,7 +15,7 @@ scalar child's scheduler for its detector work.
 | CUDA only, for example `--device 0` or `--device 0,1` | Full-frame detector work uses the selected CUDA actors. Each ordinary D1 parent has one resident detector worker. |
 | OpenVINO and CUDA together, for example `--device 0:cpu` | Preflight rejects hybrid detector dispatch. |
 | OpenVINO CPU only with requested Azimuthal or Tilted Azimuthal views | Preflight rejects those detector views. |
-| Detector tiles selected by `--enable_tile` | Preflight rejects the tile ownership route. |
+| Detector tiles selected by `--enable_tile` | Each crop has its own native dispatch and cleanup lease. Eligible tiles use the same CUDA or OpenVINO actors as full-frame inference. |
 | Multiple detector GPUs with `YOLO_TTA_D1_OWNER_GROUPS=1` | Preflight rejects multi-worker D1 owner groups. |
 
 The full-frame inventory includes direct unions, file-backed results, and
@@ -83,13 +83,40 @@ The native loop wakes on ready submissions, accepted receipts, and device or
 capacity changes. Already-prepared work can move while the Python result
 consumer is occupied as long as worker, device, and credit limits permit.
 New scientific input preparation and output completion still require their
-Python producers and consumers.
+Python producers and consumers. The bindings release the interpreter lock
+during native waits, contested state operations, and descriptor acquisition.
+Uncontended state updates stay on the calling thread. Each worker writer
+waits for its own commands, and cancellation and shutdown wake all writers.
+Concurrent close calls wait for the native threads and sockets to retire.
 
 The same native device ledger checks detector occupancy, auxiliary work,
 projection claims and overlap, and SAM residency. Python probes CUDA and
 exchanges generation-bound stage handles through `native_device_stages`.
 Shared-device reuse requires the appropriate worker retirement and residency
 proofs.
+
+## Independent tile result leases
+
+Each tile task carries its own crop, geometry, and complete frame range.
+Its native result ticket pays for the mask, optional confidence plane,
+and any raw and compact azimuthal seam results. External-policy copies
+share the task ticket. Their retirement receipts are scoped by model,
+concrete view, and result ID. The scheduler returns the ticket and bytes
+after the actor's authenticated final receipt and cleanup of all of those
+raw results, including empty ones.
+
+`YOLO_TTA_TILE_RESULT_MAX_GIB` and `YOLO_TTA_TILE_RESULT_MAX_TASKS`
+bound concurrently live tile results in a separate lane. A single larger
+tile can use an empty lane when it fits the resolved physical storage
+budget. The tile lane uses the same actor windows and device claims as
+other detector work. It has its own memory partition and can refill
+while full-frame publication retains its ticket. A singleton oversized
+host restore uses its escape lane alone.
+
+After cleanup, crop-local sparse results supply the tile configuration's
+view union and interpolation. Keeping that scientific work separate from
+raw-result ownership lets later tiles start while it runs. Full-frame
+outputs receive the configuration's contribution at the final join.
 
 ## SAM restoration grants
 
@@ -121,8 +148,11 @@ accounting.
 ## Detector backing handles
 
 On Linux, the adapter describes registered memfd-backed arrays by backing
-identity and access role. Native code pins those descriptors and sends them
-with the prepared command over the worker socket using `SCM_RIGHTS`. Sources
+identity and access role. The adapter duplicates each registered backing
+under the owner registry lock so serialization and submission can proceed
+after releasing it. Temporary submission pins close on every exit and forked
+children drop their inherited copies. Native code retains its own validated
+descriptors and sends them with the prepared command using `SCM_RIGHTS`. Sources
 and prefetched inputs use read-only handles. Result backings use read/write
 handles. The worker verifies the identity and access mode before the install
 receipt, then exposes the descriptors through its local procfs paths for the

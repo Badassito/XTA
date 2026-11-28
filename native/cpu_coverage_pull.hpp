@@ -3,6 +3,8 @@
 
 #include "cpu_coverage_geometry.hpp"
 
+#include <tuple>
+
 namespace xta::cpu::coverage {
 using coverage_geometry::axis_bounds;
 using coverage_geometry::axis_value;
@@ -66,12 +68,26 @@ inline I clamp_floor(double value, I last) {
     return static_cast<I>(std::floor(value));
 }
 
+inline bool frame_independent_of_x(const Geometry &g) noexcept {
+    // X is the stack coordinate on the coronal plane. Even with zero slope,
+    // keep the original arithmetic for extreme horizontal coordinates where
+    // a finite coefficient could generate an infinite delta and 0 * Inf.
+    const auto limit = std::numeric_limits<double>::max() / 4.;
+    return g.base != 2 && (g.vertical || (g.c[0] == 0. && std::abs(g.c[2]) < limit
+            && std::abs(g.c[11]) < limit / double(g.ow)));
+}
+
+inline double tilted_frame(const Geometry &g, double stack, double nv, double nu) noexcept {
+    return stack - g.c[0] * ((g.vertical ? nv : nu) - g.c[2]) - g.c[1];
+}
+
 template <class Read>
 inline void tilted(const Geometry &g, I frames, I height, I width, Read &&read, char *output,
                    Py_ssize_t stride, I count, I first, bool scalar_max, Stats &stats) {
     g.check_span(first, count);
     if (std::min({frames, height, width}) <= 0)
         throw std::invalid_argument("Empty tilted pull source");
+    const bool fixed_frame = frame_independent_of_x(g);
     I local = 0;
     while (local < count) {
         I at = first + local, z = at / g.plane, y = at / g.ow % g.oh, x0 = at % g.ow;
@@ -87,6 +103,14 @@ inline void tilted(const Geometry &g, I frames, I height, I width, Read &&read, 
         if (begin < end) {
             auto [z0, z1] = axis_bounds(z, g.wt, g.ot);
             auto [y0, y1] = axis_bounds(y, g.wh, g.oh);
+            const bool single_frame = fixed_frame && z1 - z0 == 1 && y1 - y0 == 1;
+            double row_nv = 0., row_frame = 0.;
+            if (single_frame) {
+                const double cz = axis_value(z, z0, g.wt, g.ot, g.c[9]);
+                const double cy = axis_value(y, y0, g.wh, g.oh, g.c[10]);
+                row_nv = g.base == 0 ? cy : cz;
+                row_frame = tilted_frame(g, g.base == 0 ? cz : cy, row_nv, 0.);
+            }
             for (I i = begin; i < end; ++i) {
                 const I x = x0 + i;
                 auto [a, b] = axis_bounds(x, g.ww, g.ow);
@@ -95,12 +119,12 @@ inline void tilted(const Geometry &g, I frames, I height, I width, Read &&read, 
                     const double cz = axis_value(z, iz, g.wt, g.ot, g.c[9]);
                     for (I iy = y0; iy < y1; ++iy) {
                         const double cy = axis_value(y, iy, g.wh, g.oh, g.c[10]);
+                        const double nv = single_frame ? row_nv : (g.base == 0 ? cy : cz);
                         for (I ix = a; ix < b; ++ix) {
                             const double cx = axis_value(x, ix, g.ww, g.ow, g.c[11]);
-                            const double nv = g.base == 0 ? cy : cz, nu = g.base == 2 ? cy : cx;
+                            const double nu = g.base == 2 ? cy : cx;
                             const double stack = g.base == 0 ? cz : (g.base == 1 ? cy : cx);
-                            const double frame =
-                                stack - g.c[0] * ((g.vertical ? nv : nu) - g.c[2]) - g.c[1];
+                            const double frame = single_frame ? row_frame : tilted_frame(g, stack, nv, nu);
                             if (!(frame >= -.5 && frame < double(frames) - .5 && nv >= -.5 &&
                                   nv < double(g.nh) - .5 && nu >= -.5 && nu < double(g.nw) - .5))
                                 continue;
@@ -149,6 +173,26 @@ inline void azimuthal(const Geometry &g, I frames, I source_width, Read &&read, 
     const bool wide_rows = rows.is<I>();
     if (!wide_rows && !rows.is<std::int32_t>())
         throw std::invalid_argument("Invalid azimuthal row lookup dtype");
+    const bool narrow_division = narrow && U(source_width) <= std::numeric_limits<std::uint32_t>::max();
+    const bool fixed_frame = frame_independent_of_x(g);
+    const auto row_range = [&](I destination, double stack, double nv, double nu) -> std::pair<I, I> {
+        const double center = stack - g.c[0] * ((g.vertical ? nv : nu) - g.c[2]);
+        const double frame = center - g.c[1];
+        if (g.nh > output_stack) {
+            const double shift = center - stack - g.c[1];
+            const double left = double(checked_extent(destination, g.nh)) / output_stack +
+                                shift * g.nh / stack_size;
+            const double right = double(checked_extent(destination + 1, g.nh)) / output_stack +
+                                 shift * g.nh / stack_size;
+            return {clamp_floor(left, g.nh), clamp_floor(std::ceil(right), g.nh)};
+        }
+        if (frame >= -.5 && frame < double(stack_size) - .5) {
+            const double native_row = (frame + .5) * g.nh / stack_size - .5;
+            const I lower = clamp_floor(std::nearbyint(native_row), g.nh - 1);
+            return {lower, lower + 1};
+        }
+        return {0, 0};
+    };
     I local = 0;
     while (local < count) {
         I at = first + local, z = at / g.plane, y = at / g.ow % g.oh, x0 = at % g.ow;
@@ -162,42 +206,48 @@ inline void azimuthal(const Geometry &g, I frames, I source_width, Read &&read, 
             output[(local + i) * stride] = 0;
         stats.visited += end - begin;
         const double cz = (z + .5) * g.c[9] - .5, cy = (y + .5) * g.c[10] - .5;
+        const I key_start = plane_keys
+            ? (g.base == 2 ? z * g.oh + y : (g.base == 0 ? y : z) * g.ow + x0)
+            : key_offset + local;
+        const bool fixed_key = plane_keys && g.base == 2;
+        const double nv = g.base == 0 ? cy : cz;
+        std::pair<I, I> fixed_range;
+        bool range_ready = false;
         for (I i = begin; i < end; ++i) {
-            I x = x0 + i;
-            I key_index = plane_keys
-                              ? (g.base == 0 ? y * g.ow + x : (g.base == 1 ? z * g.ow + x : z * g.oh + y))
-                              : key_offset + local + i;
+            const I key_index = key_start + (fixed_key ? 0 : i);
             const U key = narrow ? keys.load<std::uint32_t>(key_index) : keys.load<U>(key_index);
             std::uint8_t result = 0;
             if (key != invalid) {
-                const double cx = (x + .5) * g.c[11] - .5;
-                const double nv = g.base == 0 ? cy : cz, nu = g.base == 2 ? cy : cx;
-                const double stack = g.base == 0 ? cz : (g.base == 1 ? cy : cx);
-                const I destination = g.base == 0 ? z : (g.base == 1 ? y : x);
-                const double center = stack - g.c[0] * ((g.vertical ? nv : nu) - g.c[2]);
-                const double frame = center - g.c[1];
-                I lower = 0, upper = 0;
-                if (g.nh > output_stack) {
-                    const double shift = center - stack - g.c[1];
-                    const double left = double(checked_extent(destination, g.nh)) / output_stack +
-                                        shift * g.nh / stack_size;
-                    const double right = double(checked_extent(destination + 1, g.nh)) / output_stack +
-                                         shift * g.nh / stack_size;
-                    lower = clamp_floor(left, g.nh);
-                    upper = clamp_floor(std::ceil(right), g.nh);
-                } else if (frame >= -.5 && frame < double(stack_size) - .5) {
-                    const double native_row = (frame + .5) * g.nh / stack_size - .5;
-                    lower = clamp_floor(std::nearbyint(native_row), g.nh - 1);
-                    upper = lower + 1;
+                I lower, upper;
+                if (fixed_frame) {
+                    // Preserve lazy validation on rows containing only invalid keys.
+                    if (!range_ready) {
+                        fixed_range = row_range(g.base == 0 ? z : y, g.base == 0 ? cz : cy, nv, 0.);
+                        range_ready = true;
+                    }
+                    std::tie(lower, upper) = fixed_range;
+                } else {
+                    const I x = x0 + i;
+                    const double cx = (x + .5) * g.c[11] - .5;
+                    std::tie(lower, upper) = row_range(g.base == 0 ? z : (g.base == 1 ? y : x),
+                        g.base == 0 ? cz : (g.base == 1 ? cy : cx), nv, g.base == 2 ? cy : cx);
                 }
                 if (lower < upper) {
-                    const U angle = key / U(source_width);
+                    U angle, column;
+                    if (narrow_division) {
+                        const auto small_key = static_cast<std::uint32_t>(key);
+                        const auto small_width = static_cast<std::uint32_t>(source_width);
+                        angle = small_key / small_width;
+                        column = small_key % small_width;
+                    } else {
+                        angle = key / U(source_width);
+                        column = key % U(source_width);
+                    }
                     if (angle >= U(frames))
                         throw std::invalid_argument("Azimuthal source key is out of bounds");
-                    const I column = I(key % U(source_width));
                     for (I r = lower; r < upper; ++r) {
                         I row = wide_rows ? rows.load<I>(r) : rows.load<std::int32_t>(r);
-                        const std::uint8_t pixel = read(I(angle), row, column);
+                        const std::uint8_t pixel = read(I(angle), row, I(column));
                         ++stats.addresses;
                         if (scalar_max)
                             result = std::max(result, pixel);

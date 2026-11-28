@@ -463,3 +463,103 @@ def test_publication_rollback_preserves_another_writers_replacement(tmp_path, mo
     assert not (coverage if fail_at == 2 else output).exists()
     assert not output.with_suffix(".nrrd.registration.json").exists()
     assert not list(tmp_path.glob("*.partial"))
+
+
+@pytest.mark.parametrize("kind", ["i1", "u1", "i2", "u2", "i4", "u4", "i8", "u8"])
+@pytest.mark.parametrize("endian", ["<", ">"])
+def test_native_dense_slab_preserves_dtype_strides_masks_and_rounding(kind, endian):
+    from XTA.native_cpu import kernels
+    from XTA.registration.nrrd import _mapped_block_indices, _mask_samples
+
+    dtype = np.dtype(endian + kind)
+    shape = (4, 5, 9)
+    labels = np.arange(np.prod(shape)).astype(dtype).reshape(shape)[:, ::-1, ::-1]
+    labels[::2, ::2, ::2] = np.iinfo(dtype).max
+    labels.setflags(write=False)
+    native_shape = (4, 5, 11)
+    target = (4, 6, 12)
+    mask = np.ones(native_shape, dtype=bool)[:, ::-1, :]
+    mask[1::2, :, ::3] = False
+    target_mask = np.ones(target[1:], dtype=bool)[:, ::-1]
+    target_mask[1::2, 2:6] = False
+    native = np.eye(4)
+    native[0] = (1., -.5, .25, -.5)
+    mapped = native.copy()
+    mapped[0, 3] = np.nextafter(.5, 0.)
+    mapped[1, 2] = np.nextafter(.5, 1.)
+    output_type = dtype.newbyteorder("<")
+    bg = np.iinfo(dtype).min if dtype.kind == "i" else np.iinfo(dtype).max - 3
+    first, count = 2, 15  # crosses two target Z boundaries
+    raster, cov, fg, known = kernels.registration_warp_rows(
+        labels, native_shape, target, mask, target_mask, native, mapped,
+        first, count, np.asarray(bg, output_type).tobytes(),
+    )
+    expected = np.full((count, target[2]), bg, dtype=output_type)
+    expected_cov = np.empty(expected.shape, np.uint8)
+    xx = np.arange(target[2], dtype=np.float64)[None, :]
+    for row in range(count):
+        z, y = divmod(first + row, target[1])
+        yy = np.array([[y]], np.float64)
+        index, observed = _mapped_block_indices(native, np.array(native_shape[::-1]), xx, yy, z)
+        index2, available = _mapped_block_indices(mapped, np.array(shape[::-1]), xx, yy, z)
+        valid = observed & available & _mask_samples(mask, index) & target_mask[y:y+1]
+        expected[row, valid[0]] = labels[tuple(a[valid] for a in index2[::-1])]
+        expected_cov[row] = valid[0]
+    assert raster.dtype.str == output_type.str and cov.dtype == np.uint8
+    assert raster.tobytes() == expected.tobytes()
+    assert cov.tobytes() == expected_cov.tobytes()
+    assert (fg, known) == (np.count_nonzero(expected != bg), np.count_nonzero(expected_cov))
+
+
+@pytest.mark.parametrize("encoding", ["raw", "gzip"])
+def test_dense_registration_uses_native_gather_on_big_endian_file(tmp_path, monkeypatch, encoding):
+    from XTA.registration import nrrd as module
+
+    shape = (5, 7, 9)
+    data = (np.arange(np.prod(shape), dtype=np.uint64) + (2**63 + 403)).reshape(shape).astype(">u8")
+    mask = np.ones(shape[1:], bool)
+    mask[1:3, 1::3] = False
+    original = tmp_path / "big.nrrd"
+    write(original, data, encoding)
+    def unexpected_grid(*args):
+        pytest.fail("dense registration allocated a NumPy coordinate grid")
+    monkeypatch.setattr(module, "_mapped_block_indices", unexpected_grid)
+    output = tmp_path / "labels.nrrd"
+    bg = 2**63 + 1
+    result = transfer_nrrd_labelmap(packet(shape, masks={"fixed": mask}), original, output,
+                                    source_grid_aligned=True, encoding=encoding, background_value=bg)
+    actual, header = load(output)
+    coverage, _ = load(result["coverage_output"])
+    np.testing.assert_array_equal(actual, np.where(mask, data, np.uint64(bg)))
+    np.testing.assert_array_equal(coverage, np.broadcast_to(mask, shape))
+    assert header["endian"] == "little"
+
+
+def test_parallel_dense_registration_drains_native_rows_in_stream_order(monkeypatch):
+    import io
+    import threading
+    from XTA import workspace
+    from XTA.native_cpu import kernels
+    from XTA.registration.nrrd import _write_dense_warp
+
+    shape = (5, 64, 1024)
+    labels = np.arange(np.prod(shape), dtype=np.uint32).reshape(shape)
+    later_started = threading.Event()
+    gather = kernels.registration_warp_rows
+    reader_threads = set()
+    def concurrent(*args):
+        reader_threads.add(threading.get_ident())
+        if args[7] == 0:
+            assert later_started.wait(15)
+        else:
+            later_started.set()
+        return gather(*args)
+    monkeypatch.setattr(workspace, "_cpu_count", lambda: 3)
+    monkeypatch.setattr(kernels, "registration_warp_rows", concurrent)
+    output, coverage = io.BytesIO(), io.BytesIO()
+    counts = _write_dense_warp(labels, shape, shape, None, None, np.eye(4), None, 0,
+                               np.dtype("<u4"), 8, output, coverage)
+    assert len(reader_threads) >= 2
+    assert output.getvalue() == labels.astype("<u4", copy=False).tobytes()
+    assert coverage.getvalue() == bytes([1])*labels.size
+    assert counts == (labels.size - 1, labels.size)

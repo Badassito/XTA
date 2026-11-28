@@ -32,9 +32,9 @@ scope `xta.package_python_sources/1`. TTA execution provenance records the same
 scope per file (`modules`) and in aggregate (`package_python_sources`). That
 fingerprint includes shared SAM and geometry modules and future Python modules
 automatically. It does not identify native binaries, dependencies, or model
-weights. Historical SAM receipt readers
-also authenticate selected numerical helper implementations; those compatibility
-identities are separate from both packaging and the current-source inventory.
+weights. SAM receipts separately authenticate selected implementation
+identities. Those checks are independent of packaging and the current-source
+inventory.
 
 Standard wheels and source distributions are packaging products. They have
 generated metadata and differ from the complete source tree; do not present
@@ -177,16 +177,18 @@ rewrite tags to hide them. A requested release commit, tag, source version,
 and launcher must agree; verify the committed result with the checker without
 `--target-version`. Commits and tags occur only on request.
 
-Authenticated historical SAM receipt readers and their source hashes are
-compatibility contracts. Refactor them only while preserving accepted historical
-fixtures and rejection of malformed or incompatible evidence. Module
-implementation hashes use the inventory's CRLF-to-LF canonical bytes, while
-run-provenance receipts record actual bytes, so the two may differ on a CRLF
-working tree. When only non-numerical source changes in a module whose saved
-hashes are read strictly (`sam_filtering`, `sam_branch_selection`, `sam_cyclic`),
-add its last released identity to that module's qualified set. Qualified SAM
-filter receipt ids are honoured only while `_QUALIFIED_NUMERICAL_SOURCE` matches
-the numerical helpers; re-pin it only for edits that the radius oracle and v25
-equivalence tests show leave numerics unchanged. Likewise, keep
-copyable augmentation policy examples self-contained unless deliberately changing
-that interface.
+Authenticated historical SAM branch-selection and cyclic-evidence readers keep
+their existing compatibility contracts. Preserve accepted historical fixtures
+and rejection of malformed evidence. Module implementation hashes use the
+inventory's CRLF-to-LF canonical bytes. Run-provenance receipts record actual
+bytes, so the two may differ on a CRLF working tree. For non-numerical changes
+to `sam_branch_selection` or `sam_cyclic`, retain the last released identity in
+the module's qualified set.
+
+Explicit SAM component-filter specs require the current `sam_filtering` source
+identity. An enabled filter also requires matching native source and
+floating-point contracts and records the issuing binary and compiler. To use
+an older component-filter spec, regenerate the selection with this version.
+
+Keep copyable augmentation policy examples self-contained unless deliberately
+changing that interface.

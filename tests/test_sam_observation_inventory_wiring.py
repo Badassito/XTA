@@ -1,5 +1,4 @@
 """One parent shares discovery geometry through SAM stages, then releases it."""
-import threading
 import weakref
 
 import numpy as np
@@ -191,9 +190,8 @@ def test_assembly_shares_one_inventory_and_clears_on_success_or_error(tmp_path, 
             return assembly.prepare_view_volume_after_fullframe(**kwargs,
                 union_mm=observed, confmap_mm=None, union_path=tmp_path/'source.dat',
                 confmap_path=None, tiling_active=False, min_conf=0., min_radius=0.)
-        return assembly.finalize_consolidated_tile_volume_for_parent(**kwargs,
-            tile_accumulator_mm=observed, destination_mm=np.zeros_like(observed),
-            destination_lock=threading.Lock(), sam_upstream_lineage={'gate': 'frozen'})
+        return assembly.finalize_independent_tile_config(**kwargs,
+            tile_accumulator_mm=observed, config_id='tiles')
     if failure is None:
         run()
     else:
@@ -206,6 +204,7 @@ def test_assembly_shares_one_inventory_and_clears_on_success_or_error(tmp_path, 
     assert inventory.snapshot()['retained_bytes'] == 0
     if len(context.calls) == 2:
         if source == 'tile':
+            assert context.calls[0][2]['tile_acceptance'] == 'independent'
             for key, value in context.calls[0][2].items():
                 assert context.calls[1][2][key] == value
         else:
@@ -227,7 +226,6 @@ def test_assembly_does_not_retain_inventory_when_extrapolation_disabled(tmp_path
             union_mm=observed, confmap_mm=None, union_path=tmp_path/'source.dat',
             confmap_path=None, tiling_active=False, min_conf=0., min_radius=0.)
     else:
-        assembly.finalize_consolidated_tile_volume_for_parent(**kwargs,
-            tile_accumulator_mm=observed, destination_mm=np.zeros_like(observed),
-            destination_lock=threading.Lock())
+        assembly.finalize_independent_tile_config(**kwargs,
+            tile_accumulator_mm=observed)
     assert len(context.calls) == 1 and context.calls[0][1] is None

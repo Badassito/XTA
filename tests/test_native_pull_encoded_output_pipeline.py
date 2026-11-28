@@ -15,7 +15,10 @@ from tests.test_native_pull_cuda_handoff import native_job
 
 
 @pytest.fixture
-def encoded_gpu(monkeypatch):
+def encoded_gpu(monkeypatch, request):
+    from tests.native_stage_test_support import native_coordinator
+
+    native_coordinator(request, monkeypatch)
     monkeypatch.setenv('YOLO_TTA_GPU_BACKPROJECT', '1')
     monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_CUDA', '1')
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0')

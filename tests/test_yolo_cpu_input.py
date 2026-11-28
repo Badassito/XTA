@@ -78,6 +78,49 @@ class YoloCpuInputTests(unittest.TestCase):
                             expected=render_fullframe_frame_for_job(cube,descriptor['view'],descriptor['job'],index)
                             np.testing.assert_array_equal(render(index),expected)
 
+    def test_native_transverse_lerp_matches_numpy_for_all_byte_pairs_and_strides(self):
+        from XTA.native_cpu import kernels
+
+        grid = np.arange(256, dtype=np.uint8)
+        first = np.broadcast_to(grid[None, :], (256, 256))
+        second = first.T
+        source = np.stack((first, second))
+        lo, hi = np.array([0], np.int64), np.array([1], np.int64)
+        weights = np.array([0., .17, .5, .7, 1.], np.float32)
+        weights = np.concatenate((weights, np.nextafter(weights[1:-1], 0.0), np.nextafter(weights[1:-1], 1.0)))
+        for volume in (source, source[:, ::-1, ::-1], source.transpose(0, 2, 1)):
+            for weight in weights:
+                with self.subTest(strides=volume.strides, weight=weight):
+                    a, b = volume.astype(np.float32)
+                    expected = np.rint(a + weight * (b - a)).astype(np.uint8)
+                    output = np.empty(volume.shape[1:], np.uint8)
+                    kernels.render_cartesian_t_lerp_gray8(
+                        volume, lo, hi, np.array([weight], np.float32), 0, 0, output)
+                    np.testing.assert_array_equal(output, expected)
+
+    def test_cartesian_invalid_time_index_or_aliased_output_does_not_write(self):
+        from XTA.native_cpu import kernels
+
+        volume = self.volume.copy()
+        output = np.full(volume.shape[1:], 254, np.uint8)
+        lo, hi = np.array([0], np.int64), np.array([len(volume)], np.int64)
+        alpha = np.array([.5], np.float32)
+        with self.assertRaisesRegex(ValueError, "valid slices"):
+            kernels.render_cartesian_t_lerp_gray8(volume, lo, hi, alpha, 0, 0, output)
+        self.assertTrue((output == 254).all())
+
+        # A bad later row must also be detected before the bulk loop writes.
+        sagittal = np.full((2, volume.shape[2]), 254, np.uint8)
+        with self.assertRaisesRegex(ValueError, "valid slices"):
+            kernels.render_cartesian_t_lerp_gray8(
+                volume, np.array([0, 1], np.int64), np.array([1, len(volume)], np.int64),
+                np.array([.5, .5], np.float32), 1, 0, sagittal)
+        self.assertTrue((sagittal == 254).all())
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            kernels.render_cartesian_t_lerp_gray8(volume, lo, lo, alpha, 0, 0, volume[0])
+        np.testing.assert_array_equal(volume, self.volume)
+
+
     def test_coronal_prefetch_preserves_plane_order_across_slab_boundaries(self):
         descriptor = task('coronal', count=10)
         owner, executor, _closed = self._prefetch([descriptor])
@@ -212,10 +255,11 @@ class YoloCpuInputTests(unittest.TestCase):
     def test_backlog_is_bounded_and_failed_preparation_falls_back(self):
         first=task(count=3)
         second=task(task_id=1,start=3,count=3)
-        owner,executor,closed=self._prefetch([first,second],max_bytes=15000)
+        # Fund one packet, native plane, affine canvas and t-map, with no room for a second.
+        owner,executor,closed=self._prefetch([first,second],max_bytes=1000)
         self.assertEqual(len(executor.jobs),1)
         executor.run()
-        self.assertLessEqual(owner.bytes,15000)
+        self.assertLessEqual(owner.bytes,1000)
         owner.retire(first)
         self._idle(owner)
         self.assertEqual(len(executor.jobs),2)

@@ -32,6 +32,7 @@ def build(destination):
     # Read all sources before opening the destination. A missing package
     # dependency should never leave a half-built support bundle.
     sources = {name: path.read_bytes() for name, path in members.items()}
+    sources["XTA/_slicer_review_bundle.py"] = b'"""Identifies the portable review-only package."""\n'
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("xb") as output:

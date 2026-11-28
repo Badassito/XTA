@@ -72,6 +72,24 @@ def sponge():
     return mask
 
 
+@pytest.mark.parametrize("dtype", [np.uint8, np.bool_])
+def test_native_bridge_uses_opencv_steep_line_tie_on_strided_mask(dtype):
+    from XTA.native_cpu import kernels
+
+    # OpenCV's midpoint differs from a right-to-left Bresenham traversal.
+    first, last = (1, 0), (0, 2)
+    raster = np.zeros((3, 3), np.uint8)
+    cv2.line(raster, first, last, 1, 1, cv2.LINE_8)
+    mask = raster[:, ::-1].astype(dtype)[:, ::-1]
+    hole = np.asarray([first], np.int64)
+    attached = np.asarray([(2, 2), last], np.int64)
+    starts = np.array([0, 0], np.intp)
+    targets = np.arange(2, dtype=np.intp)
+    assert polygon_keyholes._bridge_in_foreground(hole[0], attached[1], mask)
+    assert kernels.polygon_first_foreground_bridge(mask, hole, attached, starts, targets) == 1
+    assert kernels.polygon_first_foreground_bridge(mask, hole, attached, starts[:1], targets[:1]) == -1
+
+
 def test_holes_by_parent_maps_each_outer_to_its_holes_in_contour_order():
     mask = np.zeros((30, 40), np.uint8)
     mask[2:28, 2:20] = 1

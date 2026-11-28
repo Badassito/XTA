@@ -396,3 +396,22 @@ def test_last_valid_tilted_half_step_clamps_after_rounding():
         counts = _pull_tilted_encoded(np.ones(1, np.uint8), index, packed,
                                      np.array(source.shape, np.int64), out, 0, dims, coeff, bbox)
         assert counts == (1, 1) and out[0] == 1
+
+
+def test_upright_coronal_stack_still_varies_across_one_output_row():
+    from XTA.native_cpu import kernels
+
+    coefficients = np.array((0., 0., 0., 1., 0., 0., 0., 1., 0., 1., 1., 1.))
+    bounds = np.array((0, 0, 0, 1, 1, 3), np.int64)
+    expected = np.array([11, 17, 23], np.uint8)
+    output = np.empty(3, np.uint8)
+    tilted_geometry = np.array((2, 0, 1, 1, 3, 1, 1, 3, 1, 1), np.int64)
+    assert kernels._pull_tilted(
+        expected.reshape(3, 1, 1), output, 0, tilted_geometry, coefficients, bounds, True) == (3, 3)
+    np.testing.assert_array_equal(output, expected)
+
+    angular_geometry = np.array((2, 0, 1, 1, 3, 1, 1, 3, 3, 1), np.int64)
+    assert kernels._pull_azimuthal(
+        expected.reshape(1, 3, 1), output, 0, angular_geometry, coefficients, bounds, True,
+        np.zeros(1, np.uint32), True, 0xffffffff, np.arange(3, dtype=np.int32)) == (3, 3)
+    np.testing.assert_array_equal(output, expected)

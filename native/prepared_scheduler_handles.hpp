@@ -2,12 +2,14 @@
 // only in the native actor writer. Nothing here calls into the Python runtime.
 #pragma once
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #ifdef __linux__
 #include <cerrno>
@@ -36,8 +38,26 @@ using DetectorHandles = std::vector<DetectorHandle>;
 using OutgoingFiles = std::vector<std::pair<std::uint32_t, std::shared_ptr<DetectorFile>>>;
 
 class DetectorFilePool {
+    using FileIdentity = std::array<std::uintmax_t, 6>;
+
+    static bool matches(std::string_view identity, const FileIdentity &fields) {
+        for (size_t i = 0; i < fields.size(); ++i) {
+            const auto delimiter = identity.find(':');
+            const bool last = i + 1 == fields.size();
+            if (last != (delimiter == std::string_view::npos)) return false;
+            const auto part = identity.substr(0, delimiter);
+            if (part.empty() || (part.size() > 1 && part.front() == '0')) return false;
+            std::uintmax_t value;
+            const auto end = part.data() + part.size();
+            const auto result = std::from_chars(part.data(), end, value);
+            if (result.ec != std::errc{} || result.ptr != end || value != fields[i]) return false;
+            if (!last) identity.remove_prefix(delimiter + 1);
+        }
+        return true;
+    }
+
     std::mutex mutex_;
-    std::map<std::pair<std::string, bool>, std::weak_ptr<DetectorFile>> files_;
+    std::map<std::pair<FileIdentity, bool>, std::weak_ptr<DetectorFile>> files_;
     size_t added_ = 0;
 public:
     DetectorHandle pin(int source, const std::string &identity, int role) {
@@ -45,16 +65,18 @@ public:
         struct stat info{};
         if (role < 0 || role > 2 || fstat(source, &info) != 0 || !S_ISREG(info.st_mode))
             throw std::runtime_error("invalid detector file registration");
-        const auto proof = std::to_string(info.st_dev) + ":" + std::to_string(info.st_ino) + ":" +
-            std::to_string(info.st_size) + ":" + std::to_string(info.st_mode) + ":" +
-            std::to_string(info.st_uid) + ":" + std::to_string(info.st_gid);
-        if (identity != proof) throw std::runtime_error("detector file identity changed during preparation");
+        const FileIdentity proof{
+            static_cast<std::uintmax_t>(info.st_dev), static_cast<std::uintmax_t>(info.st_ino),
+            static_cast<std::uintmax_t>(info.st_size), static_cast<std::uintmax_t>(info.st_mode),
+            static_cast<std::uintmax_t>(info.st_uid), static_cast<std::uintmax_t>(info.st_gid)
+        };
+        if (!matches(identity, proof)) throw std::runtime_error("detector file identity changed during preparation");
         bool writable = role == 2;
         int mode = fcntl(source, F_GETFL);
         if (mode < 0 || (mode & O_ACCMODE) == O_WRONLY || (writable && (mode & O_ACCMODE) != O_RDWR))
             throw std::runtime_error("detector owner lacks the requested file access");
         std::lock_guard<std::mutex> lock(mutex_);
-        auto key = std::make_pair(identity, writable);
+        auto key = std::make_pair(proof, writable);
         if (auto existing = files_[key].lock()) return {existing, identity, role == 0};
         auto file = std::make_shared<DetectorFile>();
         if ((mode & O_ACCMODE) == (writable ? O_RDWR : O_RDONLY))

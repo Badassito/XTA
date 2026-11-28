@@ -288,11 +288,15 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
                     next_progress = now + 30.0
                 if caller_encoder is not None:
                     records, frame_payload, frame_known, phase_metrics = encoded_result
+                    # A for-loop target otherwise keeps this tuple live while next()
+                    # encodes the successor, even after the fields are consumed.
+                    encoded_result = None
                     read_seconds += phase_metrics['read_seconds']
                     scan_seconds += phase_metrics['scan_seconds']
                     compression_seconds += phase_metrics['compression_seconds']
                     count = len(records)
                     if not count:
+                        records = frame_payload = None
                         continue
                     if (records.dtype != BLOCK_DTYPE or records.ndim != 1
                             or int(records['offset'][-1])+int(records['length'][-1]) != len(frame_payload)):
@@ -465,6 +469,7 @@ def write_blocks(directory, shape, slice_reader, *, layer_key, model_name, prove
         # every producer has been joined by close().
         encoded_frames = measured_frames = frames = iterator = None
         encoded_result = encoded_rows = slice_reader = caller_encoder = None
+        records = frame_payload = index_bytes = None
         payload_tmp.unlink(missing_ok=True)
         index_tmp.unlink(missing_ok=True)
 

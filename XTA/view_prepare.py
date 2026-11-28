@@ -303,7 +303,6 @@ class AdmittedViewPrepare:
     slice_meta: Mapping[str, object] | None
     fuse_azimuthal_component_layers: Callable[[], bool]
     preinterpolation_layer_already_published: bool
-    parent_mask_ready_callback: Callable[..., object] | None
     submit_component_projection: Callable[..., object]
     materialize_workspace: Callable[..., np.ndarray]
     prepare: Callable[..., PreparedViewResult]
@@ -596,9 +595,6 @@ class AdmittedViewPrepare:
                     slice_meta=self.slice_meta,
                     fuse_azimuthal_component_layers=bool(
                         self.fuse_azimuthal_component_layers()
-                    ),
-                    parent_mask_ready_callback=(
-                        self.parent_mask_ready_callback if self.tiling_active else None
                     ),
                     internal_final_layer_enabled=bool(not self.component_layers_needed),
                     retire_dense_after_prepare=bool(not self.tiling_active),

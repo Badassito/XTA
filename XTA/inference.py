@@ -954,20 +954,26 @@ def _accumulate_cpu_retina_payload_to_prediction_frame(
 
 
 def _accumulate_cpu_retina_rois(payload, target_shape, track_confidence):
-    frame_union = np.zeros(target_shape, dtype=np.uint8)
-    frame_confmap = np.zeros(target_shape, dtype=np.uint8) if track_confidence else None
-    kept_instances = 0
+    proto = np.asarray(payload.proto, dtype=np.float32)
+    if proto.ndim == 4 and proto.shape[0] == 1:
+        proto = proto[0]
+    coeffs = np.asarray(payload.coeffs, dtype=np.float32)
+    target_h, target_w = map(int, target_shape)
+    if (proto.ndim != 3 or min(proto.shape) <= 0 or coeffs.ndim != 2
+            or not coeffs.shape[0] or coeffs.shape[1] != proto.shape[0]
+            or target_h <= 0 or target_w <= 0):
+        union = np.zeros(target_shape, dtype=np.uint8)
+        return union, np.zeros_like(union) if track_confidence else None, 0
+    crop_y, crop_x = _scale_masks_crop_slices_np(proto.shape[1:], (target_h, target_w))
+    from .native_cpu import kernels
 
-    for _inst_idx, conf_val, y1, y2, x1, x2, roi_mask in _iter_cpu_retina_payload_rois(payload, target_shape):
-        roi_u8 = roi_mask.astype(np.uint8, copy=False)
-        frame_union[y1:y2, x1:x2] |= roi_u8
-        if frame_confmap is not None:
-            conf_u8 = quantize_conf_to_u8(float(conf_val))
-            conf_patch = frame_confmap[y1:y2, x1:x2]
-            conf_patch[roi_mask] = np.maximum(conf_patch[roi_mask], conf_u8)
-        kept_instances += 1
+    return kernels.accumulate_retina_rois(
+        proto, coeffs, np.asarray(payload.boxes_xyxy, dtype=np.float32),
+        np.asarray(payload.confs, dtype=np.float32),
+        crop_y.start, crop_x.start, crop_y.stop - crop_y.start, crop_x.stop - crop_x.start,
+        target_h, target_w, bool(track_confidence),
+    )
 
-    return frame_union, frame_confmap, int(kept_instances)
 
 def _realize_deferred_cpu_retina_payload(payload: DeferredCpuRetinaMaskPayload) -> CpuRetinaMaskPayload:
     """Copy compact segmentation tensors to CPU and build a CPU-retina payload."""
@@ -2322,13 +2328,15 @@ class _DeviceUnionAccumulator:
             copy_stream = torch.cuda.Stream(device=self.device)
             events = (torch.cuda.Event(), torch.cuda.Event())
         pin_np = (pin_views[0].numpy(), pin_views[1].numpy())
-        # Policy windows have one writer. Compute row/column occupancy while
-        # masks are on device instead of scanning every full host raster twice.
-        # Copy the compact metadata under the same event as the mask; the
-        # double-buffer lifetime is therefore identical to the established lane.
-        metadata_pin = (
-            torch.empty((2, chunk, h + w), dtype=torch.uint8, pin_memory=True)
-            if metadata_enabled and overwrite else None)
+        # These reductions describe the task's mask before any host union.
+        # Retire the compact occupancy under the same event as its data.
+        metadata_pin = None
+        if metadata_enabled and bool(written.any()):
+            try:
+                metadata_pin = torch.empty((2, chunk, h + w), dtype=torch.uint8, pin_memory=True)
+            except (RuntimeError, MemoryError):
+                # Preserve the established host scan if pinned memory is scarce.
+                pass
         metadata_np = metadata_pin.numpy() if metadata_pin is not None else None
 
         def _drain(
@@ -2981,9 +2989,8 @@ class _ResidentGpuPipelineSlot:
         # is rebuilt by _ResidentTensorRTRingExecutor after the slots are allocated.
         self._render_cupy_refs: Dict[str, object] = {}
 
-_RESIDENT_MASK_KERNELS: Optional[object] = None
-
-_RESIDENT_MASK_KERNELS_FAILED = False
+_RESIDENT_MASK_KERNELS_BY_DEVICE: dict[int, Optional[object]] = {}
+_RESIDENT_MASK_KERNELS_LOCK = threading.Lock()
 
 
 def _tiled_f16_proto_union_applicable(
@@ -3024,20 +3031,34 @@ def _tiled_f32_proto_union_applicable(
         return False
 
 
-def _resident_mask_kernels() -> Optional[object]:
-    """Compile the small device compaction/proto-union kernels once with NVRTC.
+def _resident_mask_kernels(device_index: Optional[int] = None) -> Optional[object]:
+    """Compile and prewarm the compaction/proto-union kernels on the selected device.
 
  The compaction count remains in device memory. The following proto kernel reads
  that count directly, so there is no per-frame ``nonzero``, ``tolist`` or count
  readback. CuPy is already an optional dependency of the GPU cleanup path; failure
  to import/compile it simply disables this stricter fast path."""
-    global _RESIDENT_MASK_KERNELS, _RESIDENT_MASK_KERNELS_FAILED
-    if _RESIDENT_MASK_KERNELS is not None:
-        return _RESIDENT_MASK_KERNELS
-    if _RESIDENT_MASK_KERNELS_FAILED:
-        return None
+    cache = _RESIDENT_MASK_KERNELS_BY_DEVICE
+    if device_index is not None and device_index in cache:
+        return cache[device_index]
     try:
         import cupy as cp  # type: ignore
+
+        if device_index is None:
+            device_index = int(cp.cuda.runtime.getDevice())
+    except Exception:
+        if device_index is None:
+            return None
+        with _RESIDENT_MASK_KERNELS_LOCK:
+            return cache.setdefault(device_index, None)
+    if device_index in cache:
+        return cache[device_index]
+
+    # Keep warm launches out of the lock. CuPy caches functions by current
+    # device, so a prewarm must explicitly select the device that will use them.
+    with _RESIDENT_MASK_KERNELS_LOCK:
+        if device_index in cache:
+            return cache[device_index]
         src = r'''
         #include <cuda_fp16.h>
         extern "C" __global__ void compact_f32(
@@ -3626,15 +3647,14 @@ def _resident_mask_kernels() -> Optional[object]:
             'upsample_quantize', 'upsample_quantize_affine', 'upsample_proto_confidence',
             'warp_retina_quantize_affine',
         )
-        module = cp.RawModule(code=src, options=('--std=c++11',), name_expressions=names)
-        _RESIDENT_MASK_KERNELS = argparse.Namespace(
-            cp=cp,
-            **{name: module.get_function(name) for name in names},
-        )
-        return _RESIDENT_MASK_KERNELS
-    except Exception:
-        _RESIDENT_MASK_KERNELS_FAILED = True
-        return None
+        try:
+            with cp.cuda.Device(device_index):
+                module = cp.RawModule(code=src, options=('--std=c++11',), name_expressions=names)
+                kernels = argparse.Namespace(cp=cp, **{name: module.get_function(name) for name in names})
+        except Exception:
+            kernels = None
+        cache[device_index] = kernels
+        return kernels
 
 class _DirectPredictResult:
     """Minimal per-frame result for the direct loop.
@@ -3938,7 +3958,10 @@ def _reduce_direct_prototypes(
     try:
         import torch  # type: ignore
 
-        kernels = _resident_mask_kernels()
+        device = head_frame.device
+        if proto_frame.device != device:
+            return None
+        kernels = _resident_mask_kernels(device.index)
         if kernels is None:
             return None
         # AutoBackend/TensorRT may reuse static output bindings on the next enqueue while this
@@ -3962,7 +3985,6 @@ def _reduce_direct_prototypes(
         if anchors <= 0 or masks <= 0 or ph <= 0 or pw <= 0:
             return None
         img_h, img_w = int(im.shape[-2]), int(im.shape[-1])
-        device = head.device
         indices = torch.empty((anchors,), dtype=torch.int32, device=device)
         count = torch.zeros((1,), dtype=torch.int32, device=device)
         max_logit = torch.empty((ph, pw), dtype=torch.float32, device=device)
@@ -3973,74 +3995,75 @@ def _reduce_direct_prototypes(
 
         cp = kernels.cp
         stream = torch.cuda.current_stream(device)
-        external = _cupy_external_stream(cp, stream)
-        cp_head = cp.asarray(head)
-        cp_proto = cp.asarray(proto)
-        cp_indices = cp.asarray(indices)
-        cp_count = cp.asarray(count)
-        cp_max_logit = cp.asarray(max_logit)
-        cp_conf_proto = cp.asarray(conf_proto) if conf_proto is not None else None
-        packed_refs = ()
-        kernel_name = 'scalar'
-        tiled_tag = (
-            'f16' if _tiled_f16_proto_union_applicable(torch, head, proto)
-            else 'f32' if _tiled_f32_proto_union_applicable(torch, head, proto)
-            else None
-        )
-        use_tiled = bool(allow_tiled and tiled_tag is not None)
-        if use_tiled:
-            # Preserve every accepted detection: capacity is the bounded backend
-            # anchor count, exactly as in the resident ring. Keep these owners with
-            # the payload until its asynchronous producer/consumer work settles.
-            try:
-                compact_coeff = torch.empty((anchors, masks), dtype=head.dtype, device=device)
-                compact_boxes = torch.empty((anchors, 4), dtype=torch.float32, device=device)
-                compact_confs = torch.empty((anchors,), dtype=torch.float32, device=device)
-            except torch.OutOfMemoryError:
-                compact_coeff = compact_boxes = compact_confs = None
-                use_tiled = False
-                kernel_name = 'scalar_workspace_fallback'
+        with cp.cuda.Device(device.index):
+            external = _cupy_external_stream(cp, stream)
+            cp_head = cp.asarray(head)
+            cp_proto = cp.asarray(proto)
+            cp_indices = cp.asarray(indices)
+            cp_count = cp.asarray(count)
+            cp_max_logit = cp.asarray(max_logit)
+            cp_conf_proto = cp.asarray(conf_proto) if conf_proto is not None else None
+            packed_refs = ()
+            kernel_name = 'scalar'
+            tiled_tag = (
+                'f16' if _tiled_f16_proto_union_applicable(torch, head, proto)
+                else 'f32' if _tiled_f32_proto_union_applicable(torch, head, proto)
+                else None
+            )
+            use_tiled = bool(allow_tiled and tiled_tag is not None)
+            if use_tiled:
+                # Preserve every accepted detection: capacity is the bounded backend
+                # anchor count, exactly as in the resident ring. Keep these owners with
+                # the payload until its asynchronous producer/consumer work settles.
+                try:
+                    compact_coeff = torch.empty((anchors, masks), dtype=head.dtype, device=device)
+                    compact_boxes = torch.empty((anchors, 4), dtype=torch.float32, device=device)
+                    compact_confs = torch.empty((anchors,), dtype=torch.float32, device=device)
+                except torch.OutOfMemoryError:
+                    compact_coeff = compact_boxes = compact_confs = None
+                    use_tiled = False
+                    kernel_name = 'scalar_workspace_fallback'
+                else:
+                    cp_coeff, cp_boxes, cp_confs = (cp.asarray(value) for value in
+                                                   (compact_coeff, compact_boxes, compact_confs))
+                    packed_refs = (compact_coeff, compact_boxes, compact_confs, cp_coeff, cp_boxes, cp_confs)
+            if use_tiled:
+                kernel_name = f'tiled_{tiled_tag}'
+            _announce_direct_compaction_layout(
+                torch, head, proto, allow_tiled=allow_tiled, kernel_name=kernel_name,
+            )
+            if use_tiled:
+                tile_width = 64 if tiled_tag == 'f16' else 32
+                getattr(kernels, f'compact_{tiled_tag}_tiled')(
+                    ((anchors + 255) // 256,), (256,),
+                    (cp_head, np.int32(anchors), np.float32(confidence_threshold), cp_indices, cp_count,
+                     np.int32(img_h), np.int32(img_w), np.uintp(0),
+                     np.int32(masks), np.int32(ph), np.int32(pw), np.int32(img_h), np.int32(img_w),
+                     cp_coeff, cp_boxes, cp_confs), stream=external,
+                )
+                getattr(kernels, f'union_{tiled_tag}_{tiled_tag}_tiled')(
+                    ((pw + tile_width - 1) // tile_width, (ph + 3) // 4), (32, 4),
+                    (cp_proto, cp_coeff, cp_boxes, cp_confs, cp_count,
+                     np.int32(masks), np.int32(ph), np.int32(pw), cp_max_logit,
+                     cp_conf_proto if cp_conf_proto is not None else np.uintp(0)), stream=external,
+                )
             else:
-                cp_coeff, cp_boxes, cp_confs = (cp.asarray(value) for value in
-                                               (compact_coeff, compact_boxes, compact_confs))
-                packed_refs = (compact_coeff, compact_boxes, compact_confs, cp_coeff, cp_boxes, cp_confs)
-        if use_tiled:
-            kernel_name = f'tiled_{tiled_tag}'
-        _announce_direct_compaction_layout(
-            torch, head, proto, allow_tiled=allow_tiled, kernel_name=kernel_name,
-        )
-        if use_tiled:
-            tile_width = 64 if tiled_tag == 'f16' else 32
-            getattr(kernels, f'compact_{tiled_tag}_tiled')(
-                ((anchors + 255) // 256,), (256,),
-                (cp_head, np.int32(anchors), np.float32(confidence_threshold), cp_indices, cp_count,
-                 np.int32(img_h), np.int32(img_w), np.uintp(0),
-                 np.int32(masks), np.int32(ph), np.int32(pw), np.int32(img_h), np.int32(img_w),
-                 cp_coeff, cp_boxes, cp_confs), stream=external,
-            )
-            getattr(kernels, f'union_{tiled_tag}_{tiled_tag}_tiled')(
-                ((pw + tile_width - 1) // tile_width, (ph + 3) // 4), (32, 4),
-                (cp_proto, cp_coeff, cp_boxes, cp_confs, cp_count,
-                 np.int32(masks), np.int32(ph), np.int32(pw), cp_max_logit,
-                 cp_conf_proto if cp_conf_proto is not None else np.uintp(0)), stream=external,
-            )
-        else:
-            compact = kernels.compact_f16 if head.dtype == torch.float16 else kernels.compact_f32
-            compact(
-                ((anchors + 255) // 256,), (256,),
-                (cp_head, np.int32(anchors), np.float32(confidence_threshold), cp_indices, cp_count,
-                 np.int32(img_h), np.int32(img_w), np.uintp(0)), stream=external,
-            )
-            htag = 'f16' if head.dtype == torch.float16 else 'f32'
-            ptag = 'f16' if proto.dtype == torch.float16 else 'f32'
-            union_kernel = getattr(kernels, f'union_{htag}_{ptag}')
-            union_kernel(
-                (((ph * pw) + 255) // 256,), (256,),
-                (cp_head, cp_proto, cp_indices, cp_count,
-                 np.int32(anchors), np.int32(masks), np.int32(ph), np.int32(pw),
-                 np.int32(img_h), np.int32(img_w), cp_max_logit,
-                 cp_conf_proto if cp_conf_proto is not None else np.uintp(0)), stream=external,
-            )
+                compact = kernels.compact_f16 if head.dtype == torch.float16 else kernels.compact_f32
+                compact(
+                    ((anchors + 255) // 256,), (256,),
+                    (cp_head, np.int32(anchors), np.float32(confidence_threshold), cp_indices, cp_count,
+                     np.int32(img_h), np.int32(img_w), np.uintp(0)), stream=external,
+                )
+                htag = 'f16' if head.dtype == torch.float16 else 'f32'
+                ptag = 'f16' if proto.dtype == torch.float16 else 'f32'
+                union_kernel = getattr(kernels, f'union_{htag}_{ptag}')
+                union_kernel(
+                    (((ph * pw) + 255) // 256,), (256,),
+                    (cp_head, cp_proto, cp_indices, cp_count,
+                     np.int32(anchors), np.int32(masks), np.int32(ph), np.int32(pw),
+                     np.int32(img_h), np.int32(img_w), cp_max_logit,
+                     cp_conf_proto if cp_conf_proto is not None else np.uintp(0)), stream=external,
+                )
 
         refs = (head, proto, indices, count, max_logit, conf_proto,
                 cp_head, cp_proto, cp_indices, cp_count, cp_max_logit, cp_conf_proto) + packed_refs
@@ -4075,18 +4098,20 @@ def _upsample_proto_confidence(conf_proto, union, image_hw):
 
     oh, ow = int(image_hw[0]), int(image_hw[1])
     ph, pw = int(conf_proto.shape[-2]), int(conf_proto.shape[-1])
-    if conf_proto.is_cuda and conf_proto.dtype == torch.float32 and union.dtype == torch.float32:
-        kernels = _resident_mask_kernels()
+    device = conf_proto.device
+    if conf_proto.is_cuda and conf_proto.dtype == union.dtype == torch.float32 and union.device == device:
+        kernels = _resident_mask_kernels(device.index)
         if kernels is not None:
             cp = kernels.cp
             source, plane = conf_proto.contiguous(), union.contiguous()
-            out = torch.empty((oh, ow), dtype=torch.float32, device=conf_proto.device)
-            kernels.upsample_proto_confidence(
-                ((ow + 31) // 32, (oh + 7) // 8), (32, 8),
-                (cp.asarray(source), cp.asarray(plane), np.int32(ph), np.int32(pw),
-                 np.int32(oh), np.int32(ow), cp.asarray(out)),
-                stream=_cupy_external_stream(cp, torch.cuda.current_stream(conf_proto.device)),
-            )
+            out = torch.empty((oh, ow), dtype=torch.float32, device=device)
+            with cp.cuda.Device(device.index):
+                kernels.upsample_proto_confidence(
+                    ((ow + 31) // 32, (oh + 7) // 8), (32, 8),
+                    (cp.asarray(source), cp.asarray(plane), np.int32(ph), np.int32(pw),
+                     np.int32(oh), np.int32(ow), cp.asarray(out)),
+                    stream=_cupy_external_stream(cp, torch.cuda.current_stream(device)),
+                )
             return out
     plane = conf_proto.reshape(ph, pw)
     nearest = F.interpolate(plane[None, None], size=(oh, ow), mode='nearest')[0, 0]
@@ -4121,8 +4146,12 @@ def _build_direct_device_compacted_payload(
     try:
         import torch
 
-        kernels = _resident_mask_kernels()
-        if kernels is None or not head_frame.is_cuda or head_frame.ndim != 2 or proto_frame.ndim != 3:
+        if not head_frame.is_cuda or head_frame.ndim != 2 or proto_frame.ndim != 3:
+            return None
+        if proto_frame.device != head_frame.device:
+            return None
+        kernels = _resident_mask_kernels(head_frame.device.index)
+        if kernels is None:
             return None
         head, proto = head_frame.contiguous(), proto_frame.contiguous()
         if own_inputs:
@@ -4136,10 +4165,10 @@ def _build_direct_device_compacted_payload(
         workspace = _retina_workspace(head, proto, indices, count, image_hw,
                                       track_confidence=gpu_flatten_conf_tracking_enabled())
         cp = kernels.cp
-        stream = _cupy_external_stream(cp, torch.cuda.current_stream(head.device))
         compact = kernels.compact_f16 if head.dtype == torch.float16 else kernels.compact_f32
         head_ptr, _, index_ptr, count_ptr = workspace._input_ptrs
         with cp.cuda.Device(workspace.device_id):
+            stream = _cupy_external_stream(cp, torch.cuda.current_stream(head.device))
             compact(
                 ((anchors + 255) // 256,), (256,),
                 (head_ptr, np.int32(anchors), np.float32(confidence_threshold), index_ptr, count_ptr,

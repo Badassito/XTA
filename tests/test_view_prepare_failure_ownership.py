@@ -131,12 +131,10 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
                     reader.fill_decoded_slice_into(1, plane)
                     self.assertEqual(int(plane.sum()), 6)
 
-    def test_failure_leaves_published_tile_support_open(self):
+    def test_fullframe_failure_with_tiling_preserves_caller_owner(self):
         original = self.mapping('tile-original.dat')
-        supports = []
         args = self.arguments(original)
-        args.update(tiling_active=True,
-                    parent_mask_ready_callback=lambda model, view, support: supports.append(support))
+        args.update(tiling_active=True)
         with mock.patch.object(assembly, 'cleanup_view_volume_after_prediction_inplace'), \
              mock.patch.object(assembly, 'allocate_workspace_array',
                                side_effect=lambda **kw: np.zeros(kw['shape'], dtype=kw['dtype'])), \
@@ -145,13 +143,10 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, 'tile parent pass failed'):
                 assembly.prepare_view_volume_after_fullframe(**args)
-        self.assertEqual(len(supports), 1)
-        self.addCleanup(supports[0].close)
-        # Simulate the outer admission owner's failure cleanup while a gate owns P.
+        self.assertFalse((self.root / 'tile_support').exists())
+        self.assertFalse(original._mmap.closed)
+        self.assertEqual(int(original[0].sum()), 1)
         close_memmap_array_without_flush(original)
-        plane = np.empty(self.shape[1:], dtype=np.uint8)
-        supports[0].fill_decoded_slice_into(0, plane)
-        self.assertEqual(int(plane.sum()), 1)
 
     def run_admitted(self, *, materialized, fail):
         local = self.mapping(f'admitted-{materialized}-{fail}.dat')
@@ -183,7 +178,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
             hole_fill_done_on_device=True, slice_meta=None,
             fuse_azimuthal_component_layers=lambda: False,
             preinterpolation_layer_already_published=True,
-            parent_mask_ready_callback=None,
+
             submit_component_projection=mock.Mock(),
             materialize_workspace=materialize_workspace, prepare=prepare,
         )

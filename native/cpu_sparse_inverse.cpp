@@ -163,26 +163,35 @@ Index index_argument(const Args& args, int position) {
     return value;
 }
 
+template<bool Encoded>
 PyObject* scatter_upright_crop(PyObject*, PyObject* arguments) {
     return protect([&]() -> PyObject* {
-        const Args args(arguments, 16);
+        constexpr int extra = Encoded ? 1 : 0;
+        const Args args(arguments, 16 + extra);
         const Buffer crop(args[0], "source crop", 2);
-        const Index azimuth = index_argument(args, 1);
-        const Index first_row = index_argument(args, 2);
-        const Index first_u = index_argument(args, 3);
-        const Buffer key_offsets(args[4], "key offsets", 1);
-        const Buffer owners(args[5], "owners", 1);
-        const Buffer row_offsets(args[6], "row offsets", 1);
-        const Buffer frames(args[7], "frames", 1);
-        const Index plane_width = index_argument(args, 8);
-        const Index processing_width = index_argument(args, 9);
-        const Index base = index_argument(args, 10);
-        const Index out_h = index_argument(args, 11);
-        const Index out_w = index_argument(args, 12);
-        const Buffer packed(args[13], "packed destination", 1, true);
-        const Buffer bounds(args[14], "destination slice bounds", 2, true);
-        const Buffer slice_counts(args[15], "destination slice counts", 1, true);
-        require_mask(crop);
+        const Index crop_width = Encoded ? index_argument(args, 1) : crop.shape(1);
+        const Index azimuth = index_argument(args, 1 + extra);
+        const Index first_row = index_argument(args, 2 + extra);
+        const Index first_u = index_argument(args, 3 + extra);
+        const Buffer key_offsets(args[4 + extra], "key offsets", 1);
+        const Buffer owners(args[5 + extra], "owners", 1);
+        const Buffer row_offsets(args[6 + extra], "row offsets", 1);
+        const Buffer frames(args[7 + extra], "frames", 1);
+        const Index plane_width = index_argument(args, 8 + extra);
+        const Index processing_width = index_argument(args, 9 + extra);
+        const Index base = index_argument(args, 10 + extra);
+        const Index out_h = index_argument(args, 11 + extra);
+        const Index out_w = index_argument(args, 12 + extra);
+        const Buffer packed(args[13 + extra], "packed destination", 1, true);
+        const Buffer bounds(args[14 + extra], "destination slice bounds", 2, true);
+        const Buffer slice_counts(args[15 + extra], "destination slice counts", 1, true);
+        if constexpr (Encoded) {
+            crop.require<std::uint8_t>();
+            if (crop_width < 0 || crop.shape(1) != crop_width / 8 + (crop_width % 8 != 0))
+                value_error("Sparse projection encoded crop differs from its logical width");
+        } else {
+            require_mask(crop);
+        }
         key_offsets.require<Owner>();
         owners.require<Owner>();
         row_offsets.require<Owner>();
@@ -200,12 +209,12 @@ PyObject* scatter_upright_crop(PyObject*, PyObject* arguments) {
             || plane_width != (base == 2 ? out_h : out_w)
             || first_row < 0 || first_row > source_rows || crop.shape(0) > source_rows - first_row
             || azimuth < 0 || processing_width <= 0 || first_u < 0 || first_u > processing_width
-            || crop.shape(1) > processing_width - first_u) {
+            || crop_width > processing_width - first_u) {
             value_error("Invalid sparse projection crop or destination geometry");
         }
         const Index first_key = checked_add(checked_extent(azimuth, processing_width), first_u);
         const Index key_count = key_offsets.shape(0) - 1;
-        if (first_key > key_count || crop.shape(1) > key_count - first_key) {
+        if (first_key > key_count || crop_width > key_count - first_key) {
             value_error("Sparse projection crop exceeds its map keys");
         }
         const Index packed_w = (out_w - 1) / 8 + 1;
@@ -223,14 +232,13 @@ PyObject* scatter_upright_crop(PyObject*, PyObject* arguments) {
             for (Index row = 0; row < crop.shape(0); ++row) {
                 OwnerRange mapped_frames{};
                 bool checked_row = false;
-                for (Index column = 0; column < crop.shape(1); ++column) {
-                    if (!crop.load<std::uint8_t>(row, column)) continue;
+                const auto scatter_column = [&](Index column) {
                     ++foreground;
                     if (!checked_row) {
                         mapped_frames = owner_range(row_offsets, first_row + row, frames.shape(0));
                         checked_row = true;
                     }
-                    if (mapped_frames.first == mapped_frames.stop) continue;
+                    if (mapped_frames.first == mapped_frames.stop) return;
                     const auto mapped_owners = owner_range(key_offsets, first_key + column, owners.shape(0));
                     for (Index frame_at = mapped_frames.first; frame_at < mapped_frames.stop; ++frame_at) {
                         const Owner frame = frames.load<Owner>(frame_at);
@@ -261,6 +269,23 @@ PyObject* scatter_upright_crop(PyObject*, PyObject* arguments) {
                             bounds.store<std::int32_t>(std::max(bounds.load<std::int32_t>(z, 3), x + 1), z, 3);
                         }
                     }
+                };
+                if constexpr (Encoded) {
+                    const auto tail = static_cast<unsigned>(crop_width % 8);
+                    for (Index byte = 0; byte < crop.shape(1); ++byte) {
+                        auto bits = crop.load<std::uint8_t>(row, byte);
+                        if (tail && byte == crop.shape(1) - 1)
+                            bits &= static_cast<std::uint8_t>((1u << tail) - 1);
+                        while (bits) {
+                            unsigned bit = 0;
+                            while (!(bits & (1u << bit))) ++bit;
+                            scatter_column(byte * 8 + bit);
+                            bits &= static_cast<std::uint8_t>(bits - 1);
+                        }
+                    }
+                } else {
+                    for (Index column = 0; column < crop_width; ++column)
+                        if (crop.load<std::uint8_t>(row, column)) scatter_column(column);
                 }
             }
         }
@@ -275,7 +300,8 @@ PyMethodDef methods[] = {
     {"sparse_inverse_count_keys", count_keys, METH_VARARGS, nullptr},
     {"sparse_inverse_prefix_counts", prefix_counts, METH_VARARGS, nullptr},
     {"sparse_inverse_fill_owners", fill_owners, METH_VARARGS, nullptr},
-    {"sparse_inverse_scatter_upright_crop", scatter_upright_crop, METH_VARARGS, nullptr},
+    {"sparse_inverse_scatter_upright_crop", scatter_upright_crop<false>, METH_VARARGS, nullptr},
+    {"sparse_inverse_scatter_upright_packed_crop", scatter_upright_crop<true>, METH_VARARGS, nullptr},
     {nullptr, nullptr, 0, nullptr},
 };
 } // namespace

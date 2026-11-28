@@ -18,21 +18,39 @@ struct Projection {
     bool use_boxes, scalar_max;
 };
 
-Index nearest_shell(const Buffer& radii, double radius) {
-    Index lo = 0;
-    Index hi = radii.shape(0);
-    while (lo < hi) {
-        const auto middle = lo + (hi - lo) / 2;
-        if (radii.load<double>(middle) < radius) {
-            lo = middle + 1;
-        } else {
-            hi = middle;
+// Cache the radius interval in which the binary search takes its previous
+// branch sequence. This works even with repeated or unsorted radii because
+// every visited comparison contributes its own open/closed bound.
+struct ShellSearch {
+    double lower = std::numeric_limits<double>::infinity();
+    double upper = -std::numeric_limits<double>::infinity();
+    Index inner = 0, outer = 0;
+    double inner_radius = 0., outer_radius = 0.;
+
+    Index nearest(const Buffer& radii, double radius) {
+        if (!(lower < radius && radius <= upper)) {
+            lower = -std::numeric_limits<double>::infinity();
+            upper = std::numeric_limits<double>::infinity();
+            Index lo = 0, hi = radii.shape(0);
+            while (lo < hi) {
+                const auto middle = lo + (hi - lo) / 2;
+                const auto candidate = radii.load<double>(middle);
+                if (candidate < radius) {
+                    lower = std::max(lower, candidate);
+                    lo = middle + 1;
+                } else {
+                    upper = std::min(upper, candidate);
+                    hi = middle;
+                }
+            }
+            outer = std::min(lo, radii.shape(0) - 1);
+            inner = std::max(Index(0), outer - 1);
+            inner_radius = radii.load<double>(inner);
+            outer_radius = radii.load<double>(outer);
         }
+        return radius - inner_radius <= outer_radius - radius ? inner : outer;
     }
-    const auto outer = std::min(lo, radii.shape(0) - 1);
-    const auto inner = std::max(Index(0), outer - 1);
-    return radius - radii.load<double>(inner) <= radii.load<double>(outer) - radius ? inner : outer;
-}
+};
 
 Index round_even(double value) {
     const auto lower = static_cast<Index>(std::floor(value));
@@ -101,60 +119,82 @@ void project(const ShellSource& source, const Buffer& radii, const Buffer& rotat
     const auto source_w = source.shape(2);
     const auto dz = ((double(cfg.z) + 0.5) - double(cfg.out_t) / 2.0) * double(cfg.work_t) / double(cfg.out_t);
     const auto width = cfg.rectangle_width ? cfg.rectangle_width : cfg.out_w;
-    for (Index pixel = cfg.first; pixel < cfg.stop; ++pixel) {
-        const auto x = pixel % width + cfg.rectangle_x;
-        const auto y = pixel / width + cfg.rectangle_y;
-        const auto dx = ((double(x) + 0.5) - double(cfg.out_w) / 2.0) * double(cfg.work_w) / double(cfg.out_w);
-        const auto dy = ((double(y) + 0.5) - double(cfg.out_h) / 2.0) * double(cfg.work_h) / double(cfg.out_h);
-        const auto radius = std::sqrt((dx * dx + dy * dy) + dz * dz);
-        if ((radius < cfg.minimum && cfg.minimum - radius > roundoff * std::max(radius, cfg.minimum))
-            || (radius > cfg.maximum && radius - cfg.maximum > roundoff * std::max(radius, cfg.maximum))) {
-            continue;
+    if (cfg.first == cfg.stop) return;
+    double matrix[3][3];
+    for (Index axis = 0; axis < 3; ++axis) {
+        for (Index component = 0; component < 3; ++component) {
+            matrix[axis][component] = rotation.load<double>(axis, component);
         }
+    }
+    const double dz_rotation[] = {dz * matrix[2][0], dz * matrix[2][1], dz * matrix[2][2]};
+    const double dz_squared = dz * dz;
+    ShellSearch shell_search;
+    Index pixel = cfg.first, x = pixel % width + cfg.rectangle_x, y = pixel / width + cfg.rectangle_y;
+    while (pixel < cfg.stop) {
+        const Index row_end = pixel + std::min(cfg.stop - pixel, width - (x - cfg.rectangle_x));
+        const auto dy = ((double(y) + 0.5) - double(cfg.out_h) / 2.0) * double(cfg.work_h) / double(cfg.out_h);
+        const auto least_radius = std::sqrt(dy * dy + dz_squared);
+        // Nonnegative additions make least_radius a lower bound in binary64.
+        // The extra margin keeps the original upper-shell tolerance intact.
+        if (least_radius > cfg.maximum && least_radius - cfg.maximum >
+                2. * roundoff * std::max(least_radius, cfg.maximum)) {
+            pixel = row_end;
+        } else {
+            const double dy_rotation[] = {dy * matrix[1][0], dy * matrix[1][1], dy * matrix[1][2]};
+            for (; pixel < row_end; ++pixel, ++x) {
+                const auto dx = ((double(x) + 0.5) - double(cfg.out_w) / 2.0) * double(cfg.work_w) / double(cfg.out_w);
+                const auto radius = std::sqrt((dx * dx + dy * dy) + dz_squared);
+                if ((radius < cfg.minimum && cfg.minimum - radius > roundoff * std::max(radius, cfg.minimum))
+                    || (radius > cfg.maximum && radius - cfg.maximum > roundoff * std::max(radius, cfg.maximum))) {
+                    continue;
+                }
 
-        Index shell = -1;
-        if (cfg.use_boxes) {
-            shell = nearest_shell(radii, radius);
-            if (boxes.load<std::int64_t>(shell, 1) <= boxes.load<std::int64_t>(shell, 0)
-                || boxes.load<std::int64_t>(shell, 3) <= boxes.load<std::int64_t>(shell, 2)) {
-                continue;
+                Index shell = -1;
+                if (cfg.use_boxes) {
+                    shell = shell_search.nearest(radii, radius);
+                    if (boxes.load<std::int64_t>(shell, 1) <= boxes.load<std::int64_t>(shell, 0)
+                        || boxes.load<std::int64_t>(shell, 3) <= boxes.load<std::int64_t>(shell, 2)) {
+                        continue;
+                    }
+                }
+                auto local = [&](int col) {
+                    return (dx * matrix[0][col] + dy_rotation[col]) + dz_rotation[col];
+                };
+                double lx = local(0), ly = local(1), lz = local(2);
+                const double scale = std::max({std::abs(lx), std::abs(ly), std::abs(lz)});
+                if (scale == 0.0 || !std::isfinite(scale)) {
+                    continue;
+                }
+                lx /= scale;
+                ly /= scale;
+                lz /= scale;
+                auto [normal, right, up] = face_direction(cfg.face, lx, ly, lz);
+                if (normal <= 0.0 || normal + roundoff < std::max(std::abs(right), std::abs(up))) {
+                    continue;
+                }
+                const double norm = std::sqrt((lx * lx + ly * ly) + lz * lz);
+                auto [u, v] = face_coordinates(normal / norm, right / norm, up / norm);
+                u = std::min(1.0, std::max(-1.0, u));
+                v = std::min(1.0, std::max(-1.0, v));
+                const Index column = round_even((u + 1.0) * double(cfg.intervals) / 2.0) - cfg.origin_u;
+                const Index row = round_even((1.0 - v) * double(cfg.intervals) / 2.0) - cfg.origin_v;
+                if (row < 0 || row >= cfg.native_h || column < 0 || column >= cfg.native_w) {
+                    continue;
+                }
+                const auto pr = source_pixel(row, cfg.native_h, source_h);
+                const auto pc = source_pixel(column, cfg.native_w, source_w);
+                if (!cfg.use_boxes) {
+                    shell = shell_search.nearest(radii, radius);
+                } else if (pr < boxes.load<std::int64_t>(shell, 0) || pr >= boxes.load<std::int64_t>(shell, 1)
+                           || pc < boxes.load<std::int64_t>(shell, 2) || pc >= boxes.load<std::int64_t>(shell, 3)) {
+                    continue;
+                }
+                const auto value = source.uint8(shell, pr, pc);
+                output.store(cfg.scalar_max ? value : std::uint8_t(value != 0), pixel - cfg.first);
             }
         }
-        auto local = [&](int col) {
-            return (dx * rotation.load<double>(0, col) + dy * rotation.load<double>(1, col))
-                   + dz * rotation.load<double>(2, col);
-        };
-        double lx = local(0), ly = local(1), lz = local(2);
-        const double scale = std::max({std::abs(lx), std::abs(ly), std::abs(lz)});
-        if (scale == 0.0 || !std::isfinite(scale)) {
-            continue;
-        }
-        lx /= scale;
-        ly /= scale;
-        lz /= scale;
-        auto [normal, right, up] = face_direction(cfg.face, lx, ly, lz);
-        if (normal <= 0.0 || normal + roundoff < std::max(std::abs(right), std::abs(up))) {
-            continue;
-        }
-        const double norm = std::sqrt((lx * lx + ly * ly) + lz * lz);
-        auto [u, v] = face_coordinates(normal / norm, right / norm, up / norm);
-        u = std::min(1.0, std::max(-1.0, u));
-        v = std::min(1.0, std::max(-1.0, v));
-        const Index column = round_even((u + 1.0) * double(cfg.intervals) / 2.0) - cfg.origin_u;
-        const Index row = round_even((1.0 - v) * double(cfg.intervals) / 2.0) - cfg.origin_v;
-        if (row < 0 || row >= cfg.native_h || column < 0 || column >= cfg.native_w) {
-            continue;
-        }
-        const auto pr = source_pixel(row, cfg.native_h, source_h);
-        const auto pc = source_pixel(column, cfg.native_w, source_w);
-        if (!cfg.use_boxes) {
-            shell = nearest_shell(radii, radius);
-        } else if (pr < boxes.load<std::int64_t>(shell, 0) || pr >= boxes.load<std::int64_t>(shell, 1)
-                   || pc < boxes.load<std::int64_t>(shell, 2) || pc >= boxes.load<std::int64_t>(shell, 3)) {
-            continue;
-        }
-        const auto value = source.uint8(shell, pr, pc);
-        output.store(cfg.scalar_max ? value : std::uint8_t(value != 0), pixel - cfg.first);
+        x = cfg.rectangle_x;
+        ++y;
     }
 }
 

@@ -19,6 +19,7 @@ from ._deps import cv2
 from .geometry import (AugJob, ViewInfo, physical_view_name, tilted_base_view_name,
                        tilted_frame_center, tilted_stack_axis_length)
 from .media import wait_for_volume_ready
+from .native_cpu import kernels
 from .runtime import (_allocate_memfd_workspace_array, _memfd_backing_path_from_array,
                       _memfd_owner_key_from_array, _memfd_owner_fd_for_path,
                       _root_memmap_for_array, close_memmap_array_without_flush, runtime_telemetry)
@@ -64,6 +65,14 @@ def _t_map(native_t, logical_t):
     return lo, hi, np.clip(positions - lo, 0., 1.).astype(np.float32)
 
 
+def _orthogonal_shape(view, base):
+    if base == 'transverse':
+        return int(view.full_h), int(view.full_w)
+    if base == 'sagittal':
+        return int(view.full_t), int(view.full_w)
+    return int(view.full_t), int(view.full_h)
+
+
 class NativeCartesianRenderer:
     """Render from decoded native t; never request the deferred processing cube."""
     def __init__(self, volume, view, job):
@@ -85,7 +94,9 @@ class NativeCartesianRenderer:
             return
         self.coronal_slab = None
         stop = min(end, start + _CORONAL_SLAB_SLICES)
-        self.coronal_slab = np.ascontiguousarray(self.volume[:, :, start:stop])
+        # Keep the logical (T, H, X) axes while storing whole planes contiguously.
+        self.coronal_slab = np.ascontiguousarray(
+            self.volume[:, :, start:stop].transpose(2, 0, 1)).transpose(1, 2, 0)
         self.coronal_start = start
 
     def _values(self, t, y, x):
@@ -94,24 +105,21 @@ class NativeCartesianRenderer:
         return np.rint(a + self.alpha[t] * (b - a)).clip(0., 255.)
 
     def __call__(self, index):
+        return self._render(index)
+
+    def _render(self, index, native=None):
         view, vol = self.view, self.volume
         if not 0 <= int(index) < int(view.num_slices):
             raise IndexError(index)
         if view.family == 'orthogonal':
-            if self.base == 'transverse':
-                a, b = vol[self.lo[index]].astype(np.float32), vol[self.hi[index]].astype(np.float32)
-                native = np.rint(a + self.alpha[index] * (b - a)).clip(0., 255.).astype(np.uint8)
-            else:
-                if self.base == 'sagittal':
-                    plane = vol[:, index, :]
-                elif self.coronal_slab is not None and 0 <= index - self.coronal_start < self.coronal_slab.shape[2]:
-                    plane = self.coronal_slab[:, :, index - self.coronal_start]
-                else:
-                    plane = vol[:, :, index]
-                # Same center-aligned linear t reconstruction as the resident renderer.
-                a = plane[self.lo].astype(np.float32)
-                native = np.rint(a + self.alpha[:, None] * (plane[self.hi].astype(np.float32) - a))
-                native = native.clip(0., 255.).astype(np.uint8)
+            if native is None:
+                native = np.empty(_orthogonal_shape(view, self.base), np.uint8)
+            axis = {'transverse': 0, 'sagittal': 1, 'coronal': 2}[self.base]
+            if axis == 2 and self.coronal_slab is not None:
+                local = index - self.coronal_start
+                if 0 <= local < self.coronal_slab.shape[2]:
+                    vol, index = self.coronal_slab, local
+            kernels.render_cartesian_t_lerp_gray8(vol, self.lo, self.hi, self.alpha, axis, index, native)
         else:
             native = np.zeros((int(view.src_h), int(view.src_w)), np.uint8)
             center = int(tilted_frame_center(view, index))
@@ -408,7 +416,10 @@ class CpuInputPrefetch:
         try:
             if self.backing(array) is None:
                 raise OSError('CPU input preparation requires transferable shared RAM')
-            render = NativeCartesianRenderer(self.volume, task['view'], task['job'])
+            view = task['view']
+            render = NativeCartesianRenderer(self.volume, view, task['job'])
+            native = (np.empty(_orthogonal_shape(view, render.base), np.uint8)
+                      if view.family == 'orthogonal' else None)
             start = int(task['slice_start'])
             end = start + int(task['slice_count'])
             for local, index in enumerate(range(start, end)):
@@ -416,7 +427,7 @@ class CpuInputPrefetch:
                     if self.closed or packet.revoked or not packet.remaining:
                         return None
                 render.prepare_coronal_slab(index, end)
-                array[local] = render(index)
+                array[local] = render._render(index, native)
             self._record('prepared_frames', int(task['slice_count']))
             self._record('prepare_seconds', time.perf_counter() - started)
             # The Future carries completion only. A returned ndarray would leave
@@ -592,9 +603,18 @@ class CpuInputPrefetch:
                         break
                     packet = self.pending[0]
                     view = packet.task['view']
-                    # Native planes and NumPy lerp temporaries are live only while building.
-                    size = self._size(packet) + int(view.src_h) * int(view.src_w) * 24
-                    size += min(128, int(view.src_h)) * int(view.src_w) * 128
+                    size = self._size(packet)
+                    if view.family == 'orthogonal':
+                        native_h, native_w = _orthogonal_shape(view, physical_view_name(view))
+                        # Private native plane, affine canvas and peak time-map work.
+                        size += native_h * native_w + int(packet.task['job'].aff.out_size) ** 2
+                        # Two int64 and one float32 input per row, plus the
+                        # validated native copy (24 bytes per row at most).
+                        size += 44 * int(view.full_t)
+                    else:
+                        # Tilted shear/gather still uses bounded NumPy bands.
+                        size += int(view.src_h) * int(view.src_w) * 24
+                        size += min(128, int(view.src_h)) * int(view.src_w) * 128
                     count = min(_CORONAL_SLAB_SLICES, int(packet.task['slice_count']))
                     if count > 1 and view.family == 'orthogonal' and physical_view_name(view) == 'coronal':
                         size += int(self.volume.shape[0]) * int(self.volume.shape[1]) * count

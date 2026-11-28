@@ -152,7 +152,7 @@ def test_only_safe_constructor_refusal_releases_lease(native_job, monkeypatch, u
     monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_GPU_RESERVE_GIB', '1')
     monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
     monkeypatch.setattr(bp, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR', SimpleNamespace(
-        can_attempt_source_projection=lambda _: True,
+        is_bound=True, can_attempt_source_projection=lambda _: True,
         cancel_spherical_retirement_request=lambda *args, **kwargs: None))
     monkeypatch.setattr(bp, '_try_acquire_main_process_gpu_stage', lambda *args: lease)
     monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(cuda=SimpleNamespace(
@@ -201,7 +201,7 @@ def test_encoded_source_borrows_common_stage_and_retires_before_release(native_j
     monkeypatch.setenv('YOLO_TTA_NATIVE_PULL_CUDA', '1')
     monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
     monkeypatch.setattr(bp, '_MAIN_PROCESS_GPU_STAGE_COORDINATOR', SimpleNamespace(
-        can_attempt_source_projection=lambda _: True,
+        is_bound=True, can_attempt_source_projection=lambda _: True,
         cancel_spherical_retirement_request=lambda *args, **kwargs: None))
     monkeypatch.setattr(bp, '_try_acquire_main_process_gpu_stage', lambda *args: lease)
     monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(cuda=SimpleNamespace(

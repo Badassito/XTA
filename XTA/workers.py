@@ -553,29 +553,27 @@ def _binary_slice_metadata_from_array(mask_volume: np.ndarray) -> Dict[str, np.n
     volume = np.asarray(mask_volume)
     if volume.ndim != 3:
         raise ValueError(f'binary metadata requires a 3-D array, got {volume.shape}')
-    z_dim, plane_h, plane_w = (int(value) for value in volume.shape)
-    slice_any = np.zeros((z_dim,), dtype=bool)
-    slice_bboxes = np.zeros((z_dim, 4), dtype=np.int64)
-    packed_rows = np.zeros((z_dim, int((plane_h + 7) // 8)), dtype=np.uint8)
-    for z in range(z_dim):
-        plane = np.asarray(volume[int(z)], dtype=bool)
-        rows = np.any(plane, axis=1)
-        packed_rows[int(z)] = np.packbits(rows)
-        if not bool(np.any(rows)):
-            continue
-        cols = np.any(plane, axis=0)
-        y_ids = np.flatnonzero(rows)
-        x_ids = np.flatnonzero(cols)
-        slice_any[int(z)] = True
-        slice_bboxes[int(z)] = (
-            int(y_ids[0]), int(y_ids[-1]) + 1,
-            int(x_ids[0]), int(x_ids[-1]) + 1,
-        )
+    from .native_cpu import kernels
+
+    if volume.dtype in (np.dtype(np.uint8), np.dtype(bool)):
+        slice_any, slice_bboxes, packed_rows = kernels.binary_slice_metadata_from_volume(volume)
+    else:
+        # Preserve legacy truth conversion for other dtypes without copying a whole volume.
+        depth, height, _ = volume.shape
+        slice_any = np.empty(depth, dtype=bool)
+        slice_bboxes = np.empty((depth, 4), dtype=np.int64)
+        packed_rows = np.empty((depth, (height + 7) // 8), dtype=np.uint8)
+        for z in range(depth):
+            section = slice(z, z + 1)
+            slice_any[section], slice_bboxes[section], packed_rows[section] = (
+                kernels.binary_slice_metadata_from_volume(volume[section].astype(bool))
+            )
+
     return {
         'slice_any': slice_any,
         'slice_bboxes': slice_bboxes,
         'slice_row_any': packed_rows,
-        'slice_row_count': np.asarray([int(plane_h)], dtype=np.int64),
+        'slice_row_count': np.asarray([volume.shape[1]], dtype=np.int64),
     }
 
 class _OpenVinoCpuSegmenter:
@@ -1319,9 +1317,9 @@ class _OpenVinoCpuSegmenter:
             raise RuntimeError(
                 f'OpenVINO CPU source produced {submitted_real}/{int(num_frames)} real frames'
             )
-        stats['slice_meta'] = _binary_slice_metadata_from_array(view_union_mm)
-        if int(azimuthal_padding_processed) > 0:
-            stats['slice_meta'] = None
+        stats['slice_meta'] = (
+            None if azimuthal_padding_processed else _binary_slice_metadata_from_array(view_union_mm)
+        )
         stats['azimuthal_padding_processed'] = int(azimuthal_padding_processed)
         stats['device_hole_filled_frames'] = 0
         stats['proto_hole_treated_frames'] = 0
